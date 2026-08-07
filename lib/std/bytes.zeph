@@ -1,0 +1,223 @@
+// Raw byte buffers: a fixed-size, GC-managed, non-moving region you can lay C
+// structs into. Backed by a `zeros()` list, so the collector owns it -- no
+// manual free, and the mark-sweep collector never moves objects.
+//
+// PINNING RULE: any address handed to a foreign library must belong to a Bytes
+// that is still reachable from a Zephyr variable for as long as that library
+// may use it. The collector never moves and never frees reachable objects, so
+// that is the entire contract.
+//
+// Every accessor is bounds-checked and panics on violation, like list indexing.
+
+struct Bytes {
+    mem: [int],     // the backing allocation -- keeps the data alive for the GC
+    p: int,         // 16-byte-aligned address of byte 0
+    n: int          // usable size in bytes
+}
+
+impl Bytes {
+    // n zero-filled bytes, aligned to 16 so any C struct laid at offset 0 is aligned
+    fn new(n: int) -> Bytes {
+        assert(n >= 0, "Bytes.new: negative size")
+        var m = zeros(n / 8 + 4)                 // slack for the alignment bump
+        let base = load64(addr(m) + 16)          // list layout: [0]len [8]cap [16]data
+        let p = (base + 15) & (0 - 16)
+        return Bytes{mem: m, p: p, n: n}
+    }
+
+    fn len(self) -> int { return self.n }
+    fn addr(self) -> int { return self.p }
+
+    // address of byte `off`, for passing an interior pointer to a foreign call
+    fn at(self, off: int) -> int {
+        assert(off >= 0 and off <= self.n, "Bytes.at: offset out of range")
+        return self.p + off
+    }
+
+    fn put8(self, off: int, v: int) {
+        assert(off >= 0 and off + 1 <= self.n, "Bytes.put8: out of range")
+        store8(self.p + off, v)
+    }
+    fn get8(self, off: int) -> int {
+        assert(off >= 0 and off + 1 <= self.n, "Bytes.get8: out of range")
+        return load8(self.p + off)
+    }
+
+    fn put16(self, off: int, v: int) {
+        assert(off >= 0 and off + 2 <= self.n, "Bytes.put16: out of range")
+        store8(self.p + off, v & 255)
+        store8(self.p + off + 1, (v >> 8) & 255)
+    }
+    fn get16(self, off: int) -> int {
+        assert(off >= 0 and off + 2 <= self.n, "Bytes.get16: out of range")
+        return load8(self.p + off) + load8(self.p + off + 1) * 256
+    }
+
+    fn put32(self, off: int, v: int) {
+        assert(off >= 0 and off + 4 <= self.n, "Bytes.put32: out of range")
+        store32(self.p + off, v)
+    }
+    // zero-extends: Vulkan's 32-bit fields are enums, flags and counts
+    fn get32(self, off: int) -> int {
+        assert(off >= 0 and off + 4 <= self.n, "Bytes.get32: out of range")
+        let lo = load8(self.p + off) + load8(self.p + off + 1) * 256
+        return lo + load8(self.p + off + 2) * 65536 + load8(self.p + off + 3) * 16777216
+    }
+
+    fn put64(self, off: int, v: int) {
+        assert(off >= 0 and off + 8 <= self.n, "Bytes.put64: out of range")
+        store64(self.p + off, v)
+    }
+    fn get64(self, off: int) -> int {
+        assert(off >= 0 and off + 8 <= self.n, "Bytes.get64: out of range")
+        return load64(self.p + off)
+    }
+
+    fn putf32(self, off: int, x: float) { self.put32(off, f32_bits(x)) }
+    fn getf32(self, off: int) -> float { return f32_from(self.get32(off)) }
+
+    fn putf64(self, off: int, x: float) { self.put64(off, bits(x)) }
+    fn getf64(self, off: int) -> float { return frombits(self.get64(off)) }
+
+    // copy a Zephyr string in and NUL-terminate it -- a C `const char*`
+    fn put_cstr(self, off: int, s: str) {
+        assert(off >= 0 and off + s.len() + 1 <= self.n, "Bytes.put_cstr: out of range")
+        for i in 0..s.len() { store8(self.p + off + i, s.byte(i)) }
+        store8(self.p + off + s.len(), 0)
+    }
+
+    // copy raw bytes of a str (e.g. a .spv file read with read_file) in
+    fn put_str(self, off: int, s: str) {
+        assert(off >= 0 and off + s.len() <= self.n, "Bytes.put_str: out of range")
+        for i in 0..s.len() { store8(self.p + off + i, s.byte(i)) }
+    }
+
+    // read `n` bytes back out as a str
+    fn get_str(self, off: int, n: int) -> str {
+        assert(off >= 0 and off + n <= self.n, "Bytes.get_str: out of range")
+        var parts: [str] = []
+        for i in 0..n { parts.push(chr(load8(self.p + off + i))) }
+        return parts.join()
+    }
+}
+
+// a standalone NUL-terminated C string; hold the returned Bytes to keep it alive
+fn cbytes(s: str) -> Bytes {
+    var b = Bytes.new(s.len() + 1)
+    b.put_cstr(0, s)
+    return b
+}
+
+// ---- array plumbing for C APIs that take count + pointer ----
+
+// a contiguous array of 64-bit values (handles, pointers)
+fn u64s(xs: [int]) -> Bytes {
+    var b = Bytes.new(8 * xs.len() + 8)
+    for i in 0..xs.len() { b.put64(i * 8, xs[i]) }
+    return b
+}
+
+// a contiguous array of 32-bit values (indices, enum values)
+fn u32s(xs: [int]) -> Bytes {
+    var b = Bytes.new(4 * xs.len() + 4)
+    for i in 0..xs.len() { b.put32(i * 4, xs[i]) }
+    return b
+}
+
+// Lay several equally-sized structs out back to back, which is what an API
+// wanting `count, pStructs` expects. Pass each builder's .raw().
+fn pack(items: [Bytes]) -> Bytes {
+    if items.len() == 0 { return Bytes.new(8) }
+    let stride = items[0].len()
+    var out = Bytes.new(stride * items.len() + 8)
+    for i in 0..items.len() {
+        for j in 0..stride { out.put8(i * stride + j, items[i].get8(j)) }
+    }
+    return out
+}
+
+// A `const char* const*`. The individual strings must outlive the call, so the
+// array and its buffers are held together.
+struct CStrs { ptrs: Bytes, bufs: [Bytes] }
+fn cstrs(xs: [str]) -> CStrs {
+    var bufs: [Bytes] = []
+    var ptrs = Bytes.new(8 * xs.len() + 8)
+    for i in 0..xs.len() {
+        var b = cbytes(xs[i])
+        bufs.push(b)
+        ptrs.put64(i * 8, b.addr())
+    }
+    return CStrs{ptrs: ptrs, bufs: bufs}
+}
+impl CStrs {
+    fn addr(self) -> int {
+        if self.bufs.len() == 0 { return 0 }
+        return self.ptrs.addr()
+    }
+    fn len(self) -> int { return self.bufs.len() }
+}
+
+// ---- IEEE-754 double <-> single conversion (Zephyr floats are all doubles) ----
+// Rounds to nearest, ties to even -- the same rule the hardware uses for a
+// double->float store, so results match what a C `(float)x` would produce.
+fn f32_bits(x: float) -> int {
+    let b = bits(x)
+    let sign = (b >> 63) & 1
+    let exp = (b >> 52) & 2047
+    let man = b & 4503599627370495                  // 2^52 - 1
+    if exp == 0 { return sign << 31 }               // zero / subnormal -> signed zero
+    if exp == 2047 {                                // inf / NaN
+        if man != 0 { return (sign << 31) | (255 << 23) | 4194303 }
+        return (sign << 31) | (255 << 23)
+    }
+    var e = exp - 1023 + 127
+    if e >= 255 { return (sign << 31) | (255 << 23) }   // overflow -> inf
+    if e <= 0 {
+        // Below the smallest normal float, but a subnormal may still represent
+        // it: value = m * 2^-149, so shift the 53-bit significand down to suit.
+        let shift = 30 - e
+        if shift > 53 { return sign << 31 }             // truly zero
+        let full = 4503599627370496 + man               // 2^52 + mantissa
+        var sm = full >> shift
+        let sdrop = full & ((1 << shift) - 1)
+        let shalf = 1 << (shift - 1)
+        if sdrop > shalf or (sdrop == shalf and (sm & 1) == 1) { sm += 1 }
+        // carrying out of the mantissa lands on the smallest normal, which this
+        // encoding already expresses correctly (exponent 1, mantissa 0)
+        return (sign << 31) | sm
+    }
+    // 52 mantissa bits down to 23: 29 bits are dropped. Round to nearest, and on
+    // an exact tie pick the even significand.
+    var m = man >> 29
+    let dropped = man & 536870911                   // 2^29 - 1
+    let half = 268435456                            // 2^28
+    if dropped > half or (dropped == half and (m & 1) == 1) {
+        m += 1
+        if m == 8388608 {                           // mantissa overflowed: bump exponent
+            m = 0
+            e += 1
+            if e >= 255 { return (sign << 31) | (255 << 23) }
+        }
+    }
+    return (sign << 31) | (e << 23) | m
+}
+
+fn f32_from(v: int) -> float {
+    let sign = (v >> 31) & 1
+    let exp = (v >> 23) & 255
+    let man = v & 8388607                           // 2^23 - 1
+    if exp == 0 {
+        if man == 0 { return frombits(sign << 63) }
+        // subnormal: man * 2^-149, renormalised into a double
+        var p = 22
+        while p > 0 and (man & (1 << p)) == 0 { p -= 1 }
+        let dexp = 0 - 149 + p + 1023
+        let dman = (man << (52 - p)) & 4503599627370495
+        return frombits((sign << 63) | (dexp << 52) | dman)
+    }
+    if exp == 255 {
+        if man != 0 { return frombits((sign << 63) | (2047 << 52) | 1) }
+        return frombits((sign << 63) | (2047 << 52))
+    }
+    return frombits((sign << 63) | ((exp - 127 + 1023) << 52) | (man << 29))
+}

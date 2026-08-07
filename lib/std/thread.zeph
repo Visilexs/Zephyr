@@ -1,0 +1,117 @@
+// Threads.
+//
+// Two things stand between Zephyr and CreateThread:
+//
+//  1. The OS calls a thread entry with Win64 conventions (one argument in RCX),
+//     but a Zephyr function reads its arguments off the stack. So there is a
+//     29-byte thunk below, assembled by hand into executable memory, that
+//     translates one into the other. This is the native callback we managed to
+//     avoid for windowing (DefWindowProcA did that job) and for Vulkan
+//     validation (a settings file did). A thread entry has no such escape.
+//
+//  2. The collector is stop-the-world and finds its roots by scanning stacks.
+//     It used to scan exactly one. runtime.zeph now keeps a registry, and
+//     rx_collect suspends every other registered thread, reads its CONTEXT for
+//     the integer registers, and scans from its Rsp to its stack base. A thread
+//     is registered before it is resumed, so it cannot allocate unseen.
+//
+// The argument passed to a thread is an `int` -- a worker index, or an address
+// in a buffer you allocated up front. It is deliberately not a heap reference:
+// it travels through memory the collector does not scan.
+//
+// String interpolation IS safe across threads: the runtime's builder is
+// per-thread, reached through TLS once a second thread exists.
+
+struct Thread { handle: int, rec: int, slot: int }
+
+// Thread bodies are closures, and a closure is a heap object. The record handed
+// to the OS lives outside the heap, so without this list the collector would
+// see no reference to a running thread's body and free it.
+// join() releases the entry, so spawning in a loop reuses these rather than
+// growing a list the collector has to walk on every cycle.
+var g_bodies: [fn(int)] = []
+var g_live: [bool] = []
+var g_thunk = 0
+
+fn body_slot(b: fn(int)) -> int {
+    for i in 0..g_bodies.len() {
+        if not g_live[i] {
+            g_bodies[i] = b
+            g_live[i] = true
+            return i
+        }
+    }
+    g_bodies.push(b)
+    g_live.push(true)
+    return g_bodies.len() - 1
+}
+
+// push rbx / mov rbx,rsp        -- keep a copy of the stack pointer
+// mov rax,[rcx]                 -- rcx = record; rax = the closure cell
+// mov rdx,[rax+8] / push rdx    -- env, pushed first (deepest) as Zephyr expects
+// mov rdx,[rcx+8] / push rdx    -- the int argument
+// mov rax,[rax] / call rax      -- code pointer
+// mov rsp,rbx / pop rbx / xor eax,eax / ret
+let THUNK_CODE = [83, 72, 137, 227, 72, 139, 1, 72, 139, 80, 8, 82,
+                  72, 139, 81, 8, 82, 72, 139, 0, 255, 208,
+                  72, 137, 220, 91, 49, 192, 195]
+
+fn tx_thunk() -> int {
+    if g_thunk != 0 { return g_thunk }
+    // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
+    let p = win("VirtualAlloc", 0, 4096, 12288, 64)
+    if p == 0 { panic("thread: cannot allocate executable memory") }
+    for i in 0..THUNK_CODE.len() { store8(p + i, THUNK_CODE[i]) }
+    g_thunk = p
+    return p
+}
+
+// Run `f(arg)` on a new thread.
+fn thread_spawn(f: fn(int), arg: int) -> Thread {
+    // wrap the caller's function so registration cannot be forgotten
+    let body = fn(a: int) {
+        rt_thread_ready()
+        f(a)
+        rt_thread_done()
+    }
+    let bslot = body_slot(body)
+
+    let rec = win("VirtualAlloc", 0, 32, 12288, 4)
+    store64(rec, addr(body))
+    store64(rec + 8, arg)
+    let ptid = win("VirtualAlloc", 0, 16, 12288, 4)
+
+    // CREATE_SUSPENDED so the thread is in the registry before it can allocate
+    let h = win("CreateThread", 0, 0, tx_thunk(), rec, 4, ptid)
+    if h == 0 { panic("thread: CreateThread failed") }
+    let slot = rt_thread_add(h, load64(ptid) & 4294967295)
+    let r = win("ResumeThread", h)
+    let f2 = win("VirtualFree", ptid, 0, 32768)                       // MEM_RELEASE
+    return Thread{handle: h, rec: rec, slot: bslot}
+}
+
+impl Thread {
+    fn join(self) {
+        let r = win("WaitForSingleObject", self.handle, 4294967295)   // INFINITE
+        let c = win("CloseHandle", self.handle)
+        // the body has returned, so nothing reaches the record or the closure
+        let f = win("VirtualFree", self.rec, 0, 32768)                // MEM_RELEASE
+        g_live[self.slot] = false
+    }
+}
+
+// Run `f(i)` for i in 0..n across n threads and wait for all of them.
+fn parallel_for(n: int, f: fn(int)) {
+    var ts: [Thread] = []
+    for i in 0..n { ts.push(thread_spawn(f, i)) }
+    for t in ts { t.join() }
+}
+
+fn cpu_count() -> int {
+    // GetSystemInfo fills a SYSTEM_INFO; dwNumberOfProcessors sits at offset 32
+    let si = win("VirtualAlloc", 0, 128, 12288, 4)
+    let r = win("GetSystemInfo", si)
+    let n = load64(si + 32) & 4294967295
+    if n < 1 { return 1 }
+    return n
+}

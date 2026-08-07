@@ -1,0 +1,163 @@
+// GPU-accelerated particle engine: 200,000 particles, drawn by OpenGL.
+//
+// Same simulation as particles.zeph (see particle_sim.zeph), but the software
+// rasterizer is gone. Instead the CPU packs positions and colors into two
+// vertex arrays and hands the whole frame to the GPU in ONE glDrawArrays call:
+// blending, rasterization and fill are the graphics card's problem now, which
+// is why this runs 200k particles where the CPU renderer ran 6k.
+//
+// This is fixed-function OpenGL 1.1 on purpose -- every entry point used here
+// is exported directly from opengl32.dll, so Zephyr's win() FFI reaches it
+// with no shader compiler, no extension loader, no wglGetProcAddress. Vertices
+// go up as GL_DOUBLE (Zephyr floats are doubles, so bits() stores them raw)
+// in clip space, so no projection matrix is needed either -- glOrtho takes
+// float arguments, which win() cannot pass.
+//
+//   zc.exe --rt examples\particles_gl.zeph particles_gl.exe && .\particles_gl.exe
+//   .\particles_gl.exe 200     (headless: 200 steps, print a position checksum)
+//
+// Controls: 1 fountain, 2 burst, 3 vortex; hold the left mouse button to drag
+// the particles toward the cursor. Close the window to exit.
+
+import "particle_sim.zeph"
+
+let COUNT = 200000               // particles
+
+// GL constants
+let GL_POINTS = 0
+let GL_COLOR_BUFFER_BIT = 16384
+let GL_BLEND = 3042
+let GL_ONE = 1
+let GL_DOUBLE = 5130
+let GL_UNSIGNED_BYTE = 5121
+let GL_VERTEX_ARRAY = 32884
+let GL_COLOR_ARRAY = 32886
+
+var vbuf = 0                     // COUNT * 2 doubles: x, y in clip space
+var cbuf = 0                     // COUNT * 4 bytes: r, g, b, pad
+
+// pack the live particles into the vertex arrays; returns how many to draw
+fn pack() -> int {
+    let sx = 2.0 / (PW as float)
+    let sy = 2.0 / (PH as float)
+    let ci = 255.0 / LIFE
+    var n = 0
+    var i = 0
+    while i < NP {
+        let l = plife[i]
+        if l > 0.0 {
+            store64(vbuf + n * 16, bits(px[i] * sx - 1.0))
+            store64(vbuf + n * 16 + 8, bits(1.0 - py[i] * sy))   // GL's y points up
+            // ember ramp: young particles are white-hot, old ones deep red
+            let t = (l * ci) as int
+            store8(cbuf + n * 4, clampi(t * 3, 0, 255))
+            store8(cbuf + n * 4 + 1, clampi(t * 2 - 90, 0, 255))
+            store8(cbuf + n * 4 + 2, clampi(t * 3 - 500, 0, 255))
+            n += 1
+        }
+        i += 1
+    }
+    return n
+}
+
+fn draw(hwnd: int, hdc: int) {
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 { return }
+    gcw = cw
+    gch = ch
+    let n = pack()
+    let vp = win("opengl32!glViewport", 0, 0, cw, ch)
+    let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT)
+    let v1 = win("opengl32!glVertexPointer", 2, GL_DOUBLE, 16, vbuf)
+    let c1 = win("opengl32!glColorPointer", 3, GL_UNSIGNED_BYTE, 4, cbuf)
+    let da = win("opengl32!glDrawArrays", GL_POINTS, 0, n)
+    let sb = win("gdi32!SwapBuffers", hdc)
+}
+
+sim_init(COUNT)
+
+var steps = 0
+if args().len() > 1 { steps = args()[1] as int }
+
+if steps > 0 {
+    // headless: run the sim and print a position checksum (no window, no GL)
+    var s = 0
+    while s < steps {
+        step()
+        s += 1
+    }
+    var chk = 0
+    var i = 0
+    while i < NP {
+        chk += (px[i] as int) * 7 + (py[i] as int) * 13
+        i += 1
+    }
+    print(chk)
+} else {
+    vbuf = mem(COUNT * 16)
+    cbuf = mem(COUNT * 4)
+
+    let hInst = win("GetModuleHandleA", 0)
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+    let clsname = cstr("zephyrParticleGLWindow")
+
+    let wc = mem(72)                       // WNDCLASSA
+    store32(wc + 0, 3 | 32)                // CS_HREDRAW|CS_VREDRAW|CS_OWNDC
+    store64(wc + 8, defwp)
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+    store64(wc + 48, 0)
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - particles (GPU)"),
+        282001408, 120, 100, 1100, 800, 0, 0, hInst, 0)     // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let hdc = win("user32!GetDC", hwnd)
+
+    // ---- PIXELFORMATDESCRIPTOR: 32-bit RGBA, double buffered, no depth ----
+    let pfd = mem(40)
+    store32(pfd + 0, 40 | 1 * 65536)       // nSize = 40, nVersion = 1
+    store32(pfd + 4, 4 | 32 | 1)           // DRAW_TO_WINDOW|SUPPORT_OPENGL|DOUBLEBUFFER
+    store8(pfd + 8, 0)                     // iPixelType = PFD_TYPE_RGBA
+    store8(pfd + 9, 32)                    // cColorBits
+    store8(pfd + 26, 0)                    // iLayerType = PFD_MAIN_PLANE
+    let pf = win("gdi32!ChoosePixelFormat", hdc, pfd)
+    assert(pf != 0, "no suitable pixel format")
+    let spf = win("gdi32!SetPixelFormat", hdc, pf, pfd)
+
+    let ctx = win("opengl32!wglCreateContext", hdc)
+    assert(ctx != 0, "wglCreateContext failed")
+    let mc = win("opengl32!wglMakeCurrent", hdc, ctx)
+
+    // additive blending: overlapping particles accumulate into a glow
+    let e1 = win("opengl32!glEnable", GL_BLEND)
+    let bf = win("opengl32!glBlendFunc", GL_ONE, GL_ONE)
+    let e2 = win("opengl32!glEnableClientState", GL_VERTEX_ARRAY)
+    let e3 = win("opengl32!glEnableClientState", GL_COLOR_ARRAY)
+    // ponytail: point size stays at 1px -- glPointSize takes a float, and win()
+    // passes integer registers only. Bigger points would need an FFI float path.
+
+    let msg = mem(48)
+    var running = 1
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }     // WM_QUIT
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            poll_input(hwnd)
+            step()
+            draw(hwnd, hdc)
+            fps_tick()
+        }
+    }
+    let mc0 = win("opengl32!wglMakeCurrent", 0, 0)
+    let dl = win("opengl32!wglDeleteContext", ctx)
+}

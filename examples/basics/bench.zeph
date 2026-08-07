@@ -1,0 +1,12 @@
+// Compute-heavy benchmark: naive recursive fib + a tight loop.
+fn fib(n: int) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+print(fib(32))
+
+var sum = 0
+for i in 0..100000000 {
+    sum += i % 7
+}
+print(sum)

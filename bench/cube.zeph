@@ -1,0 +1,93 @@
+// Wireframe cube (edges only, hollow center), spinning a full turn.
+// Renders `frames` frames of a rotating cube into a W x H framebuffer with a
+// Bresenham line rasterizer, then folds each frame's buffer into a checksum.
+// Same algorithm and same output as cube.c / cube.rs, so the checksum matches
+// exactly across all three. The spin is advanced by composing a fixed small
+// rotation each frame (a unit vector (c, s), renormalized with sqrt), so no
+// sin/cos is needed and every floating-point op is identical across languages.
+// Usage: cube [frames]   (default 1500)
+
+let W = 100
+let H = 100
+// the 8 cube corners at (+/-1, +/-1, +/-1)
+let VX = [0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0]
+let VY = [0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0]
+let VZ = [0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 1.0, 1.0]
+// the 12 edges, as pairs of corner indices (4 bottom, 4 top, 4 verticals)
+let E0 = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]
+let E1 = [1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7]
+
+var grid: [int] = zeros(W * H)
+var sx: [int] = zeros(8)
+var sy: [int] = zeros(8)
+
+fn draw_line(x0: int, y0: int, x1: int, y1: int) {
+    var dx = x1 - x0
+    if dx < 0 { dx = 0 - dx }
+    var dy = y1 - y0
+    if dy < 0 { dy = 0 - dy }
+    var stepx = 0 - 1
+    if x0 < x1 { stepx = 1 }
+    var stepy = 0 - 1
+    if y0 < y1 { stepy = 1 }
+    var err = dx - dy
+    var x = x0
+    var y = y0
+    while true {
+        if x >= 0 and x < W and y >= 0 and y < H {
+            grid[y * W + x] = 1
+        }
+        if x == x1 and y == y1 { break }
+        let e2 = 2 * err
+        if e2 > 0 - dy {
+            err -= dy
+            x += stepx
+        }
+        if e2 < dx {
+            err += dx
+            y += stepy
+        }
+    }
+}
+
+fn render(frames: int) -> int {
+    // fixed camera tilt about X: cos(0.5), sin(0.5)
+    let tc = 0.8775825618903728
+    let ts = 0.479425538604203
+    // per-frame spin step about Y: cos(0.08), sin(0.08)
+    let stc = 0.9968017063026194
+    let sts = 0.07991469396917269
+    var c = 1.0
+    var s = 0.0
+    var chk = 0
+    for f in 0..frames {
+        for i in 0..W * H { grid[i] = 0 }        // clear framebuffer
+        for v in 0..8 {                          // project the 8 corners
+            let x = VX[v]
+            let y = VY[v]
+            let z = VZ[v]
+            let rx = x * c + z * s                // spin about Y
+            let rz = z * c - x * s
+            let ry = y * tc - rz * ts             // tilt about X
+            let rz2 = y * ts + rz * tc
+            let depth = rz2 + 4.0
+            let sc = 60.0 / depth                 // perspective divide
+            sx[v] = (50.0 + rx * sc + 0.5) as int
+            sy[v] = (50.0 + ry * sc + 0.5) as int
+        }
+        for e in 0..12 {                          // rasterize the 12 edges
+            draw_line(sx[E0[e]], sy[E0[e]], sx[E1[e]], sy[E1[e]])
+        }
+        for i in 0..W * H { chk += grid[i] * i }  // fold framebuffer -> checksum
+        let nc = c * stc - s * sts                // advance the spin, renormalize
+        let ns = s * stc + c * sts
+        let nn = sqrt(nc * nc + ns * ns)
+        c = nc / nn
+        s = ns / nn
+    }
+    return chk
+}
+
+var frames = 1500
+if args().len() > 1 { frames = args()[1] as int }
+print(render(frames))

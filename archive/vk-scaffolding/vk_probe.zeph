@@ -1,0 +1,119 @@
+// Stage 2 acceptance: bring up a Vulkan instance, enumerate physical devices,
+// pick a graphics queue family, create a logical device and fetch its queue.
+// Everything is raw -- structs are laid into Bytes at generated offsets.
+
+import "std/bytes.zeph"
+import "vk/raw.zeph"
+
+fn check(r: int, what: str) {
+    if r != VK_SUCCESS { panic("{what} failed: VkResult {r}") }
+}
+
+// ---- instance ----
+var appname = cbytes("zephyr-vk")
+var app = Bytes.new(VkApplicationInfo_sizeof)
+app.put32(VkApplicationInfo_sType, VK_STRUCTURE_TYPE_APPLICATION_INFO)
+app.put64(VkApplicationInfo_pApplicationName, appname.addr())
+app.put64(VkApplicationInfo_pEngineName, appname.addr())
+app.put32(VkApplicationInfo_apiVersion, VK_API_VERSION_1_0)
+
+var ici = Bytes.new(VkInstanceCreateInfo_sizeof)
+ici.put32(VkInstanceCreateInfo_sType, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
+ici.put64(VkInstanceCreateInfo_pApplicationInfo, app.addr())
+
+var pinst = Bytes.new(8)
+check(vkCreateInstance(ici.addr(), 0, pinst.addr()), "vkCreateInstance")
+let instance = pinst.get64(0)
+assert(instance != 0, "instance handle is null")
+print("instance ok")
+
+// ---- physical devices ----
+var pcount = Bytes.new(8)
+check(vkEnumeratePhysicalDevices(instance, pcount.addr(), 0), "vkEnumeratePhysicalDevices(count)")
+let ndev = pcount.get32(0)
+print("physical devices = {ndev}")
+assert(ndev >= 1, "no Vulkan physical devices")
+
+var devs = Bytes.new(8 * ndev)
+check(vkEnumeratePhysicalDevices(instance, pcount.addr(), devs.addr()), "vkEnumeratePhysicalDevices(list)")
+
+// pick the first discrete GPU, else device 0
+var phys = devs.get64(0)
+var props = Bytes.new(VkPhysicalDeviceProperties_sizeof)
+for i in 0..ndev {
+    let d = devs.get64(i * 8)
+    vkGetPhysicalDeviceProperties(d, props.addr())
+    let kind = props.get32(VkPhysicalDeviceProperties_deviceType)
+    var name: [str] = []
+    var j = 0
+    var going = true
+    while going and j < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE {
+        let c = props.get8(VkPhysicalDeviceProperties_deviceName + j)
+        if c == 0 { going = false }
+        else { name.push(chr(c)) }
+        j += 1
+    }
+    let av = props.get32(VkPhysicalDeviceProperties_apiVersion)
+    print("  [{i}] {name.join()}  type={kind}  api={av / 4194304}.{(av / 4096) % 1024}.{av % 4096}")
+    if kind == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and phys == devs.get64(0) and i > 0 { phys = d }
+    if kind == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and i == 0 { phys = d }
+}
+
+// ---- queue families: find one that can do graphics ----
+var qcount = Bytes.new(8)
+vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), 0)
+let nq = qcount.get32(0)
+assert(nq >= 1, "no queue families")
+var qprops = Bytes.new(VkQueueFamilyProperties_sizeof * nq)
+vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), qprops.addr())
+
+var qfam = 0 - 1
+for i in 0..nq {
+    let flags = qprops.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
+    let n = qprops.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueCount)
+    print("  queue family {i}: flags={flags} count={n}")
+    if qfam < 0 and (flags & VK_QUEUE_GRAPHICS_BIT) != 0 { qfam = i }
+}
+assert(qfam >= 0, "no graphics queue family")
+print("graphics queue family = {qfam}")
+
+// ---- memory heaps (cached later by Gfx for allocation) ----
+var memprops = Bytes.new(VkPhysicalDeviceMemoryProperties_sizeof)
+vkGetPhysicalDeviceMemoryProperties(phys, memprops.addr())
+let ntypes = memprops.get32(VkPhysicalDeviceMemoryProperties_memoryTypeCount)
+let nheaps = memprops.get32(VkPhysicalDeviceMemoryProperties_memoryHeapCount)
+print("memory types = {ntypes}, heaps = {nheaps}")
+assert(ntypes >= 1 and nheaps >= 1, "no memory types")
+
+// ---- logical device + queue ----
+var prio = Bytes.new(4)
+prio.putf32(0, 1.0)
+
+var qci = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
+qci.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+qci.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, qfam)
+qci.put32(VkDeviceQueueCreateInfo_queueCount, 1)
+qci.put64(VkDeviceQueueCreateInfo_pQueuePriorities, prio.addr())
+
+var dci = Bytes.new(VkDeviceCreateInfo_sizeof)
+dci.put32(VkDeviceCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+dci.put32(VkDeviceCreateInfo_queueCreateInfoCount, 1)
+dci.put64(VkDeviceCreateInfo_pQueueCreateInfos, qci.addr())
+
+var pdev = Bytes.new(8)
+check(vkCreateDevice(phys, dci.addr(), 0, pdev.addr()), "vkCreateDevice")
+let dev = pdev.get64(0)
+assert(dev != 0, "device handle is null")
+print("device ok")
+
+var pqueue = Bytes.new(8)
+vkGetDeviceQueue(dev, qfam, 0, pqueue.addr())
+let queue = pqueue.get64(0)
+assert(queue != 0, "queue handle is null")
+print("queue ok")
+
+// ---- teardown ----
+check(vkDeviceWaitIdle(dev), "vkDeviceWaitIdle")
+vkDestroyDevice(dev, 0)
+vkDestroyInstance(instance, 0)
+print("OK")

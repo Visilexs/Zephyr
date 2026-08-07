@@ -1,0 +1,335 @@
+// lib/os/linux.zeph -- the kernel32 surface runtime.zeph uses, on top of Linux
+// syscalls. Merged ahead of runtime.zeph by `zc --linux --rt`, which rewrites
+// every win("Foo", ...) in the runtime into a call to k32_Foo(...). The runtime,
+// the GC and the string machinery are already platform-neutral and are compiled
+// unchanged for both targets.
+//
+// Nothing in here may allocate: rx_init calls k32_VirtualAlloc before the GC
+// heap exists, so these functions use raw syscalls, load*/store* and mmap only.
+
+let SYS_READ = 0
+let SYS_WRITE = 1
+let SYS_OPEN = 2
+let SYS_CLOSE = 3
+let SYS_LSEEK = 8
+let SYS_MMAP = 9
+let SYS_MPROTECT = 10
+let SYS_EXIT_GROUP = 231
+
+let PROT_NONE = 0
+let PROT_RW = 3
+let MAP_ANON_PRIV = 34          // MAP_PRIVATE | MAP_ANONYMOUS
+let MAP_NORESERVE = 16384
+
+// mmap and friends report failure as a small negative value (-errno)
+fn lx_failed(r: int) -> bool {
+    return r < 0 and r > 0 - 4096
+}
+
+fn lx_mmap(addr: int, n: int, prot: int, flags: int) -> int {
+    let r = syscall(SYS_MMAP, addr, n, prot, flags, 0 - 1, 0)
+    if lx_failed(r) { return 0 }
+    return r
+}
+
+// ---- memory ----
+
+// MEM_RESERVE=0x2000 MEM_COMMIT=0x1000. A reserve maps PROT_NONE address space
+// (Linux overcommits, so this costs nothing); a later commit just mprotects it.
+fn k32_VirtualAlloc(base: int, n: int, flags: int, prot: int) -> int {
+    let want_commit = (flags & 4096) != 0
+    let want_reserve = (flags & 8192) != 0
+    if want_reserve and not want_commit {
+        return lx_mmap(base, n, PROT_NONE, MAP_ANON_PRIV + MAP_NORESERVE)
+    }
+    if want_commit and base != 0 {
+        let r = syscall(SYS_MPROTECT, base, n, PROT_RW)
+        if lx_failed(r) { return 0 }
+        return base
+    }
+    return lx_mmap(base, n, PROT_RW, MAP_ANON_PRIV)
+}
+
+// ---- console and files ----
+
+// Windows handles are opaque; on Linux we hand back the fd itself, so the
+// runtime's WriteFile/ReadFile calls land on the right descriptor unchanged.
+fn k32_GetStdHandle(which: int) -> int {
+    if which == 0 - 10 { return 0 }
+    if which == 0 - 11 { return 1 }
+    return 2
+}
+
+fn k32_WriteFile(h: int, ptr: int, n: int, pwritten: int, ov: int) -> int {
+    var done = 0
+    while done < n {
+        let r = syscall(SYS_WRITE, h, ptr + done, n - done)
+        if r <= 0 {
+            if pwritten != 0 { store64(pwritten, done) }
+            return 0
+        }
+        done += r
+    }
+    if pwritten != 0 { store64(pwritten, done) }
+    return 1
+}
+
+fn k32_ReadFile(h: int, buf: int, n: int, pread: int, ov: int) -> int {
+    let r = syscall(SYS_READ, h, buf, n)
+    if r < 0 {
+        if pread != 0 { store64(pread, 0) }
+        return 0
+    }
+    if pread != 0 { store64(pread, r) }
+    return 1
+}
+
+fn k32_CreateFileA(cp: int, access: int, share: int, sa: int, disp: int, flags: int, tmpl: int) -> int {
+    var oflags = 0                       // O_RDONLY
+    var mode = 0
+    if (access & 1073741824) != 0 {      // GENERIC_WRITE
+        oflags = 577                     // O_WRONLY | O_CREAT | O_TRUNC
+        mode = 420                       // 0644
+    }
+    let fd = syscall(SYS_OPEN, cp, oflags, mode)
+    if fd < 0 { return 0 - 1 }
+    return fd
+}
+
+fn k32_GetFileSize(h: int, phigh: int) -> int {
+    let size = syscall(SYS_LSEEK, h, 0, 2)      // SEEK_END
+    let back = syscall(SYS_LSEEK, h, 0, 0)      // SEEK_SET
+    if size < 0 { return 0 }
+    return size
+}
+
+fn k32_CloseHandle(h: int) -> int {
+    let r = syscall(SYS_CLOSE, h)
+    return 1
+}
+
+// Only the "does it exist" bit is ever read, so access(F_OK) is enough:
+// 0 for present, INVALID_FILE_ATTRIBUTES for anything else.
+fn k32_GetFileAttributesA(cp: int) -> int {
+    let r = syscall(21, cp, 0)                  // access(path, F_OK)
+    if r == 0 { return 0 }
+    return 4294967295
+}
+
+// /proc/self/exe is the Linux answer to GetModuleFileNameA. readlink does not
+// NUL-terminate, so do it here -- callers pass the length back but exe_dir
+// reads the buffer directly.
+var __lx_scratch = 0
+
+fn k32_GetModuleFileNameA(module: int, buf: int, cap: int) -> int {
+    if __lx_scratch == 0 { __lx_scratch = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
+    let p = lx_path_proc_self(__lx_scratch)
+    store8(p, 101)           // e
+    store8(p + 1, 120)       // x
+    store8(p + 2, 101)       // e
+    store8(p + 3, 0)
+    let n = syscall(89, __lx_scratch, buf, cap - 1)     // readlink
+    if n < 0 { return 0 }
+    store8(buf + n, 0)
+    return n
+}
+
+fn k32_ExitProcess(code: int) -> int {
+    let r = syscall(SYS_EXIT_GROUP, code)
+    return 0
+}
+
+// ---- reading a whole /proc file into an off-heap page ----
+
+// The two /proc paths, written out a byte at a time. rx_collect calls into
+// k32_GetCurrentThreadStackLimits, so nothing on that path may touch the heap
+// -- not even a list literal for the filename.
+fn lx_path_proc_self(dst: int) -> int {
+    store8(dst, 47)          // /
+    store8(dst + 1, 112)     // p
+    store8(dst + 2, 114)     // r
+    store8(dst + 3, 111)     // o
+    store8(dst + 4, 99)      // c
+    store8(dst + 5, 47)      // /
+    store8(dst + 6, 115)     // s
+    store8(dst + 7, 101)     // e
+    store8(dst + 8, 108)     // l
+    store8(dst + 9, 102)     // f
+    store8(dst + 10, 47)     // /
+    return dst + 11
+}
+
+fn lx_path_maps(dst: int) -> int {
+    let p = lx_path_proc_self(dst)
+    store8(p, 109)           // m
+    store8(p + 1, 97)        // a
+    store8(p + 2, 112)       // p
+    store8(p + 3, 115)       // s
+    store8(p + 4, 0)
+    return dst
+}
+
+fn lx_path_cmdline(dst: int) -> int {
+    let p = lx_path_proc_self(dst)
+    store8(p, 99)            // c
+    store8(p + 1, 109)       // m
+    store8(p + 2, 100)       // d
+    store8(p + 3, 108)       // l
+    store8(p + 4, 105)       // i
+    store8(p + 5, 110)       // n
+    store8(p + 6, 101)       // e
+    store8(p + 7, 0)
+    return dst
+}
+
+// Reads a whole file into a fresh off-heap buffer; returns the byte count and
+// leaves the bytes at `buf`. /proc files report size 0, so this just reads
+// until EOF or the buffer is full.
+fn lx_slurp(cpath: int, buf: int, cap: int) -> int {
+    let fd = syscall(SYS_OPEN, cpath, 0, 0)
+    if fd < 0 { return 0 }
+    var got = 0
+    var going = true
+    while going {
+        let r = syscall(SYS_READ, fd, buf + got, cap - 1 - got)
+        if r <= 0 { going = false } else { got += r }
+        if got >= cap - 1 { going = false }
+    }
+    let c = syscall(SYS_CLOSE, fd)
+    store8(buf + got, 0)
+    return got
+}
+
+// ---- command line ----
+
+// /proc/self/cmdline is argv joined by NULs; rt_args wants the Windows
+// GetCommandLineA shape, so the NULs become spaces.
+// ponytail: no quoting, so an argument containing a space splits in two.
+// Capture argv at _start if that ever matters.
+var __lx_cmdline = 0
+
+fn k32_GetCommandLineA() -> int {
+    if __lx_cmdline != 0 { return __lx_cmdline }
+    let page = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
+    if page == 0 { return 0 }
+    let path = lx_path_cmdline(page + 4096)
+    let n = lx_slurp(path, page, 4096)
+    for i in 0..n {
+        if load8(page + i) == 0 { store8(page + i, 32) }
+    }
+    store8(page + n, 0)
+    __lx_cmdline = page
+    return page
+}
+
+// ---- stack bounds (GC root scanning) ----
+
+var __lx_stack_lo = 0
+var __lx_stack_hi = 0
+
+fn lx_hex_at(buf: int, pos: int) -> int {
+    var v = 0
+    var i = pos
+    var going = true
+    while going {
+        let c = load8(buf + i)
+        var d = 0 - 1
+        if c >= 48 and c <= 57 { d = c - 48 }
+        else if c >= 97 and c <= 102 { d = c - 87 }
+        if d < 0 { going = false } else {
+            v = v * 16 + d
+            i += 1
+        }
+    }
+    return v
+}
+
+// "[stack]" at p?
+fn lx_is_stack_tag(p: int) -> bool {
+    if load8(p + 1) != 115 { return false }      // s
+    if load8(p + 2) != 116 { return false }      // t
+    if load8(p + 3) != 97 { return false }       // a
+    if load8(p + 4) != 99 { return false }       // c
+    if load8(p + 5) != 107 { return false }      // k
+    if load8(p + 6) != 93 { return false }       // ]
+    return true
+}
+
+// The main thread's stack is the one region /proc/self/maps tags "[stack]".
+fn lx_find_stack() {
+    let page = lx_mmap(0, 262144, PROT_RW, MAP_ANON_PRIV)
+    if page == 0 { return }
+    let path = lx_path_maps(page + 258048)
+    let n = lx_slurp(path, page, 258048)
+    var linestart = 0
+    var i = 0
+    while i <= n {
+        let c = load8(page + i)
+        if c == 10 or i == n {
+            // a "[stack]" tag anywhere in the line identifies the region
+            var j = linestart
+            var tagged = false
+            while j + 6 < i {
+                if load8(page + j) == 91 and lx_is_stack_tag(page + j) { tagged = true }
+                j += 1
+            }
+            if tagged {
+                __lx_stack_lo = lx_hex_at(page, linestart)
+                var k = linestart
+                while load8(page + k) != 45 { k += 1 }
+                __lx_stack_hi = lx_hex_at(page, k + 1)
+            }
+            linestart = i + 1
+        }
+        i += 1
+    }
+}
+
+fn k32_GetCurrentThreadStackLimits(lo: int, hi: int) -> int {
+    if __lx_stack_hi == 0 { lx_find_stack() }
+    if __lx_stack_hi == 0 {
+        // no maps, no roots we can trust -- better to stop than to collect blind
+        let r = syscall(SYS_EXIT_GROUP, 70)
+    }
+    store64(lo, __lx_stack_lo)
+    store64(hi, __lx_stack_hi)
+    return 0
+}
+
+// ---- threads ----
+//
+// ponytail: single-threaded. The runtime only reaches the lock and the suspend
+// paths once __nthr > 0, and nothing can raise __nthr on Linux because
+// std/thread.zeph's CreateThread is not bound here. Wire clone(2) plus a futex
+// lock and a signal-based stop-the-world when Linux threading is wanted.
+
+fn k32_GetCurrentThreadId() -> int { return 1 }
+fn k32_InitializeCriticalSection(p: int) -> int { return 0 }
+fn k32_EnterCriticalSection(p: int) -> int { return 0 }
+fn k32_LeaveCriticalSection(p: int) -> int { return 0 }
+fn k32_SuspendThread(h: int) -> int { return 0 - 1 }
+fn k32_ResumeThread(h: int) -> int { return 0 - 1 }
+fn k32_GetThreadContext(h: int, ctx: int) -> int { return 0 }
+
+// ---- thread-local storage ----
+//
+// One process-wide slot table, which is exactly right while the process is
+// single-threaded and must become a real TLS block alongside clone(2).
+var __lx_tls = 0
+var __lx_ntls = 0
+
+fn k32_TlsAlloc() -> int {
+    if __lx_tls == 0 { __lx_tls = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
+    let i = __lx_ntls
+    __lx_ntls += 1
+    return i
+}
+
+fn k32_TlsSetValue(i: int, v: int) -> int {
+    store64(__lx_tls + 8 * i, v)
+    return 1
+}
+
+fn k32_TlsGetValue(i: int) -> int {
+    return load64(__lx_tls + 8 * i)
+}

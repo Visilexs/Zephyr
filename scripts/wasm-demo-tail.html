@@ -1,0 +1,23 @@
+";
+const bytes = Uint8Array.from(atob(B64), c => c.charCodeAt(0));
+let mem = null, buf = "";
+const dec = new TextDecoder();
+const imports = { env: {
+  print_i64: v => buf += v + "\n",
+  print_f64: v => buf += v + "\n",
+  print_bool: v => buf += (v ? "true" : "false") + "\n",
+  write: (fd, ptr, len) => {
+    buf += dec.decode(new Uint8Array(mem.buffer, Number(ptr), Number(len)));
+  },
+  exit: () => { throw new Error("exit") },
+}};
+const t0 = performance.now();
+const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
+mem = inst.exports.memory;
+try { inst.exports.main() } catch (e) { if (!/exit/.test(e.message)) throw e }
+const ms = (performance.now() - t0).toFixed(1);
+document.getElementById("out").textContent = buf;
+document.getElementById("meta").textContent =
+  bytes.length.toLocaleString() + " bytes of wasm · linear memory " +
+  (mem.buffer.byteLength / 65536) + " pages · rendered in " + ms + " ms";
+</script>

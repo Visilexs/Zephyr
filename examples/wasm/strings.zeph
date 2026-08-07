@@ -1,0 +1,26 @@
+// Strings, lists and maps through the runtime -- and enough short-lived garbage
+// to force real collections, which is the test that the shadow-stack roots work.
+var words: [str] = []
+for i in 0..2000 {
+    words.push("item-{i}-{i * i}")
+}
+print(words.len())
+print(words[0])
+print(words[1999])
+
+var index = ["": 0]
+for i in 0..words.len() {
+    index[words[i]] = i
+}
+print(index.len())
+print(index["item-777-603729"])
+
+var joined = ""
+for i in 0..8 { joined = joined + words[i] + " " }
+print(joined.trim())
+
+var counts = [0, 0, 0]
+for w in words {
+    counts[w.len() % 3] = counts[w.len() % 3] + 1
+}
+print(counts)

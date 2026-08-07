@@ -1,0 +1,21 @@
+// Conversions: int widens to float implicitly; everything else is explicit with `as`.
+let n = 42
+let f = n as float / 4.0
+print(f)
+
+let s = "3.14"
+let pi = s as float
+print(pi * 2.0)
+
+let count = "12" as int + 1
+print(count)
+
+let msg = "count is " + (count as str)
+print(msg)
+
+// mixed int/float arithmetic widens automatically
+let mixed = 1 + 2.5
+print(mixed)
+
+// float -> int truncates toward zero
+print(-7.9 as int)

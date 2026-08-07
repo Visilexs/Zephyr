@@ -1,0 +1,11 @@
+// Recursion / call-overhead benchmark: naive recursive Fibonacci.
+// Same algorithm across fib.zeph / fib.c / fib.rs, so fib(N) is identical.
+// Usage: fib [N]   (default 35)
+fn fib(n: int) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+var N = 35
+if args().len() > 1 { N = args()[1] as int }
+print(fib(N))

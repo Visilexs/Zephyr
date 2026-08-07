@@ -1,0 +1,121 @@
+#version 450
+
+// Integrate the accretion flow, then deposit it into a polar (r, phi) density
+// grid covering the disc plane.
+//
+// This is the join between the two halves of the renderer. The particles are
+// never projected to the screen -- they cannot be, because their light does not
+// travel in a straight line to the camera. Instead they record WHERE THE GAS IS
+// on the disc, and the geodesic ray-tracer looks that up wherever its bent ray
+// happens to cross the disc plane. So the turbulent structure gets lensed along
+// with everything else: clumps appear in the halo above the hole, which is
+// light from gas on the far side bent over the top.
+//
+// Physics is unchanged from the OpenGL/compute versions: Paczynski-Wiita
+// gravity, Shakura-Sunyaev alpha viscosity, spatially-correlated MRI turbulence.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parts { vec4 P[]; };   // [2i] pos, [2i+1] vel
+layout(std430, binding = 1) buffer Grid  { uint G[]; };   // NR * NPHI counts
+
+layout(push_constant) uniform PC {
+    vec4 eye;    // xyz camera, w time
+    vec4 right;  // xyz basis,  w tan(fov/2)*aspect
+    vec4 up;     // xyz basis,  w tan(fov/2)
+    vec4 fwd;    // xyz basis,  w frame
+    vec4 disc;   // r_isco, r_out, T_scale, exposure
+    vec4 dims;   // W, H, NR, NPHI
+    vec4 phys;   // alpha, H/R, turbulence, dt
+    vec4 misc;   // r_horizon, r_escape, count, T_ref
+} pc;
+
+const float M = 1.0;
+const float TAU = 6.28318530718;
+
+uint hash(uint h) { h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16; return h; }
+float rnd(inout uint s) { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFFFFu) / 16777216.0; }
+
+float h31(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float vn(vec3 x) {
+    vec3 i = floor(x); vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(h31(i + vec3(0,0,0)), h31(i + vec3(1,0,0)), f.x);
+    float b = mix(h31(i + vec3(0,1,0)), h31(i + vec3(1,1,0)), f.x);
+    float c = mix(h31(i + vec3(0,0,1)), h31(i + vec3(1,0,1)), f.x);
+    float d = mix(h31(i + vec3(0,1,1)), h31(i + vec3(1,1,1)), f.x);
+    return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint N = uint(pc.misc.z);
+    if (i >= N) return;
+
+    float dt    = pc.phys.w;
+    float rhor  = pc.misc.x;
+    float resc  = pc.misc.y;
+    float risco = pc.disc.x;
+    float rout  = pc.disc.y;
+    float alpha = pc.phys.x;
+    float hr    = pc.phys.y;
+    float turb  = pc.phys.z;
+    float frame = pc.fwd.w;
+
+    vec3 p = P[2u * i].xyz;
+    vec3 v = P[2u * i + 1u].xyz;
+    uint s = hash(i ^ hash(uint(frame)));
+
+    float r = length(p);
+    // frame 0 seeds the buffer in-shader, so nothing is uploaded from the host
+    if (frame < 0.5 || r < rhor * 1.08 || r > resc) {
+        float rad = sqrt(mix(risco * risco, rout * rout, rnd(s)));
+        float a = rnd(s) * TAU;
+        float ca = cos(a), sa = sin(a);
+        p = vec3(ca * rad, hr * rad * (rnd(s) + rnd(s) - 1.0), sa * rad);
+        v = vec3(-sa, 0.0, ca) * (sqrt(M * rad) / (rad - rhor));   // PW circular speed
+    } else {
+        vec3 rh = p / r;
+        float Om = sqrt(M / (r * r * r));
+        float rr = max(r - rhor, 0.05);
+        v -= rh * (M / (rr * rr)) * dt;                       // Paczynski-Wiita gravity
+        vec3 vt = v - rh * dot(v, rh);
+        v -= vt * (0.5 * alpha * hr * hr * Om * dt);          // alpha viscosity
+        if (r > risco) {
+            float cs = hr * sqrt(M / r);
+            float f = clamp(Om * dt, 0.0, 0.5);
+            // coherent field: the kick balances f, not sqrt(f)
+            float dv = turb * sqrt(alpha) * cs * f;
+            vec3 xn = p / max(hr * r, 0.5);
+            float tt = pc.eye.w * 0.35;
+            vec3 kick = vec3(vn(xn + vec3(tt, 0.0, 0.0)),
+                             vn(xn + vec3(0.0, tt, 11.3)),
+                             vn(xn + vec3(5.2, 0.0, tt))) * 2.0 - 1.0;
+            vec3 ph = normalize(vec3(-p.z, 0.0, p.x));
+            kick -= ph * dot(kick, ph);
+            v += kick * dv;
+            vec3 Rh = vec3(p.x, 0.0, p.z);
+            float Rl = length(Rh);
+            if (Rl > 0.001) {
+                Rh /= Rl;
+                v -= Rh * (dot(v, Rh) * f);
+                v.y -= v.y * f;
+            }
+        }
+        p += v * dt;
+        float sp = length(v);
+        if (sp > 0.99) v *= 0.99 / sp;
+    }
+    P[2u * i]      = vec4(p, 0.0);
+    P[2u * i + 1u] = vec4(v, 0.0);
+
+    // ---- deposit into the polar grid (the disc is treated as thin) ----
+    float rp = length(vec2(p.x, p.z));
+    if (rp >= rout || rp < 0.25) return;
+    float ang = atan(p.z, p.x);
+    if (ang < 0.0) ang += TAU;
+    uint NR = uint(pc.dims.z), NPHI = uint(pc.dims.w);
+    uint ir = uint(clamp(rp / rout * float(NR), 0.0, float(NR) - 1.0));
+    uint ip = uint(clamp(ang / TAU * float(NPHI), 0.0, float(NPHI) - 1.0));
+    atomicAdd(G[ir * NPHI + ip], 1u);
+}

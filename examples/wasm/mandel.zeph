@@ -1,0 +1,27 @@
+// Mandelbrot escape-time, folded into a checksum. Float-heavy, so it exercises
+// the reinterpret-around-every-operation shape the wasm backend uses for f64.
+fn escape(cx: float, cy: float, limit: int) -> int {
+    var x = 0.0
+    var y = 0.0
+    var i = 0
+    while i < limit {
+        let xx = x * x
+        let yy = y * y
+        if xx + yy > 4.0 { return i }
+        let nx = xx - yy + cx
+        y = 2.0 * x * y + cy
+        x = nx
+        i = i + 1
+    }
+    return limit
+}
+
+var chk = 0
+for py in 0..40 {
+    for px in 0..70 {
+        let cx = (px as float) / 70.0 * 3.5 - 2.5
+        let cy = (py as float) / 40.0 * 2.0 - 1.0
+        chk = (chk * 31 + escape(cx, cy, 200)) % 1000000007
+    }
+}
+print(chk)

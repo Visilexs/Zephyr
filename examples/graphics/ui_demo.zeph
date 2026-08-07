@@ -1,0 +1,137 @@
+// A full showcase of the Zephyr immediate-mode UI toolkit (ui/ui.zeph):
+// a tab bar, buttons, checkboxes, radio groups, sliders, a collapsing section,
+// a text field, a progress bar and a live state read-out -- a native Win32
+// window drawn through GDI, no C.
+//
+//   zc.exe --rt examples\ui_demo.zeph ui_demo.exe && .\ui_demo.exe
+import "ui/ui.zeph"
+
+var tab = 0
+var clicks = 0
+var enabled = true
+var wireframe = false
+var vsync = true
+var quality = 2              // 0 low, 1 medium, 2 high, 3 ultra
+var volume = 0.65
+var brightness = 0.4
+var contrast = 0.5
+var particles = 250
+var advanced = false
+var name = "player"
+var loading = 0.0
+
+ui_init("Zephyr UI - showcase", 780, 600)
+
+while ui_running() {
+    ui_begin()
+
+    // ---- left panel with a tab bar ----
+    ui_panel(24, 24, 360, 540, "Zephyr UI")
+
+    tab = ui_tab(100, "General", tab, 0)
+    ui_same_line()
+    tab = ui_tab(101, "Graphics", tab, 1)
+    ui_same_line()
+    tab = ui_tab(102, "About", tab, 2)
+    ui_separator()
+
+    if tab == 0 {
+        ui_heading("Actions")
+        if ui_button(1, "Click me") { clicks += 1 }
+        ui_same_line()
+        if ui_button(2, "Reset") { clicks = 0 }
+        ui_text_dim("Button pressed " + (clicks as str) + " times")
+        ui_spacing()
+        ui_heading("Toggles")
+        enabled = ui_checkbox(10, "Enable effects", enabled)
+        wireframe = ui_checkbox(11, "Wireframe overlay", wireframe)
+        vsync = ui_checkbox(12, "V-Sync", vsync)
+        ui_spacing()
+        ui_heading("Profile")
+        ui_text_dim("Name (click and type)")
+        name = ui_textbox(40, name)
+        ui_label("Hello, " + name + "!")
+    }
+
+    if tab == 1 {
+        ui_heading("Quality")
+        quality = ui_radio(20, "Low", quality, 0)
+        quality = ui_radio(21, "Medium", quality, 1)
+        quality = ui_radio(22, "High", quality, 2)
+        quality = ui_radio(23, "Ultra", quality, 3)
+        ui_spacing()
+        ui_heading("Levels")
+        volume = ui_slider(30, "Volume", volume, 0.0, 1.0)
+        brightness = ui_slider(31, "Brightness", brightness, 0.0, 1.0)
+        particles = ui_slideri(32, "Particles", particles, 0, 1000)
+        ui_spacing()
+        advanced = ui_collapsing(50, "Advanced", advanced)
+        if advanced {
+            contrast = ui_slider(33, "Contrast", contrast, 0.0, 2.0)
+            if ui_button_wide(34, "Restore defaults") {
+                volume = 0.65
+                brightness = 0.4
+                contrast = 0.5
+                particles = 250
+            }
+        }
+    }
+
+    if tab == 2 {
+        ui_heading("Zephyr UI")
+        ui_text_dim("An immediate-mode GUI toolkit written in Zephyr.")
+        ui_text_dim("Native Win32 + GDI. Imports only kernel32,")
+        ui_text_dim("user32 and gdi32 -- no C anywhere.")
+        ui_separator()
+        ui_text_dim("Every widget is a plain function call that both")
+        ui_text_dim("draws and reports interaction. Mutable widgets")
+        ui_text_dim("take a value and return the new one.")
+        ui_spacing()
+        if ui_button(60, "Start loading") { loading = 0.02 }
+    }
+
+    // ---- right panel: live state ----
+    ui_panel(400, 24, 356, 540, "State")
+    ui_kv("Effects", on_off(enabled))
+    ui_kv("Wireframe", on_off(wireframe))
+    ui_kv("V-Sync", on_off(vsync))
+    ui_kv("Quality", qname(quality))
+    ui_separator()
+    ui_kv("Volume", pct(volume))
+    ui_kv("Brightness", pct(brightness))
+    ui_kv("Contrast", fmt2(contrast))
+    ui_kv("Particles", particles as str)
+    ui_separator()
+    ui_kv("Active tab", qtab(tab))
+    ui_kv("Clicks", clicks as str)
+    ui_kv("Name", name)
+    ui_spacing()
+    ui_text_dim("Progress")
+    ui_progress(loading, pct(loading))
+    if loading > 0.0 {
+        loading += 0.006
+        if loading >= 1.0 { loading = 0.0 }
+    }
+
+    ui_end()
+    let s = win("Sleep", 12)
+}
+
+fn on_off(b: bool) -> str {
+    if b { return "on" }
+    return "off"
+}
+fn qname(q: int) -> str {
+    if q == 0 { return "Low" }
+    if q == 1 { return "Medium" }
+    if q == 2 { return "High" }
+    return "Ultra"
+}
+fn qtab(t: int) -> str {
+    if t == 0 { return "General" }
+    if t == 1 { return "Graphics" }
+    return "About"
+}
+fn pct(v: float) -> str {
+    return ((v * 100.0 + 0.5) as int as str) + "%"
+}

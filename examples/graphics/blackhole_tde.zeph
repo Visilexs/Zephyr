@@ -1,0 +1,574 @@
+import "vk/gfx.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+extern fn GetCursorPos(p: int) -> i32 from "user32.dll"
+extern fn ScreenToClient(hwnd: int, p: int) -> i32 from "user32.dll"
+
+let WIDTH = 1600
+let HEIGHT = 940
+var COUNT = 4000000
+let NSTAR = 1200000               // particles making up the star
+let NR = 320                      // 3D volume: radial bins
+let NPHI = 640                    //            azimuthal bins
+let NZ = 96                       //            vertical bins
+let ZEXT = 60.0                   //            half-height, in r_g
+
+// ---- Schwarzschild geometry, in units of r_g = GM/c^2 = 1 ----
+let R_HOR = 2.0
+let R_ISCO = 6.0
+let B_CRIT = 5.19615242270663     // sqrt(27): the apparent shadow radius
+let R_DISC_OUT = 60.0              // disc injection outer radius
+let R_GRID = 260.0                 // density grid / sampling outer radius
+let R_ESCAPE = 900.0
+
+// ---- accretion flow ----
+let DTS = 0.05
+let ALPHA = 0.4                   // Shakura-Sunyaev viscosity parameter
+let HR = 0.10                     // disc aspect ratio H/R
+let TURB = 1.2                    // MRI fluctuation amplitude, in sqrt(alpha)*c_s
+let T_PEAK = 4200.0
+let T_REF = 4200.0
+let EXPO = 0.35                   // volumetric: emission integrated along the ray
+
+// Sgr A*: r_g = GM/c^2 = 6.35e9 m. The victim is a 1 solar-mass SUBGIANT of
+// 3 solar radii, so R* = 0.33 r_g and M*/M_BH = 2.33e-7, giving r_t = 54 r_g.
+// A main-sequence star works too (R* = 0.11 r_g, r_t = 18 r_g) but is only a
+// pixel across and disrupts inside the disc glow, where you cannot see it.
+let R_STAR = 30.0
+let GM_STAR = 0.037
+let R_TIDAL = 90.0
+let STAR_R0 = 200.0                 // launch radius
+let STAR_RP = 45.0                 // pericentre, well inside r_t
+
+var scx = 0.0
+var scy = 0.0
+var scz = 0.0
+var svx = 0.0
+var svy = 0.0
+var svz = 0.0
+var torn = 0
+var reseed = 1
+
+// launch on a parabolic orbit with pericentre STAR_RP:
+// v = sqrt(2GM/r), L = sqrt(2GM r_p), so v_t = L/r and v_r = -sqrt(v^2 - v_t^2)
+fn launch_star() {
+    scx = STAR_R0
+    scy = 0.0
+    scz = 0.0
+    let vt = sqrt(2.0 * STAR_RP) / STAR_R0
+    let v2 = 2.0 / STAR_R0
+    var vr2 = v2 - vt * vt
+    if vr2 < 0.0 { vr2 = 0.0 }
+    svx = 0.0 - sqrt(vr2)
+    svy = 0.0
+    svz = vt
+    torn = 0
+    reseed = 1
+}
+
+// the centre of mass follows the same Paczynski-Wiita orbit, until it is torn
+fn star_step() {
+    if torn == 1 { return }
+    let r = sqrt(scx * scx + scy * scy + scz * scz)
+    if r < R_TIDAL {
+        torn = 1
+        print("  star disrupted at r = {r as int} r_g  (tidal radius {R_TIDAL as int})")
+        return
+    }
+    let rr = max(r - R_HOR, 0.05)
+    let a = 1.0 / (rr * rr) * DTS
+    svx = svx - scx / r * a
+    svy = svy - scy / r * a
+    svz = svz - scz / r * a
+    scx = scx + svx * DTS
+    scy = scy + svy * DTS
+    scz = scz + svz * DTS
+}
+
+let PUSH_STAGES = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+
+let RPK = R_ISCO * 49.0 / 36.0
+let FPK = sqrt(sqrt((1.0 - sqrt(R_ISCO / RPK)) / (RPK * RPK * RPK)))
+let TSCALE = T_PEAK / FPK
+
+fn p10(n: int) -> float {
+    var v = 1.0
+    var i = 0
+    while i < n {
+        v = v * 10.0
+        i += 1
+    }
+    return v
+}
+
+fn banner() {
+    let GRAV = 6.6743 / p10(11)
+    let CLIGHT = 299792458.0
+    let MSUN = 1.98892 * p10(30)
+    let AU = 1.495978707 * p10(11)
+    let PARSEC = 3.0856775814913673 * p10(16)
+    let PI = 3.141592653589793
+    let MASS = 4000.0 * MSUN            // an intermediate-mass black hole
+    let DIST = 8277.0 * PARSEC
+    let rg = GRAV * MASS / (CLIGHT * CLIGHT)
+    let uas = (2.0 * B_CRIT * rg / DIST) * (180.0 / PI) * 3600.0 * p10(6)
+    print("Intermediate-mass black hole, 4000 Msun, eating a white dwarf")
+    print("  gravitational radius {rg / 1000.0} km")
+    print("  star radius {R_STAR} r_g, mass ratio M_BH/M* = 27")
+    print("  tidal radius        {R_TIDAL} r_g  (star torn apart here)")
+    print("  r_t = R*(M_BH/M*)^(1/3) = {R_TIDAL} r_g -- outside the 2 r_g horizon")
+}
+
+// ---- camera ----
+var ocx = 1.0
+var ocz = 0.0
+let DRIFT = 0.0011
+var psin = 0.30
+var orad = 300.0
+let FOVT = 0.55
+let SENS = 0.0055
+let PMAX = 0.94
+let RMIN = 22.0
+let RMAXC = 1500.0
+
+var dragging = 0
+var lastx = 0
+var lasty = 0
+var wheel = 0
+
+fn yaw_by(t: float) {
+    let nx = ocx - ocz * t
+    let nz = ocz + ocx * t
+    let n = sqrt(nx * nx + nz * nz)
+    ocx = nx / n
+    ocz = nz / n
+}
+fn sext32(v: int) -> int {
+    let x = v & 4294967295
+    if x >= 2147483648 { return x - 4294967296 }
+    return x
+}
+
+var pt = Bytes.new(16)
+var curx = 0
+var cury = 0
+fn read_cursor(hwnd: int) {
+    let a = GetCursorPos(pt.addr())
+    let b = ScreenToClient(hwnd, pt.addr())
+    curx = sext32(pt.get32(0))
+    cury = sext32(pt.get32(4))
+}
+
+fn camera_input(hwnd: int) {
+    read_cursor(hwnd)
+    if (GetAsyncKeyState(1) & 32768) != 0 {
+        if dragging == 1 {
+            yaw_by(((curx - lastx) as float) * SENS)
+            psin = psin + ((cury - lasty) as float) * SENS * 0.6
+            if psin > PMAX { psin = PMAX }
+            if psin < 0.0 - PMAX { psin = 0.0 - PMAX }
+        }
+        dragging = 1
+        lastx = curx
+        lasty = cury
+    } else {
+        dragging = 0
+        yaw_by(DRIFT)
+    }
+    if wheel != 0 {
+        var f = 1.0
+        var w = wheel
+        while w > 0 {
+            f = f * 0.88
+            w -= 1
+        }
+        while w < 0 {
+            f = f * 1.136
+            w += 1
+        }
+        orad = orad * f
+        if orad < RMIN { orad = RMIN }
+        if orad > RMAXC { orad = RMAXC }
+        wheel = 0
+    }
+}
+
+// our own pump so WM_MOUSEWHEEL can be read
+var pmsg = Bytes.new(64)
+fn pump(hwnd: int) -> bool {
+    while PeekMessageA(pmsg.addr(), 0, 0, 0, 1) != 0 {
+        let m = pmsg.get32(8)
+        if m == 18 { return false }
+        if m == 522 {
+            var d = (pmsg.get64(16) >> 16) & 65535
+            if d >= 32768 { d = d - 65536 }
+            wheel += d / 120
+        }
+        let t = TranslateMessage(pmsg.addr())
+        let dd = DispatchMessageA(pmsg.addr())
+    }
+    if IsWindow(hwnd) == 0 { return false }
+    if (GetAsyncKeyState(27) & 32768) != 0 { return false }
+    return true
+}
+
+var layers: [str] = []
+for a in args() {
+    if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+if args().len() > 1 {
+    let a1 = args()[1]
+    if not a1.starts_with("-") {          // a flag, not a particle count
+        let n = a1 as int
+        if n > 1000 { COUNT = n }
+    }
+}
+banner()
+
+var wnd = window_open("Zephyr - black hole (lensed particle accretion, Vulkan)", WIDTH, HEIGHT)
+var g = Gfx.init_windowed("zephyr-blackhole-lensed", layers, wnd)
+print("gpu: {g.gpu_name()}")
+let format = g.surface_format()
+
+// ---------------- render pass ----------------
+var attach = Bytes.new(VkAttachmentDescription_sizeof)
+attach.put32(VkAttachmentDescription_format, format)
+attach.put32(VkAttachmentDescription_samples, VK_SAMPLE_COUNT_1_BIT)
+attach.put32(VkAttachmentDescription_loadOp, VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_storeOp, VK_ATTACHMENT_STORE_OP_STORE)
+attach.put32(VkAttachmentDescription_stencilLoadOp, VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_stencilStoreOp, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+attach.put32(VkAttachmentDescription_finalLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+
+var ref = Bytes.new(VkAttachmentReference_sizeof)
+ref.put32(VkAttachmentReference_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+
+var subpass = Bytes.new(VkSubpassDescription_sizeof)
+subpass.put32(VkSubpassDescription_pipelineBindPoint, VK_PIPELINE_BIND_POINT_GRAPHICS)
+subpass.put32(VkSubpassDescription_colorAttachmentCount, 1)
+subpass.put64(VkSubpassDescription_pColorAttachments, ref.addr())
+
+var rpci = Bytes.new(VkRenderPassCreateInfo_sizeof)
+rpci.put32(VkRenderPassCreateInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO)
+rpci.put32(VkRenderPassCreateInfo_attachmentCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pAttachments, attach.addr())
+rpci.put32(VkRenderPassCreateInfo_subpassCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pSubpasses, subpass.addr())
+var prp = Bytes.new(8)
+vkcheck(vkCreateRenderPass(g.dev, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
+let renderpass = prp.get64(0)
+
+var swap = g.swapchain(format, renderpass, 0)
+print("swapchain: {swap.w}x{swap.h}, {swap.images.len()} images")
+
+// ---------------- buffers ----------------
+let gbytes = NR * NPHI * NZ * 2 * 4      // two channels: disc gas and star
+var pbuf = g.buffer(pbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+var gbuf = g.buffer(gbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+var sbuf = g.buffer(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+var smap = Bytes.new(8)
+vkcheck(vkMapMemory(g.dev, sbuf.mem, 0, sbuf.size, 0, smap.addr()), "vkMapMemory")
+let sptr = smap.get64(0)
+print("storage: {pbytes / 1048576} MB particles + {gbytes / 1048576} MB 3D volume")
+
+var bufs: [GpuBuffer] = []
+bufs.push(pbuf)
+bufs.push(gbuf)
+bufs.push(sbuf)
+let ds = g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+
+var setlayouts: [int] = []
+setlayouts.push(ds.layout)
+let layout = g.pipeline_layout(setlayouts, 128,
+    VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+
+var entry = cbytes("main")
+let shclear = g.shader("examples/shaders/bh_gclear.comp.spv")
+let shsim = g.shader("examples/shaders/bh_vox.comp.spv")
+let pipe_clear = g.compute_pipeline(shclear, layout, entry)
+let pipe_sim = g.compute_pipeline(shsim, layout, entry)
+print("compute pipelines ok")
+
+// ---------------- present pipeline ----------------
+let vs = g.shader("examples/shaders/blackhole.vert.spv")
+let fs = g.shader("examples/shaders/bh_vol.frag.spv")
+
+var stages = Bytes.new(VkPipelineShaderStageCreateInfo_sizeof * 2)
+stages.put32(VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_VERTEX_BIT)
+stages.put64(VkPipelineShaderStageCreateInfo_module, vs)
+stages.put64(VkPipelineShaderStageCreateInfo_pName, entry.addr())
+let s1 = VkPipelineShaderStageCreateInfo_sizeof
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_FRAGMENT_BIT)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_module, fs)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_pName, entry.addr())
+
+var vi = Bytes.new(VkPipelineVertexInputStateCreateInfo_sizeof)
+vi.put32(VkPipelineVertexInputStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
+var ia = Bytes.new(VkPipelineInputAssemblyStateCreateInfo_sizeof)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+
+var viewport = Bytes.new(VkViewport_sizeof)
+var scissor = Bytes.new(VkRect2D_sizeof)
+var dynstates = Bytes.new(8)
+dynstates.put32(0, VK_DYNAMIC_STATE_VIEWPORT)
+dynstates.put32(4, VK_DYNAMIC_STATE_SCISSOR)
+var dyn = Bytes.new(VkPipelineDynamicStateCreateInfo_sizeof)
+dyn.put32(VkPipelineDynamicStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+dyn.put32(VkPipelineDynamicStateCreateInfo_dynamicStateCount, 2)
+dyn.put64(VkPipelineDynamicStateCreateInfo_pDynamicStates, dynstates.addr())
+
+var vp = Bytes.new(VkPipelineViewportStateCreateInfo_sizeof)
+vp.put32(VkPipelineViewportStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+vp.put32(VkPipelineViewportStateCreateInfo_viewportCount, 1)
+vp.put32(VkPipelineViewportStateCreateInfo_scissorCount, 1)
+
+var rs = Bytes.new(VkPipelineRasterizationStateCreateInfo_sizeof)
+rs.put32(VkPipelineRasterizationStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+rs.put32(VkPipelineRasterizationStateCreateInfo_polygonMode, VK_POLYGON_MODE_FILL)
+rs.put32(VkPipelineRasterizationStateCreateInfo_cullMode, VK_CULL_MODE_NONE)
+rs.put32(VkPipelineRasterizationStateCreateInfo_frontFace, VK_FRONT_FACE_CLOCKWISE)
+rs.putf32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
+
+var ms = Bytes.new(VkPipelineMultisampleStateCreateInfo_sizeof)
+ms.put32(VkPipelineMultisampleStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+ms.put32(VkPipelineMultisampleStateCreateInfo_rasterizationSamples, VK_SAMPLE_COUNT_1_BIT)
+
+var cba = Bytes.new(VkPipelineColorBlendAttachmentState_sizeof)
+cba.put32(VkPipelineColorBlendAttachmentState_colorWriteMask, 15)
+var cbs = Bytes.new(VkPipelineColorBlendStateCreateInfo_sizeof)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_attachmentCount, 1)
+cbs.put64(VkPipelineColorBlendStateCreateInfo_pAttachments, cba.addr())
+
+var gpci = Bytes.new(VkGraphicsPipelineCreateInfo_sizeof)
+gpci.put32(VkGraphicsPipelineCreateInfo_sType, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+gpci.put32(VkGraphicsPipelineCreateInfo_stageCount, 2)
+gpci.put64(VkGraphicsPipelineCreateInfo_pStages, stages.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pVertexInputState, vi.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pInputAssemblyState, ia.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pViewportState, vp.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pRasterizationState, rs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pMultisampleState, ms.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pColorBlendState, cbs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pDynamicState, dyn.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_layout, layout)
+gpci.put64(VkGraphicsPipelineCreateInfo_renderPass, renderpass)
+gpci.put32(VkGraphicsPipelineCreateInfo_basePipelineIndex, 0 - 1)
+var ppipe = Bytes.new(8)
+vkcheck(vkCreateGraphicsPipelines(g.dev, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
+let pipe_present = ppipe.get64(0)
+print("present pipeline ok")
+
+// ---------------- frame loop ----------------
+var rpbi = Bytes.new(VkRenderPassBeginInfo_sizeof)
+rpbi.put32(VkRenderPassBeginInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+rpbi.put64(VkRenderPassBeginInfo_renderPass, renderpass)
+
+// VkMemoryBarrier: sType 0, pNext 8, srcAccessMask 16, dstAccessMask 20.
+// (vk/consts.zeph has no VK_STRUCTURE_TYPE_MEMORY_BARRIER; it is 46.)
+var mb = Bytes.new(24)
+mb.put32(0, 46)
+mb.put32(16, VK_ACCESS_SHADER_WRITE_BIT)
+mb.put32(20, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+
+var pushc = Bytes.new(128)
+var sets = u64s([ds.set])
+
+var qpc = Bytes.new(8)
+var qpf = Bytes.new(8)
+let qf = QueryPerformanceFrequency(qpf.addr())
+let freq = qpf.get64(0)
+let q0 = QueryPerformanceCounter(qpc.addr())
+let t0 = qpc.get64(0)
+
+let rpa = rpbi.addr()
+let pla = layout
+let pusha = pushc.addr()
+let vpa = viewport.addr()
+let sca = scissor.addr()
+let seta = sets.addr()
+let mba = mb.addr()
+let hwnd = wnd.hwnd
+let pcl = pipe_clear
+let psi = pipe_sim
+let ppr = pipe_present
+let nparts = COUNT
+let simgroups = (COUNT + 255) / 256
+
+var sparams = Bytes.new(64)
+let ndisc = COUNT - NSTAR
+var rkey_prev = 0
+launch_star()
+print("star launched: r0 = {STAR_R0} r_g, pericentre {STAR_RP} r_g (inside r_t)")
+
+var frame = 0
+var fps_mark = 0
+var fps_t = 0.0
+var running = true
+while running {
+    if not pump(hwnd) { running = false }
+    if running {
+        let q = QueryPerformanceCounter(qpc.addr())
+        let t = ((qpc.get64(0) - t0) as float) / (freq as float)
+        camera_input(hwnd)
+
+        // 'R' sends in another star
+        let rkey = (GetAsyncKeyState(82) & 32768)
+        if rkey != 0 and rkey_prev == 0 { launch_star() }
+        rkey_prev = rkey
+
+        star_step()
+        sparams.putf32(0, scx)
+        sparams.putf32(4, scy)
+        sparams.putf32(8, scz)
+        sparams.putf32(12, R_STAR)
+        sparams.putf32(16, GM_STAR)
+        sparams.putf32(20, torn as float)
+        sparams.putf32(24, ndisc as float)
+        sparams.putf32(28, reseed as float)
+        sparams.putf32(32, svx)
+        sparams.putf32(36, svy)
+        sparams.putf32(40, svz)
+        sparams.putf32(44, R_DISC_OUT)
+        sparams.putf32(48, NZ as float)
+        sparams.putf32(52, ZEXT)
+        for bi in 0..64 { store8(sptr + bi, sparams.get8(bi)) }
+        reseed = 0
+
+        let pc2 = sqrt(1.0 - psin * psin)
+        let ex = ocx * pc2 * orad
+        let ey = psin * orad
+        let ez = ocz * pc2 * orad
+        let el = sqrt(ex * ex + ey * ey + ez * ez)
+        let fx = (0.0 - ex) / el
+        let fy = (0.0 - ey) / el
+        let fz = (0.0 - ez) / el
+        var rx = fz
+        var rz = 0.0 - fx
+        let rl = sqrt(rx * rx + rz * rz)
+        rx = rx / rl
+        rz = rz / rl
+        let upx = fy * rz
+        let upy = fz * rx - fx * rz
+        let upz = 0.0 - fy * rx
+        let fw = swap.w as float
+        let fh = swap.h as float
+        let aspect = fw / fh
+
+        // eye.xyz | time ; right.xyz | tan_x ; up.xyz | tan_y ; fwd.xyz | frame
+        pushc.putf32(0, ex)
+        pushc.putf32(4, ey)
+        pushc.putf32(8, ez)
+        pushc.putf32(12, t)
+        pushc.putf32(16, rx)
+        pushc.putf32(20, 0.0)
+        pushc.putf32(24, rz)
+        pushc.putf32(28, FOVT * aspect)
+        pushc.putf32(32, upx)
+        pushc.putf32(36, upy)
+        pushc.putf32(40, upz)
+        pushc.putf32(44, FOVT)
+        pushc.putf32(48, fx)
+        pushc.putf32(52, fy)
+        pushc.putf32(56, fz)
+        pushc.putf32(60, frame as float)
+        // disc: r_isco, r_out, T_scale, exposure
+        pushc.putf32(64, R_ISCO)
+        pushc.putf32(68, R_GRID)
+        pushc.putf32(72, TSCALE)
+        pushc.putf32(76, EXPO)
+        // dims: W, H, NR, NPHI
+        pushc.putf32(80, fw)
+        pushc.putf32(84, fh)
+        pushc.putf32(88, NR as float)
+        pushc.putf32(92, NPHI as float)
+        // phys: alpha, H/R, turbulence, dt
+        pushc.putf32(96, ALPHA)
+        pushc.putf32(100, HR)
+        pushc.putf32(104, TURB)
+        pushc.putf32(108, DTS)
+        // misc: r_horizon, r_escape, particle count, T_ref
+        pushc.putf32(112, R_HOR)
+        pushc.putf32(116, R_ESCAPE)
+        pushc.putf32(120, nparts as float)
+        pushc.putf32(124, T_REF)
+
+        viewport.putf32(VkViewport_width, fw)
+        viewport.putf32(VkViewport_height, fh)
+        viewport.putf32(VkViewport_maxDepth, 1.0)
+        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.w)
+        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.h)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+
+        let clrgroups = (NR * NPHI * NZ * 2 / 8 + 255) / 256
+        let fbs = swap.fbs
+        let ok = g.frame(swap, fn(cb: int, idx: int) {
+            // 1. zero the accumulator
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pcl)
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pla, 0, 1, seta, 0, 0)
+            vkCmdPushConstants(cb, pla, PUSH_STAGES, 0, 128, pusha)
+            vkCmdDispatch(cb, clrgroups, 1, 1)
+            vkCmdPipelineBarrier(cb,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, mba, 0, 0, 0, 0)
+
+            // 2. integrate the flow and splat it
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, psi)
+            vkCmdDispatch(cb, simgroups, 1, 1)
+            vkCmdPipelineBarrier(cb,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 1, mba, 0, 0, 0, 0)
+
+            // 3. tone-map it onto the swapchain
+            store64(rpa + VkRenderPassBeginInfo_framebuffer, fbs[idx])
+            vkCmdBeginRenderPass(cb, rpa, VK_SUBPASS_CONTENTS_INLINE)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ppr)
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pla, 0, 1, seta, 0, 0)
+            vkCmdPushConstants(cb, pla, PUSH_STAGES, 0, 128, pusha)
+            vkCmdSetViewport(cb, 0, 1, vpa)
+            vkCmdSetScissor(cb, 0, 1, sca)
+            vkCmdDraw(cb, 3, 1, 0, 0)
+            vkCmdEndRenderPass(cb)
+        })
+
+        if running and not ok {
+            let fresh = g.rebuild(swap, renderpass)
+            if fresh.has() { swap = fresh.get() }
+        }
+        frame += 1
+        if frame - fps_mark >= 120 {
+            print("{(120.0 / (t - fps_t)) as int} fps  ({swap.w}x{swap.h}, {nparts} particles, eye {orad as int} r_g)")
+            fps_mark = frame
+            fps_t = t
+        }
+    }
+}
+
+let q1 = QueryPerformanceCounter(qpc.addr())
+print("{frame} frames in {((qpc.get64(0) - t0) as float) / (freq as float)}s")
+
+vkcheck(vkDeviceWaitIdle(g.dev), "vkDeviceWaitIdle")
+vkDestroyPipeline(g.dev, pipe_present, 0)
+vkDestroyPipeline(g.dev, pipe_sim, 0)
+vkDestroyPipeline(g.dev, pipe_clear, 0)
+vkDestroyPipelineLayout(g.dev, layout, 0)
+vkDestroyShaderModule(g.dev, vs, 0)
+vkDestroyShaderModule(g.dev, fs, 0)
+vkDestroyShaderModule(g.dev, shsim, 0)
+vkDestroyShaderModule(g.dev, shclear, 0)
+g.destroy_desc_set(ds)
+g.destroy_buffer(pbuf)
+g.destroy_buffer(gbuf)
+g.destroy_buffer(sbuf)
+g.destroy_swapchain(swap)
+vkDestroyRenderPass(g.dev, renderpass, 0)
+g.shutdown()
+wnd.close()
+print("OK")

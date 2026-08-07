@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Particles { vec4 p[]; };
+layout(push_constant) uniform Push { float dt; uint count; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) { return; }
+    vec4 q = p[i];              // xy = position, zw = velocity
+    q.xy += q.zw * pc.dt;
+    if (q.x < -1.0 || q.x > 1.0) { q.z = -q.z; }
+    if (q.y < -1.0 || q.y > 1.0) { q.w = -q.w; }
+    p[i] = q;
+}

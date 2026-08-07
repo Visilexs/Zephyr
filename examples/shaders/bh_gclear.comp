@@ -1,0 +1,22 @@
+#version 450
+
+// Zero the polar density grid before the deposit pass.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 1) buffer Grid { uint G[]; };
+layout(std430, binding = 2) readonly buffer Star { float S[]; };
+
+layout(push_constant) uniform PC {
+    vec4 eye; vec4 right; vec4 up; vec4 fwd;
+    vec4 disc; vec4 dims; vec4 phys; vec4 misc;
+} pc;
+
+void main() {
+    uint n = uint(pc.dims.z) * uint(pc.dims.w) * uint(S[12]) * 2u;
+    uint base = gl_GlobalInvocationID.x * 8u;
+    for (uint k = 0u; k < 8u; k++) {
+        uint i = base + k;
+        if (i < n) { G[i] = 0u; }
+    }
+}

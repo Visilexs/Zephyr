@@ -1,0 +1,14 @@
+// Hash-map benchmark: insert N entries into ~500k colliding integer keys
+// (last write wins), then look every key up and sum the stored values.
+// zeph uses the built-in [int: int] map; Rust uses std HashMap; C uses a
+// hand-rolled open-addressing table. Last-write-wins => identical checksum.
+// Usage: hashmap [N]   (default 2000000)
+var N = 2000000
+if args().len() > 1 { N = args()[1] as int }
+
+var m: [int: int] = [:]
+for i in 0..N { m[(i * 2654435761) % 500009] = i }
+
+var chk = 0
+for i in 0..N { chk += m.get((i * 2654435761) % 500009).or(0) }
+print(chk)

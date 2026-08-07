@@ -1,0 +1,24 @@
+# Build artifacts. Everything here is regenerable from source.
+#
+# zc.exe is NOT ignored: it is the seed the self-hosting loop needs. A fresh
+# clone can rebuild it with .\bootstrap\build.ps1, but keeping it committed
+# means selfbuild.ps1 works immediately.
+
+*.exe
+!zc.exe
+!bootstrap/zephyr.exe
+
+*.o
+*.obj
+*.s
+
+# rendered output
+out.bmp
+out.png
+
+# package.ps1 output (dist/GETTING-STARTED.md is a source and stays)
+dist/zephyr-*/
+dist/*.zip
+
+# copied next to test outputs by bootstrap/build.ps1
+zephyr_rt.dll

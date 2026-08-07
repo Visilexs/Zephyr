@@ -1,0 +1,18 @@
+fn fib(n: int) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+print(fib(30))
+var sum = 0
+for i in 0..1000 {
+    sum = sum + i * i
+}
+print(sum)
+var k = 0
+var acc = 1
+while k < 10 {
+    acc = acc * 2
+    k = k + 1
+}
+print(acc)
+print(fib(10) > 50 and acc == 1024)

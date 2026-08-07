@@ -1,0 +1,88 @@
+// pi.zeph — N digits of pi via Machin's formula, same algorithm as pi.c/pi.rs.
+// pi = 16*atan(1/5) - 4*atan(1/239), base-10^9 fixed point, deferred carries.
+let BASE = 1000000000
+
+var D = 10000
+if args().len() > 1 { D = args()[1] as int }
+let N = D / 9 + 3
+
+var res: [int] = []
+var w: [int] = []
+for i in 0..N {
+    res.push(0)
+    w.push(0)
+}
+
+fn arctan_small(x: int, mul: int) {
+    for i in 0..N { w[i] = 0 }
+    w[0] = 1
+    var rem = 0
+    for i in 0..N {                 // w = 1/x
+        let cur = rem * BASE + w[i]
+        let q = cur / x
+        w[i] = q
+        rem = cur - q * x
+    }
+    for i in 0..N { res[i] += mul * w[i] }
+    let x2 = x * x
+    var k = 1
+    var sign = -1
+    var start = 0
+    while start < N {
+        let d = 2 * k + 1
+        var rw = 0
+        var rt = 0
+        let m = mul * sign
+        for i in start..N {
+            let cur = rw * BASE + w[i]   // w /= x^2
+            let q = cur / x2
+            w[i] = q
+            rw = cur - q * x2
+            let curt = rt * BASE + q     // term = w / (2k+1)
+            let qt = curt / d
+            rt = curt - qt * d
+            res[i] += m * qt
+        }
+        while start < N and w[start] == 0 { start += 1 }
+        k += 1
+        sign = -sign
+    }
+}
+
+fn pad9(v: int) -> str {
+    let t = "00000000" + (v as str)   // 8 zeros + 1..9 digits, keep the last 9
+    return t.sub(t.len() - 9, t.len())
+}
+
+arctan_small(5, 16)
+arctan_small(239, -4)
+
+var carry = 0                       // single end normalization
+var ni = N - 1
+while ni >= 1 {
+    let v = res[ni] + carry
+    var c = v / BASE
+    var m = v - c * BASE
+    if m < 0 {
+        m += BASE
+        c -= 1
+    }
+    res[ni] = m
+    carry = c
+    ni -= 1
+}
+res[0] += carry
+
+// stream the digits: no megabyte output string is ever assembled
+emit((res[0] as str) + ".")
+var printed = 0
+var li = 1
+while printed + 9 <= D {
+    emit(pad9(res[li]))
+    printed += 9
+    li += 1
+}
+if printed < D {
+    emit(pad9(res[li]).sub(0, D - printed))
+}
+emit("\n")

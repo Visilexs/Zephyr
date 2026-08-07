@@ -1,0 +1,135 @@
+// zdbg-backend — a native Windows debugger loop, written in Zephyr.
+// Increment 2: launch a target under DEBUG_ONLY_THIS_PROCESS, pump the debug
+// event loop, let the child's inherited stdout flow through, report exit code.
+// No breakpoints yet. Compile:  zc.exe --rt debugger\zdbg-backend.zeph zdbg-backend.exe
+// Run:      zdbg-backend.exe <target.exe>
+
+// ---- kernel32 constants ----
+let STD_OUTPUT = 0 - 11
+let DEBUG_ONLY_THIS_PROCESS = 2
+let INHERIT_HANDLES = 1
+let INFINITE = 4294967295
+let DBG_CONTINUE = 65538              // 0x00010002
+let DWMASK = 4294967295              // low 32 bits
+
+// debug event codes
+let EXCEPTION_DEBUG_EVENT = 1
+let CREATE_PROCESS_DEBUG_EVENT = 3
+let EXIT_PROCESS_DEBUG_EVENT = 5
+
+// ---- stdout (same GetStdHandle/WriteFile pattern as ffi_runtime.zeph) ----
+fn write_str(s: str) {
+    let h = win("GetStdHandle", STD_OUTPUT)
+    var written: [int] = [0]
+    let r = win("WriteFile", h, addr(s) + 8, s.len(), addr(written), 0)
+}
+
+fn int_to_str(n: int) -> str {
+    if n == 0 { return "0" }
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = 0 - v
+    }
+    var digits = 0
+    var t = v
+    while t > 0 {
+        digits += 1
+        t = t / 10
+    }
+    var total = digits
+    if neg { total += 1 }
+    var s = ""
+    for i in 0..total { s = s + " " }
+    let p = addr(s) + 8
+    var pos = total - 1
+    while v > 0 {
+        store8(p + pos, 48 + v % 10)
+        pos -= 1
+        v = v / 10
+    }
+    if neg { store8(p, 45) }
+    return s
+}
+
+// A null-terminated copy of s; the returned str must stay alive while its
+// pointer is in use (the conservative GC scans it on the stack).
+fn make_cstr(s: str) -> str {
+    var r = ""
+    for i in 0..s.len() { r = r + " " }
+    r = r + " "
+    let p = addr(r) + 8
+    for i in 0..s.len() { store8(p + i, s.byte(i)) }
+    store8(p + s.len(), 0)
+    return r
+}
+
+fn zeroed(n: int) -> [int] {
+    var b: [int] = []
+    for i in 0..n { b.push(0) }
+    return b
+}
+
+// A Zephyr list is {i64 len; i64 cap; i64 data}; the contiguous element storage
+// (usable as a raw Win32 struct buffer) is the data pointer at header offset 16.
+fn dataptr(b: [int]) -> int {
+    return load64(addr(b) + 16)
+}
+
+fn dword(base: int, off: int) -> int {
+    return load64(base + off) & DWMASK
+}
+
+let argv = args()
+if argv.len() < 2 {
+    write_str("usage: zdbg-backend <target.exe>\n")
+} else {
+    let target = argv[1]
+    let cs = make_cstr(target)              // keep alive for the whole CreateProcess call
+    let appPtr = addr(cs) + 8
+
+    var si = zeroed(13)                      // STARTUPINFOA (104 bytes)
+    let siPtr = dataptr(si)
+    store32(siPtr, 104)                       // si.cb
+    var pi = zeroed(3)                       // PROCESS_INFORMATION (24 bytes)
+    let piPtr = dataptr(pi)
+
+    write_str("[zdbg] launching ")
+    write_str(target)
+    write_str("\n")
+
+    // CreateProcessA(app, cmdline=0, procAttr=0, threadAttr=0, inherit=1,
+    //                flags=DEBUG_ONLY_THIS_PROCESS, env=0, cwd=0, &si, &pi)
+    let ok = win("CreateProcessA", appPtr, 0, 0, 0, INHERIT_HANDLES,
+                 DEBUG_ONLY_THIS_PROCESS, 0, 0, siPtr, piPtr)
+    if ok == 0 {
+        write_str("[zdbg] CreateProcess failed, GetLastError=")
+        write_str(int_to_str(win("GetLastError")))
+        write_str("\n")
+    } else {
+        var ev = zeroed(32)                  // DEBUG_EVENT (~176 bytes)
+        let evPtr = dataptr(ev)
+        var exitCode = 0
+        var running = true
+        while running {
+            let got = win("WaitForDebugEvent", evPtr, INFINITE)
+            if got == 0 { running = false }
+            else {
+                let code = dword(evPtr, 0)
+                let pid = dword(evPtr, 4)
+                let tid = dword(evPtr, 8)
+                if code == EXIT_PROCESS_DEBUG_EVENT {
+                    exitCode = dword(evPtr, 16)   // EXIT_PROCESS_DEBUG_INFO.dwExitCode
+                    let c = win("ContinueDebugEvent", pid, tid, DBG_CONTINUE)
+                    running = false
+                } else {
+                    let c = win("ContinueDebugEvent", pid, tid, DBG_CONTINUE)
+                }
+            }
+        }
+        write_str("[zdbg] exit code ")
+        write_str(int_to_str(exitCode))
+        write_str("\n")
+    }
+}

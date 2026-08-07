@@ -1,0 +1,15 @@
+import "std/list.zeph"
+
+let nums = [5, 3, 9, 1, 7]
+let doubled = map(nums, fn(x: int) -> int { return x * 2 })
+print(doubled)
+print(filter(nums, fn(x: int) -> bool { return x > 4 }))
+print(fold(nums, 0, fn(a: int, b: int) -> int { return a + b }))
+
+let bump = 100
+let shifted = map(nums, fn(x: int) -> int { return x + bump })
+print(shifted)
+
+fn twice(f: fn(int) -> int, x: int) -> int { return f(f(x)) }
+fn inc(n: int) -> int { return n + 1 }
+print(twice(inc, 5))

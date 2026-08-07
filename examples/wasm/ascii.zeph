@@ -1,0 +1,35 @@
+// Mandelbrot as text. Built for the browser demo: the module's only contact
+// with the outside world is the runtime's write, so the same bytes run under
+// node and in a page.
+let W = 78
+let H = 30
+let RAMP = " .:-=+*#%@"
+
+fn escape(cx: float, cy: float) -> int {
+    var x = 0.0
+    var y = 0.0
+    var i = 0
+    while i < 90 {
+        let xx = x * x
+        let yy = y * y
+        if xx + yy > 4.0 { return i }
+        let nx = xx - yy + cx
+        y = 2.0 * x * y + cy
+        x = nx
+        i = i + 1
+    }
+    return 90
+}
+
+for py in 0..H {
+    var row = ""
+    for px in 0..W {
+        let cx = (px as float) / (W as float) * 3.2 - 2.2
+        let cy = (py as float) / (H as float) * 2.4 - 1.2
+        let n = escape(cx, cy)
+        var idx = n * 10 / 91
+        if idx > 9 { idx = 9 }
+        row = row + RAMP.sub(idx, idx + 1)
+    }
+    print(row)
+}

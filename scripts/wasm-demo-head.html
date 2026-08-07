@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Zephyr &rarr; WebAssembly</title>
+<style>
+  :root { --ink:#e6e1d7; --bg:#12100e; --accent:#d98a3d; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:"Iosevka","IBM Plex Mono",ui-monospace,monospace; padding:2.5rem 1.5rem; }
+  header { max-width:70ch; margin:0 auto 1.75rem; }
+  h1 { font-size:1.15rem; font-weight:600; letter-spacing:.02em; margin:0 0 .4rem; }
+  h1 span { color:var(--accent); }
+  p { margin:0; font-size:.82rem; line-height:1.6; opacity:.62; }
+  pre { max-width:80ch; margin:0 auto; font-size:11px; line-height:1.06;
+        white-space:pre; overflow-x:auto; color:var(--accent);
+        text-shadow:0 0 14px rgba(217,138,61,.28); }
+  #meta { max-width:70ch; margin:1.75rem auto 0; font-size:.72rem; opacity:.45; }
+</style>
+<header>
+  <h1>compiled by <span>zc.exe</span> &rarr; WebAssembly</h1>
+  <p>examples/wasm/ascii.zeph, built with <code>zc --wasm --rt</code>. The Zephyr
+     runtime &mdash; conservative mark-sweep GC, strings, interpolation &mdash;
+     is inside this module. Its only import is a write callback.</p>
+</header>
+<pre id="out">running&hellip;</pre>
+<div id="meta"></div>
+<script>
+const B64 = "

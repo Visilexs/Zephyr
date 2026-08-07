@@ -1,0 +1,15 @@
+// Sorting benchmark: fill N ints with a fixed pseudo-shuffle, sort ascending,
+// fold into an order-sensitive checksum (so it verifies the sort actually ran).
+// zeph uses the runtime's native sort; C uses qsort; Rust uses sort_unstable.
+// Same input and same sorted order => identical checksum.
+// Usage: sort [N]   (default 3000000)
+var N = 3000000
+if args().len() > 1 { N = args()[1] as int }
+
+var a = zeros(N)              // preallocated, like C's malloc / Rust's collect
+for i in 0..N { a[i] = (i * 2654435761 + 12345) % 1000003 }
+a.sort()
+
+var chk = 0
+for i in 0..N { chk = (chk * 31 + a[i]) % 1000000007 }
+print(chk)

@@ -1,0 +1,19 @@
+#version 450
+
+// Zero the HDR accumulation buffer before the splat pass.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 1) buffer Accum { uint A[]; };
+
+layout(push_constant) uniform PC {
+    vec4 eye; vec4 right; vec4 up; vec4 fwd;
+    vec4 disc; vec4 dims; vec4 phys; vec4 misc;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = uint(pc.dims.x) * uint(pc.dims.y) * 3u;
+    if (i >= n) return;
+    A[i] = 0u;
+}

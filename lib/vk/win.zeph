@@ -1,0 +1,88 @@
+// A minimal Win32 window for Vulkan presentation.
+//
+// There is no window procedure written in Zephyr: the class installs the
+// address of user32's own DefWindowProcA, and the app polls messages with
+// PeekMessageA. That sidesteps needing to hand a native callback back to the
+// OS -- Vulkan never calls us, so nothing here needs a thunk.
+
+import "std/bytes.zeph"
+
+extern fn GetModuleHandleA(name: int) -> int from "kernel32.dll"
+extern fn RegisterClassA(wc: int) -> int from "user32.dll"
+extern fn CreateWindowExA(ex: int, cls: int, title: int, style: int, x: int, y: int, w: int, h: int, parent: int, menu: int, inst: int, param: int) -> int from "user32.dll"
+extern fn ShowWindow(hwnd: int, cmd: int) -> i32 from "user32.dll"
+extern fn DestroyWindow(hwnd: int) -> i32 from "user32.dll"
+extern fn PeekMessageA(msg: int, hwnd: int, min: int, max: int, remove: int) -> i32 from "user32.dll"
+extern fn TranslateMessage(msg: int) -> i32 from "user32.dll"
+extern fn DispatchMessageA(msg: int) -> int from "user32.dll"
+extern fn IsWindow(hwnd: int) -> i32 from "user32.dll"
+extern fn GetClientRect(hwnd: int, rect: int) -> i32 from "user32.dll"
+extern fn LoadCursorA(inst: int, name: int) -> int from "user32.dll"
+extern fn GetAsyncKeyState(key: int) -> i32 from "user32.dll"
+
+struct Window {
+    hwnd: int,
+    hinst: int,
+    msg: Bytes,        // MSG scratch, reused every poll
+    rect: Bytes,
+    cls: Bytes,        // WNDCLASSA and the class name must outlive the window
+    name: Bytes
+}
+
+// WNDCLASSA on x64: style 0, lpfnWndProc 8, cbClsExtra 16, cbWndExtra 20,
+// hInstance 24, hIcon 32, hCursor 40, hbrBackground 48, lpszMenuName 56,
+// lpszClassName 64  (size 72)
+fn window_open(title: str, w: int, h: int) -> Window {
+    let hinst = GetModuleHandleA(0)
+    // LoadLibraryA, not GetModuleHandleA: every user32 entry point here is
+    // resolved lazily through `extern fn`, so user32 may not be mapped yet and
+    // GetModuleHandleA would hand back 0.
+    let u32mod = win("LoadLibraryA", cbytes("user32.dll").addr())
+    if u32mod == 0 { panic("could not load user32.dll") }
+    // the window procedure is user32's own default handler
+    let defwp = win("GetProcAddress", u32mod, cbytes("DefWindowProcA").addr())
+    if defwp == 0 { panic("could not resolve DefWindowProcA") }
+
+    var name = cbytes("zephyrVulkanWindow")
+    var cls = Bytes.new(72)
+    cls.put32(0, 3)                            // CS_HREDRAW | CS_VREDRAW
+    cls.put64(8, defwp)
+    cls.put64(24, hinst)
+    cls.put64(40, LoadCursorA(0, 32512))       // IDC_ARROW
+    cls.put64(64, name.addr())
+    if RegisterClassA(cls.addr()) == 0 { panic("RegisterClassA failed") }
+
+    var titleb = cbytes(title)
+    // WS_OVERLAPPEDWINDOW | WS_VISIBLE
+    let hwnd = CreateWindowExA(0, name.addr(), titleb.addr(), 282001408,
+                               120, 90, w, h, 0, 0, hinst, 0)
+    if hwnd == 0 { panic("CreateWindowExA failed") }
+    let s = ShowWindow(hwnd, 5)
+    return Window{hwnd: hwnd, hinst: hinst, msg: Bytes.new(64),
+                  rect: Bytes.new(16), cls: cls, name: name}
+}
+
+impl Window {
+    // Drain the queue; false once the window is gone or Esc is pressed.
+    fn poll(self) -> bool {
+        while PeekMessageA(self.msg.addr(), 0, 0, 0, 1) != 0 {
+            let m = self.msg.get32(8)
+            if m == 18 { return false }               // WM_QUIT
+            let t = TranslateMessage(self.msg.addr())
+            let d = DispatchMessageA(self.msg.addr())
+        }
+        if IsWindow(self.hwnd) == 0 { return false }
+        if (GetAsyncKeyState(27) & 32768) != 0 { return false }   // VK_ESCAPE
+        return true
+    }
+
+    fn width(self) -> int {
+        let r = GetClientRect(self.hwnd, self.rect.addr())
+        return self.rect.get32(8)
+    }
+    fn height(self) -> int {
+        let r = GetClientRect(self.hwnd, self.rect.addr())
+        return self.rect.get32(12)
+    }
+    fn close(self) { let r = DestroyWindow(self.hwnd) }
+}

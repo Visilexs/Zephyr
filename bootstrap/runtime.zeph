@@ -1,0 +1,1895 @@
+// runtime.zeph — the Zephyr runtime, written in Zephyr.
+// Compiled in with `zephyr build --rt`, producing an executable that depends on
+// nothing but kernel32. Memory comes from VirtualAlloc and is reclaimed by a
+// conservative mark-sweep collector (below); I/O goes straight to WriteFile.
+// Values are laid out exactly as the C runtime expects:
+// str = {i64 len; bytes}, list = {i64 len; i64 cap; i64 data}.
+
+// ---- heap: conservative mark-sweep GC over one reserved region ----
+// The heap is a single contiguous reservation, committed as it grows, so a
+// candidate pointer maps to a bit index in O(1). Every object is
+// [8-byte header][payload]; the header holds the payload size (a multiple of
+// 8, so the low 3 bits are free) plus flags. A start bit marks each payload
+// address, which is how a conservatively-scanned word is recognised as a real
+// object pointer. Roots are the machine stack and the globals array.
+let HEAP_RESERVE = 1073741824       // 1 GiB of address space (reserved, not committed)
+let COMMIT_STEP = 4194304           // commit 4 MiB at a time
+let F_MARK = 1
+let F_FREE = 2
+
+var __hbase = 0      // heap base
+var __hbump = 0      // next never-yet-used address
+var __hcommit = 0    // committed end
+var __startb = 0     // start bitmap
+var __markb = 0      // mark bitmap
+var __bcommit = 0    // committed bytes in each bitmap
+// Free blocks are held in size-segregated lists so allocation is O(1): one
+// list per 8-byte size class up to 1 KiB (exact fit, no search, no splitting)
+// plus a first-fit list for anything larger. A single first-fit list made
+// allocation O(n) and the compiler 11x slower.
+let NCLASS = 128     // classes 1..128 => payloads of 8..1024 bytes
+var __fl = 0         // array of NCLASS+1 list heads (off-heap)
+var __flbig = 0      // blocks larger than 1 KiB
+var __gc_at = 8388608    // collect once the bump pointer reaches this absolute address
+var __live = 0       // bytes surviving the last collection
+var __groots = 0     // globals array (roots)
+var __ngroots = 0
+var __wl = 0         // mark worklist
+var __wlcommit = 0
+var __wltop = 0
+var __gc_on = 0      // 1 once the heap is initialised
+
+fn rx_bit_set(base: int, idx: int) {
+    let b = base + (idx >> 3)
+    store8(b, load8(b) | (1 << (idx & 7)))
+}
+fn rx_bit_get(base: int, idx: int) -> int {
+    return (load8(base + (idx >> 3)) >> (idx & 7)) & 1
+}
+fn rx_bit_clr(base: int, idx: int) {
+    let b = base + (idx >> 3)
+    store8(b, load8(b) & (255 - (1 << (idx & 7))))
+}
+
+fn rx_reserve(n: int) -> int {
+    // VirtualAlloc(NULL, n, MEM_RESERVE, PAGE_READWRITE)
+    let p = win("VirtualAlloc", 0, n, 8192, 4)
+    if p == 0 { rt_die("out of memory (reserve)") }
+    return p
+}
+fn rx_commit(base: int, n: int) {
+    // VirtualAlloc(base, n, MEM_COMMIT, PAGE_READWRITE)
+    if win("VirtualAlloc", base, n, 4096, 4) == 0 { rt_die("out of memory (commit)") }
+}
+
+fn rx_free_push(obj: int, size: int) {
+    let cls = size >> 3
+    if cls <= NCLASS {
+        store64(obj, load64(__fl + cls * 8))
+        store64(__fl + cls * 8, obj)
+    } else {
+        store64(obj, __flbig)
+        __flbig = obj
+    }
+}
+
+fn rx_heap_init() {
+    __fl = win("VirtualAlloc", 0, 4096, 12288, 4)     // (NCLASS+1) heads, off-heap
+    if __fl == 0 { rt_die("out of memory") }
+    __hbase = rx_reserve(HEAP_RESERVE)
+    __hbump = __hbase
+    __hcommit = __hbase
+    __gc_at = __hbase + 8388608                   // first collection after 8 MiB of growth
+    __startb = rx_reserve(HEAP_RESERVE >> 6)     // 1 bit per 8-byte word
+    __markb = rx_reserve(HEAP_RESERVE >> 6)
+    __bcommit = 0
+    __wl = rx_reserve(HEAP_RESERVE >> 3)   // mark worklist: up to 16M pending objects
+    __wlcommit = 0                         // (reserve is address space only -- free)
+    rx_sb_init()                           // before any formatting can happen
+    __gc_on = 1
+}
+
+// make sure the heap is committed through `upto`, with bitmaps to match
+fn rx_grow(upto: int) {
+    if upto <= __hcommit { return }
+    var want = upto - __hbase
+    want = ((want + COMMIT_STEP - 1) / COMMIT_STEP) * COMMIT_STEP
+    if want > HEAP_RESERVE { rt_die("out of memory (heap full)") }
+    rx_commit(__hbase, want)
+    __hcommit = __hbase + want
+    let bwant = ((want >> 6) + 65535) & (0 - 65536)
+    if bwant > __bcommit {
+        rx_commit(__startb, bwant)
+        rx_commit(__markb, bwant)
+        __bcommit = bwant
+    }
+}
+
+fn rx_wl_push(obj: int) {
+    let need = (__wltop + 1) * 8
+    if need > __wlcommit {
+        let want = ((need + COMMIT_STEP - 1) / COMMIT_STEP) * COMMIT_STEP
+        if want > HEAP_RESERVE >> 3 { rt_die("out of memory (mark worklist)") }
+        rx_commit(__wl, want)
+        __wlcommit = want
+    }
+    store64(__wl + __wltop * 8, obj)
+    __wltop += 1
+}
+
+// scan a word range conservatively, marking anything that looks like a pointer
+fn rx_scan_range(lo: int, hi: int) {
+    var p = lo
+    while p + 8 <= hi {
+        rx_try_mark(load64(p))
+        p += 8
+    }
+}
+
+fn rx_try_mark(cand: int) {
+    if cand < __hbase { return }
+    if cand >= __hbump { return }
+    if (cand & 7) != 0 { return }
+    let idx = (cand - __hbase) >> 3
+    if rx_bit_get(__startb, idx) == 0 { return }     // not an object payload
+    if rx_bit_get(__markb, idx) == 1 { return }      // already marked
+    let h = load64(cand - 8)
+    if (h & F_FREE) != 0 { return }
+    rx_bit_set(__markb, idx)
+    rx_wl_push(cand)
+}
+
+// ---------------- threads ----------------
+// The collector is stop-the-world and conservative, so it must see every
+// thread's stack and registers. Threads register themselves here; rx_collect
+// suspends them all, reads each one's CONTEXT (which carries the integer
+// registers) and scans from its Rsp to its stack base.
+//
+// Slot layout, 32 bytes: [0] handle  [8] stack base (0 = not yet registered)
+//                        [16] thread id  [24] spare
+let MAXTHR = 64
+var __thr = 0
+var __gcpad = 0        // collector's own scratch: rx_scratch() is shared
+var __nthr = 0
+var __lock = 0
+var __ctx = 0
+
+fn rx_thr_init() {
+    if __lock != 0 { return }
+    __lock = win("VirtualAlloc", 0, 4096, 12288, 4)
+    let a = win("InitializeCriticalSection", __lock)
+    __thr = win("VirtualAlloc", 0, MAXTHR * 32, 12288, 4)
+    __ctx = win("VirtualAlloc", 0, 4096, 12288, 4)      // CONTEXT, page-aligned
+    __gcpad = win("VirtualAlloc", 0, 4096, 12288, 4)
+}
+
+// Allocation is only locked once a second thread exists, so single-threaded
+// programs pay nothing. A thread is registered before it is resumed, and
+// registration touches the registry rather than the heap, so a racing
+// allocator on the main thread cannot corrupt anything.
+// Unconditional: testing __nthr at lock time and again at unlock time can
+// disagree if a thread is spawned in between, and leaving a critical section
+// that was never entered corrupts it.
+fn rt_lock() {
+    rx_thr_init()
+    let a = win("EnterCriticalSection", __lock)
+}
+fn rt_unlock() {
+    let a = win("LeaveCriticalSection", __lock)
+}
+
+// called by the parent, before the new thread is resumed.
+// Slots are reused: a program that spawns threads in a loop -- parallel_for
+// inside an outer loop is the obvious case -- would otherwise walk off the end
+// of the registry after MAXTHR spawns and corrupt whatever follows it. A free
+// slot is one whose handle is 0, which rt_thread_done sets on the way out; a
+// registered-but-not-yet-running thread keeps its handle and so is never taken,
+// which matters because its stack base is still 0 too.
+fn rt_thread_add(handle: int, tid: int) -> int {
+    rx_thr_init()
+    let a = win("EnterCriticalSection", __lock)
+    var ix = -1
+    var i = 0
+    while i < __nthr {
+        if load64(__thr + i * 32) == 0 {
+            ix = i
+            i = __nthr
+        } else {
+            i += 1
+        }
+    }
+    if ix < 0 {
+        if __nthr >= MAXTHR {
+            let c = win("LeaveCriticalSection", __lock)
+            panic("thread: more than 64 live threads")
+        }
+        ix = __nthr
+        __nthr += 1
+    }
+    let slot = __thr + ix * 32
+    store64(slot, handle)
+    store64(slot + 8, 0)
+    store64(slot + 16, tid)
+    let b = win("LeaveCriticalSection", __lock)
+    return ix
+}
+
+// called by the new thread as its first act: publish where its stack lives
+fn rt_thread_ready() {
+    rx_thr_init()
+    let a0 = win("EnterCriticalSection", __lock)
+    let lo = __gcpad + 64          // private to registration, which holds the lock
+    let hi = lo + 8
+    let ig = win("GetCurrentThreadStackLimits", lo, hi)
+    let me = win("GetCurrentThreadId")
+    var i = 0
+    while i < __nthr {
+        if load64(__thr + i * 32 + 16) == me { store64(__thr + i * 32 + 8, load64(hi)) }
+        i += 1
+    }
+    let b = win("LeaveCriticalSection", __lock)
+}
+
+fn rt_thread_done() {
+    let me = win("GetCurrentThreadId")
+    let a = win("EnterCriticalSection", __lock)
+    var i = 0
+    while i < __nthr {
+        if load64(__thr + i * 32 + 16) == me {
+            store64(__thr + i * 32 + 8, 0)     // no stack: the collector skips it
+            store64(__thr + i * 32, 0)         // no handle: the slot is reusable
+        }
+        i += 1
+    }
+    let b = win("LeaveCriticalSection", __lock)
+}
+
+// Suspend every other registered thread, scan it, then resume. All of them are
+// suspended before any is scanned: a thread allowed to run mid-scan could move
+// the only reference to an object past a region already visited.
+fn rx_scan_threads() {
+    if __nthr == 0 { return }
+    let me = win("GetCurrentThreadId")
+    var i = 0
+    while i < __nthr {
+        let slot = __thr + i * 32
+        if load64(slot + 16) != me and load64(slot + 8) != 0 {
+            let s = win("SuspendThread", load64(slot))
+        }
+        i += 1
+    }
+    i = 0
+    while i < __nthr {
+        let slot = __thr + i * 32
+        let base = load64(slot + 8)
+        if load64(slot + 16) != me and base != 0 {
+            store32(__ctx + 48, 1048587)                  // ContextFlags = CONTEXT_FULL
+            let ok = win("GetThreadContext", load64(slot), __ctx)
+            if ok != 0 {
+                // Rax..R15 live at 0x78..0xF8 in the x64 CONTEXT; scanning that
+                // span covers the registers a value could be sitting in.
+                rx_scan_range(__ctx + 120, __ctx + 248)
+                rx_scan_range(load64(__ctx + 152), base)  // Rsp .. stack base
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < __nthr {
+        let slot = __thr + i * 32
+        if load64(slot + 16) != me and load64(slot + 8) != 0 {
+            let r = win("ResumeThread", load64(slot))
+        }
+        i += 1
+    }
+}
+
+fn rx_collect() {
+    // clear marks
+    var i = 0
+    while i < __bcommit {
+        store64(__markb + i, 0)
+        i += 8
+    }
+    __wltop = 0
+    // roots: globals, then the machine stack (current rsp .. stack base)
+    if __ngroots > 0 { rx_scan_range(__groots, __groots + __ngroots * 8) }
+    let lo = __gcpad
+    let hi = lo + 8
+    let ignored = win("GetCurrentThreadStackLimits", lo, hi)   // returns VOID
+    rx_scan_range(stackptr(), load64(hi))
+    rx_scan_threads()
+    // trace
+    while __wltop > 0 {
+        __wltop -= 1
+        let obj = load64(__wl + __wltop * 8)
+        let size = load64(obj - 8) & (0 - 8)
+        rx_scan_range(obj, obj + size)
+    }
+    // sweep: rebuild the free lists from unmarked objects
+    var c = 0
+    while c <= NCLASS {
+        store64(__fl + c * 8, 0)
+        c += 1
+    }
+    __flbig = 0
+    __live = 0
+    var obj = __hbase + 8
+    while obj < __hbump {
+        let h = load64(obj - 8)
+        let size = h & (0 - 8)
+        let idx = (obj - __hbase) >> 3
+        if rx_bit_get(__markb, idx) == 0 {
+            store64(obj - 8, size | F_FREE)          // dead (or already free)
+            rx_free_push(obj, size)
+        } else {
+            store64(obj - 8, size)                   // clear mark/free flags
+            __live += size + 8
+        }
+        obj = obj + 8 + size
+    }
+}
+
+// a small scratch page for out-params (never freed, not on the GC heap)
+var __scratchp = 0
+fn rx_scratch() -> int {
+    if __scratchp == 0 {
+        __scratchp = win("VirtualAlloc", 0, 4096, 12288, 4)
+        if __scratchp == 0 { rt_die("out of memory") }
+    }
+    return __scratchp
+}
+
+// Take a block off the free lists, or 0 if none fits. Small sizes come off
+// their exact-size class in O(1); large ones use first fit with splitting.
+fn rx_take_free(need: int) -> int {
+    let cls = need >> 3
+    if cls <= NCLASS {
+        let head = load64(__fl + cls * 8)
+        if head == 0 { return 0 }
+        store64(__fl + cls * 8, load64(head))        // pop
+        store64(head - 8, need)                      // live again, flags cleared
+        rx_zero(head, need)
+        return head
+    }
+    var prev = 0
+    var cur = __flbig
+    while cur != 0 {
+        let sz = load64(cur - 8) & (0 - 8)
+        let nxt = load64(cur)
+        if sz >= need {
+            if prev == 0 { __flbig = nxt } else { store64(prev, nxt) }
+            if sz >= need + 16 {                     // split off the tail
+                let rest = sz - need - 8
+                store64(cur - 8, need)
+                let nb = cur + need + 8              // payload of the remainder
+                store64(nb - 8, rest | F_FREE)
+                rx_bit_set(__startb, (nb - __hbase) >> 3)
+                rx_free_push(nb, rest)
+            } else {
+                store64(cur - 8, sz)
+            }
+            rx_zero(cur, load64(cur - 8) & (0 - 8))
+            return cur
+        }
+        prev = cur
+        cur = nxt
+    }
+    return 0
+}
+
+fn rt_alloc(size: int) -> int {
+    rt_lock()
+    let r = rx_alloc_body(size)
+    rt_unlock()
+    return r
+}
+
+fn rx_alloc_body(size: int) -> int {
+    if __gc_on == 0 { rx_heap_init() }
+    var need = (size + 7) & (0 - 8)
+    if need == 0 { need = 8 }
+    let a = rx_take_free(need)
+    if a != 0 { return a }
+    // free list exhausted and the heap has doubled: collect, then retry.
+    // ponytail: first-fit over one free list; size-segregated lists would let
+    // us collect more often without the O(n) search, but this is correct and
+    // halves peak memory as is.
+    if __hbump >= __gc_at {
+        rx_collect()
+        // Proportional trigger (Go-style): allow the bump pointer to advance by
+        // another `live` bytes before the next collection, so the heap peaks at
+        // ~2x the live set. The target is measured from the CURRENT bump, i.e.
+        // from growth-since-this-collection -- NOT from __hbase, which is the
+        // all-time high-water extent and never shrinks. Keying on the extent
+        // meant that once it passed 2x live, every free-list miss collected
+        // (a full mark that reclaimed nothing new), which is O(live) per
+        // allocation whenever the live set pins its size class's free list empty.
+        // The 256 KiB floor only bites when the live set is tiny (a churn loop
+        // whose garbage dies immediately): it collects a little more often to
+        // keep the peak low, and each such collection is cheap precisely because
+        // little is live. A larger floor traded ~8 MiB of extra peak for no time.
+        var headroom = __live
+        if headroom < 262144 { headroom = 262144 }
+        __gc_at = __hbump + headroom
+        let b = rx_take_free(need)
+        if b != 0 { return b }
+    }
+    // bump
+    rx_grow(__hbump + 8 + need)
+    let obj = __hbump + 8
+    store64(__hbump, need)
+    __hbump = __hbump + 8 + need
+    rx_bit_set(__startb, (obj - __hbase) >> 3)
+    return obj                                       // committed pages start zeroed
+}
+
+fn rx_zero(p: int, n: int) {
+    var i = 0
+    while i < n {
+        store64(p + i, 0)
+        i += 8
+    }
+}
+
+// records the globals array so the collector can scan it as a root set
+fn rt_set_globals(p: int, n: int) {
+    __groots = p
+    __ngroots = n
+}
+
+// ---- raw byte copy ----
+fn rx_mcopy(dst: int, src: int, n: int) {
+    var i = 0
+    while i + 8 <= n {
+        store64(dst + i, load64(src + i))
+        i += 8
+    }
+    while i < n {
+        store8(dst + i, load8(src + i))
+        i += 1
+    }
+}
+
+// ---- strings ----  (a str value is a pointer to {i64 len; bytes})
+fn rx_str_alloc(slen: int) -> int {
+    let p = rt_alloc(8 + slen)
+    store64(p, slen)
+    return p
+}
+
+fn rt_str_concat(a: int, b: int) -> int {
+    let la = load64(a)
+    let lb = load64(b)
+    let s = rx_str_alloc(la + lb)
+    rx_mcopy(s + 8, a + 8, la)
+    rx_mcopy(s + 8 + la, b + 8, lb)
+    return s
+}
+
+fn rt_str_eq(a: int, b: int) -> int {
+    let la = load64(a)
+    if la != load64(b) { return 0 }
+    var i = 0
+    while i < la {
+        if load8(a + 8 + i) != load8(b + 8 + i) { return 0 }
+        i += 1
+    }
+    return 1
+}
+
+fn rt_str_cmp(a: int, b: int) -> int {
+    let la = load64(a)
+    let lb = load64(b)
+    var n = la
+    if lb < n { n = lb }
+    var i = 0
+    while i < n {
+        let ca = load8(a + 8 + i)
+        let cb = load8(b + 8 + i)
+        if ca < cb { return 0 - 1 }
+        if ca > cb { return 1 }
+        i += 1
+    }
+    if la < lb { return 0 - 1 }
+    if la > lb { return 1 }
+    return 0
+}
+
+fn rt_str_sub(s: int, lo: int, hi: int) -> int {
+    let n = load64(s)
+    if lo < 0 or hi < lo or hi > n { rt_die("invalid substring") }
+    let r = rx_str_alloc(hi - lo)
+    rx_mcopy(r + 8, s + 8 + lo, hi - lo)
+    return r
+}
+
+fn rt_chr(c: int) -> int {
+    if c < 0 or c > 255 { rt_die("chr out of range") }
+    let s = rx_str_alloc(1)
+    store8(s + 8, c)
+    return s
+}
+
+// ---- stdlib: string / list / math helpers ----
+fn rt_ipow(base: int, exp: int) -> int {
+    if exp < 0 { return 0 }
+    var r = 1
+    var b = base
+    var e = exp
+    while e > 0 {
+        if e & 1 == 1 { r = r * b }
+        b = b * b
+        e = e >> 1
+    }
+    return r
+}
+
+fn rt_str_index_of(s: int, sub: int) -> int {
+    let n = load64(s)
+    let m = load64(sub)
+    if m == 0 { return 0 }
+    var i = 0
+    while i + m <= n {
+        var j = 0
+        while j < m and load8(s + 8 + i + j) == load8(sub + 8 + j) { j += 1 }
+        if j == m { return i }
+        i += 1
+    }
+    return 0 - 1
+}
+fn rt_str_contains(s: int, sub: int) -> int {
+    if rt_str_index_of(s, sub) >= 0 { return 1 }
+    return 0
+}
+fn rt_str_starts_with(s: int, p: int) -> int {
+    let n = load64(s)
+    let m = load64(p)
+    if m > n { return 0 }
+    var j = 0
+    while j < m {
+        if load8(s + 8 + j) != load8(p + 8 + j) { return 0 }
+        j += 1
+    }
+    return 1
+}
+fn rt_str_ends_with(s: int, p: int) -> int {
+    let n = load64(s)
+    let m = load64(p)
+    if m > n { return 0 }
+    var j = 0
+    while j < m {
+        if load8(s + 8 + n - m + j) != load8(p + 8 + j) { return 0 }
+        j += 1
+    }
+    return 1
+}
+fn rt_str_split(s: int, sep: int) -> int {
+    let n = load64(s)
+    let m = load64(sep)
+    let out = rt_list_new(0)
+    if m == 0 {
+        var i = 0
+        while i < n {
+            let piece = rx_str_alloc(1)
+            store8(piece + 8, load8(s + 8 + i))
+            rt_list_push(out, piece)
+            i += 1
+        }
+        return out
+    }
+    var start = 0
+    var i = 0
+    while i + m <= n {
+        var j = 0
+        while j < m and load8(s + 8 + i + j) == load8(sep + 8 + j) { j += 1 }
+        if j == m {
+            rt_list_push(out, rt_str_sub(s, start, i))
+            i += m
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    rt_list_push(out, rt_str_sub(s, start, n))
+    return out
+}
+fn rt_str_replace(s: int, old: int, rep: int) -> int {
+    let n = load64(s)
+    let m = load64(old)
+    if m == 0 { return s }
+    var out = rx_str_alloc(0)
+    var start = 0
+    var i = 0
+    while i + m <= n {
+        var j = 0
+        while j < m and load8(s + 8 + i + j) == load8(old + 8 + j) { j += 1 }
+        if j == m {
+            out = rt_str_concat(out, rt_str_sub(s, start, i))
+            out = rt_str_concat(out, rep)
+            i += m
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    out = rt_str_concat(out, rt_str_sub(s, start, n))
+    return out
+}
+fn rt_str_upper(s: int) -> int {
+    let n = load64(s)
+    let r = rx_str_alloc(n)
+    var i = 0
+    while i < n {
+        var c = load8(s + 8 + i)
+        if c >= 97 and c <= 122 { c -= 32 }
+        store8(r + 8 + i, c)
+        i += 1
+    }
+    return r
+}
+fn rt_str_lower(s: int) -> int {
+    let n = load64(s)
+    let r = rx_str_alloc(n)
+    var i = 0
+    while i < n {
+        var c = load8(s + 8 + i)
+        if c >= 65 and c <= 90 { c += 32 }
+        store8(r + 8 + i, c)
+        i += 1
+    }
+    return r
+}
+fn rx_is_ws(c: int) -> int {
+    if c == 32 or c == 9 or c == 10 or c == 13 { return 1 }
+    return 0
+}
+fn rt_str_trim(s: int) -> int {
+    let n = load64(s)
+    var lo = 0
+    while lo < n and rx_is_ws(load8(s + 8 + lo)) == 1 { lo += 1 }
+    var hi = n
+    while hi > lo and rx_is_ws(load8(s + 8 + hi - 1)) == 1 { hi -= 1 }
+    return rt_str_sub(s, lo, hi)
+}
+fn rt_str_repeat(s: int, k: int) -> int {
+    let n = load64(s)
+    var cnt = k
+    if cnt < 0 { cnt = 0 }
+    let r = rx_str_alloc(n * cnt)
+    var i = 0
+    while i < cnt {
+        rx_mcopy(r + 8 + i * n, s + 8, n)
+        i += 1
+    }
+    return r
+}
+fn rt_list_contains(l: int, v: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var i = 0
+    while i < n {
+        if load64(data + i * 8) == v { return 1 }
+        i += 1
+    }
+    return 0
+}
+fn rt_list_contains_str(l: int, v: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var i = 0
+    while i < n {
+        if rt_str_eq(load64(data + i * 8), v) == 1 { return 1 }
+        i += 1
+    }
+    return 0
+}
+// ---- hash map ----
+// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind
+// state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.
+fn rt_map_new(keykind: int) -> int {
+    let m = rt_alloc(48)
+    let cap = 8
+    store64(m, 0)
+    store64(m + 8, cap)
+    store64(m + 16, rt_alloc(cap * 8))
+    store64(m + 24, rt_alloc(cap * 8))
+    store64(m + 32, rt_alloc(cap))
+    store64(m + 40, keykind)
+    return m
+}
+fn rx_hash_int(k: int) -> int {
+    var h = k * 1000003
+    h = h ^ (h >> 31)
+    h = h * 2654435761
+    h = h ^ (h >> 29)
+    return h & 9223372036854775807
+}
+fn rx_hash_str(s: int) -> int {
+    let n = load64(s)
+    var h = 2166136261
+    var i = 0
+    while i < n {
+        h = h ^ load8(s + 8 + i)
+        h = h * 16777619
+        i += 1
+    }
+    return h & 9223372036854775807
+}
+fn rx_map_hash(m: int, k: int) -> int {
+    if load64(m + 40) == 1 { return rx_hash_str(k) }
+    return rx_hash_int(k)
+}
+fn rx_key_eq(m: int, a: int, b: int) -> int {
+    if load64(m + 40) == 1 { return rt_str_eq(a, b) }
+    if a == b { return 1 }
+    return 0
+}
+// slot holding k, or -1
+fn rx_map_lookup(m: int, k: int) -> int {
+    let cap = load64(m + 8)
+    let keys = load64(m + 16)
+    let state = load64(m + 32)
+    var i = rx_map_hash(m, k) & (cap - 1)
+    var probes = 0
+    while probes < cap {
+        let st = load8(state + i)
+        if st == 0 { return 0 - 1 }
+        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 { return i }
+        i = (i + 1) & (cap - 1)
+        probes += 1
+    }
+    return 0 - 1
+}
+fn rx_map_insert(m: int, k: int, v: int) {
+    let cap = load64(m + 8)
+    let keys = load64(m + 16)
+    let vals = load64(m + 24)
+    let state = load64(m + 32)
+    var i = rx_map_hash(m, k) & (cap - 1)
+    var tomb = 0 - 1
+    var probes = 0
+    while probes < cap {
+        let st = load8(state + i)
+        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 {
+            store64(vals + i * 8, v)          // update in place
+            return
+        }
+        if st == 2 and tomb < 0 { tomb = i }
+        if st == 0 {
+            var slot = i
+            if tomb >= 0 { slot = tomb }
+            store64(keys + slot * 8, k)
+            store64(vals + slot * 8, v)
+            store8(state + slot, 1)
+            store64(m, load64(m) + 1)
+            return
+        }
+        i = (i + 1) & (cap - 1)
+        probes += 1
+    }
+    rt_die("map overflow")
+}
+fn rx_map_grow(m: int) {
+    let oldcap = load64(m + 8)
+    let oldkeys = load64(m + 16)
+    let oldvals = load64(m + 24)
+    let oldstate = load64(m + 32)
+    let ncap = oldcap * 2
+    store64(m + 8, ncap)
+    store64(m + 16, rt_alloc(ncap * 8))
+    store64(m + 24, rt_alloc(ncap * 8))
+    store64(m + 32, rt_alloc(ncap))       // fresh pages are zero = all empty
+    store64(m, 0)
+    let isint = load64(m + 40) == 0
+    var i = 0
+    while i < oldcap {
+        if load8(oldstate + i) == 1 {
+            if isint { rx_iinsert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) }
+            else { rx_map_insert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) }
+        }
+        i += 1
+    }
+}
+// ---- int-key fast paths: hash and == inlined, no call per probe ----
+fn rx_ilookup(m: int, k: int) -> int {
+    let cap = load64(m + 8)
+    let keys = load64(m + 16)
+    let state = load64(m + 32)
+    var h = k * 1000003
+    h = h ^ (h >> 31)
+    h = h * 2654435761
+    h = h ^ (h >> 29)
+    var i = h & 9223372036854775807 & (cap - 1)
+    var probes = 0
+    while probes < cap {
+        let st = load8(state + i)
+        if st == 0 { return 0 - 1 }
+        if st == 1 and load64(keys + i * 8) == k { return i }
+        i = (i + 1) & (cap - 1)
+        probes += 1
+    }
+    return 0 - 1
+}
+fn rx_iinsert(m: int, k: int, v: int) {
+    let cap = load64(m + 8)
+    let keys = load64(m + 16)
+    let vals = load64(m + 24)
+    let state = load64(m + 32)
+    var h = k * 1000003
+    h = h ^ (h >> 31)
+    h = h * 2654435761
+    h = h ^ (h >> 29)
+    var i = h & 9223372036854775807 & (cap - 1)
+    var tomb = 0 - 1
+    var probes = 0
+    while probes < cap {
+        let st = load8(state + i)
+        if st == 1 and load64(keys + i * 8) == k {
+            store64(vals + i * 8, v)
+            return
+        }
+        if st == 2 and tomb < 0 { tomb = i }
+        if st == 0 {
+            var slot = i
+            if tomb >= 0 { slot = tomb }
+            store64(keys + slot * 8, k)
+            store64(vals + slot * 8, v)
+            store8(state + slot, 1)
+            store64(m, load64(m) + 1)
+            return
+        }
+        i = (i + 1) & (cap - 1)
+        probes += 1
+    }
+    rt_die("map overflow")
+}
+fn rt_map_set(m: int, k: int, v: int) {
+    if (load64(m) + 1) * 10 >= load64(m + 8) * 7 { rx_map_grow(m) }   // grow at 70%
+    if load64(m + 40) == 0 {
+        rx_iinsert(m, k, v)
+        return
+    }
+    rx_map_insert(m, k, v)
+}
+fn rt_map_get(m: int, k: int) -> int {
+    let i = rx_lookup(m, k)
+    if i < 0 { rt_die("map key not found") }
+    return load64(load64(m + 24) + i * 8)
+}
+// fused m.get(k).or(d): the value or the default, no optional cell allocated
+fn rt_map_get_or(m: int, k: int, d: int) -> int {
+    let i = rx_lookup(m, k)
+    if i < 0 { return d }
+    return load64(load64(m + 24) + i * 8)
+}
+// dispatch: int-keyed maps take the inlined fast path
+fn rx_lookup(m: int, k: int) -> int {
+    if load64(m + 40) == 0 { return rx_ilookup(m, k) }
+    return rx_map_lookup(m, k)
+}
+// safe lookup: returns an optional cell (0 = none)
+fn rt_map_get_opt(m: int, k: int) -> int {
+    let i = rx_lookup(m, k)
+    if i < 0 { return 0 }
+    let cell = rt_alloc(8)
+    store64(cell, load64(load64(m + 24) + i * 8))
+    return cell
+}
+fn rt_map_has(m: int, k: int) -> int {
+    if rx_lookup(m, k) >= 0 { return 1 }
+    return 0
+}
+fn rt_map_remove(m: int, k: int) {
+    let i = rx_lookup(m, k)
+    if i < 0 { return }
+    store8(load64(m + 32) + i, 2)         // tombstone
+    store64(m, load64(m) - 1)
+}
+fn rt_map_keys(m: int) -> int {
+    let cap = load64(m + 8)
+    let keys = load64(m + 16)
+    let state = load64(m + 32)
+    let out = rt_list_new(0)
+    var i = 0
+    while i < cap {
+        if load8(state + i) == 1 { rt_list_push(out, load64(keys + i * 8)) }
+        i += 1
+    }
+    return out
+}
+fn rt_map_values(m: int) -> int {
+    let cap = load64(m + 8)
+    let vals = load64(m + 24)
+    let state = load64(m + 32)
+    let out = rt_list_new(0)
+    var i = 0
+    while i < cap {
+        if load8(state + i) == 1 { rt_list_push(out, load64(vals + i * 8)) }
+        i += 1
+    }
+    return out
+}
+
+// ---- sorting (heapsort: in place, O(n log n), no recursion) ----
+// kind: 0 = by value (int/bool/enum), 1 = str, 2 = float.  Kept free of
+// function values so the C seed can still compile this file.
+fn rx_cmp_kind(kind: int, a: int, b: int) -> int {
+    if kind == 1 { return rt_str_cmp(a, b) }
+    if kind == 2 {
+        let x = frombits(a)
+        let y = frombits(b)
+        if x < y { return 0 - 1 }
+        if x > y { return 1 }
+        return 0
+    }
+    if a < b { return 0 - 1 }
+    if a > b { return 1 }
+    return 0
+}
+fn rx_sift(data: int, n: int, start: int, kind: int) {
+    var root = start
+    var going = true
+    while going {
+        let child = 2 * root + 1
+        if child >= n {
+            going = false
+            continue
+        }
+        var big = root
+        if rx_cmp_kind(kind, load64(data + big * 8), load64(data + child * 8)) < 0 { big = child }
+        if child + 1 < n {
+            if rx_cmp_kind(kind, load64(data + big * 8), load64(data + child * 8 + 8)) < 0 { big = child + 1 }
+        }
+        if big == root {
+            going = false
+            continue
+        }
+        let t = load64(data + root * 8)
+        store64(data + root * 8, load64(data + big * 8))
+        store64(data + big * 8, t)
+        root = big
+    }
+}
+fn rx_swap(data: int, i: int, j: int) {
+    let t = load64(data + i * 8)
+    store64(data + i * 8, load64(data + j * 8))
+    store64(data + j * 8, t)
+}
+// heapsort restricted to [lo, hi] -- the introsort depth-limit fallback that
+// keeps the worst case O(n log n).
+fn rx_heapsort_range(data: int, lo: int, hi: int, kind: int) {
+    let base = data + lo * 8
+    let n = hi - lo + 1
+    var i = n / 2 - 1
+    while i >= 0 {
+        rx_sift(base, n, i, kind)
+        i -= 1
+    }
+    var e = n - 1
+    while e > 0 {
+        let t = load64(base)
+        store64(base, load64(base + e * 8))
+        store64(base + e * 8, t)
+        rx_sift(base, e, 0, kind)
+        e -= 1
+    }
+}
+// median-of-three Hoare partition; pivot is an element value so it always
+// terminates. Returns the split index j: [lo, j] and [j+1, hi].
+fn rx_partition(data: int, lo: int, hi: int, kind: int) -> int {
+    let mid = lo + (hi - lo) / 2
+    if rx_cmp_kind(kind, load64(data + mid * 8), load64(data + lo * 8)) < 0 { rx_swap(data, lo, mid) }
+    if rx_cmp_kind(kind, load64(data + hi * 8), load64(data + lo * 8)) < 0 { rx_swap(data, lo, hi) }
+    if rx_cmp_kind(kind, load64(data + hi * 8), load64(data + mid * 8)) < 0 { rx_swap(data, mid, hi) }
+    let pivot = load64(data + mid * 8)
+    var i = lo - 1
+    var j = hi + 1
+    var res = 0
+    var done = false
+    while not done {
+        i += 1
+        while rx_cmp_kind(kind, load64(data + i * 8), pivot) < 0 { i += 1 }
+        j -= 1
+        while rx_cmp_kind(kind, load64(data + j * 8), pivot) > 0 { j -= 1 }
+        if i >= j {
+            res = j
+            done = true
+        } else {
+            rx_swap(data, i, j)
+        }
+    }
+    return res
+}
+// introsort: quicksort, recursing into the smaller partition and looping on the
+// larger (stack depth O(log n)); drop to heapsort when recursion gets too deep.
+fn rx_introsort(data: int, lo0: int, hi0: int, depth0: int, kind: int) {
+    var lo = lo0
+    var hi = hi0
+    var depth = depth0
+    while hi - lo > 16 {
+        if depth <= 0 {
+            rx_heapsort_range(data, lo, hi, kind)
+            return
+        }
+        depth -= 1
+        let p = rx_partition(data, lo, hi, kind)
+        if p - lo < hi - p - 1 {
+            rx_introsort(data, lo, p, depth, kind)
+            lo = p + 1
+        } else {
+            rx_introsort(data, p + 1, hi, depth, kind)
+            hi = p
+        }
+    }
+}
+// finishing pass: ranges left <= 16 wide by introsort are nearly sorted, so one
+// insertion sort over the whole array is O(n) with a tiny constant.
+fn rx_insertion(data: int, lo: int, hi: int, kind: int) {
+    var i = lo + 1
+    while i <= hi {
+        let v = load64(data + i * 8)
+        var j = i - 1
+        var going = true
+        while going and j >= lo {
+            if rx_cmp_kind(kind, load64(data + j * 8), v) > 0 {
+                store64(data + (j + 1) * 8, load64(data + j * 8))
+                j -= 1
+            } else {
+                going = false
+            }
+        }
+        store64(data + (j + 1) * 8, v)
+        i += 1
+    }
+}
+// ---- int-specialized introsort: same structure, but comparisons are inline
+// `<`/`>` on loaded values instead of a call to rx_cmp_kind per compare. The
+// call overhead dominates a generic sort, so this is the path that matters. ----
+fn rx_heapsort_range_int(data: int, lo: int, hi: int) {
+    let base = data + lo * 8
+    let n = hi - lo + 1
+    var i = n / 2 - 1
+    while i >= 0 {
+        var root = i
+        var going = true
+        while going {
+            let child = 2 * root + 1
+            if child >= n {
+                going = false
+            } else {
+                var big = root
+                if load64(base + big * 8) < load64(base + child * 8) { big = child }
+                if child + 1 < n and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
+                if big == root {
+                    going = false
+                } else {
+                    rx_swap(base, root, big)
+                    root = big
+                }
+            }
+        }
+        i -= 1
+    }
+    var e = n - 1
+    while e > 0 {
+        rx_swap(base, 0, e)
+        var root = 0
+        var going = true
+        while going {
+            let child = 2 * root + 1
+            if child >= e {
+                going = false
+            } else {
+                var big = root
+                if load64(base + big * 8) < load64(base + child * 8) { big = child }
+                if child + 1 < e and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
+                if big == root {
+                    going = false
+                } else {
+                    rx_swap(base, root, big)
+                    root = big
+                }
+            }
+        }
+        e -= 1
+    }
+}
+// Branchless Lomuto partition (the pdqsort / Alexandrescu technique). The
+// median-of-3 pivot is parked at a[hi]; the scan swaps a[r] and a[w]
+// UNCONDITIONALLY -- when a[r] >= pivot both slots hold >=pivot elements, so
+// the exchange is harmless -- and advances w by the comparison RESULT computed
+// arithmetically (overflow-safe signed less-than via sign bits). Zero
+// data-dependent branches: random data costs no branch mispredictions, which
+// is where a classic Hoare scan loses half its time. Returns w with the pivot
+// fixed at a[w]: [lo, w-1] < pivot, [w+1, hi] >= pivot.
+fn rx_partition_int(data: int, lo: int, hi: int) -> int {
+    let mid = lo + (hi - lo) / 2
+    if load64(data + mid * 8) < load64(data + lo * 8) { rx_swap(data, lo, mid) }
+    if load64(data + hi * 8) < load64(data + lo * 8) { rx_swap(data, lo, hi) }
+    if load64(data + hi * 8) < load64(data + mid * 8) { rx_swap(data, mid, hi) }
+    rx_swap(data, mid, hi)               // park the median at hi
+    let p = load64(data + hi * 8)
+    var w = lo
+    var r = lo
+    while r < hi {
+        // one temp only, so register promotion covers every hot value here
+        // (data, w, r, p, x, hi -> six callee-saved registers, zero spills)
+        let x = load64(data + r * 8)
+        store64(data + r * 8, load64(data + w * 8))
+        store64(data + w * 8, x)
+        w += ((((x - p) ^ ((x ^ p) & ((x - p) ^ x))) >> 63) & 1)   // w += (x < p)
+        r += 1
+    }
+    rx_swap(data, w, hi)                 // pivot into its final slot
+    return w
+}
+fn rx_introsort_int(data: int, lo0: int, hi0: int, depth0: int) {
+    var lo = lo0
+    var hi = hi0
+    var depth = depth0
+    while hi - lo > 24 {
+        if depth <= 0 {
+            rx_heapsort_range_int(data, lo, hi)
+            return
+        }
+        depth -= 1
+        let w = rx_partition_int(data, lo, hi)     // pivot is FIXED at a[w]
+        // skip the run of pivot-equal elements after w: with many duplicates
+        // (or an all-equal range) this is what keeps the right side shrinking
+        let p = load64(data + w * 8)
+        var rl = w + 1
+        while rl <= hi and load64(data + rl * 8) == p { rl += 1 }
+        if w - lo < hi - rl {
+            rx_introsort_int(data, lo, w - 1, depth)
+            lo = rl
+        } else {
+            rx_introsort_int(data, rl, hi, depth)
+            hi = w - 1
+        }
+    }
+}
+fn rx_insertion_int(data: int, lo: int, hi: int) {
+    var i = lo + 1
+    while i <= hi {
+        let v = load64(data + i * 8)
+        var j = i - 1
+        var going = true
+        while going and j >= lo {
+            if load64(data + j * 8) > v {
+                store64(data + (j + 1) * 8, load64(data + j * 8))
+                j -= 1
+            } else {
+                going = false
+            }
+        }
+        store64(data + (j + 1) * 8, v)
+        i += 1
+    }
+}
+fn rx_sort(l: int, kind: int) {
+    let n = load64(l)
+    if n < 2 { return }
+    let data = load64(l + 16)
+    var depth = 0
+    var t = n
+    while t > 0 {
+        depth += 1
+        t = t / 2
+    }
+    depth = depth * 2
+    if kind == 0 {
+        rx_introsort_int(data, 0, n - 1, depth)
+        rx_insertion_int(data, 0, n - 1)
+    } else {
+        rx_introsort(data, 0, n - 1, depth, kind)
+        rx_insertion(data, 0, n - 1, kind)
+    }
+}
+fn rt_list_sort_int(l: int) { rx_sort(l, 0) }
+fn rt_list_sort_str(l: int) { rx_sort(l, 1) }
+fn rt_list_sort_float(l: int) { rx_sort(l, 2) }
+
+fn rt_list_index_of(l: int, v: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var i = 0
+    while i < n {
+        if load64(data + i * 8) == v { return i }
+        i += 1
+    }
+    return 0 - 1
+}
+fn rt_list_index_of_str(l: int, v: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var i = 0
+    while i < n {
+        if rt_str_eq(load64(data + i * 8), v) == 1 { return i }
+        i += 1
+    }
+    return 0 - 1
+}
+fn rt_list_reverse(l: int) {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var i = 0
+    var j = n - 1
+    while i < j {
+        let a = load64(data + i * 8)
+        let b = load64(data + j * 8)
+        store64(data + i * 8, b)
+        store64(data + j * 8, a)
+        i += 1
+        j -= 1
+    }
+}
+fn rt_list_slice(l: int, lo: int, hi: int) -> int {
+    let n = load64(l)
+    if lo < 0 or hi < lo or hi > n { rt_die("invalid slice") }
+    let data = load64(l + 16)
+    let out = rt_list_new(hi - lo)
+    rx_mcopy(load64(out + 16), data + lo * 8, (hi - lo) * 8)
+    return out
+}
+
+fn rt_join(l: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    var total = 0
+    var i = 0
+    while i < n {
+        total += load64(load64(data + i * 8))
+        i += 1
+    }
+    let r = rx_str_alloc(total)
+    var off = 0
+    i = 0
+    while i < n {
+        let part = load64(data + i * 8)
+        let pl = load64(part)
+        rx_mcopy(r + 8 + off, part + 8, pl)
+        off += pl
+        i += 1
+    }
+    return r
+}
+
+fn rt_str_to_int(s: int) -> int {
+    let n = load64(s)
+    var i = 0
+    while i < n and load8(s + 8 + i) == 32 { i += 1 }
+    var neg = false
+    if i < n and (load8(s + 8 + i) == 43 or load8(s + 8 + i) == 45) {
+        if load8(s + 8 + i) == 45 { neg = true }
+        i += 1
+    }
+    var v = 0
+    var any = false
+    while i < n {
+        let c = load8(s + 8 + i)
+        if c < 48 or c > 57 { break }
+        v = v * 10 + (c - 48)
+        any = true
+        i += 1
+    }
+    while i < n and load8(s + 8 + i) == 32 { i += 1 }
+    if not any or i != n { rt_die("cannot convert to int") }
+    if neg { return 0 - v }
+    return v
+}
+
+// decimal float parser (sign, integer part, fraction; no exponent yet).
+// returns the IEEE-754 bit pattern, which is what a float value is.
+fn rt_str_to_float(s: int) -> int {
+    let n = load64(s)
+    var i = 0
+    while i < n and load8(s + 8 + i) == 32 { i += 1 }
+    var neg = false
+    if i < n and (load8(s + 8 + i) == 43 or load8(s + 8 + i) == 45) {
+        if load8(s + 8 + i) == 45 { neg = true }
+        i += 1
+    }
+    // Collect every digit into an integer mantissa and count the fractional
+    // ones, then divide ONCE. Both the mantissa (< 2^53) and 10^k (k <= 22)
+    // are exactly representable, so a single rounding lands on the same double
+    // strtod would produce -- accumulating digit-by-digit with a 0.1 scale
+    // instead lets a rounding error compound per digit, which put literals
+    // like 1.72 and 0.09 one or two ulp off every other language's value.
+    var mant = 0
+    var nd = 0                                     // digits kept in mant
+    var k = 0                                      // fractional digits
+    var extra = 0                                  // integer digits dropped
+    var any = false
+    while i < n and load8(s + 8 + i) >= 48 and load8(s + 8 + i) <= 57 {
+        let d0 = load8(s + 8 + i) - 48
+        if mant == 0 and d0 == 0 {
+            // a leading zero carries no information; spending mantissa budget on
+            // it would push real digits off the end
+        } else if nd < 17 {
+            mant = mant * 10 + d0
+            nd += 1
+        } else {
+            extra += 1                             // too big for exact mantissa
+        }
+        any = true
+        i += 1
+    }
+    if i < n and load8(s + 8 + i) == 46 {          // '.'
+        i += 1
+        while i < n and load8(s + 8 + i) >= 48 and load8(s + 8 + i) <= 57 {
+            let d1 = load8(s + 8 + i) - 48
+            if mant == 0 and d1 == 0 {
+                k += 1                             // shifts the value, adds no digit
+            } else if nd < 17 {
+                mant = mant * 10 + d1
+                nd += 1
+                k += 1
+            }
+            any = true
+            i += 1
+        }
+    }
+    var val = mant as float
+    if extra > 0 {
+        // more integer digits than fit: scale back up (loses exactness, but
+        // such a literal has already lost it)
+        var e = 0
+        while e < extra {
+            val = val * 10.0
+            e += 1
+        }
+    }
+    if k > 0 {
+        if k <= 22 {
+            var p = 1.0                            // 10^k is exact through 10^22
+            var e2 = 0
+            while e2 < k {
+                p = p * 10.0
+                e2 += 1
+            }
+            val = val / p
+        } else {
+            var e3 = 0
+            while e3 < k {
+                val = val / 10.0
+                e3 += 1
+            }
+        }
+    }
+    while i < n and load8(s + 8 + i) == 32 { i += 1 }
+    if not any or i != n { rt_die("cannot convert to float") }
+    if neg { val = 0.0 - val }
+    return bits(val)
+}
+
+// ---- lists ----  (a list value points to {i64 len; i64 cap; i64 data})
+fn rt_list_new(n: int) -> int {
+    let l = rt_alloc(24)
+    var cap = n
+    if cap < 4 { cap = 4 }
+    let data = rt_alloc(cap * 8)
+    store64(l, n)
+    store64(l + 8, cap)
+    store64(l + 16, data)
+    return l
+}
+
+fn rt_list_push(l: int, v: int) {
+    let n = load64(l)
+    let cap = load64(l + 8)
+    if n == cap {
+        let ncap = cap * 2
+        let nd = rt_alloc(ncap * 8)
+        rx_mcopy(nd, load64(l + 16), n * 8)
+        store64(l + 8, ncap)
+        store64(l + 16, nd)
+    }
+    store64(load64(l + 16) + n * 8, v)
+    store64(l, n + 1)
+}
+
+fn rt_list_pop(l: int) -> int {
+    let n = load64(l)
+    if n == 0 { rt_die("pop from empty list") }
+    store64(l, n - 1)
+    return load64(load64(l + 16) + (n - 1) * 8)
+}
+
+// ---- output: unbuffered WriteFile ----
+var __scratch = 0
+var __stdout = 0
+
+fn rx_out(fd: int, ptr: int, n: int) {
+    if __scratch == 0 { __scratch = rt_alloc(16) }
+    let r = win("WriteFile", fd, ptr, n, __scratch, 0)
+}
+
+fn rx_stdout_h() -> int {
+    if __stdout == 0 { __stdout = win("GetStdHandle", 0 - 11) }
+    return __stdout
+}
+
+fn rx_out_str(s: int) {
+    rx_out(rx_stdout_h(), s + 8, load64(s))
+}
+
+// ---- panics ----
+fn rt_die(msg: str) {
+    let h = win("GetStdHandle", 0 - 12)   // stderr
+    rx_out(h, addr("panic: ") + 8, 7)
+    rx_out(h, addr(msg) + 8, msg.len())
+    rx_out(h, addr("\n") + 8, 1)
+    let r = win("ExitProcess", 1)
+}
+
+fn rt_panic_str(s: str) {
+    rt_die(s)                             // a str value already is its pointer
+}
+
+fn rt_bounds_fail(i: int, n: int) {
+    rt_die("index out of bounds")
+}
+
+fn rt_div_zero() {
+    rt_die("division by zero")
+}
+
+fn rt_mod_zero() {
+    rt_die("modulo by zero")
+}
+
+// ---- formatting into the interpolation buffer ----
+// The builder is per-thread. Its state is a 24-byte block -- [0] buffer,
+// [8] length, [16] capacity -- reached through TLS once a second thread exists.
+// The single-threaded fast path returns __sbmain, which is also what the main
+// thread's TLS slot holds, so the two paths cannot disagree about which block a
+// half-finished interpolation is building into.
+var __sbmain = 0
+var __tlsidx = 0
+
+fn rx_sb_init() {
+    if __sbmain != 0 { return }
+    __sbmain = win("VirtualAlloc", 0, 64, 12288, 4)
+    store64(__sbmain, win("VirtualAlloc", 0, 65536, 12288, 4))
+    store64(__sbmain + 8, 0)
+    store64(__sbmain + 16, 65536)
+    __tlsidx = win("TlsAlloc")
+    let r = win("TlsSetValue", __tlsidx, __sbmain)
+}
+
+fn rx_sb_p() -> int {
+    // Formatting can happen before the first allocation (print(5) reaches the
+    // builder without ever calling rt_alloc), so this guard cannot be dropped
+    // in favour of initialising from rx_heap_init alone.
+    if __sbmain == 0 { rx_sb_init() }
+    if __nthr == 0 { return __sbmain }
+    var p = win("TlsGetValue", __tlsidx)
+    if p == 0 {
+        p = win("VirtualAlloc", 0, 64, 12288, 4)
+        store64(p, win("VirtualAlloc", 0, 65536, 12288, 4))
+        store64(p + 8, 0)
+        store64(p + 16, 65536)
+        let r = win("TlsSetValue", __tlsidx, p)
+    }
+    return p
+}
+
+fn rx_sb_ensure(p: int, extra: int) {
+    let cur = load64(p + 8)
+    let cap = load64(p + 16)
+    if cur + extra <= cap { return }
+    var ncap = cap * 2
+    if ncap < 65536 { ncap = 65536 }
+    while ncap < cur + extra { ncap = ncap * 2 }
+    // VirtualAlloc, not rt_alloc: the builder must not itself allocate on the
+    // GC heap, or formatting could trigger a collection mid-interpolation.
+    let nb = win("VirtualAlloc", 0, ncap, 12288, 4)
+    rx_mcopy(nb, load64(p), cur)
+    store64(p, nb)
+    store64(p + 16, ncap)
+}
+
+fn rx_sb_byte(c: int) {
+    let p = rx_sb_p()
+    rx_sb_ensure(p, 1)
+    store8(load64(p) + load64(p + 8), c)
+    store64(p + 8, load64(p + 8) + 1)
+}
+
+fn rx_sb_bytes(ptr: int, n: int) {
+    let p = rx_sb_p()
+    rx_sb_ensure(p, n)
+    rx_mcopy(load64(p) + load64(p + 8), ptr, n)
+    store64(p + 8, load64(p + 8) + n)
+}
+
+fn rx_sb_int(v: int) {
+    if v == 0 {
+        rx_sb_byte(48)
+        return
+    }
+    let neg = v < 0
+    // work in the non-positive domain so i64 MIN never overflows a negate
+    var x = v
+    if x > 0 { x = 0 - x }
+    var digits = 0
+    var t = x
+    while t < 0 {
+        digits += 1
+        t = t / 10
+    }
+    var total = digits
+    if neg { total += 1 }
+    let p = rx_sb_p()
+    rx_sb_ensure(p, total)
+    let buf = load64(p)
+    let cur = load64(p + 8)
+    var pos = cur + total - 1
+    while x < 0 {
+        store8(buf + pos, 48 - x % 10)      // x%10 is <= 0, so -(x%10) is the digit
+        pos -= 1
+        x = x / 10
+    }
+    if neg { store8(buf + cur, 45) }
+    store64(p + 8, cur + total)
+}
+
+// td kinds: 0 int, 1 float, 2 bool, 3 str, 4 list, 5 struct
+fn rx_fmt_val(v: int, td: int, repr: int) {
+    let kind = load64(td)
+    if kind == 0 {
+        rx_sb_int(v)
+    } else if kind == 2 {
+        if v != 0 { rx_sb_bytes(addr("true") + 8, 4) }
+        else { rx_sb_bytes(addr("false") + 8, 5) }
+    } else if kind == 3 {
+        if repr != 0 { rx_sb_byte(34) }
+        let n = load64(v)
+        var i = 0
+        while i < n {
+            let c = load8(v + 8 + i)
+            if repr != 0 and (c == 34 or c == 92) {
+                rx_sb_byte(92)
+                rx_sb_byte(c)
+            } else if repr != 0 and c == 10 {
+                rx_sb_byte(92)
+                rx_sb_byte(110)
+            } else {
+                rx_sb_byte(c)
+            }
+            i += 1
+        }
+        if repr != 0 { rx_sb_byte(34) }
+    } else if kind == 4 {
+        let eltd = load64(td + 8)
+        let n = load64(v)
+        let data = load64(v + 16)
+        rx_sb_byte(91)
+        var i = 0
+        while i < n {
+            if i > 0 {
+                rx_sb_byte(44)
+                rx_sb_byte(32)
+            }
+            rx_fmt_val(load64(data + i * 8), eltd, 1)
+            i += 1
+        }
+        rx_sb_byte(93)
+    } else if kind == 5 {
+        let name = load64(td + 8)
+        let nf = load64(td + 16)
+        rx_sb_bytes(name, rx_cstrlen(name))
+        rx_sb_byte(123)
+        var f = 0
+        while f < nf {
+            if f > 0 {
+                rx_sb_byte(44)
+                rx_sb_byte(32)
+            }
+            let fname = load64(td + 24 + f * 16)
+            let ftd = load64(td + 32 + f * 16)
+            rx_sb_bytes(fname, rx_cstrlen(fname))
+            rx_sb_byte(58)
+            rx_sb_byte(32)
+            rx_fmt_val(load64(v + f * 8), ftd, 1)
+            f += 1
+        }
+        rx_sb_byte(125)
+    } else if kind == 8 {                 // optional: none, or the wrapped value
+        if v == 0 {
+            rx_sb_bytes(addr("none") + 8, 4)
+        } else {
+            rx_fmt_val(load64(v), load64(td + 8), repr)
+        }
+    } else if kind == 7 {                 // map: {k: v, ...}
+        let ktd = load64(td + 8)
+        let vtd = load64(td + 16)
+        let cap = load64(v + 8)
+        let keys = load64(v + 16)
+        let vals = load64(v + 24)
+        let state = load64(v + 32)
+        rx_sb_byte(123)
+        var shown = 0
+        var i = 0
+        while i < cap {
+            if load8(state + i) == 1 {
+                if shown > 0 {
+                    rx_sb_byte(44)
+                    rx_sb_byte(32)
+                }
+                rx_fmt_val(load64(keys + i * 8), ktd, 1)
+                rx_sb_byte(58)
+                rx_sb_byte(32)
+                rx_fmt_val(load64(vals + i * 8), vtd, 1)
+                shown += 1
+            }
+            i += 1
+        }
+        rx_sb_byte(125)
+    } else if kind == 6 {                 // enum: print the member name
+        let nm = load64(td + 8)
+        if v < 0 or v >= nm {
+            rx_sb_int(v)
+        } else {
+            let nameptr = load64(td + 16 + v * 8)
+            rx_sb_bytes(nameptr, rx_cstrlen(nameptr))
+        }
+    } else {
+        rx_sb_float(v)
+    }
+}
+
+fn rx_pow10(k: int) -> int {
+    var r = 1
+    var i = 0
+    while i < k {
+        r = r * 10
+        i += 1
+    }
+    return r
+}
+
+// Format a double (given as its bit pattern) with up to 16 significant
+// fractional digits, rounded, with trailing zeros trimmed (like %g). Handles
+// magnitudes below 2^63; NaN and infinity are named.
+// A double of magnitude >= 2^63 has no fractional bits, but its integer value
+// does not fit in an i64 -- `y as int` saturates and the digit loop then
+// generated negative digits (1e20 printed as "0.-).0-*(+,))+(0("). Peel powers
+// of two off until the mantissa fits, then double the decimal digits back k
+// times. Exact for every finite double, including 1e300.
+fn rx_sb_bigint_float(yin: float) {
+    var m = yin
+    var k = 0
+    while m >= 9223372036854775808.0 {
+        m = m / 2.0                       // exact: halving a normal double
+        k += 1
+    }
+    var dg: [int] = []
+    var t = m as int
+    while t > 0 {
+        dg.push(t % 10)
+        t = t / 10
+    }
+    if dg.len() == 0 { dg.push(0) }
+    var i = 0
+    while i < k {
+        var carry = 0
+        var j = 0
+        while j < dg.len() {
+            let v = dg[j] * 2 + carry
+            dg[j] = v % 10
+            carry = v / 10
+            j += 1
+        }
+        while carry > 0 {
+            dg.push(carry % 10)
+            carry = carry / 10
+        }
+        i += 1
+    }
+    var p = dg.len() - 1
+    while p >= 0 {
+        rx_sb_byte(48 + dg[p])
+        p -= 1
+    }
+}
+
+fn rx_sb_float(bitpat: int) {
+    let x = frombits(bitpat)
+    if x != x {                          // NaN
+        rx_sb_byte(110)
+        rx_sb_byte(97)
+        rx_sb_byte(110)
+        return
+    }
+    var y = x
+    if y < 0.0 {
+        rx_sb_byte(45)                   // '-'
+        y = 0.0 - y
+    }
+    let INF = frombits(9218868437227405312)   // 0x7FF0000000000000
+    if y == INF {
+        rx_sb_byte(105)
+        rx_sb_byte(110)
+        rx_sb_byte(102)
+        return
+    }
+    if y >= 9223372036854775808.0 {      // integer part too large for i64
+        rx_sb_bigint_float(y)
+        return
+    }
+    var ip = y as int
+    var frac = y - (ip as float)
+    var di = 0                            // integer-part digit count
+    var tmp = ip
+    while tmp > 0 {
+        tmp = tmp / 10
+        di += 1
+    }
+    var nfrac = 15 - di                   // ~15 significant figures total (like %.15g)
+    if nfrac < 1 { nfrac = 1 }
+    if nfrac > 16 { nfrac = 16 }
+    var fd = 0
+    var f = frac
+    var i = 0
+    while i < nfrac {
+        f = f * 10.0
+        let d = f as int
+        fd = fd * 10 + d
+        f = f - (d as float)
+        i += 1
+    }
+    f = f * 10.0                          // round on the next digit
+    if (f as int) >= 5 { fd = fd + 1 }
+    let cap = rx_pow10(nfrac)
+    if fd >= cap {                        // carry rounded past the fraction
+        fd = fd - cap
+        ip = ip + 1
+    }
+    rx_sb_int(ip)
+    if fd == 0 { return }                 // no fractional part (matches %g)
+    rx_sb_byte(46)                        // '.'
+    var last = nfrac - 1
+    var t = fd
+    while last > 0 and t % 10 == 0 {      // trim trailing zeros
+        t = t / 10
+        last -= 1
+    }
+    var p = 0
+    while p <= last {                     // emit MSD-first, keeping leading zeros
+        let digit = (fd / rx_pow10(nfrac - 1 - p)) % 10
+        rx_sb_byte(48 + digit)
+        p += 1
+    }
+}
+
+fn rx_cstrlen(p: int) -> int {
+    var n = 0
+    while load8(p + n) != 0 { n += 1 }
+    return n
+}
+
+// ---- runtime entry points the code generator calls ----
+fn rt_to_str(v: int, td: int) -> int {
+    let p = rx_sb_p()
+    let mark = load64(p + 8)
+    rx_fmt_val(v, td, 0)
+    let outlen = load64(p + 8) - mark
+    let s = rx_str_alloc(outlen)
+    rx_mcopy(s + 8, load64(p) + mark, outlen)
+    store64(p + 8, mark)
+    return s
+}
+
+fn rt_print_val(v: int, td: int) {
+    if load64(td) == 3 {                  // plain str: straight to stdout
+        rx_out_str(v)
+        rx_out(rx_stdout_h(), addr("\n") + 8, 1)
+        return
+    }
+    let p = rx_sb_p()
+    let mark = load64(p + 8)
+    rx_fmt_val(v, td, 0)
+    rx_out(rx_stdout_h(), load64(p) + mark, load64(p + 8) - mark)
+    store64(p + 8, mark)
+    rx_out(rx_stdout_h(), addr("\n") + 8, 1)
+}
+
+fn rt_emit(s: int) {
+    rx_out_str(s)
+}
+
+fn rt_sb_begin() -> int {
+    return load64(rx_sb_p() + 8)
+}
+fn rt_sb_txt(s: int) {
+    rx_sb_bytes(s + 8, load64(s))
+}
+fn rt_sb_val(v: int, td: int) {
+    rx_fmt_val(v, td, 0)
+}
+fn rt_sb_end(mark: int) -> int {
+    let p = rx_sb_p()
+    let outlen = load64(p + 8) - mark
+    let s = rx_str_alloc(outlen)
+    rx_mcopy(s + 8, load64(p) + mark, outlen)
+    store64(p + 8, mark)
+    return s
+}
+
+// ---- command-line args ----
+fn rt_args() -> int {
+    let cl = win("GetCommandLineA")       // LPSTR
+    let l = rt_list_new(0)
+    var i = 0
+    var going = true
+    while going {
+        while load8(cl + i) == 32 or load8(cl + i) == 9 { i += 1 }
+        if load8(cl + i) == 0 {
+            going = false
+        } else {
+            let start = i
+            var quoted = false
+            let buf = rt_alloc(2048)
+            var bl = 0
+            var scanning = true
+            while scanning {
+                let c = load8(cl + i)
+                if c == 0 { scanning = false }
+                else if c == 34 {
+                    if quoted { quoted = false } else { quoted = true }
+                    i += 1
+                } else if (c == 32 or c == 9) and not quoted {
+                    scanning = false
+                } else {
+                    store8(buf + bl, c)
+                    bl += 1
+                    i += 1
+                }
+            }
+            let s = rx_str_alloc(bl)
+            rx_mcopy(s + 8, buf, bl)
+            rt_list_push(l, s)
+        }
+    }
+    return l
+}
+
+// null-terminated copy of a str's bytes into fresh memory, for the Win32 *A apis
+fn rx_cstr(s: int) -> int {
+    let n = load64(s)
+    let p = rt_alloc(n + 1)
+    rx_mcopy(p, s + 8, n)
+    store8(p + n, 0)
+    return p
+}
+
+// rt_read_file(path) -> str with the whole file
+fn rt_read_file(path: int) -> int {
+    let cp = rx_cstr(path)
+    // CreateFileA(name, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0)
+    let h = win("CreateFileA", cp, 2147483648, 1, 0, 3, 0, 0)
+    if h == 0 - 1 { rt_die("cannot read file") }
+    let size = win("GetFileSize", h, 0)
+    let s = rx_str_alloc(size)
+    if __scratch == 0 { __scratch = rt_alloc(16) }
+    var got = 0
+    while got < size {
+        let r = win("ReadFile", h, s + 8 + got, size - got, __scratch, 0)
+        let n = load64(__scratch) & 4294967295
+        if r == 0 or n == 0 { got = size }
+        else { got += n }
+    }
+    let c = win("CloseHandle", h)
+    return s
+}
+
+fn rt_write_file(path: int, data: int) {
+    let cp = rx_cstr(path)
+    // CreateFileA(name, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
+    let h = win("CreateFileA", cp, 1073741824, 0, 0, 2, 0, 0)
+    if h == 0 - 1 { rt_die("cannot write file") }
+    rx_out(h, data + 8, load64(data))
+    let c = win("CloseHandle", h)
+}

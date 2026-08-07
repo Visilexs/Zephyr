@@ -1,0 +1,458 @@
+// A ray-traced Schwarzschild black hole, in Vulkan, in pure Zephyr.
+//
+// The OpenGL version (examples/blackhole_gpu.zeph) simulates 1.5M particles of
+// accreting gas but propagates light in straight lines, so the far side of the
+// disc is simply hidden behind the hole. This one integrates the real null
+// geodesic for every pixel, which is what produces the halo.
+//
+// All the physics lives in examples/shaders/blackhole.frag. Per pixel it solves
+//
+//     d2u/dphi2 = -u + 3 M u^2        (u = 1/r, exact in Schwarzschild)
+//
+// backwards from the camera until the ray hits the disc, crosses the horizon,
+// or escapes. The shadow, the photon ring and the Interstellar-style halo are
+// not drawn -- they fall out of that one equation.
+//
+// This maps onto the Vulkan wrapper unusually well: the whole image is one
+// full-screen triangle with NO vertex buffers, NO descriptor sets and NO
+// compute, driven entirely by 112 bytes of push constants. (Which is just as
+// well -- vk/raw.zeph currently binds none of those; see the note at the end.)
+//
+//   glslangValidator -V examples/shaders/blackhole.frag -o examples/shaders/blackhole.frag.spv
+//   zc.exe --rt examples\blackhole_vk.zeph blackhole_vk.exe && .\blackhole_vk.exe
+//
+// Drag with the left mouse button to orbit, wheel to zoom, Esc to quit.
+
+import "vk/gfx.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+// PeekMessageA / TranslateMessage / DispatchMessageA / IsWindow /
+// GetAsyncKeyState already come in from vk/win.zeph via the import above.
+extern fn GetCursorPos(p: int) -> i32 from "user32.dll"
+extern fn ScreenToClient(hwnd: int, p: int) -> i32 from "user32.dll"
+
+let WIDTH = 1600
+let HEIGHT = 940
+
+// ---- Schwarzschild geometry, in units of r_g = GM/c^2 = 1 ----
+let R_ISCO = 6.0
+let R_DISC_OUT = 40.0
+let T_PEAK = 5000.0        // K at the profile peak (display normalisation)
+let T_REF = 5000.0
+let EXPO = 0.60
+let TURB = 0.45
+let DPHI = 0.02            // geodesic integration step, in radians of phi
+let STEPS = 420.0
+
+// temperature normalisation: T_PEAK at the profile's peak, r = (49/36) r_isco
+let RPK = R_ISCO * 49.0 / 36.0
+let FPK = sqrt(sqrt((1.0 - sqrt(R_ISCO / RPK)) / (RPK * RPK * RPK)))
+let TSCALE = T_PEAK / FPK
+
+fn p10(n: int) -> float {
+    var v = 1.0
+    var i = 0
+    while i < n {
+        v = v * 10.0
+        i += 1
+    }
+    return v
+}
+
+// what this geometry means for M87*, from real measured constants
+fn banner() {
+    let GRAV = 6.6743 / p10(11)
+    let CLIGHT = 299792458.0
+    let MSUN = 1.98892 * p10(30)
+    let AU = 1.495978707 * p10(11)
+    let PARSEC = 3.0856775814913673 * p10(16)
+    let PI = 3.141592653589793
+    let MASS = 6.5 * p10(9) * MSUN
+    let DIST = 16.8 * p10(6) * PARSEC
+    let rg = GRAV * MASS / (CLIGHT * CLIGHT)
+    let bcrit = sqrt(27.0)
+    let uas = (2.0 * bcrit * rg / DIST) * (180.0 / PI) * 3600.0 * p10(6)
+    print("Schwarzschild black hole, scaled to M87* (EHT 2019)")
+    print("  gravitational radius {rg / AU} AU")
+    print("  shadow    2*sqrt(27) {uas} uas   (EHT measured 42 +/- 3)")
+    print("  light bending: per-pixel geodesic integration, {STEPS} steps of {DPHI} rad")
+}
+
+// ---- camera: drag to orbit, wheel to zoom ----
+// Trig-free like the rest of these demos: yaw is a unit vector rotated by a
+// small angle per drag pixel, pitch is stored as its sine and clamped short of
+// the poles so the up-vector never degenerates.
+var ocx = 1.0
+var ocz = 0.0
+let DRIFT = 0.0016
+var psin = 0.16              // a low, near-edge-on view: the halo is clearest here
+var orad = 105.0
+let FOVT = 0.55              // tan(fov/2), vertical
+let SENS = 0.0055
+let PMAX = 0.94
+let RMIN = 12.0
+let RMAXC = 400.0
+
+var dragging = 0
+var lastx = 0
+var lasty = 0
+var wheel = 0
+
+fn yaw_by(t: float) {
+    let nx = ocx - ocz * t
+    let nz = ocz + ocx * t
+    let n = sqrt(nx * nx + nz * nz)
+    ocx = nx / n
+    ocz = nz / n
+}
+
+fn sext32(v: int) -> int {
+    let x = v & 4294967295
+    if x >= 2147483648 { return x - 4294967296 }
+    return x
+}
+
+var pt = Bytes.new(16)
+var curx = 0
+var cury = 0
+fn read_cursor(hwnd: int) {
+    let g = GetCursorPos(pt.addr())
+    let s = ScreenToClient(hwnd, pt.addr())
+    curx = sext32(pt.get32(0))
+    cury = sext32(pt.get32(4))
+}
+
+fn camera_input(hwnd: int) {
+    read_cursor(hwnd)
+    if (GetAsyncKeyState(1) & 32768) != 0 {          // VK_LBUTTON
+        if dragging == 1 {
+            yaw_by(((curx - lastx) as float) * SENS)
+            psin = psin + ((cury - lasty) as float) * SENS * 0.6
+            if psin > PMAX { psin = PMAX }
+            if psin < 0.0 - PMAX { psin = 0.0 - PMAX }
+        }
+        dragging = 1
+        lastx = curx
+        lasty = cury
+    } else {
+        dragging = 0
+        yaw_by(DRIFT)
+    }
+    if wheel != 0 {
+        var f = 1.0
+        var w = wheel
+        while w > 0 {
+            f = f * 0.88
+            w -= 1
+        }
+        while w < 0 {
+            f = f * 1.136
+            w += 1
+        }
+        orad = orad * f
+        if orad < RMIN { orad = RMIN }
+        if orad > RMAXC { orad = RMAXC }
+        wheel = 0
+    }
+}
+
+// Our own message pump rather than Window.poll(), so the mouse wheel can be
+// read (WM_MOUSEWHEEL never reaches GetAsyncKeyState).
+var pmsg = Bytes.new(64)
+fn pump(hwnd: int) -> bool {
+    while PeekMessageA(pmsg.addr(), 0, 0, 0, 1) != 0 {
+        let m = pmsg.get32(8)
+        if m == 18 { return false }                   // WM_QUIT
+        if m == 522 {                                 // WM_MOUSEWHEEL
+            var d = (pmsg.get64(16) >> 16) & 65535    // HIWORD(wParam)
+            if d >= 32768 { d = d - 65536 }
+            wheel += d / 120
+        }
+        let t = TranslateMessage(pmsg.addr())
+        let dd = DispatchMessageA(pmsg.addr())
+    }
+    if IsWindow(hwnd) == 0 { return false }
+    if (GetAsyncKeyState(27) & 32768) != 0 { return false }   // Esc
+    return true
+}
+
+var layers: [str] = []
+for a in args() {
+    if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+if layers.len() > 0 { print("validation enabled") }
+
+banner()
+
+var wnd = window_open("Zephyr - black hole (Vulkan, geodesic ray-traced)", WIDTH, HEIGHT)
+var g = Gfx.init_windowed("zephyr-blackhole", layers, wnd)
+print("gpu: {g.gpu_name()}")
+
+let format = g.surface_format()
+
+// ---------------- render pass ----------------
+var attach = Bytes.new(VkAttachmentDescription_sizeof)
+attach.put32(VkAttachmentDescription_format, format)
+attach.put32(VkAttachmentDescription_samples, VK_SAMPLE_COUNT_1_BIT)
+attach.put32(VkAttachmentDescription_loadOp, VK_ATTACHMENT_LOAD_OP_CLEAR)
+attach.put32(VkAttachmentDescription_storeOp, VK_ATTACHMENT_STORE_OP_STORE)
+attach.put32(VkAttachmentDescription_stencilLoadOp, VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_stencilStoreOp, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+attach.put32(VkAttachmentDescription_finalLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+
+var ref = Bytes.new(VkAttachmentReference_sizeof)
+ref.put32(VkAttachmentReference_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+
+var subpass = Bytes.new(VkSubpassDescription_sizeof)
+subpass.put32(VkSubpassDescription_pipelineBindPoint, VK_PIPELINE_BIND_POINT_GRAPHICS)
+subpass.put32(VkSubpassDescription_colorAttachmentCount, 1)
+subpass.put64(VkSubpassDescription_pColorAttachments, ref.addr())
+
+var rpci = Bytes.new(VkRenderPassCreateInfo_sizeof)
+rpci.put32(VkRenderPassCreateInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO)
+rpci.put32(VkRenderPassCreateInfo_attachmentCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pAttachments, attach.addr())
+rpci.put32(VkRenderPassCreateInfo_subpassCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pSubpasses, subpass.addr())
+var prp = Bytes.new(8)
+vkcheck(vkCreateRenderPass(g.dev, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
+let renderpass = prp.get64(0)
+
+var swap = g.swapchain(format, renderpass, 0)
+print("swapchain: {swap.w}x{swap.h}, {swap.images.len()} images")
+
+// ---------------- pipeline ----------------
+let vs = g.shader("examples/shaders/blackhole.vert.spv")
+let fs = g.shader("examples/shaders/blackhole.frag.spv")
+var entry = cbytes("main")
+
+var stages = Bytes.new(VkPipelineShaderStageCreateInfo_sizeof * 2)
+stages.put32(VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_VERTEX_BIT)
+stages.put64(VkPipelineShaderStageCreateInfo_module, vs)
+stages.put64(VkPipelineShaderStageCreateInfo_pName, entry.addr())
+let s1 = VkPipelineShaderStageCreateInfo_sizeof
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_FRAGMENT_BIT)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_module, fs)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_pName, entry.addr())
+
+var vi = Bytes.new(VkPipelineVertexInputStateCreateInfo_sizeof)
+vi.put32(VkPipelineVertexInputStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
+
+var ia = Bytes.new(VkPipelineInputAssemblyStateCreateInfo_sizeof)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+
+var viewport = Bytes.new(VkViewport_sizeof)
+var scissor = Bytes.new(VkRect2D_sizeof)
+var dynstates = Bytes.new(8)
+dynstates.put32(0, VK_DYNAMIC_STATE_VIEWPORT)
+dynstates.put32(4, VK_DYNAMIC_STATE_SCISSOR)
+var dyn = Bytes.new(VkPipelineDynamicStateCreateInfo_sizeof)
+dyn.put32(VkPipelineDynamicStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+dyn.put32(VkPipelineDynamicStateCreateInfo_dynamicStateCount, 2)
+dyn.put64(VkPipelineDynamicStateCreateInfo_pDynamicStates, dynstates.addr())
+
+var vp = Bytes.new(VkPipelineViewportStateCreateInfo_sizeof)
+vp.put32(VkPipelineViewportStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+vp.put32(VkPipelineViewportStateCreateInfo_viewportCount, 1)
+vp.put32(VkPipelineViewportStateCreateInfo_scissorCount, 1)
+
+var rs = Bytes.new(VkPipelineRasterizationStateCreateInfo_sizeof)
+rs.put32(VkPipelineRasterizationStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+rs.put32(VkPipelineRasterizationStateCreateInfo_polygonMode, VK_POLYGON_MODE_FILL)
+rs.put32(VkPipelineRasterizationStateCreateInfo_cullMode, VK_CULL_MODE_NONE)
+rs.put32(VkPipelineRasterizationStateCreateInfo_frontFace, VK_FRONT_FACE_CLOCKWISE)
+rs.putf32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
+
+var ms = Bytes.new(VkPipelineMultisampleStateCreateInfo_sizeof)
+ms.put32(VkPipelineMultisampleStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+ms.put32(VkPipelineMultisampleStateCreateInfo_rasterizationSamples, VK_SAMPLE_COUNT_1_BIT)
+
+var cba = Bytes.new(VkPipelineColorBlendAttachmentState_sizeof)
+cba.put32(VkPipelineColorBlendAttachmentState_colorWriteMask, 15)
+
+var cbs = Bytes.new(VkPipelineColorBlendStateCreateInfo_sizeof)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_attachmentCount, 1)
+cbs.put64(VkPipelineColorBlendStateCreateInfo_pAttachments, cba.addr())
+
+// 112 bytes of push constants carry the entire scene: camera, disc, physics
+var pcr = Bytes.new(VkPushConstantRange_sizeof)
+pcr.put32(VkPushConstantRange_stageFlags, VK_SHADER_STAGE_FRAGMENT_BIT)
+pcr.put32(VkPushConstantRange_offset, 0)
+pcr.put32(VkPushConstantRange_size, 112)
+
+var plci = Bytes.new(VkPipelineLayoutCreateInfo_sizeof)
+plci.put32(VkPipelineLayoutCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+plci.put32(VkPipelineLayoutCreateInfo_pushConstantRangeCount, 1)
+plci.put64(VkPipelineLayoutCreateInfo_pPushConstantRanges, pcr.addr())
+var ppl = Bytes.new(8)
+vkcheck(vkCreatePipelineLayout(g.dev, plci.addr(), 0, ppl.addr()), "vkCreatePipelineLayout")
+let layout = ppl.get64(0)
+
+var gpci = Bytes.new(VkGraphicsPipelineCreateInfo_sizeof)
+gpci.put32(VkGraphicsPipelineCreateInfo_sType, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+gpci.put32(VkGraphicsPipelineCreateInfo_stageCount, 2)
+gpci.put64(VkGraphicsPipelineCreateInfo_pStages, stages.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pVertexInputState, vi.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pInputAssemblyState, ia.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pViewportState, vp.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pRasterizationState, rs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pMultisampleState, ms.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pColorBlendState, cbs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pDynamicState, dyn.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_layout, layout)
+gpci.put64(VkGraphicsPipelineCreateInfo_renderPass, renderpass)
+gpci.put32(VkGraphicsPipelineCreateInfo_basePipelineIndex, 0 - 1)
+var ppipe = Bytes.new(8)
+vkcheck(vkCreateGraphicsPipelines(g.dev, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
+let pipeline = ppipe.get64(0)
+print("pipeline ok")
+
+// ---------------- frame loop ----------------
+var clear = Bytes.new(VkClearValue_sizeof)
+clear.putf32(0, 0.0)
+clear.putf32(4, 0.0)
+clear.putf32(8, 0.0)
+clear.putf32(12, 1.0)
+
+var rpbi = Bytes.new(VkRenderPassBeginInfo_sizeof)
+rpbi.put32(VkRenderPassBeginInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+rpbi.put64(VkRenderPassBeginInfo_renderPass, renderpass)
+rpbi.put32(VkRenderPassBeginInfo_clearValueCount, 1)
+rpbi.put64(VkRenderPassBeginInfo_pClearValues, clear.addr())
+
+var pushc = Bytes.new(112)
+
+var qpc = Bytes.new(8)
+var qpf = Bytes.new(8)
+let qf = QueryPerformanceFrequency(qpf.addr())
+let freq = qpf.get64(0)
+let q0 = QueryPerformanceCounter(qpc.addr())
+let t0 = qpc.get64(0)
+
+var seconds = 1000000.0
+for a in args() {
+    if a == "--seconds" { seconds = 6.0 }
+}
+
+let rpa = rpbi.addr()
+let pipe = pipeline
+let pla = layout
+let pusha = pushc.addr()
+let vpa = viewport.addr()
+let sca = scissor.addr()
+let hwnd = wnd.hwnd
+
+var frames = 0
+var fps_mark = 0
+var fps_t = 0.0
+var running = true
+while running {
+    if not pump(hwnd) { running = false }
+    if running {
+        let q = QueryPerformanceCounter(qpc.addr())
+        let t = ((qpc.get64(0) - t0) as float) / (freq as float)
+        if t > seconds { running = false }
+
+        camera_input(hwnd)
+
+        // ---- camera basis: eye on a sphere, always looking at the hole ----
+        let pc2 = sqrt(1.0 - psin * psin)
+        let ex = ocx * pc2 * orad
+        let ey = psin * orad
+        let ez = ocz * pc2 * orad
+        let el = sqrt(ex * ex + ey * ey + ez * ez)
+        let fx = (0.0 - ex) / el
+        let fy = (0.0 - ey) / el
+        let fz = (0.0 - ez) / el
+        var rx = fz
+        var rz = 0.0 - fx
+        let rl = sqrt(rx * rx + rz * rz)
+        rx = rx / rl
+        rz = rz / rl
+        let upx = fy * rz
+        let upy = fz * rx - fx * rz
+        let upz = 0.0 - fy * rx
+        let aspect = (swap.w as float) / (swap.h as float)
+
+        pushc.putf32(0, ex)
+        pushc.putf32(4, ey)
+        pushc.putf32(8, ez)
+        pushc.putf32(12, t * 6.0)               // simulation time, in r_g/c
+        pushc.putf32(16, rx)
+        pushc.putf32(20, 0.0)
+        pushc.putf32(24, rz)
+        pushc.putf32(28, FOVT * aspect)
+        pushc.putf32(32, upx)
+        pushc.putf32(36, upy)
+        pushc.putf32(40, upz)
+        pushc.putf32(44, FOVT)
+        pushc.putf32(48, fx)
+        pushc.putf32(52, fy)
+        pushc.putf32(56, fz)
+        pushc.putf32(60, 0.0)
+        pushc.putf32(64, R_ISCO)
+        pushc.putf32(68, R_DISC_OUT)
+        pushc.putf32(72, TSCALE)
+        pushc.putf32(76, EXPO)
+        pushc.putf32(80, TURB)
+        pushc.putf32(84, swap.w as float)
+        pushc.putf32(88, swap.h as float)
+        pushc.putf32(92, STEPS)
+        pushc.putf32(96, T_REF)
+        pushc.putf32(100, DPHI)
+        pushc.putf32(104, 0.0)
+        pushc.putf32(108, 0.0)
+
+        viewport.putf32(VkViewport_width, swap.w as float)
+        viewport.putf32(VkViewport_height, swap.h as float)
+        viewport.putf32(VkViewport_maxDepth, 1.0)
+        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.w)
+        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.h)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+
+        let fbs = swap.fbs
+        let ok = g.frame(swap, fn(cb: int, idx: int) {
+            store64(rpa + VkRenderPassBeginInfo_framebuffer, fbs[idx])
+            vkCmdBeginRenderPass(cb, rpa, VK_SUBPASS_CONTENTS_INLINE)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe)
+            vkCmdSetViewport(cb, 0, 1, vpa)
+            vkCmdSetScissor(cb, 0, 1, sca)
+            vkCmdPushConstants(cb, pla, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112, pusha)
+            vkCmdDraw(cb, 3, 1, 0, 0)
+            vkCmdEndRenderPass(cb)
+        })
+
+        if running and not ok {
+            let fresh = g.rebuild(swap, renderpass)
+            if fresh.has() { swap = fresh.get() }
+        }
+        frames += 1
+        if frames - fps_mark >= 120 {
+            print("{(120.0 / (t - fps_t)) as int} fps  ({swap.w}x{swap.h}, eye {orad as int} r_g)")
+            fps_mark = frames
+            fps_t = t
+        }
+    }
+}
+
+let q1 = QueryPerformanceCounter(qpc.addr())
+let elapsed = ((qpc.get64(0) - t0) as float) / (freq as float)
+print("{frames} frames in {elapsed}s")
+
+vkcheck(vkDeviceWaitIdle(g.dev), "vkDeviceWaitIdle")
+vkDestroyPipeline(g.dev, pipeline, 0)
+vkDestroyPipelineLayout(g.dev, layout, 0)
+vkDestroyShaderModule(g.dev, vs, 0)
+vkDestroyShaderModule(g.dev, fs, 0)
+g.destroy_swapchain(swap)
+vkDestroyRenderPass(g.dev, renderpass, 0)
+g.shutdown()
+wnd.close()
+print("OK")

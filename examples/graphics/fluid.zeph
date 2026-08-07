@@ -1,0 +1,362 @@
+// A real-time, fully-rasterized fluid simulation in pure Zephyr.
+//
+// Jos Stam's "Stable Fluids": a velocity field advects itself and a dye
+// (density) field; a Gauss-Seidel pressure solve keeps the flow
+// mass-conserving (that projection is what makes it swirl instead of just
+// diffuse). Buoyancy makes the dye rise; a wandering emitter at the bottom
+// keeps feeding it. Every cell is float arithmetic on flat arrays -- the part
+// of Zephyr the optimizer accelerates hardest.
+//
+// Rendering is a software rasterizer: each frame the density grid is written
+// into a 32-bit BGRA pixel buffer (one store per cell) and the whole frame is
+// blitted to the window with a single StretchDIBits call, which upscales the
+// grid to the client area. No per-pixel GDI calls, no flicker.
+//
+//   zc.exe --rt examples\fluid.zeph fluid.exe && .\fluid.exe     (opens a window)
+//   .\fluid.exe 200                                              (headless: 200
+//                                                                 steps, print a
+//                                                                 density checksum)
+// Close the window to exit.
+
+let N = 128                       // simulation grid is N x N (interior)
+let W = N + 2                     // +1 boundary cell on each side
+let SIZE = W * W
+let ITERS = 20                    // Gauss-Seidel iterations per pressure solve
+let DT = 0.12
+let BUOY = 1.1                    // how strongly dye rises
+let DAMP_D = 0.990               // per-frame dye dissipation
+let DAMP_V = 0.999               // per-frame velocity dissipation
+
+// per-frame rotation step for the wandering emitter (a unit vector advanced
+// each frame -- the same trig-free trick the cube demo uses)
+let WCS = 0.99928           // cos(0.038)
+let WSN = 0.037991          // sin(0.038)
+
+// --- allocate the fields (declared before the functions that use them) ---
+fn fzeros(n: int) -> [float] {
+    var a: [float] = []
+    var i = 0
+    while i < n {
+        a.push(0.0)
+        i += 1
+    }
+    return a
+}
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)      // -> the list's data pointer (never freed)
+}
+
+var gu = fzeros(SIZE)            // velocity x
+var gv = fzeros(SIZE)            // velocity y
+var gu0 = fzeros(SIZE)           // velocity scratch / previous
+var gv0 = fzeros(SIZE)
+var gd = fzeros(SIZE)            // dye density
+var gd0 = fzeros(SIZE)
+var gp = fzeros(SIZE)            // pressure
+var gdiv = fzeros(SIZE)          // divergence
+var fu = fzeros(SIZE)            // per-frame force x
+var fv = fzeros(SIZE)            // per-frame force y
+var sd = fzeros(SIZE)            // per-frame dye source
+
+var owx = 1.0                    // emitter wander unit vector
+var owy = 0.0
+
+var pixels = mem(N * N * 4)      // BGRA framebuffer
+var bmi = mem(40)                // BITMAPINFOHEADER
+
+fn IX(i: int, j: int) -> int { return i + W * j }
+
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+fn clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// wall boundary conditions: b=1 reflects x-velocity at the left/right walls,
+// b=2 reflects y-velocity at the top/bottom, b=0 just copies (for dye/pressure)
+fn set_bnd(b: int, x: [float]) {
+    var i = 1
+    while i <= N {
+        if b == 1 { x[IX(0, i)] = 0.0 - x[IX(1, i)] } else { x[IX(0, i)] = x[IX(1, i)] }
+        if b == 1 { x[IX(N + 1, i)] = 0.0 - x[IX(N, i)] } else { x[IX(N + 1, i)] = x[IX(N, i)] }
+        if b == 2 { x[IX(i, 0)] = 0.0 - x[IX(i, 1)] } else { x[IX(i, 0)] = x[IX(i, 1)] }
+        if b == 2 { x[IX(i, N + 1)] = 0.0 - x[IX(i, N)] } else { x[IX(i, N + 1)] = x[IX(i, N)] }
+        i += 1
+    }
+    x[IX(0, 0)] = 0.5 * (x[IX(1, 0)] + x[IX(0, 1)])
+    x[IX(0, N + 1)] = 0.5 * (x[IX(1, N + 1)] + x[IX(0, N)])
+    x[IX(N + 1, 0)] = 0.5 * (x[IX(N, 0)] + x[IX(N + 1, 1)])
+    x[IX(N + 1, N + 1)] = 0.5 * (x[IX(N, N + 1)] + x[IX(N + 1, N)])
+}
+
+fn lin_solve(b: int, x: [float], x0: [float], a: float, c: float) {
+    let inv = 1.0 / c
+    var k = 0
+    while k < ITERS {
+        var j = 1
+        while j <= N {
+            var i = 1
+            while i <= N {
+                x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) * inv
+                i += 1
+            }
+            j += 1
+        }
+        set_bnd(b, x)
+        k += 1
+    }
+}
+
+// make the velocity field divergence-free (incompressible) -- the swirl step
+fn project() {
+    let nf = N as float
+    var j = 1
+    while j <= N {
+        var i = 1
+        while i <= N {
+            gdiv[IX(i, j)] = 0.0 - 0.5 * (gu[IX(i + 1, j)] - gu[IX(i - 1, j)] + gv[IX(i, j + 1)] - gv[IX(i, j - 1)]) / nf
+            gp[IX(i, j)] = 0.0
+            i += 1
+        }
+        j += 1
+    }
+    set_bnd(0, gdiv)
+    set_bnd(0, gp)
+    lin_solve(0, gp, gdiv, 1.0, 4.0)
+    j = 1
+    while j <= N {
+        var i = 1
+        while i <= N {
+            gu[IX(i, j)] -= 0.5 * nf * (gp[IX(i + 1, j)] - gp[IX(i - 1, j)])
+            gv[IX(i, j)] -= 0.5 * nf * (gp[IX(i, j + 1)] - gp[IX(i, j - 1)])
+            i += 1
+        }
+        j += 1
+    }
+    set_bnd(1, gu)
+    set_bnd(2, gv)
+}
+
+// semi-Lagrangian advection: trace each cell backwards along the velocity
+// field and bilinearly sample where it came from
+fn advect(b: int, d: [float], d0: [float], uu: [float], vv: [float]) {
+    let dt0 = DT * (N as float)
+    let nf = N as float
+    var j = 1
+    while j <= N {
+        var i = 1
+        while i <= N {
+            var x = (i as float) - dt0 * uu[IX(i, j)]
+            var y = (j as float) - dt0 * vv[IX(i, j)]
+            if x < 0.5 { x = 0.5 }
+            if x > nf + 0.5 { x = nf + 0.5 }
+            if y < 0.5 { y = 0.5 }
+            if y > nf + 0.5 { y = nf + 0.5 }
+            let i0 = x as int
+            let i1 = i0 + 1
+            let j0 = y as int
+            let j1 = j0 + 1
+            let s1 = x - (i0 as float)
+            let s0 = 1.0 - s1
+            let t1 = y - (j0 as float)
+            let t0 = 1.0 - t1
+            d[IX(i, j)] = s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) + s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)])
+            i += 1
+        }
+        j += 1
+    }
+    set_bnd(b, d)
+}
+
+fn add_source(x: [float], s: [float]) {
+    var i = 0
+    while i < SIZE {
+        x[i] += DT * s[i]
+        i += 1
+    }
+}
+
+fn vel_step() {
+    add_source(gu, fu)
+    add_source(gv, fv)
+    project()
+    var t = gu
+    gu = gu0
+    gu0 = t
+    t = gv
+    gv = gv0
+    gv0 = t
+    advect(1, gu, gu0, gu0, gv0)
+    advect(2, gv, gv0, gu0, gv0)
+    project()
+}
+
+fn dens_step() {
+    add_source(gd, sd)
+    var t = gd
+    gd = gd0
+    gd0 = t
+    advect(0, gd, gd0, gu, gv)
+}
+
+fn frame_sim() {
+    var k = 0
+    while k < SIZE {
+        fu[k] = 0.0
+        fv[k] = 0.0
+        sd[k] = 0.0
+        k += 1
+    }
+    // wandering emitter near the bottom edge
+    let cxg = N / 2 + (owx * 20.0) as int
+    let jg = N - 8
+    var di = 0 - 7
+    while di <= 7 {
+        var dj = 0 - 3
+        while dj <= 3 {
+            let ii = cxg + di
+            let jj = jg + dj
+            if ii >= 1 and ii <= N and jj >= 1 and jj <= N {
+                sd[IX(ii, jj)] = 90.0
+                fv[IX(ii, jj)] = 0.0 - 22.0        // push up (toward smaller j)
+                fu[IX(ii, jj)] = owx * 9.0         // sideways puff, follows the wander
+            }
+            dj += 1
+        }
+        di += 1
+    }
+    // buoyancy: dense (dyed) fluid rises
+    var j = 1
+    while j <= N {
+        var i = 1
+        while i <= N {
+            fv[IX(i, j)] -= BUOY * gd[IX(i, j)]
+            i += 1
+        }
+        j += 1
+    }
+    vel_step()
+    dens_step()
+    // dissipate a little so the field doesn't saturate
+    var m = 0
+    while m < SIZE {
+        gd[m] = gd[m] * DAMP_D
+        gu[m] = gu[m] * DAMP_V
+        gv[m] = gv[m] * DAMP_V
+        m += 1
+    }
+    // advance the emitter's wander
+    let nx = owx * WCS - owy * WSN
+    let ny = owx * WSN + owy * WCS
+    let nn = sqrt(nx * nx + ny * ny)
+    owx = nx / nn
+    owy = ny / nn
+}
+
+// map the density grid into the BGRA framebuffer: a cool blue -> cyan -> white
+// smoke ramp on black
+fn render() {
+    var j = 0
+    while j < N {
+        var i = 0
+        while i < N {
+            var t = gd[IX(i + 1, j + 1)] * 1.1
+            if t > 1.0 { t = 1.0 }
+            if t < 0.0 { t = 0.0 }
+            let bch = clampi((t * 1.7 * 255.0) as int, 0, 255)
+            let gch = clampi(((t * 1.3 - 0.18) * 255.0) as int, 0, 255)
+            let rch = clampi(((t * 1.2 - 0.45) * 255.0) as int, 0, 255)
+            store32(pixels + (j * N + i) * 4, rch * 65536 | gch * 256 | bch)
+            i += 1
+        }
+        j += 1
+    }
+}
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    render()
+    let sm = win("gdi32!SetStretchBltMode", hdc, 3)        // COLORONCOLOR
+    // StretchDIBits(hdc, 0,0,cw,ch, 0,0,N,N, pixels, bmi, DIB_RGB_COLORS=0, SRCCOPY)
+    let bb = win("gdi32!StretchDIBits", hdc, 0, 0, cw, ch, 0, 0, N, N, pixels, bmi, 0, 13369376)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+// ---- BITMAPINFOHEADER for a 32-bit top-down DIB ----
+store32(bmi + 0, 40)                     // biSize
+store32(bmi + 4, N)                      // biWidth
+store32(bmi + 8, 0 - N)                  // biHeight < 0  => top-down rows
+store32(bmi + 12, 1 | 32 * 65536)        // biPlanes=1, biBitCount=32
+store32(bmi + 16, 0)                     // biCompression = BI_RGB
+
+var steps = 0
+if args().len() > 1 { steps = args()[1] as int }
+
+if steps > 0 {
+    // headless: run the solver and print a checksum (no window)
+    var s = 0
+    while s < steps {
+        frame_sim()
+        s += 1
+    }
+    var chk = 0.0
+    var i = 0
+    while i < SIZE {
+        chk += gd[i]
+        i += 1
+    }
+    print(chk)
+} else {
+    // ---- open a window and animate ----
+    let hInst = win("GetModuleHandleA", 0)
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+    let clsname = cstr("zephyrFluidWindow")
+
+    let wc = mem(72)                       // WNDCLASSA
+    store32(wc + 0, 3)                     // CS_HREDRAW|CS_VREDRAW
+    store64(wc + 8, defwp)                 // lpfnWndProc = DefWindowProcA
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+    store64(wc + 48, 0)                    // hbrBackground = NULL (we paint every pixel; no flicker)
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - fluid"),
+        282001408, 120, 120, 780, 780, 0, 0, hInst, 0)     // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let uw = win("user32!UpdateWindow", hwnd)
+
+    let msg = mem(48)
+    var running = 1
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }     // WM_QUIT
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            frame_sim()
+            draw(hwnd)
+            let sl = win("Sleep", 8)
+        }
+    }
+}

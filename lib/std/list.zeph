@@ -1,0 +1,114 @@
+// std/list.zeph — generic list algorithms, written in Zephyr.
+//
+// These used to be compiler builtins, because without generics there was no way
+// to write "works for any element type" in the language itself. They are plain
+// library code now. Call them directly, or as methods via UFCS:
+//
+//     import "std/list.zeph"
+//     print(xs.contains(3))        // == contains(xs, 3)
+//
+// Instantiation is what type-checks each use: `contains` compiles `v == x` for
+// the concrete T, so it works for int/str/enum and is rejected for element types
+// that have no ==. No trait system needed — the monomorphisation is the contract.
+
+fn contains[T](xs: [T], x: T) -> bool {
+    for v in xs {
+        if v == x { return true }
+    }
+    return false
+}
+
+fn index_of[T](xs: [T], x: T) -> int {
+    for i in 0..xs.len() {
+        if xs[i] == x { return i }
+    }
+    return 0 - 1
+}
+
+fn reverse[T](xs: [T]) {
+    var i = 0
+    var j = xs.len() - 1
+    while i < j {
+        let t = xs[i]
+        xs[i] = xs[j]
+        xs[j] = t
+        i += 1
+        j -= 1
+    }
+}
+
+fn slice[T](xs: [T], lo: int, hi: int) -> [T] {
+    if lo < 0 or hi < lo or hi > xs.len() { panic("slice out of range") }
+    var out: [T] = []
+    for i in lo..hi { out.push(xs[i]) }
+    return out
+}
+
+fn first[T](xs: [T]) -> T? {
+    if xs.len() == 0 { return none }
+    return xs[0]
+}
+
+fn last[T](xs: [T]) -> T? {
+    if xs.len() == 0 { return none }
+    return xs[xs.len() - 1]
+}
+
+fn map[T, U](xs: [T], f: fn(T) -> U) -> [U] {
+    var out: [U] = []
+    for x in xs { out.push(f(x)) }
+    return out
+}
+
+fn filter[T](xs: [T], keep: fn(T) -> bool) -> [T] {
+    var out: [T] = []
+    for x in xs {
+        if keep(x) { out.push(x) }
+    }
+    return out
+}
+
+fn fold[T, A](xs: [T], start: A, f: fn(A, T) -> A) -> A {
+    var acc = start
+    for x in xs { acc = f(acc, x) }
+    return acc
+}
+
+fn any[T](xs: [T], pred: fn(T) -> bool) -> bool {
+    for x in xs {
+        if pred(x) { return true }
+    }
+    return false
+}
+
+fn all[T](xs: [T], pred: fn(T) -> bool) -> bool {
+    for x in xs {
+        if not pred(x) { return false }
+    }
+    return true
+}
+
+fn count[T](xs: [T], x: T) -> int {
+    var n = 0
+    for v in xs {
+        if v == x { n += 1 }
+    }
+    return n
+}
+
+// in-place insertion sort with a caller-supplied ordering.
+// cmp(a, b) < 0 when a should come first. For the common orders, `.sort()` is a
+// native heapsort in the runtime and is what you want on large lists.
+fn sort_by[T](xs: [T], cmp: fn(T, T) -> int) {
+    var i = 1
+    while i < xs.len() {
+        let v = xs[i]
+        var j = i - 1
+        while j >= 0 and cmp(xs[j], v) > 0 {
+            xs[j + 1] = xs[j]
+            j -= 1
+        }
+        xs[j + 1] = v
+        i += 1
+    }
+}

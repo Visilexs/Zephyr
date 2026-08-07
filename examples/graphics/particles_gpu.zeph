@@ -1,0 +1,404 @@
+// A GPU particle engine in pure Zephyr: 1,000,000 particles, simulated AND
+// drawn entirely on the graphics card.
+//
+// particles.zeph runs the physics on the CPU and rasterizes in software.
+// particles_gl.zeph moves only the drawing to the GPU -- which turns out not
+// to help, because the CPU then has to push every particle across the bus each
+// frame. This version moves the *simulation* too, so nothing crosses the bus
+// at all: the particle state lives in two vertex buffers, a vertex shader
+// integrates buffer A into buffer B through transform feedback, and the second
+// pass draws whichever buffer is current. Per frame the CPU sends 16 uniform
+// floats and two draw calls.
+//
+// That needs GL 3.3 entry points, which Windows' opengl32.dll does not export
+// -- they come from wglGetProcAddress at runtime. Calling a raw address like
+// that is what the `callptr(addr, args...)` intrinsic is for (it marshals
+// Win64 the same way `win()` does). Uniforms go up through the *fv pointer
+// forms, since callptr passes integer registers only; f32() converts Zephyr's
+// doubles to the 32-bit floats the GPU wants.
+//
+//   zc.exe --rt examples\particles_gpu.zeph particles_gpu.exe && .\particles_gpu.exe
+//   .\particles_gpu.exe 2000000    (run with a different particle count)
+//
+// Controls: 1 fountain, 2 burst, 3 vortex; hold the left mouse button to drag
+// the particles toward the cursor. Close the window to exit.
+
+import "particle_sim.zeph"          // constants, cursor/mode input, fps report
+
+var COUNT = 1000000                 // particles (state lives only on the GPU)
+let STRIDE = 20                     // bytes per particle: pos.xy, vel.xy, life
+
+// ---- GL constants ----
+let GL_ARRAY_BUFFER = 34962
+let GL_TRANSFORM_FEEDBACK_BUFFER = 35982
+let GL_STREAM_COPY = 35042
+let GL_FLOAT = 5126
+let GL_POINTS = 0
+let GL_COLOR_BUFFER_BIT = 16384
+let GL_BLEND = 3042
+let GL_ONE = 1
+let GL_VERTEX_SHADER = 35633
+let GL_FRAGMENT_SHADER = 35632
+let GL_COMPILE_STATUS = 35713
+let GL_LINK_STATUS = 35714
+let GL_INTERLEAVED_ATTRIBS = 35980
+let GL_RASTERIZER_DISCARD = 35977
+let GL_PROGRAM_POINT_SIZE = 34370
+
+// ---- GL 3.3 entry points, resolved at startup ----
+var pCreateShader = 0
+var pShaderSource = 0
+var pCompileShader = 0
+var pGetShaderiv = 0
+var pGetShaderInfoLog = 0
+var pCreateProgram = 0
+var pAttachShader = 0
+var pBindAttribLocation = 0
+var pTransformFeedbackVaryings = 0
+var pLinkProgram = 0
+var pGetProgramiv = 0
+var pGetProgramInfoLog = 0
+var pUseProgram = 0
+var pGenBuffers = 0
+var pBindBuffer = 0
+var pBufferData = 0
+var pVertexAttribPointer = 0
+var pEnableVertexAttribArray = 0
+var pBindBufferBase = 0
+var pBeginTransformFeedback = 0
+var pEndTransformFeedback = 0
+var pGetUniformLocation = 0
+var pUniform4fv = 0
+
+fn gp(name: str) -> int {
+    let p = win("opengl32!wglGetProcAddress", cstr(name))
+    assert(p > 3, "this GPU/driver has no {name} (OpenGL 3.3 required)")
+    return p
+}
+
+// IEEE-754 double -> the 32-bit float bit pattern the GPU expects
+fn f32(x: float) -> int {
+    let b = bits(x)
+    let s = (b >> 63) & 1
+    let e = (b >> 52) & 2047
+    let m = b & 4503599627370495
+    if e == 0 { return s << 31 }                        // zero / denormal
+    let ne = e - 1023 + 127
+    if ne <= 0 { return s << 31 }                       // underflows to zero
+    if ne >= 255 { return (s << 31) | (255 << 23) }     // overflows to inf
+    return (s << 31) | (ne << 23) | (m >> 29)
+}
+
+fn from_cstr(p: int) -> str {
+    var s = ""
+    var i = 0
+    while i < 1024 {
+        let c = load8(p + i)
+        if c == 0 { return s }
+        s = s + chr(c)
+        i += 1
+    }
+    return s
+}
+
+// ---- the shaders ----
+// The update shader IS the simulation: same physics as particle_sim.zeph, one
+// invocation per particle, results captured by transform feedback.
+fn update_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec2 iPos; in vec2 iVel; in float iLife;\n")
+    p.push("out vec2 oPos; out vec2 oVel; out float oLife;\n")
+    p.push("uniform vec4 A;   // dt, grav*dt, drag, life\n")
+    p.push("uniform vec4 B;   // mouse.x, mouse.y, attraction, mode\n")
+    p.push("uniform vec4 C;   // wind, speed, seed, floor\n")
+    p.push("uniform vec4 D;   // width, height, 0, 0\n")
+    p.push("float rnd(inout uint s) \{ s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFFFFu) / 16777216.0; \}\n")
+    p.push("void main() \{\n")
+    p.push("  uint s = uint(gl_VertexID) * 747796405u + uint(C.z) * 2891336453u;\n")
+    p.push("  vec2 p = iPos; vec2 v = iVel; float l = iLife - A.x;\n")
+    p.push("  if (l <= 0.0) \{\n")
+    p.push("    float sp = C.y * (0.65 + rnd(s) * 0.5);\n")
+    p.push("    float a = rnd(s) * 6.2831853;\n")
+    p.push("    vec2 u = vec2(cos(a), sin(a));\n")
+    p.push("    if (B.w < 0.5) \{\n")
+    p.push("      float dx = (rnd(s) - 0.5) * 0.9;\n")
+    p.push("      float inv = 1.0 / sqrt(dx * dx + 1.0);\n")
+    p.push("      p = vec2(D.x * 0.5 + (rnd(s) - 0.5) * 4.0, D.y - 12.0);\n")
+    p.push("      v = vec2(dx * inv * sp, -inv * sp);\n")
+    p.push("    \} else if (B.w < 1.5) \{\n")
+    p.push("      p = B.xy; v = u * sp;\n")
+    p.push("    \} else \{\n")
+    p.push("      p = B.xy + u * (20.0 + rnd(s) * 45.0);\n")
+    p.push("      v = vec2(-u.y, u.x) * sp * 0.5;\n")
+    p.push("    \}\n")
+    p.push("    l = A.w * (0.55 + rnd(s) * 0.45);\n")
+    p.push("  \} else \{\n")
+    p.push("    vec2 acc = vec2(0.0);\n")
+    p.push("    if (B.z > 0.0) \{\n")
+    p.push("      vec2 r = B.xy - p;\n")
+    p.push("      float r2 = dot(r, r) + 220.0;\n")
+    p.push("      acc = r * (B.z / (r2 * sqrt(r2)));\n")
+    p.push("    \}\n")
+    p.push("    v = (v + vec2(C.x, A.y) + acc * A.x) * A.z;\n")
+    p.push("    p += v * A.x;\n")
+    p.push("    if (p.y > C.w) \{ p.y = C.w; v.y = -v.y * 0.42; v.x *= 0.75; \}\n")
+    p.push("    if (p.x < 1.0) \{ p.x = 1.0; v.x = -v.x * 0.6; \}\n")
+    p.push("    if (p.x > D.x - 2.0) \{ p.x = D.x - 2.0; v.x = -v.x * 0.6; \}\n")
+    p.push("  \}\n")
+    p.push("  oPos = p; oVel = v; oLife = l;\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+fn draw_vs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec2 iPos; in vec2 iVel; in float iLife;\n")
+    p.push("uniform vec4 D;\n")
+    p.push("uniform vec4 A;\n")
+    p.push("out vec3 vCol;\n")
+    p.push("void main() \{\n")
+    p.push("  gl_Position = vec4(iPos.x / D.x * 2.0 - 1.0, 1.0 - iPos.y / D.y * 2.0, 0.0, 1.0);\n")
+    p.push("  gl_PointSize = 1.0;\n")
+    p.push("  float t = clamp(iLife / A.w, 0.0, 1.0);\n")
+    p.push("  // ember ramp: young particles are white-hot, old ones deep red\n")
+    p.push("  vCol = vec3(t * 1.1, t * t * 0.9, t * t * t * t * 0.8) * 0.55;\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+fn draw_fs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec3 vCol;\n")
+    p.push("out vec4 oCol;\n")
+    p.push("void main() \{ oCol = vec4(vCol, 1.0); \}\n")
+    return p.join()
+}
+
+// ---- shader plumbing ----
+var srcbuf = mem(16)                // one char* for glShaderSource
+var intbuf = mem(16)                // one GLint out-param
+var logbuf = mem(2048)
+
+fn compile(kind: int, src: str) -> int {
+    let sh = callptr(pCreateShader, kind)
+    store64(srcbuf, cstr(src))
+    let s1 = callptr(pShaderSource, sh, 1, srcbuf, 0)
+    let s2 = callptr(pCompileShader, sh)
+    let s3 = callptr(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
+    if lo32(load64(intbuf)) == 0 {
+        let s4 = callptr(pGetShaderInfoLog, sh, 2047, 0, logbuf)
+        print("shader compile failed:")
+        print(from_cstr(logbuf))
+        assert(false, "shader compile failed")
+    }
+    return sh
+}
+
+// bind the three particle attributes to fixed locations, so no lookups later
+fn bind_attrs(prog: int) {
+    let b0 = callptr(pBindAttribLocation, prog, 0, cstr("iPos"))
+    let b1 = callptr(pBindAttribLocation, prog, 1, cstr("iVel"))
+    let b2 = callptr(pBindAttribLocation, prog, 2, cstr("iLife"))
+}
+
+fn link(prog: int) {
+    let l1 = callptr(pLinkProgram, prog)
+    let l2 = callptr(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
+    if lo32(load64(intbuf)) == 0 {
+        let l3 = callptr(pGetProgramInfoLog, prog, 2047, 0, logbuf)
+        print("program link failed:")
+        print(from_cstr(logbuf))
+        assert(false, "program link failed")
+    }
+}
+
+// point the three attributes at a buffer's interleaved records
+fn attach_buffer(buf: int) {
+    let b1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, buf)
+    let e0 = callptr(pEnableVertexAttribArray, 0)
+    let e1 = callptr(pEnableVertexAttribArray, 1)
+    let e2 = callptr(pEnableVertexAttribArray, 2)
+    let v0 = callptr(pVertexAttribPointer, 0, 2, GL_FLOAT, 0, STRIDE, 0)
+    let v1 = callptr(pVertexAttribPointer, 1, 2, GL_FLOAT, 0, STRIDE, 8)
+    let v2 = callptr(pVertexAttribPointer, 2, 1, GL_FLOAT, 0, STRIDE, 16)
+}
+
+var ubuf = mem(16)                  // a vec4, staged as four 32-bit floats
+fn set4(loc: int, x: float, y: float, z: float, w: float) {
+    if loc < 0 { return }
+    store32(ubuf + 0, f32(x))
+    store32(ubuf + 4, f32(y))
+    store32(ubuf + 8, f32(z))
+    store32(ubuf + 12, f32(w))
+    let u = callptr(pUniform4fv, loc, 1, ubuf)
+}
+fn uloc(prog: int, name: str) -> int { return callptr(pGetUniformLocation, prog, cstr(name)) }
+
+if args().len() > 1 { COUNT = args()[1] as int }
+
+// ---- window ----
+let hInst = win("GetModuleHandleA", 0)
+let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+let clsname = cstr("zephyrParticleGPUWindow")
+
+let wc = mem(72)                       // WNDCLASSA
+store32(wc + 0, 3 | 32)                // CS_HREDRAW|CS_VREDRAW|CS_OWNDC
+store64(wc + 8, defwp)
+store64(wc + 24, hInst)
+store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+store64(wc + 48, 0)
+store64(wc + 64, clsname)
+let atom = win("user32!RegisterClassA", wc)
+
+let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - particles (GPU)"),
+    282001408, 100, 80, 1200, 850, 0, 0, hInst, 0)      // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+let sw = win("user32!ShowWindow", hwnd, 5)
+let hdc = win("user32!GetDC", hwnd)
+
+// ---- PIXELFORMATDESCRIPTOR: 32-bit RGBA, double buffered, no depth ----
+let pfd = mem(40)
+store32(pfd + 0, 40 | 1 * 65536)       // nSize = 40, nVersion = 1
+store32(pfd + 4, 4 | 32 | 1)           // DRAW_TO_WINDOW|SUPPORT_OPENGL|DOUBLEBUFFER
+store8(pfd + 8, 0)                     // iPixelType = PFD_TYPE_RGBA
+store8(pfd + 9, 32)                    // cColorBits
+store8(pfd + 26, 0)                    // iLayerType = PFD_MAIN_PLANE
+let pf = win("gdi32!ChoosePixelFormat", hdc, pfd)
+assert(pf != 0, "no suitable pixel format")
+let spf = win("gdi32!SetPixelFormat", hdc, pf, pfd)
+let ctx = win("opengl32!wglCreateContext", hdc)
+assert(ctx != 0, "wglCreateContext failed")
+let mc = win("opengl32!wglMakeCurrent", hdc, ctx)
+
+pCreateShader = gp("glCreateShader")
+pShaderSource = gp("glShaderSource")
+pCompileShader = gp("glCompileShader")
+pGetShaderiv = gp("glGetShaderiv")
+pGetShaderInfoLog = gp("glGetShaderInfoLog")
+pCreateProgram = gp("glCreateProgram")
+pAttachShader = gp("glAttachShader")
+pBindAttribLocation = gp("glBindAttribLocation")
+pTransformFeedbackVaryings = gp("glTransformFeedbackVaryings")
+pLinkProgram = gp("glLinkProgram")
+pGetProgramiv = gp("glGetProgramiv")
+pGetProgramInfoLog = gp("glGetProgramInfoLog")
+pUseProgram = gp("glUseProgram")
+pGenBuffers = gp("glGenBuffers")
+pBindBuffer = gp("glBindBuffer")
+pBufferData = gp("glBufferData")
+pVertexAttribPointer = gp("glVertexAttribPointer")
+pEnableVertexAttribArray = gp("glEnableVertexAttribArray")
+pBindBufferBase = gp("glBindBufferBase")
+pBeginTransformFeedback = gp("glBeginTransformFeedback")
+pEndTransformFeedback = gp("glEndTransformFeedback")
+pGetUniformLocation = gp("glGetUniformLocation")
+pUniform4fv = gp("glUniform4fv")
+
+// ---- the update program: a vertex shader whose outputs are captured ----
+let uprog = callptr(pCreateProgram)
+let a1 = callptr(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
+bind_attrs(uprog)
+let vary = mem(24)                     // char*[3], the captured outputs
+store64(vary + 0, cstr("oPos"))
+store64(vary + 8, cstr("oVel"))
+store64(vary + 16, cstr("oLife"))
+let tf = callptr(pTransformFeedbackVaryings, uprog, 3, vary, GL_INTERLEAVED_ATTRIBS)
+link(uprog)
+
+// ---- the draw program ----
+let dprog = callptr(pCreateProgram)
+let a2 = callptr(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
+let a3 = callptr(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
+bind_attrs(dprog)
+link(dprog)
+
+// ---- two state buffers, zero-filled: life 0 means "respawn me" ----
+let bufs = mem(8)
+let gb = callptr(pGenBuffers, 2, bufs)
+var bufA = lo32(load64(bufs))
+var bufB = load64(bufs) >> 32
+let zero = mem(COUNT * STRIDE)         // zeros() memory, so lives start at 0
+let d1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufA)
+let d2 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d3 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufB)
+let d4 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+
+let uA = uloc(uprog, "A")
+let uB = uloc(uprog, "B")
+let uC = uloc(uprog, "C")
+let uD = uloc(uprog, "D")
+let dA = uloc(dprog, "A")
+let dD = uloc(dprog, "D")
+
+let e1 = win("opengl32!glEnable", GL_BLEND)
+let bf = win("opengl32!glBlendFunc", GL_ONE, GL_ONE)   // additive: particles glow
+let e2 = win("opengl32!glEnable", GL_PROGRAM_POINT_SIZE)
+
+let msg = mem(48)
+var frame = 0
+var running = 1
+while running == 1 {
+    while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+        if lo32(load64(msg + 8)) == 18 { running = 0 }     // WM_QUIT
+        let tr = win("user32!TranslateMessage", msg)
+        let dp = win("user32!DispatchMessageA", msg)
+    }
+    if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+    if running == 1 {
+        let rc = mem(24)
+        let g = win("user32!GetClientRect", hwnd, rc)
+        gcw = lo32(load64(rc + 8))
+        gch = lo32(load64(rc + 12))
+        poll_input(hwnd)
+
+        // the wind vector still advances on the CPU -- it is one value a frame
+        let nx = wx * WCS - wy * WSN
+        let ny = wx * WSN + wy * WCS
+        let nn = sqrt(nx * nx + ny * ny)
+        wx = nx / nn
+        wy = ny / nn
+        var att = pull * 9000.0
+        var gdt = GRAV * DT
+        if mode == 2 {
+            att = 26000.0
+            gdt = 0.0
+        }
+        frame += 1
+
+        // pass 1: integrate bufA -> bufB, rasterizer off
+        let up = callptr(pUseProgram, uprog)
+        set4(uA, DT, gdt, DRAG, LIFE)
+        set4(uB, mx, my, att, mode as float)
+        set4(uC, wx * WIND * DT, SPEED, frame as float, (PH - 3) as float)
+        set4(uD, PW as float, PH as float, 0.0, 0.0)
+        attach_buffer(bufA)
+        let bb = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
+        let rd = win("opengl32!glEnable", GL_RASTERIZER_DISCARD)
+        let bt = callptr(pBeginTransformFeedback, GL_POINTS)
+        let dr = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
+        let et = callptr(pEndTransformFeedback)
+        let rd2 = win("opengl32!glDisable", GL_RASTERIZER_DISCARD)
+        let bb0 = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
+
+        // pass 2: draw the buffer we just wrote
+        let vp = win("opengl32!glViewport", 0, 0, gcw, gch)
+        let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT)
+        let dp2 = callptr(pUseProgram, dprog)
+        set4(dA, DT, gdt, DRAG, LIFE)
+        set4(dD, PW as float, PH as float, 0.0, 0.0)
+        attach_buffer(bufB)
+        let dr2 = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
+        let sb = win("gdi32!SwapBuffers", hdc)
+
+        let t = bufA                   // ping-pong
+        bufA = bufB
+        bufB = t
+        NP = COUNT                     // so the fps line reports the right count
+        fps_tick()
+    }
+}
+let mc0 = win("opengl32!wglMakeCurrent", 0, 0)
+let dl = win("opengl32!wglDeleteContext", ctx)

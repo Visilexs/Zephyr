@@ -1,0 +1,59 @@
+// A mini "runtime" written in pure Zephyr: stdout I/O and integer formatting
+// implemented with only kernel32 calls (win) and raw memory intrinsics
+// (addr/load64/store8) — no rt_print, no rt_to_str. This is the proof that
+// Zephyr's runtime can itself be written in Zephyr.
+
+// write raw bytes of a str to stdout via WriteFile
+fn write_str(s: str) {
+    let h = win("GetStdHandle", -11)        // STD_OUTPUT_HANDLE
+    var written: [int] = [0]                 // scratch for lpNumberOfBytesWritten
+    let r = win("WriteFile", h, addr(s) + 8, s.len(), addr(written), 0)
+}
+
+// format an int to decimal, writing digits straight into a fresh str's bytes
+fn int_to_str(n: int) -> str {
+    if n == 0 { return "0" }
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = 0 - v
+    }
+    // count digits
+    var digits = 0
+    var t = v
+    while t > 0 {
+        digits += 1
+        t = t / 10
+    }
+    var total = digits
+    if neg { total += 1 }
+    // an empty str of the right length, then poke bytes into its payload
+    var s = " ".sub(0, 0)
+    for i in 0..total { s = s + " " }
+    let p = addr(s) + 8                       // payload start
+    var pos = total - 1
+    while v > 0 {
+        store8(p + pos, 48 + v % 10)          // '0' + digit
+        pos -= 1
+        v = v / 10
+    }
+    if neg { store8(p, 45) }                  // '-'
+    return s
+}
+
+fn println_int(n: int) {
+    write_str(int_to_str(n))
+    write_str("\n")
+}
+
+write_str("integers formatted and printed by a Zephyr-written runtime:\n")
+println_int(0)
+println_int(42)
+println_int(-1234567)
+println_int(1000000000)
+
+var sum = 0
+for i in 1..101 { sum += i }
+write_str("sum 1..100 = ")
+println_int(sum)

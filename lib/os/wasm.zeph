@@ -1,0 +1,201 @@
+// lib/os/wasm.zeph -- the kernel32 surface runtime.zeph uses, on top of a wasm
+// linear memory. Merged ahead of runtime.zeph by `zc --wasm --rt`, which rewrites
+// every win("Foo", ...) in the runtime into a call to k32_Foo(...). The GC, the
+// string machinery and the collections compile unchanged for all three targets.
+//
+// Nothing here may allocate: rx_init calls k32_VirtualAlloc before the GC heap
+// exists, so these functions use raw loads/stores and memgrow only.
+
+// The compiler writes three constants into the first words of linear memory,
+// because only it knows where the data segment and globals block ended:
+// [8] heap base, [16] stack bottom, [24] stack top. The heap base is page
+// aligned and equals the initial memory size, so no memory.size query is needed.
+let W_HEAP = 8
+let W_STKLO = 16
+let W_STKTOP = 24
+
+// Reserving address space is free on Windows and Linux. On wasm it is not:
+// memory.grow only extends the end, so a committed region ABOVE a sparse one
+// forces every page in between to exist. rx_heap_init reserves the 1 GiB heap
+// first and its bitmaps second, which would mean 1 GiB of linear memory the
+// moment a bitmap page is touched.
+//
+// Two adjustments, both confined to this file:
+//   - every reserve is SCALED DOWN. The bitmap sizes the runtime derives from
+//     HEAP_RESERVE scale by the same factor, so the arithmetic stays consistent
+//     -- a 64 MiB heap needs exactly the 1 MiB bitmap that 16 MiB >> 4 gives.
+//   - the first (largest) reserve is placed ABOVE a window kept for the later,
+//     smaller ones, so the heap is the topmost region and nothing sparse sits
+//     underneath a committed one.
+// A commit that runs past its own region returns 0, which the runtime reports
+// as "out of memory (commit)" rather than silently scribbling on the bitmaps.
+let W_OFFHEAP = 4194304            // 4 MiB for committed off-heap blocks
+let W_RSHIFT = 4                   // reserves are scaled by 1/16
+let W_MAXREG = 8
+
+var __w_off = 0                    // small committed blocks, grows up
+var __w_small = 0                  // window for the post-heap reserves
+var __w_res = 0                    // the heap region, above that window
+var __w_end = 0                    // first address past what memory.grow gave us
+var __w_tab = 0                    // W_MAXREG entries of (base, end)
+var __w_ntab = 0
+
+fn w_init() {
+    if __w_off != 0 { return }
+    let base = load64(W_HEAP)
+    __w_end = base
+    __w_tab = base                 // carve the region table out by hand: calling
+    __w_off = base + 16 * W_MAXREG // k32_VirtualAlloc here would recurse
+    let ok = w_ensure(__w_off)
+}
+
+fn w_region_add(at: int, size: int) {
+    if __w_ntab >= W_MAXREG { return }
+    store64(__w_tab + 16 * __w_ntab, at)
+    store64(__w_tab + 16 * __w_ntab + 8, at + size)
+    __w_ntab += 1
+}
+
+// the end of the reserved region containing `base`, or 0 if it is in none
+fn w_region_end(base: int) -> int {
+    var i = 0
+    while i < __w_ntab {
+        let lo = load64(__w_tab + 16 * i)
+        let hi = load64(__w_tab + 16 * i + 8)
+        if base >= lo and base < hi { return hi }
+        i += 1
+    }
+    return 0
+}
+
+// Grow linear memory until `need` is a valid address to touch.
+fn w_ensure(need: int) -> bool {
+    w_init()
+    if need <= __w_end { return true }
+    let pages = (need - __w_end + 65535) / 65536
+    if memgrow(pages) < 0 { return false }
+    __w_end = __w_end + pages * 65536
+    return true
+}
+
+// MEM_RESERVE=0x2000, MEM_COMMIT=0x1000. Reserving takes address space without
+// growing memory, which is exactly what a wasm heap wants: the GC reserves a
+// large region up front and only ever touches the part it has committed.
+fn k32_VirtualAlloc(base: int, n: int, flags: int, prot: int) -> int {
+    w_init()
+    let want_commit = (flags & 4096) != 0
+    let want_reserve = (flags & 8192) != 0
+    if want_reserve and not want_commit {
+        let want = n >> W_RSHIFT
+        if __w_res == 0 {
+            // the first reserve is the heap: park it above a window sized for
+            // the bitmaps and worklist that rx_heap_init asks for next
+            __w_small = load64(W_HEAP) + W_OFFHEAP
+            __w_res = __w_small + (want >> 3)
+            let at = __w_res
+            __w_res = __w_res + want
+            w_region_add(at, want)
+            return at
+        }
+        let at = __w_small
+        if at + want > load64(W_HEAP) + W_OFFHEAP + (__w_res - __w_small) { return 0 }
+        __w_small = __w_small + want
+        w_region_add(at, want)
+        return at
+    }
+    if want_commit and base != 0 {
+        let end = w_region_end(base)
+        if end != 0 and base + n > end { return 0 }
+        if not w_ensure(base + n) { return 0 }
+        return base
+    }
+    let at = __w_off
+    if at + n > load64(W_HEAP) + W_OFFHEAP { return 0 }
+    __w_off = __w_off + n
+    if not w_ensure(at + n) { return 0 }
+    return at
+}
+
+// ---- console ----
+//
+// Output is buffered into linear memory and handed to the host one line at a
+// time; the host import takes a (pointer, length) pair and decodes UTF-8.
+fn k32_GetStdHandle(which: int) -> int {
+    if which == 0 - 12 { return 2 }
+    return 1
+}
+
+fn k32_WriteFile(h: int, ptr: int, n: int, pwritten: int, ov: int) -> int {
+    hostwrite(h, ptr, n)
+    if pwritten != 0 { store64(pwritten, n) }
+    return 1
+}
+
+fn k32_ExitProcess(code: int) -> int {
+    hostexit(code)
+    return 0
+}
+
+// ---- files ----
+//
+// ponytail: no filesystem. read_file/write_file panic rather than silently
+// returning nothing; wire them to host imports if a wasm build ever needs them.
+fn k32_CreateFileA(cp: int, access: int, share: int, sa: int, disp: int, flags: int, tmpl: int) -> int {
+    return 0 - 1
+}
+fn k32_GetFileSize(h: int, phigh: int) -> int { return 0 }
+fn k32_ReadFile(h: int, buf: int, n: int, pread: int, ov: int) -> int { return 0 }
+fn k32_CloseHandle(h: int) -> int { return 1 }
+fn k32_GetFileAttributesA(cp: int) -> int { return 4294967295 }
+fn k32_GetModuleFileNameA(module: int, buf: int, cap: int) -> int { return 0 }
+
+// The command line is a single NUL so rt_args yields an empty argument list.
+var __w_cmdline = 0
+fn k32_GetCommandLineA() -> int {
+    if __w_cmdline == 0 {
+        __w_cmdline = k32_VirtualAlloc(0, 16, 12288, 4)
+        store8(__w_cmdline, 0)
+    }
+    return __w_cmdline
+}
+
+// ---- GC roots ----
+//
+// The shadow stack occupies a fixed window below the heap, and Zephyr frames
+// live in it, so the conservative scan works here exactly as it does natively.
+fn k32_GetCurrentThreadStackLimits(lo: int, hi: int) -> int {
+    store64(lo, load64(W_STKLO))
+    store64(hi, load64(W_STKTOP))
+    return 0
+}
+
+// ---- threads ----
+//
+// ponytail: wasm without the threads proposal is single-threaded, so __nthr
+// never rises and the lock and suspend paths are never reached.
+fn k32_GetCurrentThreadId() -> int { return 1 }
+fn k32_InitializeCriticalSection(p: int) -> int { return 0 }
+fn k32_EnterCriticalSection(p: int) -> int { return 0 }
+fn k32_LeaveCriticalSection(p: int) -> int { return 0 }
+fn k32_SuspendThread(h: int) -> int { return 0 - 1 }
+fn k32_ResumeThread(h: int) -> int { return 0 - 1 }
+fn k32_GetThreadContext(h: int, ctx: int) -> int { return 0 }
+
+var __w_tls = 0
+var __w_ntls = 0
+
+fn k32_TlsAlloc() -> int {
+    if __w_tls == 0 { __w_tls = k32_VirtualAlloc(0, 4096, 12288, 4) }
+    let i = __w_ntls
+    __w_ntls += 1
+    return i
+}
+
+fn k32_TlsSetValue(i: int, v: int) -> int {
+    store64(__w_tls + 8 * i, v)
+    return 1
+}
+
+fn k32_TlsGetValue(i: int) -> int {
+    return load64(__w_tls + 8 * i)
+}

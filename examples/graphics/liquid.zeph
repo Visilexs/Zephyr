@@ -1,0 +1,512 @@
+// A liquid: particle-based fluid simulation in pure Zephyr.
+//
+// The other particle demos are embarrassingly parallel -- every particle
+// ignores every other one. A liquid is the opposite: the interesting behaviour
+// (incompressibility, surface tension, splashing, sloshing) comes entirely
+// from what neighbours do to each other, so most of this file is about finding
+// neighbours cheaply and resolving them stably.
+//
+// The method is Clavet, Beaudoin & Poulin's "Particle-based Viscoelastic Fluid
+// Simulation" (2005), which is prediction-relaxation rather than force-based:
+//
+//   1. gravity, then viscosity impulses between approaching neighbours
+//   2. remember where everyone was, advance by velocity
+//   3. DOUBLE DENSITY RELAXATION -- each particle measures a density and a
+//      "near density" over its neighbours and pushes them apart or pulls them
+//      together to restore the rest density. The near-density term is what
+//      gives surface tension: it only ever repels, at very short range, so
+//      droplets round off instead of exploding.
+//   4. bounce off the container
+//   5. recover velocity from how far each particle actually moved
+//
+// It stays stable at dt = 1 because nothing integrates a stiff force -- the
+// relaxation moves positions directly.
+//
+// Neighbours come from a uniform grid rebuilt every frame (cell size = the
+// interaction radius, so only the 3x3 cells around a particle can matter).
+// Rendering reuses the software rasterizer idea from particles.zeph: splat a
+// smooth kernel into a density field, then tone-map it, which makes the
+// particles read as connected fluid rather than dots.
+//
+//   zc.exe --rt examples\liquid.zeph liquid.exe && .\liquid.exe
+//   .\liquid.exe 300      (headless: 300 steps, print a stability checksum)
+//
+// Controls: hold the LEFT mouse button to shove the liquid away from the
+// cursor, the RIGHT button to pull it in. Close the window to exit.
+
+let W = 320                      // simulation box, in world units
+let H = 240
+let N = 6000                     // particles (~a third of the box when settled)
+
+let RADIUS = 7.0                 // interaction radius h
+let DT = 1.0                     // one step per frame; relaxation stays stable
+let GRAV = 0.09
+let REST = 4.5                   // rest density
+let K = 0.055                    // pressure stiffness
+let KNEAR = 0.28                 // near-pressure stiffness (surface tension)
+let SIGMA = 0.03                 // linear viscosity
+let BETA = 0.06                  // quadratic viscosity
+let MOUSE_R = 45.0               // radius of the cursor's influence
+
+let GW = W / 7 + 1               // grid is one cell per interaction radius
+let GH = H / 7 + 1
+let CELLS = GW * GH
+let CAP = 40                     // ponytail: fixed bucket capacity, overflow is
+                                 // dropped. Raise it if the liquid ever gets
+                                 // compressed past ~40 particles in a 7x7 cell.
+
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)      // -> the list's data pointer (never freed)
+}
+fn fzeros(n: int) -> [float] {
+    var a: [float] = []
+    var i = 0
+    while i < n {
+        a.push(0.0)
+        i += 1
+    }
+    return a
+}
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+fn clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+fn sext32(v: int) -> int {
+    let x = v & 4294967295
+    if x >= 2147483648 { return x - 4294967296 }
+    return x
+}
+
+var px = fzeros(N)               // position
+var py = fzeros(N)
+var ox = fzeros(N)               // position before the advance (Clavet's x_prev)
+var oy = fzeros(N)
+var vx = fzeros(N)               // velocity
+var vy = fzeros(N)
+
+var cnt = zeros(CELLS)           // particles per grid cell
+var bucket = zeros(CELLS * CAP)  // cell -> particle indices
+var nbr = zeros(256)             // scratch: the neighbours of one particle
+var nd = fzeros(256)             // ... and their normalized distances
+
+var mx = 0.0                     // cursor, in world coordinates
+var my = 0.0
+var shove = 0.0                   // +1 left button (repel), -1 right (attract)
+var gcw = 1
+var gch = 1
+var ptbuf = mem(8)
+
+// ---- the fluid ----
+
+fn cell_of(x: float, y: float) -> int {
+    let cx = clampi((x / RADIUS) as int, 0, GW - 1)
+    let cy = clampi((y / RADIUS) as int, 0, GH - 1)
+    return cy * GW + cx
+}
+
+fn build_grid() {
+    var c = 0
+    while c < CELLS {
+        cnt[c] = 0
+        c += 1
+    }
+    var i = 0
+    while i < N {
+        let k = cell_of(px[i], py[i])
+        let n = cnt[k]
+        if n < CAP {                      // see CAP above: overflow is dropped
+            bucket[k * CAP + n] = i
+            cnt[k] = n + 1
+        }
+        i += 1
+    }
+}
+
+// collect the neighbours of particle i within RADIUS, into nbr/nd.
+// nd holds 1 - dist/RADIUS, which is the only form the kernels need.
+fn neighbours(i: int) -> int {
+    let xi = px[i]
+    let yi = py[i]
+    let cx = clampi((xi / RADIUS) as int, 0, GW - 1)
+    let cy = clampi((yi / RADIUS) as int, 0, GH - 1)
+    var n = 0
+    var gy = cy - 1
+    while gy <= cy + 1 {
+        if gy >= 0 and gy < GH {
+            var gx = cx - 1
+            while gx <= cx + 1 {
+                if gx >= 0 and gx < GW {
+                    let k = gy * GW + gx
+                    let m = cnt[k]
+                    var s = 0
+                    while s < m {
+                        let j = bucket[k * CAP + s]
+                        if j != i and n < 256 {
+                            let dx = px[j] - xi
+                            let dy = py[j] - yi
+                            let d2 = dx * dx + dy * dy
+                            if d2 < RADIUS * RADIUS {
+                                let q = 1.0 - sqrt(d2) / RADIUS
+                                nbr[n] = j
+                                nd[n] = q
+                                n += 1
+                            }
+                        }
+                        s += 1
+                    }
+                }
+                gx += 1
+            }
+        }
+        gy += 1
+    }
+    return n
+}
+
+// viscosity: neighbours that are approaching each other trade momentum along
+// the line between them. This is what makes the liquid gooey instead of sandy.
+fn viscosity() {
+    var i = 0
+    while i < N {
+        let n = neighbours(i)
+        var s = 0
+        while s < n {
+            let j = nbr[s]
+            if j > i {                    // each pair once
+                let q = nd[s]
+                var dx = px[j] - px[i]
+                var dy = py[j] - py[i]
+                let dist = sqrt(dx * dx + dy * dy)
+                if dist > 0.0001 {
+                    dx = dx / dist
+                    dy = dy / dist
+                    let u = (vx[i] - vx[j]) * dx + (vy[i] - vy[j]) * dy
+                    if u > 0.0 {
+                        var im = DT * q * (SIGMA * u + BETA * u * u) * 0.5
+                        if im > u * 0.5 { im = u * 0.5 }     // never overshoot
+                        vx[i] -= dx * im
+                        vy[i] -= dy * im
+                        vx[j] += dx * im
+                        vy[j] += dy * im
+                    }
+                }
+            }
+            s += 1
+        }
+        i += 1
+    }
+}
+
+// the heart of it: measure density, turn the error into a displacement, and
+// move neighbours directly. Two kernels -- (1-q)^2 for pressure, (1-q)^3 for
+// the near-pressure that only ever pushes apart.
+fn relax() {
+    var i = 0
+    while i < N {
+        let n = neighbours(i)
+        var rho = 0.0
+        var rho_near = 0.0
+        var s = 0
+        while s < n {
+            let q = nd[s]
+            rho += q * q
+            rho_near += q * q * q
+            s += 1
+        }
+        let pres = K * (rho - REST)
+        let pres_near = KNEAR * rho_near
+        var dxi = 0.0
+        var dyi = 0.0
+        s = 0
+        while s < n {
+            let j = nbr[s]
+            let q = nd[s]
+            var dx = px[j] - px[i]
+            var dy = py[j] - py[i]
+            let dist = sqrt(dx * dx + dy * dy)
+            if dist > 0.0001 {
+                dx = dx / dist
+                dy = dy / dist
+                let d = DT * DT * (pres * q + pres_near * q * q) * 0.5
+                px[j] += dx * d
+                py[j] += dy * d
+                dxi -= dx * d
+                dyi -= dy * d
+            }
+            s += 1
+        }
+        px[i] += dxi
+        py[i] += dyi
+        i += 1
+    }
+}
+
+fn step() {
+    let wf = W as float
+    let hf = H as float
+    var i = 0
+    while i < N {
+        vy[i] += GRAV * DT
+        // the cursor shoves the liquid around
+        if shove != 0.0 {
+            let dx = px[i] - mx
+            let dy = py[i] - my
+            let d2 = dx * dx + dy * dy
+            if d2 < MOUSE_R * MOUSE_R and d2 > 0.01 {
+                let d = sqrt(d2)
+                let f = shove * 0.9 * (1.0 - d / MOUSE_R)
+                vx[i] += dx / d * f
+                vy[i] += dy / d * f
+            }
+        }
+        i += 1
+    }
+    build_grid()
+    viscosity()
+    i = 0
+    while i < N {                        // advance, remembering where we were
+        ox[i] = px[i]
+        oy[i] = py[i]
+        px[i] += vx[i] * DT
+        py[i] += vy[i] * DT
+        i += 1
+    }
+    build_grid()                         // neighbours are stale after moving
+    relax()
+    i = 0
+    while i < N {
+        // container walls, with a little damping so the liquid settles
+        if px[i] < 1.0 { px[i] = 1.0 }
+        if px[i] > wf - 2.0 { px[i] = wf - 2.0 }
+        if py[i] < 1.0 { py[i] = 1.0 }
+        if py[i] > hf - 2.0 { py[i] = hf - 2.0 }
+        // velocity is wherever the particle actually ended up
+        vx[i] = (px[i] - ox[i]) / DT
+        vy[i] = (py[i] - oy[i]) / DT
+        i += 1
+    }
+}
+
+// start as a tall column held against the left wall -- a dam break: it
+// collapses, runs along the floor, hits the far wall and sloshes back
+fn fill() {
+    let cols = 46
+    var i = 0
+    while i < N {
+        px[i] = 4.0 + ((i % cols) as float) * 1.72
+        py[i] = 236.0 - ((i / cols) as float) * 1.72
+        i += 1
+    }
+}
+
+// ---- rendering: splat a smooth kernel, then tone-map the density field ----
+
+let CELLS_PX = W * H
+var acc = zeros(CELLS_PX)
+var foam = zeros(CELLS_PX)       // how fast the liquid is moving, per pixel
+var pixels = mem(CELLS_PX * 4)
+var bmi = mem(40)
+
+fn splat() {
+    var k = 0
+    while k < CELLS_PX {
+        acc[k] = 0
+        foam[k] = 0
+        k += 1
+    }
+    var i = 0
+    while i < N {
+        let xi = px[i] as int
+        let yi = py[i] as int
+        if xi >= 2 and xi < W - 2 and yi >= 2 and yi < H - 2 {
+            let c = yi * W + xi
+            // moving liquid goes white: spray, crests and the leading edge
+            let sp2 = vx[i] * vx[i] + vy[i] * vy[i]
+            foam[c] += (sp2 * 9.0) as int
+            foam[c - 1] += (sp2 * 5.0) as int
+            foam[c + 1] += (sp2 * 5.0) as int
+            foam[c - W] += (sp2 * 5.0) as int
+            foam[c + W] += (sp2 * 5.0) as int
+            acc[c] += 60                       // a 5-point kernel, wide enough
+            acc[c - 1] += 38                   // that neighbouring particles
+            acc[c + 1] += 38                   // merge into a surface
+            acc[c - W] += 38
+            acc[c + W] += 38
+            acc[c - W - 1] += 22
+            acc[c - W + 1] += 22
+            acc[c + W - 1] += 22
+            acc[c + W + 1] += 22
+            acc[c - 2] += 12
+            acc[c + 2] += 12
+            acc[c - W - W] += 12
+            acc[c + W + W] += 12
+        }
+        i += 1
+    }
+}
+
+// deep water -> cyan -> white foam at the crests
+fn render() {
+    var k = 0
+    while k < CELLS_PX {
+        let v = acc[k]
+        var r = 0
+        var g = 0
+        var b = 0
+        if v > 14 {
+            // depth ramp: thin edges are pale, the body is deep blue
+            let thin = clampi(120 - v / 2, 0, 120)
+            r = thin / 4
+            g = clampi(45 + thin, 0, 255)
+            b = clampi(115 + thin, 0, 255)
+            let f = clampi(foam[k], 0, 255)      // then whiten by speed
+            r = clampi(r + f, 0, 255)
+            g = clampi(g + f * 2 / 3, 0, 255)
+            b = clampi(b + f / 3, 0, 255)
+        }
+        store32(pixels + k * 4, r * 65536 | g * 256 | b)
+        k += 1
+    }
+}
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    gcw = cw
+    gch = ch
+    splat()
+    render()
+    let sm = win("gdi32!SetStretchBltMode", hdc, 3)        // COLORONCOLOR
+    let bb = win("gdi32!StretchDIBits", hdc, 0, 0, cw, ch, 0, 0, W, H, pixels, bmi, 0, 13369376)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+fn dwn(vk: int) -> bool { return (win("user32!GetAsyncKeyState", vk) & 32768) != 0 }
+
+fn poll_input(hwnd: int) {
+    let g = win("user32!GetCursorPos", ptbuf)
+    let s = win("user32!ScreenToClient", hwnd, ptbuf)
+    let v = load64(ptbuf)
+    mx = (sext32(v) as float) * (W as float) / (gcw as float)
+    my = ((v >> 32) as float) * (H as float) / (gch as float)
+    shove = 0.0
+    if dwn(1) { shove = 1.0 }              // VK_LBUTTON: shove away
+    if dwn(2) { shove = 0.0 - 1.0 }        // VK_RBUTTON: pull in
+}
+
+var f_last = 0
+var f_count = 0
+fn fps_tick() {
+    f_count += 1
+    if f_count >= 30 {
+        let now = win("GetTickCount")
+        let ms = now - f_last
+        if f_last != 0 and ms > 0 { print("{N} particles, {30000 / ms} fps") }
+        f_last = now
+        f_count = 0
+    }
+}
+
+// ---- BITMAPINFOHEADER for a 32-bit top-down DIB ----
+store32(bmi + 0, 40)
+store32(bmi + 4, W)
+store32(bmi + 8, 0 - H)                  // biHeight < 0 => top-down rows
+store32(bmi + 12, 1 | 32 * 65536)
+store32(bmi + 16, 0)
+
+fill()
+
+var steps = 0
+if args().len() > 1 { steps = args()[1] as int }
+
+if steps > 0 {
+    // headless: run and report where the liquid settled. A stable fluid keeps
+    // its particle count inside the box and its mean density near REST.
+    var s = 0
+    while s < steps {
+        step()
+        s += 1
+    }
+    build_grid()
+    var rho_sum = 0.0
+    var i = 0
+    while i < N {
+        let n = neighbours(i)
+        var rho = 0.0
+        var t = 0
+        while t < n {
+            rho += nd[t] * nd[t]
+            t += 1
+        }
+        rho_sum += rho
+        i += 1
+    }
+    var high = 0.0
+    var top = 1000.0
+    i = 0
+    while i < N {
+        if py[i] > high { high = py[i] }
+        if py[i] < top { top = py[i] }
+        i += 1
+    }
+    var ysum = 0.0
+    i = 0
+    while i < N {
+        ysum += py[i]
+        i += 1
+    }
+    print("mean density {rho_sum / (N as float)} (rest {REST}), mean y {ysum / (N as float)} of {H}, spray top {top}")
+} else {
+    let hInst = win("GetModuleHandleA", 0)
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+    let clsname = cstr("zephyrLiquidWindow")
+
+    let wc = mem(72)                       // WNDCLASSA
+    store32(wc + 0, 3)                     // CS_HREDRAW|CS_VREDRAW
+    store64(wc + 8, defwp)
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+    store64(wc + 48, 0)
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - liquid"),
+        282001408, 120, 100, 960, 740, 0, 0, hInst, 0)     // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let uw = win("user32!UpdateWindow", hwnd)
+
+    let msg = mem(48)
+    var running = 1
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }     // WM_QUIT
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            poll_input(hwnd)
+            step()
+            draw(hwnd)
+            fps_tick()
+        }
+    }
+}

@@ -1,0 +1,27 @@
+// Floating-point benchmark: Mandelbrot escape-time over a W x H grid.
+// Only +,-,*,<= on doubles (no transcendentals), so with FMA contraction off
+// the integer checksum (sum of escape counts) is bit-identical across langs.
+// Usage: mandel [W]   (grid is W x W, default 900, 256 iterations)
+var W = 900
+if args().len() > 1 { W = args()[1] as int }
+let H = W
+let MAXIT = 256
+
+var total = 0
+for py in 0..H {
+    let y0 = (py as float) / (H as float) * 2.0 - 1.0
+    for px in 0..W {
+        let x0 = (px as float) / (W as float) * 3.5 - 2.5
+        var x = 0.0
+        var y = 0.0
+        var it = 0
+        while x * x + y * y <= 4.0 and it < MAXIT {
+            let xt = x * x - y * y + x0
+            y = 2.0 * x * y + y0
+            x = xt
+            it += 1
+        }
+        total += it
+    }
+}
+print(total)

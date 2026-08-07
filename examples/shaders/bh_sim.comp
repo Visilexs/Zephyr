@@ -1,0 +1,172 @@
+#version 450
+
+// The turbulent accretion flow: 1.5M particles integrated AND splatted by one
+// compute dispatch. Physics is identical to the OpenGL version -- this is the
+// port, not a rewrite.
+//
+//   1. Paczynski-Wiita gravity, Phi = -GM/(r - r_s), which reproduces the
+//      Schwarzschild ISCO at 6M and the horizon at 2M exactly, so the plunge
+//      inside the ISCO happens by itself.
+//   2. Shakura-Sunyaev alpha viscosity as a torque, a_phi = -1/2 alpha (H/R)^2
+//      Omega v_phi -- the rate that gives v_r = -alpha (H/R)^2 v_K.
+//   3. MRI turbulence: a SPATIALLY CORRELATED value-noise field on an eddy
+//      scale of one scale height, so neighbours move together and orbital
+//      shear draws them into spiral streamers.
+//
+// Each particle then emits as a Novikov-Thorne blackbody with relativistic
+// beaming, and is accumulated into a fixed-point HDR buffer with atomics.
+// Accumulating in 20.12 fixed point rather than an 8-bit framebuffer is what
+// keeps faint gas from quantising its colour ratio into olive banding.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parts { vec4 P[]; };   // [2i] = pos, [2i+1] = vel
+layout(std430, binding = 1) buffer Accum { uint A[]; };   // W*H*3, 20.12 fixed point
+
+layout(push_constant) uniform PC {
+    vec4 eye;    // xyz camera, w time
+    vec4 right;  // xyz basis,  w pixels-per-unit x
+    vec4 up;     // xyz basis,  w pixels-per-unit y
+    vec4 fwd;    // xyz basis,  w frame number
+    vec4 disc;   // r_isco, r_out, T_scale, exposure
+    vec4 dims;   // W, H, particle count, b_crit
+    vec4 phys;   // alpha, H/R, turbulence, T_ref
+    vec4 misc;   // dt, r_horizon, r_escape, 0
+} pc;
+
+const float M = 1.0;
+
+uint hash(uint h) { h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16; return h; }
+float rnd(inout uint s) { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFFFFu) / 16777216.0; }
+
+float h31(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float vn(vec3 x) {
+    vec3 i = floor(x); vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(h31(i + vec3(0,0,0)), h31(i + vec3(1,0,0)), f.x);
+    float b = mix(h31(i + vec3(0,1,0)), h31(i + vec3(1,1,0)), f.x);
+    float c = mix(h31(i + vec3(0,0,1)), h31(i + vec3(1,0,1)), f.x);
+    float d = mix(h31(i + vec3(0,1,1)), h31(i + vec3(1,1,1)), f.x);
+    return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
+}
+
+vec3 blackbody(float K) {
+    float t = clamp(K, 1000.0, 40000.0) / 100.0;
+    float r, g, b;
+    if (t <= 66.0) { r = 255.0; } else { r = 329.698727446 * pow(t - 60.0, -0.1332047592); }
+    if (t <= 66.0) { g = 99.4708025861 * log(t) - 161.1195681661; }
+    else           { g = 288.1221695283 * pow(t - 60.0, -0.0755148492); }
+    if (t >= 66.0)      { b = 255.0; }
+    else if (t <= 19.0) { b = 0.0; }
+    else                { b = 138.5177312231 * log(t - 10.0) - 305.0447927307; }
+    return clamp(vec3(r, g, b) / 255.0, 0.0, 1.0);
+}
+
+void addpx(uint base, vec3 c) {
+    atomicAdd(A[base],      uint(clamp(c.r, 0.0, 60.0) * 4096.0));
+    atomicAdd(A[base + 1u], uint(clamp(c.g, 0.0, 60.0) * 4096.0));
+    atomicAdd(A[base + 2u], uint(clamp(c.b, 0.0, 60.0) * 4096.0));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint N = uint(pc.dims.z);
+    if (i >= N) return;
+
+    float dt    = pc.misc.x;
+    float rhor  = pc.misc.y;
+    float resc  = pc.misc.z;
+    float risco = pc.disc.x;
+    float rout  = pc.disc.y;
+    float alpha = pc.phys.x;
+    float hr    = pc.phys.y;
+    float turb  = pc.phys.z;
+    float frame = pc.fwd.w;
+
+    vec3 p = P[2u * i].xyz;
+    vec3 v = P[2u * i + 1u].xyz;
+    uint s = hash(i ^ hash(uint(frame)));
+
+    float r = length(p);
+    // frame 0 seeds the buffer, so no host upload is needed at all
+    if (frame < 0.5 || r < rhor * 1.08 || r > resc) {
+        float rad = sqrt(mix(risco * risco, rout * rout, rnd(s)));
+        float a = rnd(s) * 6.2831853;
+        float ca = cos(a), sa = sin(a);
+        float h = hr * rad * (rnd(s) + rnd(s) - 1.0);
+        p = vec3(ca * rad, h, sa * rad);
+        v = vec3(-sa, 0.0, ca) * (sqrt(M * rad) / (rad - rhor));  // PW circular speed
+    } else {
+        vec3 rh = p / r;
+        float Om = sqrt(M / (r * r * r));
+        float rr = max(r - rhor, 0.05);
+        v -= rh * (M / (rr * rr)) * dt;                        // Paczynski-Wiita gravity
+        vec3 vt = v - rh * dot(v, rh);
+        v -= vt * (0.5 * alpha * hr * hr * Om * dt);           // alpha viscosity
+        if (r > risco) {
+            float cs = hr * sqrt(M / r);
+            float f = clamp(Om * dt, 0.0, 0.5);
+            // a coherent field drives the same way every step, so the kick
+            // balances the decorrelation rate f, NOT sqrt(f)
+            float dv = turb * sqrt(alpha) * cs * f;
+            vec3 xn = p / max(hr * r, 0.5);
+            float tt = pc.eye.w * 0.35;
+            vec3 kick = vec3(vn(xn + vec3(tt, 0.0, 0.0)),
+                             vn(xn + vec3(0.0, tt, 11.3)),
+                             vn(xn + vec3(5.2, 0.0, tt))) * 2.0 - 1.0;
+            vec3 ph = normalize(vec3(-p.z, 0.0, p.x));
+            kick -= ph * dot(kick, ph);        // radial/vertical only: those get damped
+            v += kick * dv;
+            vec3 Rh = vec3(p.x, 0.0, p.z);
+            float Rl = length(Rh);
+            if (Rl > 0.001) {
+                Rh /= Rl;
+                v -= Rh * (dot(v, Rh) * f);
+                v.y -= v.y * f;
+            }
+        }
+        p += v * dt;
+        float sp = length(v);
+        if (sp > 0.99) v *= 0.99 / sp;                          // nothing outruns light
+    }
+    P[2u * i]      = vec4(p, 0.0);
+    P[2u * i + 1u] = vec4(v, 0.0);
+
+    // ---------------- splat ----------------
+    vec3 q = p - pc.eye.xyz;
+    float vz = dot(q, pc.fwd.xyz);
+    if (vz < 0.05) return;
+
+    // hidden behind the shadow? (the hole is at the origin, camera looks at it)
+    vec3 L = -pc.eye.xyz;
+    float dl = length(L);
+    vec3 lh = L / dl;
+    float along = dot(q, lh);
+    if (along > dl && length(q - lh * along) < pc.dims.w) return;
+
+    float W = pc.dims.x, H = pc.dims.y;
+    float sx = 0.5 * W + dot(q, pc.right.xyz) / vz * pc.right.w;
+    float sy = 0.5 * H - dot(q, pc.up.xyz)    / vz * pc.up.w;
+    if (sx < 1.0 || sy < 1.0 || sx >= W - 1.0 || sy >= H - 1.0) return;
+
+    float rp = length(p);
+    float fr = max(1.0 - sqrt(risco / max(rp, risco)), 0.0);
+    float Te = pc.disc.z * pow(fr / (rp * rp * rp), 0.25);
+    float dtau = sqrt(max(1.0 - 3.0 * M / rp, 0.0025));
+    float blos = dot(v, -normalize(q));
+    float g = dtau / max(1.0 - blos, 0.05);
+    float To = g * Te;
+    float x = max(To, 1.0) / pc.phys.w;
+    float I = x * x * x * x * pc.disc.w;        // I_obs = g^4 I_emit, and I ~ T^4
+    vec3 c = blackbody(To) * I;
+
+    uint uw = uint(W);
+    uint base = (uint(sy) * uw + uint(sx)) * 3u;
+    addpx(base, c);
+    // a small plus-kernel so sparse regions read as gas rather than dots
+    vec3 cq = c * 0.13;
+    addpx(base - 3u, cq);
+    addpx(base + 3u, cq);
+    addpx(base - uw * 3u, cq);
+    addpx(base + uw * 3u, cq);
+}

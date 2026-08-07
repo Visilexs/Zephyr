@@ -1,0 +1,996 @@
+// ui.zeph -- an immediate-mode GUI toolkit for Zephyr.
+//
+// Native Win32, drawn through GDI (real TrueType text, crisp filled rects),
+// double-buffered so it never flickers. Input (mouse + keyboard) is polled each
+// frame, so there's no window-procedure callback to wire up. Pure Zephyr on top
+// of the win() FFI to user32/gdi32.
+//
+// Immediate mode means there is no widget tree and no retained state you have to
+// manage: you call widget functions every frame and they both draw and report
+// interaction. Because Zephyr has no pointers, mutable widgets are FUNCTIONAL --
+// they take the current value and return the new one:
+//
+//     ui_init("Demo", 900, 620)
+//     var vol = 0.5
+//     var on  = true
+//     while ui_running() {
+//         ui_begin()
+//         ui_panel(30, 30, 320, 400, "Settings")
+//         if ui_button(1, "Apply") { ... }
+//         on  = ui_checkbox(2, "Enabled", on)
+//         vol = ui_slider(3, "Volume", vol, 0.0, 1.0)
+//         ui_end()
+//     }
+//
+// See examples/ui_demo.zeph for a full showcase.
+
+// ---- raw, permanent memory (VirtualAlloc, never GC-managed) ----
+fn ualloc(n: int) -> int {
+    // MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_READWRITE = 4
+    return win("VirtualAlloc", 0, n, 12288, 4)
+}
+
+var g_scratch = 0                 // scratch C-string buffer (one at a time)
+fn cstr(s: str) -> int {
+    let n = s.len()
+    var i = 0
+    while i < n {
+        store8(g_scratch + i, s.byte(i))
+        i += 1
+    }
+    store8(g_scratch + n, 0)
+    return g_scratch
+}
+// a permanent copy (its own buffer), for strings that must outlive the scratch
+fn cstrp(s: str) -> int {
+    let n = s.len()
+    let p = ualloc(n + 1)
+    var i = 0
+    while i < n {
+        store8(p + i, s.byte(i))
+        i += 1
+    }
+    store8(p + n, 0)
+    return p
+}
+fn rgb(r: int, g: int, b: int) -> int { return r + g * 256 + b * 65536 }
+fn lo32(v: int) -> int { return v & 4294967295 }
+fn s32(v: int) -> int {           // sign-extend a 32-bit field
+    let x = v & 4294967295
+    if x >= 2147483648 { return x - 4294967296 }
+    return x
+}
+
+// ---- theme (JetBrains "New UI" dark) ----
+// One flat surface colour everywhere; regions are separated by 1px seams that
+// are DARKER than the surface, never lighter. Interaction = rounded rects.
+let COL_BG     = rgb(30, 31, 34)      // editor / darkest surface  (#1E1F22)
+let COL_PANEL  = rgb(43, 45, 48)      // tool windows, bars        (#2B2D30)
+let COL_TITLE  = rgb(43, 45, 48)      // toolbar/status: Gray2 (real MainToolbar.background)
+let COL_ITEM   = rgb(57, 59, 64)      // hover                     (#393B40)
+let COL_HOT    = rgb(67, 69, 74)      // pressed: Gray4 #43454A (exact)
+let COL_ACTIVE = rgb(46, 67, 110)     // selection blue            (#2E436E)
+let COL_ACCENT = rgb(53, 116, 240)    // accent blue               (#3574F0)
+let COL_TEXT   = rgb(223, 225, 229)   // primary text              (#DFE1E5)
+let COL_DIM    = rgb(157, 160, 168)   // secondary text            (#9DA0A8)
+let COL_FAINT  = rgb(111, 115, 122)   // tertiary (line numbers)   (#6F737A)
+let COL_BORDER = rgb(30, 31, 34)      // seams between regions (darker!)
+let COL_OUTLINE= rgb(78, 81, 87)      // widget outlines (buttons, fields)
+let COL_TRACK  = rgb(35, 36, 40)      // slider/progress track
+let COL_FIELD  = rgb(30, 31, 34)      // text field background
+
+let PAD = 8                       // inner padding
+let GAP = 7                       // vertical gap between rows
+let ROWH = 26                     // default widget height
+
+// ---- state ----
+var g_hwnd = 0
+var g_wdc = 0                     // window DC
+var g_mdc = 0                     // memory (back buffer) DC
+var g_bmp = 0
+var g_bw = 0
+var g_bh = 0
+var g_font = 0
+var g_fontb = 0                   // bold font (titles)
+var g_fontm = 0                   // monospace (code)
+var g_wheel = 0                   // wheel notches accumulated by the pump
+var g_wheelf = 0                  // wheel notches available this frame
+var g_cw = 0                      // client width
+var g_ch = 0                      // client height
+var g_running = 1
+
+var g_rect = 0                    // scratch RECT
+var g_pt = 0                      // scratch POINT
+var g_size = 0                    // scratch SIZE
+var g_wc = 0
+var g_msg = 0
+
+var g_mx = 0                      // mouse x/y in client space
+var g_my = 0
+var g_mdown = false               // left button down this frame
+var g_mprev = false               // ... last frame
+var g_press = false               // pressed this frame (down & !prev)
+var g_release = false             // released this frame
+var g_focused = false             // our window is foreground
+
+var g_hot = 0                     // widget id under the cursor
+var g_row_ix = 0                  // last ui_tree_row icon center x (for SVG overlay)
+var g_row_iy = 0                  // last ui_tree_row icon center y
+var g_strip_x = 0                 // right-to-left toolbar strip cursor
+var g_strip_y = 0                 // top-to-bottom rail strip cursor
+var g_active = 0                  // widget id being manipulated
+
+// keyboard: previous key states, and text typed this frame
+var g_keyprev = 0                 // 256-byte table
+var g_typed: str = ""             // printable chars typed this frame
+var g_bs = 0                      // backspace count this frame
+var g_enter = false
+var g_focus_id = 0                // focused text field
+var g_field_hit = false           // a text field was clicked this frame
+var g_frame = 0                   // frame counter (caret blink)
+
+// layout cursor
+var g_cx = 0
+var g_cy = 0
+var g_content_x = 0
+var g_content_w = 0
+var g_row_h = 0
+var g_same = false
+var g_pending = false
+var g_wx = 0                      // last widget rect
+var g_wy = 0
+var g_ww = 0
+var g_wh = 0
+var g_maxy = 0                    // furthest y reached (for scroll content height)
+
+fn ui_init(title: str, w: int, h: int) {
+    g_scratch = ualloc(2048)
+    g_rect = ualloc(16)
+    g_pt = ualloc(16)
+    g_size = ualloc(16)
+    g_wc_alloc()
+    let hInst = win("GetModuleHandleA", 0)
+    let u32 = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32, cstr("DefWindowProcA"))
+    let clsname = cstrp("zephyrUiWindow")
+    store32(g_wc + 0, 3)                            // CS_HREDRAW|CS_VREDRAW
+    store64(g_wc + 8, defwp)
+    store64(g_wc + 24, hInst)
+    store64(g_wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+    // dark class brush: area exposed during OS moves/resizes paints theme-dark
+    // instead of undefined (white); steady-state frames never invalidate, so no flicker
+    store64(g_wc + 48, win("gdi32!CreateSolidBrush", 2236190))   // #1E1F22 as BGR
+    store64(g_wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", g_wc)
+    g_hwnd = win("user32!CreateWindowExA", 0, clsname, cstr(title),
+        282001408, 90, 70, w, h, 0, 0, hInst, 0)     // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+    let sw = win("user32!ShowWindow", g_hwnd, 5)
+    // fonts: CreateFontA(height, w, esc, orient, weight, italic, ul, so, charset,
+    //                    outprec, clipprec, quality, pitch, face)
+    g_font = win("gdi32!CreateFontA", 0 - 15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, cstr("Segoe UI"))
+    g_fontb = win("gdi32!CreateFontA", 0 - 17, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, cstr("Segoe UI"))
+    g_fontm = win("gdi32!CreateFontA", 0 - 15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 49, 0, cstr("Consolas"))
+    g_keyprev = ualloc(256)
+}
+fn g_wc_alloc() {
+    g_wc = ualloc(80)
+    g_msg = ualloc(64)
+}
+
+// keep the message queue drained; report whether the window still exists
+fn ui_running() -> bool {
+    while win("user32!PeekMessageA", g_msg, 0, 0, 0, 1) != 0 {
+        let m = lo32(load64(g_msg + 8))
+        if m == 18 { g_running = 0 }                          // WM_QUIT
+        if m == 522 {                                         // WM_MOUSEWHEEL
+            var d = (load64(g_msg + 16) >> 16) & 65535        // high word of wParam = delta
+            if d >= 32768 { d = d - 65536 }
+            g_wheel += d / 120
+        }
+        let tr = win("user32!TranslateMessage", g_msg)
+        let dp = win("user32!DispatchMessageA", g_msg)
+    }
+    if win("user32!IsWindow", g_hwnd) == 0 { g_running = 0 }
+    return g_running == 1
+}
+
+// grab client size and (re)build the back buffer if it changed
+fn ensure_buffer() {
+    let g = win("user32!GetClientRect", g_hwnd, g_rect)
+    g_cw = s32(load64(g_rect + 8))
+    g_ch = s32(load64(g_rect + 12))
+    if g_cw < 1 { g_cw = 1 }
+    if g_ch < 1 { g_ch = 1 }
+    if g_wdc == 0 { g_wdc = win("user32!GetDC", g_hwnd) }
+    if g_mdc == 0 { g_mdc = win("gdi32!CreateCompatibleDC", g_wdc) }
+    if g_cw != g_bw or g_ch != g_bh {
+        if g_bmp != 0 { let d = win("gdi32!DeleteObject", g_bmp) }
+        g_bmp = win("gdi32!CreateCompatibleBitmap", g_wdc, g_cw, g_ch)
+        let old = win("gdi32!SelectObject", g_mdc, g_bmp)
+        g_bw = g_cw
+        g_bh = g_ch
+    }
+    let sf = win("gdi32!SelectObject", g_mdc, g_font)
+    let bk = win("gdi32!SetBkMode", g_mdc, 1)         // TRANSPARENT
+}
+
+fn poll_input() {
+    // mouse position in client space
+    let gc = win("user32!GetCursorPos", g_pt)
+    let sc = win("user32!ScreenToClient", g_hwnd, g_pt)
+    g_mx = s32(load64(g_pt + 0))
+    g_my = s32(load64(g_pt + 4))
+    g_focused = win("user32!GetForegroundWindow") == g_hwnd
+    g_mprev = g_mdown
+    g_mdown = false
+    if g_focused {
+        if win("user32!GetAsyncKeyState", 1) & 32768 != 0 { g_mdown = true }   // VK_LBUTTON
+    }
+    g_press = g_mdown and not g_mprev
+    g_release = (not g_mdown) and g_mprev
+    g_wheelf = g_wheel
+    g_wheel = 0
+    // keyboard -> typed chars this frame (transitions up->down)
+    g_typed = ""
+    g_bs = 0
+    g_enter = false
+    if g_focused {
+        let shift = win("user32!GetAsyncKeyState", 16) & 32768 != 0    // VK_SHIFT
+        var vk = 8
+        while vk < 223 {
+            let now = win("user32!GetAsyncKeyState", vk) & 32768 != 0
+            let was = load8(g_keyprev + vk) != 0
+            if now and not was { key_press(vk, shift) }
+            if now { store8(g_keyprev + vk, 1) } else { store8(g_keyprev + vk, 0) }
+            vk += 1
+        }
+    }
+}
+
+fn key_press(vk: int, shift: bool) {
+    if vk == 8 {
+        g_bs += 1
+        return
+    }
+    if vk == 13 {
+        g_enter = true
+        return
+    }
+    var ch = 0
+    if vk >= 65 and vk <= 90 {                       // letters
+        if shift { ch = vk } else { ch = vk + 32 }
+    } else if vk >= 48 and vk <= 57 {                // digits / shifted symbols
+        if shift { ch = ")!@#$%^&*(".byte(vk - 48) } else { ch = vk }
+    } else if vk == 32 { ch = 32 }
+    else if vk == 190 { if shift { ch = 62 } else { ch = 46 } }   // . >
+    else if vk == 188 { if shift { ch = 60 } else { ch = 44 } }   // , <
+    else if vk == 189 { if shift { ch = 95 } else { ch = 45 } }   // - _
+    else if vk == 191 { if shift { ch = 63 } else { ch = 47 } }   // / ?
+    if ch != 0 { g_typed = g_typed + chr(ch) }
+}
+
+// ---- drawing primitives (into the back buffer) ----
+fn fill(x: int, y: int, w: int, h: int, col: int) {
+    store32(g_rect + 0, x)
+    store32(g_rect + 4, y)
+    store32(g_rect + 8, x + w)
+    store32(g_rect + 12, y + h)
+    let br = win("gdi32!CreateSolidBrush", col)
+    let r = win("user32!FillRect", g_mdc, g_rect, br)
+    let d = win("gdi32!DeleteObject", br)
+}
+fn frame(x: int, y: int, w: int, h: int, col: int) {   // 1px border
+    fill(x, y, w, 1, col)
+    fill(x, y + h - 1, w, 1, col)
+    fill(x, y, 1, h, col)
+    fill(x + w - 1, y, 1, h, col)
+}
+// rounded fill / outline (r = corner diameter, ~8 for the JetBrains look)
+fn fill_rr(x: int, y: int, w: int, h: int, r: int, col: int) {
+    let br = win("gdi32!CreateSolidBrush", col)
+    let pn = win("gdi32!CreatePen", 0, 1, col)
+    let ob = win("gdi32!SelectObject", g_mdc, br)
+    let op = win("gdi32!SelectObject", g_mdc, pn)
+    let rr = win("gdi32!RoundRect", g_mdc, x, y, x + w, y + h, r, r)
+    let rb = win("gdi32!SelectObject", g_mdc, ob)
+    let rp = win("gdi32!SelectObject", g_mdc, op)
+    let db = win("gdi32!DeleteObject", br)
+    let dp = win("gdi32!DeleteObject", pn)
+}
+fn frame_rr(x: int, y: int, w: int, h: int, r: int, col: int) {
+    let pn = win("gdi32!CreatePen", 0, 1, col)
+    let hb = win("gdi32!GetStockObject", 5)          // NULL_BRUSH
+    let ob = win("gdi32!SelectObject", g_mdc, hb)
+    let op = win("gdi32!SelectObject", g_mdc, pn)
+    let rr = win("gdi32!RoundRect", g_mdc, x, y, x + w, y + h, r, r)
+    let rb = win("gdi32!SelectObject", g_mdc, ob)
+    let rp = win("gdi32!SelectObject", g_mdc, op)
+    let dp = win("gdi32!DeleteObject", pn)
+}
+fn text_w(s: str) -> int {
+    let c = win("gdi32!GetTextExtentPoint32A", g_mdc, cstr(s), s.len(), g_size)
+    return s32(load64(g_size + 0))
+}
+fn dtext(x: int, y: int, s: str, col: int) {
+    let c = win("gdi32!SetTextColor", g_mdc, col)
+    let t = win("gdi32!TextOutA", g_mdc, x, y, cstr(s), s.len())
+}
+fn dtext_c(x: int, y: int, w: int, h: int, s: str, col: int) {   // centered in a box
+    let tw = text_w(s)
+    dtext(x + (w - tw) / 2, y + (h - 15) / 2, s, col)
+}
+fn dtext_v(x: int, y: int, h: int, s: str, col: int) {          // vertically centered, left
+    dtext(x, y + (h - 15) / 2, s, col)
+}
+
+// ---- frame lifecycle ----
+fn ui_begin() {
+    g_frame += 1
+    ensure_buffer()
+    poll_input()
+    fill(0, 0, g_cw, g_ch, COL_BG)
+    g_hot = 0
+    g_field_hit = false
+    // reset layout to the whole client; a panel narrows it
+    g_content_x = PAD
+    g_content_w = g_cw - PAD * 2
+    g_cx = PAD
+    g_cy = PAD
+    g_row_h = 0
+    g_same = false
+    g_pending = false
+}
+fn ui_end() {
+    // a click that missed every text field drops focus
+    if g_press and not g_field_hit { g_focus_id = 0 }
+    let b = win("gdi32!BitBlt", g_wdc, 0, 0, g_cw, g_ch, g_mdc, 0, 0, 13369376)  // SRCCOPY
+}
+
+// ---- layout ----
+fn begin_widget(w: int, h: int) {
+    if not g_same {
+        if g_pending {
+            g_cy = g_cy + g_row_h + GAP
+            g_row_h = 0
+        }
+        g_cx = g_content_x
+        g_pending = true
+    }
+    var ww = w
+    if ww <= 0 { ww = g_content_x + g_content_w - g_cx }   // fill remaining width
+    g_wx = g_cx
+    g_wy = g_cy
+    g_ww = ww
+    g_wh = h
+    g_cx = g_cx + ww + GAP
+    if h > g_row_h { g_row_h = h }
+    if g_cy + h > g_maxy { g_maxy = g_cy + h }
+    g_same = false
+}
+fn ui_same_line() { g_same = true }
+fn ui_spacing() { g_cy = g_cy + 6 }
+fn ui_separator() {
+    if g_pending {
+        g_cy = g_cy + g_row_h + GAP
+        g_row_h = 0
+        g_pending = false
+    }
+    g_cx = g_content_x
+    fill(g_content_x, g_cy + 3, g_content_w, 1, COL_BORDER)
+    g_cy = g_cy + 8
+}
+
+// a panel: draws a titled container and constrains following widgets to it
+fn ui_panel(x: int, y: int, w: int, h: int, title: str) {
+    fill_rr(x, y, w, h, 14, COL_PANEL)
+    var top = y
+    if title.len() > 0 {
+        let sf = win("gdi32!SelectObject", g_mdc, g_fontb)
+        dtext(x + PAD + 4, y + 8, title, COL_TEXT)
+        let sn = win("gdi32!SelectObject", g_mdc, g_font)
+        fill(x + PAD, y + 31, w - PAD * 2, 1, COL_BORDER)
+        top = y + 34
+    }
+    g_content_x = x + PAD
+    g_content_w = w - PAD * 2
+    g_cx = g_content_x
+    g_cy = top + PAD
+    g_row_h = 0
+    g_same = false
+    g_pending = false
+}
+
+fn hit(x: int, y: int, w: int, h: int) -> bool {
+    return g_mx >= x and g_mx < x + w and g_my >= y and g_my < y + h
+}
+
+// round a float to a 2-decimal display string
+fn fmt2(v: float) -> str {
+    var x = v
+    var sg = ""
+    if x < 0.0 {
+        sg = "-"
+        x = 0.0 - x
+    }
+    let scaled = (x * 100.0 + 0.5) as int
+    let w = scaled / 100
+    let f = scaled - w * 100
+    var fs = f as str
+    if f < 10 { fs = "0" + fs }
+    return sg + (w as str) + "." + fs
+}
+
+// shared button-like interaction: returns true on a click (press+release inside)
+fn press_click(id: int, x: int, y: int, w: int, h: int) -> bool {
+    let over = hit(x, y, w, h)
+    if over { g_hot = id }
+    var clicked = false
+    if g_active == id {
+        if g_release {
+            if over { clicked = true }
+            g_active = 0
+        }
+    } else if over and g_press {
+        g_active = id
+    }
+    return clicked
+}
+
+// ---- widgets ----
+fn ui_label(s: str) {
+    begin_widget(0, 19)
+    dtext(g_wx, g_wy + 2, s, COL_TEXT)
+}
+fn ui_text_dim(s: str) {
+    begin_widget(0, 19)
+    dtext(g_wx, g_wy + 2, s, COL_DIM)
+}
+fn ui_heading(s: str) {
+    begin_widget(0, 24)
+    let sf = win("gdi32!SelectObject", g_mdc, g_fontb)
+    dtext(g_wx, g_wy + 2, s, COL_TEXT)
+    let sn = win("gdi32!SelectObject", g_mdc, g_font)
+}
+
+fn ui_button(id: int, label: str) -> bool {
+    let bw = text_w(label) + 30
+    begin_widget(bw, ROWH)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let clicked = press_click(id, x, y, w, h)
+    var col = COL_ITEM
+    if g_hot == id { col = COL_HOT }
+    if g_active == id { col = COL_ACCENT }
+    fill_rr(x, y, w, h, 10, col)
+    if g_active != id { frame_rr(x, y, w, h, 10, COL_OUTLINE) }
+    dtext_c(x, y, w, h, label, COL_TEXT)
+    return clicked
+}
+// full-width button (menus, dialogs)
+fn ui_button_wide(id: int, label: str) -> bool {
+    begin_widget(0, ROWH)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let clicked = press_click(id, x, y, w, h)
+    var col = COL_ITEM
+    if g_hot == id { col = COL_HOT }
+    if g_active == id { col = COL_ACCENT }
+    fill_rr(x, y, w, h, 10, col)
+    if g_active != id { frame_rr(x, y, w, h, 10, COL_OUTLINE) }
+    dtext_c(x, y, w, h, label, COL_TEXT)
+    return clicked
+}
+
+fn ui_checkbox(id: int, label: str, value: bool) -> bool {
+    let bx = 20
+    begin_widget(bx + 8 + text_w(label), ROWH)
+    let x = g_wx
+    let y = g_wy
+    let h = g_wh
+    let clicked = press_click(id, x, y, g_ww, h)
+    var v = value
+    if clicked { v = not value }
+    let by = y + (h - bx) / 2
+    if v {
+        fill_rr(x, by, bx, bx, 8, COL_ACCENT)
+        // check mark
+        fill(x + 4, by + 9, 2, 2, COL_TEXT)
+        fill(x + 5, by + 10, 2, 2, COL_TEXT)
+        fill(x + 6, by + 11, 2, 2, COL_TEXT)
+        fill(x + 8, by + 10, 2, 2, COL_TEXT)
+        fill(x + 9, by + 9, 2, 2, COL_TEXT)
+        fill(x + 10, by + 8, 2, 2, COL_TEXT)
+        fill(x + 11, by + 7, 2, 2, COL_TEXT)
+        fill(x + 12, by + 6, 2, 2, COL_TEXT)
+        fill(x + 13, by + 5, 2, 2, COL_TEXT)
+    } else {
+        var oc = COL_OUTLINE
+        if g_hot == id { oc = COL_DIM }
+        fill_rr(x, by, bx, bx, 8, COL_FIELD)
+        frame_rr(x, by, bx, bx, 8, oc)
+    }
+    dtext_v(x + bx + 8, y, h, label, COL_TEXT)
+    return v
+}
+
+fn ui_radio(id: int, label: str, current: int, val: int) -> int {
+    let bx = 18
+    begin_widget(bx + 8 + text_w(label), ROWH)
+    let x = g_wx
+    let y = g_wy
+    let h = g_wh
+    let clicked = press_click(id, x, y, g_ww, h)
+    var cur = current
+    if clicked { cur = val }
+    let by = y + (h - bx) / 2
+    if cur == val {
+        fill_rr(x, by, bx, bx, bx, COL_ACCENT)
+        fill_rr(x + 6, by + 6, bx - 12, bx - 12, bx, COL_TEXT)
+    } else {
+        var oc = COL_OUTLINE
+        if g_hot == id { oc = COL_DIM }
+        fill_rr(x, by, bx, bx, bx, COL_FIELD)
+        frame_rr(x, by, bx, bx, bx, oc)
+    }
+    dtext_v(x + bx + 8, y, h, label, COL_TEXT)
+    return cur
+}
+
+fn ui_slider(id: int, label: str, value: float, lo: float, hi: float) -> float {
+    begin_widget(0, ROWH)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let labw = 96
+    let valw = 52
+    let tx = x + labw
+    let tw = w - labw - valw
+    let over = hit(tx, y, tw, h)
+    if over { g_hot = id }
+    var v = value
+    if g_active == id or (over and g_press) {
+        g_active = id
+        var t = ((g_mx - (tx + 6)) as float) / ((tw - 12) as float)
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        v = lo + t * (hi - lo)
+        if g_release { g_active = 0 }
+    }
+    dtext_v(x, y, h, label, COL_DIM)
+    let ty = y + h / 2 - 2
+    fill_rr(tx, ty, tw, 4, 4, COL_OUTLINE)
+    var frac = (v - lo) / (hi - lo)
+    if frac < 0.0 { frac = 0.0 }
+    if frac > 1.0 { frac = 1.0 }
+    let fw = (frac * ((tw - 14) as float)) as int
+    fill_rr(tx, ty, fw + 8, 4, 4, COL_ACCENT)
+    let kx = tx + fw
+    var kc = COL_TEXT
+    if g_active == id { kc = COL_ACCENT }
+    fill_rr(kx, y + h / 2 - 7, 14, 14, 14, kc)
+    if g_active != id { frame_rr(kx, y + h / 2 - 7, 14, 14, 14, COL_OUTLINE) }
+    dtext(tx + tw + 8, y + (h - 15) / 2, fmt2(v), COL_TEXT)
+    return v
+}
+
+fn ui_slideri(id: int, label: str, value: int, lo: int, hi: int) -> int {
+    let f = ui_slider(id, label, value as float, lo as float, hi as float)
+    return (f + 0.5) as int
+}
+
+fn ui_progress(frac: float, label: str) {
+    begin_widget(0, 20)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    var fr = frac
+    if fr < 0.0 { fr = 0.0 }
+    if fr > 1.0 { fr = 1.0 }
+    fill_rr(x, y, w, h, 10, COL_TRACK)
+    let fw = (fr * (w as float)) as int
+    if fw > 4 { fill_rr(x, y, fw, h, 10, COL_ACCENT) }
+    if label.len() > 0 { dtext_c(x, y, w, h, label, COL_TEXT) }
+}
+
+fn ui_textbox(id: int, value: str) -> str {
+    begin_widget(0, ROWH + 2)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let over = hit(x, y, w, h)
+    if over { g_hot = id }
+    if over and g_press {
+        g_focus_id = id
+        g_field_hit = true
+    }
+    var v = value
+    if g_focus_id == id {
+        var i = 0
+        while i < g_bs {
+            if v.len() > 0 { v = v.sub(0, v.len() - 1) }
+            i += 1
+        }
+        v = v + g_typed
+    }
+    var bcol = COL_OUTLINE
+    if g_hot == id { bcol = COL_DIM }
+    if g_focus_id == id { bcol = COL_ACCENT }
+    fill_rr(x, y, w, h, 10, COL_FIELD)
+    frame_rr(x, y, w, h, 10, bcol)
+    dtext(x + 8, y + (h - 15) / 2, v, COL_TEXT)
+    if g_focus_id == id and (g_frame / 25) % 2 == 0 {
+        let cx = x + 8 + text_w(v) + 1
+        fill(cx, y + 5, 2, h - 10, COL_ACCENT)
+    }
+    return v
+}
+
+// a tab in a tab bar: place several on one row with ui_same_line(). Returns the
+// selected index (this tab's `index` if clicked, else `current`).
+fn ui_tab(id: int, label: str, current: int, index: int) -> int {
+    let bw = text_w(label) + 26
+    begin_widget(bw, ROWH)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let clicked = press_click(id, x, y, w, h)
+    var cur = current
+    if clicked { cur = index }
+    if g_hot == id and cur != index { fill_rr(x, y + 2, w, h - 4, 8, COL_ITEM) }
+    if cur == index { fill_rr(x + 4, y + h - 3, w - 8, 3, 3, COL_ACCENT) }
+    var tc = COL_DIM
+    if cur == index or g_hot == id { tc = COL_TEXT }
+    dtext_c(x, y, w, h, label, tc)
+    return cur
+}
+
+// a collapsing section header: returns the new open/closed state (guard the
+// section's widgets with `if ui_collapsing(...) { ... }`)
+fn ui_collapsing(id: int, label: str, open: bool) -> bool {
+    begin_widget(0, ROWH)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let clicked = press_click(id, x, y, w, h)
+    var o = open
+    if clicked { o = not open }
+    if g_hot == id { fill_rr(x, y, w, h, 8, COL_ITEM) }
+    let mx = x + 10
+    let my = y + h / 2
+    if o { chev_down(mx, my, COL_DIM) } else { chev_right(mx, my, COL_DIM) }
+    dtext_v(x + 24, y, h, label, COL_TEXT)
+    return o
+}
+
+// small chevron glyphs (expanders, dropdowns)
+fn chev_down(x: int, y: int, col: int) {
+    var i = 0
+    while i < 4 {
+        fill(x - 4 + i, y - 1 + i, 2, 2, col)
+        fill(x + 3 - i, y - 1 + i, 2, 2, col)
+        i += 1
+    }
+}
+fn chev_right(x: int, y: int, col: int) {
+    var i = 0
+    while i < 4 {
+        fill(x - 1 + i, y - 4 + i, 2, 2, col)
+        fill(x - 1 + i, y + 3 - i, 2, 2, col)
+        i += 1
+    }
+}
+
+// value read-out helper: "label   value" on one line (dim label, bright value)
+fn ui_kv(label: str, value: str) {
+    begin_widget(0, 19)
+    dtext(g_wx, g_wy + 2, label, COL_DIM)
+    let vw = text_w(value)
+    dtext(g_wx + g_ww - vw, g_wy + 2, value, COL_TEXT)
+}
+
+// ================= IDE-scale primitives =================
+// clipping, split panes, scrollable regions, tree views, colored code text.
+
+// ---- clipping (so scroll regions and panels don't draw outside themselves) ----
+fn ui_clip(x: int, y: int, w: int, h: int) {
+    let r = win("gdi32!CreateRectRgn", x, y, x + w, y + h)
+    let s = win("gdi32!SelectClipRgn", g_mdc, r)
+    let d = win("gdi32!DeleteObject", r)
+}
+fn ui_clip_off() {
+    let s = win("gdi32!SelectClipRgn", g_mdc, 0)
+}
+
+// ---- font selection + colored text runs (for code / rich lines) ----
+fn ui_mono() { let s = win("gdi32!SelectObject", g_mdc, g_fontm) }
+fn ui_ui() { let s = win("gdi32!SelectObject", g_mdc, g_font) }
+// draw a run of text and return its pixel width (advance) -- build colored lines
+fn ui_run(x: int, y: int, s: str, col: int) -> int {
+    dtext(x, y, s, col)
+    return text_w(s)
+}
+
+// ---- absolute-positioned building blocks (for toolbars, tabs, custom chrome) ----
+fn ui_fill(x: int, y: int, w: int, h: int, col: int) { fill(x, y, w, h, col) }
+fn ui_frame(x: int, y: int, w: int, h: int, col: int) { frame(x, y, w, h, col) }
+fn ui_text(x: int, y: int, s: str, col: int) { dtext(x, y, s, col) }
+fn ui_text_c(x: int, y: int, w: int, h: int, s: str, col: int) { dtext_c(x, y, w, h, s, col) }
+// ---- right-aligned toolbar strip: allocate slots right-to-left, no magic offsets ----
+// ActionToolbar analogue: begin at the right edge, then each slot()/sep() reserves
+// space leftward and returns the left-x (or centre-x) to draw at.
+fn ui_strip_begin(right_x: int) { g_strip_x = right_x }
+fn ui_strip_slot(w: int, gap: int) -> int {
+    g_strip_x -= gap
+    g_strip_x -= w
+    return g_strip_x
+}
+fn ui_strip_sep(space: int) -> int {
+    g_strip_x -= space
+    return g_strip_x + space / 2
+}
+fn ui_strip_x() -> int { return g_strip_x }
+// left-to-right variant (mirror): slots advance rightward from a start x.
+fn ui_lstrip_begin(left_x: int) { g_strip_x = left_x }
+fn ui_lstrip_slot(w: int, gap: int) -> int {
+    let x = g_strip_x
+    g_strip_x += w + gap
+    return x
+}
+fn ui_lstrip_sep(space: int) -> int {
+    let x = g_strip_x + space / 2
+    g_strip_x += space
+    return x
+}
+// JetBrains-style text field: rounded fill, accent frame when focused, blinking caret.
+fn ui_field(x: int, y: int, w: int, h: int, text: str, focused: bool) {
+    fill_rr(x, y, w, h, 8, COL_FIELD)
+    var fc = COL_OUTLINE
+    if focused { fc = COL_ACCENT }
+    frame_rr(x, y, w, h, 8, fc)
+    var shown = text
+    if focused and (g_frame / 15) % 2 == 0 { shown = shown + "_" }
+    dtext(x + 8, y + (h - 16) / 2, shown, COL_TEXT)
+}
+// vertical (top-to-bottom) strip for the tool-window rail.
+fn ui_vstrip_begin(top_y: int) { g_strip_y = top_y }
+fn ui_vstrip_slot(h: int, gap: int) -> int {
+    let y = g_strip_y
+    g_strip_y += h + gap
+    return y
+}
+fn ui_abtn(id: int, x: int, y: int, w: int, h: int, label: str) -> bool {
+    let clicked = press_click(id, x, y, w, h)
+    var col = COL_PANEL
+    if g_hot == id { col = COL_ITEM }
+    if g_active == id { col = COL_ACCENT }
+    fill_rr(x, y, w, h, 8, col)
+    if g_active != id { frame_rr(x, y, w, h, 8, COL_OUTLINE) }
+    dtext_c(x, y, w, h, label, COL_TEXT)
+    return clicked
+}
+// a flat (chrome-less) clickable region -- toolbar icons, tab strips
+fn ui_flat(id: int, x: int, y: int, w: int, h: int, glyph: str, hotcol: int) -> bool {
+    let clicked = press_click(id, x, y, w, h)
+    if g_hot == id or g_active == id { fill_rr(x, y, w, h, 10, hotcol) }
+    if glyph.len() > 0 { dtext_c(x, y, w, h, glyph, COL_DIM) }
+    return clicked
+}
+fn hit_abs(x: int, y: int, w: int, h: int) -> bool { return hit(x, y, w, h) }
+
+// ---- split panes (draggable) ----
+fn ui_vsplit(id: int, x: int, y: int, h: int, lo: int, hi: int) -> int {
+    let over = g_mx >= x - 3 and g_mx < x + 4 and g_my >= y and g_my < y + h
+    if over { g_hot = id }
+    var nx = x
+    if g_active == id {
+        nx = g_mx
+        if g_release { g_active = 0 }
+    } else if over and g_press {
+        g_active = id
+    }
+    if nx < lo { nx = lo }
+    if nx > hi { nx = hi }
+    fill(x, y, 1, h, COL_BORDER)
+    if over or g_active == id { fill(x - 1, y, 3, h, COL_ACCENT) }
+    return nx
+}
+fn ui_hsplit(id: int, y: int, x: int, w: int, lo: int, hi: int) -> int {
+    let over = g_my >= y - 3 and g_my < y + 4 and g_mx >= x and g_mx < x + w
+    if over { g_hot = id }
+    var ny = y
+    if g_active == id {
+        ny = g_my
+        if g_release { g_active = 0 }
+    } else if over and g_press {
+        g_active = id
+    }
+    if ny < lo { ny = lo }
+    if ny > hi { ny = hi }
+    fill(x, y, w, 1, COL_BORDER)
+    if over or g_active == id { fill(x, y - 1, w, 3, COL_ACCENT) }
+    return ny
+}
+
+// ---- scrollable region (vertical), with wheel + scrollbar ----
+var g_sc_x = 0
+var g_sc_y = 0
+var g_sc_w = 0
+var g_sc_h = 100000
+var g_sc_ch = 0
+var g_sc_off = 0
+var g_sc_indent = 6
+fn ui_scroll_begin(id: int, x: int, y: int, w: int, h: int, content_h: int, offset: int) -> int {
+    var off = offset
+    if hit(x, y, w, h) { off = off - g_wheelf * 46 }
+    var maxoff = content_h - h
+    if maxoff < 0 { maxoff = 0 }
+    if off > maxoff { off = maxoff }
+    if off < 0 { off = 0 }
+    g_sc_x = x
+    g_sc_y = y
+    g_sc_w = w
+    g_sc_h = h
+    g_sc_ch = content_h
+    g_sc_off = off
+    ui_clip(x, y, w, h)
+    g_content_x = x + g_sc_indent
+    g_content_w = w - g_sc_indent - 12
+    g_cx = g_content_x
+    g_cy = y - off + 4
+    g_row_h = 0
+    g_same = false
+    g_pending = false
+    g_maxy = y
+    return off
+}
+// returns the measured content height, to feed back next frame for a correct thumb
+fn ui_scroll_end() -> int {
+    ui_clip_off()
+    if g_sc_ch > g_sc_h {
+        let tx = g_sc_x + g_sc_w - 8
+        var th = g_sc_h * g_sc_h / g_sc_ch
+        if th < 24 { th = 24 }
+        let ty = g_sc_y + g_sc_off * (g_sc_h - th) / (g_sc_ch - g_sc_h)
+        var tc = rgb(78, 81, 87)
+        if hit(g_sc_x, g_sc_y, g_sc_w, g_sc_h) { tc = rgb(102, 106, 112) }
+        fill_rr(tx, ty, 5, th, 5, tc)
+    }
+    let measured = g_maxy - g_sc_y + g_sc_off + 8
+    g_sc_y = 0
+    g_sc_h = 100000
+    return measured
+}
+
+// ---- tree view (retained expand + selection state) ----
+var g_open: [int] = []
+var g_selected = 0
+fn is_open(id: int) -> bool {
+    for o in g_open {
+        if o == id { return true }
+    }
+    return false
+}
+fn set_open(id: int, v: bool) {
+    var n: [int] = []
+    for o in g_open {
+        if o != id { n.push(o) }
+    }
+    if v { n.push(id) }
+    g_open = n
+}
+fn ui_tree_selected() -> int { return g_selected }
+
+// one tree row. depth = indent level, has_kids draws an expander, iconcol draws a
+// small colour swatch (0 = none). Returns whether the node is open (draw its
+// children when true). Clicking selects; clicking a parent also toggles it.
+// icon kinds for tree rows: encode as ui_icon(kind, colour).
+//   0 = plain swatch, 1 = folder, 2 = file, 3 = database, 4 = table, 5 = dot
+fn ui_icon(kind: int, col: int) -> int { return col + kind * 16777216 }
+// ---- Material icon font (optional) ----
+// Load a Material Icons .ttf privately for this process; afterwards any icon
+// kind >= 256 (in ui_icon / draw_icon / ui_micon) is a Material codepoint
+// drawn as a real font glyph, e.g. 58055 = folder, 59574 = search.
+var g_iconfont = 0
+var g_wbuf = 0                    // 1-wchar UTF-16 buffer for TextOutW
+fn ui_icon_font(path: str, px: int) -> bool {
+    if win("gdi32!AddFontResourceExA", cstr(path), 16, 0) == 0 { return false }   // FR_PRIVATE
+    g_iconfont = win("gdi32!CreateFontA", 0 - px, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, cstrp("Material Icons"))
+    g_wbuf = ualloc(4)
+    return g_iconfont != 0
+}
+fn ui_micon(cp: int, x: int, y: int, col: int) {
+    if g_iconfont == 0 { return }
+    store8(g_wbuf + 0, cp & 255)
+    store8(g_wbuf + 1, (cp >> 8) & 255)
+    let sf = win("gdi32!SelectObject", g_mdc, g_iconfont)
+    let c = win("gdi32!SetTextColor", g_mdc, col)
+    let t = win("gdi32!TextOutW", g_mdc, x, y, g_wbuf, 1)
+    let rf = win("gdi32!SelectObject", g_mdc, g_font)
+}
+
+fn draw_icon(kind: int, col: int, x: int, cy: int) {
+    if kind >= 256 {                                  // Material codepoint
+        ui_micon(kind, x - 1, cy - 8, col)
+        return
+    }
+    if kind == 1 {                                    // folder: tab + body
+        fill_rr(x, cy - 6, 6, 3, 2, col)
+        fill_rr(x, cy - 5, 13, 10, 4, col)
+    } else if kind == 2 {                             // file: page + folded corner
+        fill_rr(x + 1, cy - 6, 11, 13, 3, col)
+        fill(x + 8, cy - 6, 4, 4, COL_PANEL)
+        fill(x + 8, cy - 3, 4, 1, col)
+    } else if kind == 3 {                             // database: cylinder bands
+        fill_rr(x, cy - 6, 13, 13, 7, col)
+        fill(x + 2, cy - 2, 9, 1, COL_PANEL)
+        fill(x + 2, cy + 2, 9, 1, COL_PANEL)
+    } else if kind == 4 {                             // table: grid
+        fill_rr(x, cy - 6, 13, 13, 3, col)
+        fill(x + 1, cy - 2, 11, 1, COL_PANEL)
+        fill(x + 6, cy - 5, 1, 11, COL_PANEL)
+    } else if kind == 5 {                             // status dot
+        fill_rr(x + 3, cy - 3, 7, 7, 7, col)
+    } else {
+        fill_rr(x + 1, cy - 5, 10, 10, 4, col)
+    }
+}
+
+// one tree row. depth = indent level, has_kids draws an expander, icon draws a
+// small icon (0 = none; use ui_icon(kind, colour) for real shapes). Returns
+// whether the node is open (draw its children when true). Clicking selects;
+// clicking a parent also toggles it.
+fn ui_tree_row(id: int, depth: int, label: str, has_kids: bool, iconcol: int) -> bool {
+    begin_widget(0, 24)
+    let x = g_wx
+    let y = g_wy
+    let w = g_ww
+    let h = g_wh
+    let over = hit(g_sc_x, y, g_sc_w, h) and g_my >= g_sc_y and g_my < g_sc_y + g_sc_h
+    if over { g_hot = id }
+    let opn = is_open(id)
+    if over and g_press {
+        g_selected = id
+        if has_kids { set_open(id, not opn) }
+    }
+    // full-width rounded selection / hover, JetBrains-style
+    let rx = g_sc_x + 4
+    let rw = g_sc_w - 8
+    if g_selected == id { fill_rr(rx, y + 1, rw, h - 2, 8, COL_ACTIVE) }
+    else if over { fill_rr(rx, y + 1, rw, h - 2, 8, COL_ITEM) }
+    let ax = x + 6 + depth * 16
+    let cy = y + h / 2
+    if has_kids {
+        if opn { chev_down(ax + 4, cy, COL_DIM) } else { chev_right(ax + 4, cy, COL_DIM) }
+    }
+    let kind = iconcol / 16777216
+    let col = iconcol % 16777216
+    g_row_ix = ax + 22                   // icon centre clears the 10px-wide chevron at ax+4
+    g_row_iy = cy
+    if iconcol != 0 { draw_icon(kind, col, ax + 22, cy) }
+    dtext_v(ax + 40, y, h, label, COL_TEXT)
+    return is_open(id)
+}
+
+// ---- accessors + IDE chrome helpers ----
+fn ui_w() -> int { return g_cw }
+fn ui_h() -> int { return g_ch }
+fn ui_selectb() -> int { return win("gdi32!SelectObject", g_mdc, g_fontb) }
+fn ui_selectn() -> int { return win("gdi32!SelectObject", g_mdc, g_font) }
+// a flat document/tool tab (no border); `active` highlights it
+fn ui_abtn_flat(id: int, x: int, y: int, w: int, h: int, label: str, active: bool) -> bool {
+    let clicked = press_click(id, x, y, w, h)
+    if g_hot == id and not active { fill_rr(x + 2, y + 3, w - 4, h - 6, 8, COL_ITEM) }
+    var tc = COL_DIM
+    if active or g_hot == id { tc = COL_TEXT }
+    dtext_c(x, y, w, h, label, tc)
+    return clicked
+}

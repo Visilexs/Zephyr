@@ -1,0 +1,118 @@
+// Compute dispatch over a storage buffer -- the path the particle sim needs.
+//
+// N particles live in a device storage buffer as vec4 (xy = position,
+// zw = velocity). A compute shader integrates them, we dispatch it several
+// times so state carries across dispatches, then read the buffer back and check
+// the arithmetic against what the CPU says it should be.
+
+import "vk/gfx.zeph"
+
+let N = 1500000                 // 1.5M particles, 24 MB
+let STEPS = 8
+let DT = 0.01
+
+var layers: [str] = []
+for a in args() {
+    if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+var g = Gfx.init("zephyr-compute", layers)
+print("gpu: {g.gpu_name()}")
+
+// ---------------- particle buffer ----------------
+// Host-visible so we can seed and verify it without a staging copy.
+let bytes_needed = N * 16
+var buf = g.buffer(bytes_needed,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+print("storage buffer: {bytes_needed / 1048576} MB for {N} particles")
+
+// seed: particle i starts at the origin with a velocity that varies per index
+var pp = Bytes.new(8)
+vkcheck(vkMapMemory(g.dev, buf.mem, 0, buf.size, 0, pp.addr()), "vkMapMemory")
+let base = pp.get64(0)
+var seed = Bytes.new(16)
+for i in 0..N {
+    let vx = ((i % 7) as float) * 0.01
+    let vy = ((i % 5) as float) * 0.01
+    seed.putf32(0, 0.0)
+    seed.putf32(4, 0.0)
+    seed.putf32(8, vx)
+    seed.putf32(12, vy)
+    for j in 0..16 { store8(base + i * 16 + j, seed.get8(j)) }
+}
+vkUnmapMemory(g.dev, buf.mem)
+print("seeded")
+
+// ---------------- pipeline ----------------
+var bufs: [GpuBuffer] = []
+bufs.push(buf)
+let ds = g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT)
+
+var entry = cbytes("main")
+let shader = g.shader("examples/shaders/particles.comp.spv")
+var setlayouts: [int] = []
+setlayouts.push(ds.layout)
+let layout = g.pipeline_layout(setlayouts, 8, VK_SHADER_STAGE_COMPUTE_BIT)
+let pipeline = g.compute_pipeline(shader, layout, entry)
+print("compute pipeline ok")
+
+// push constants: dt + particle count
+var pc = Bytes.new(8)
+pc.putf32(0, DT)
+pc.put32(4, N)
+
+var sets = u64s([ds.set])
+let groups = (N + 255) / 256
+let pl = layout
+let pipe = pipeline
+let seta = sets.addr()
+let pca = pc.addr()
+
+// ---------------- dispatch STEPS times ----------------
+// A barrier between dispatches: each step reads what the previous one wrote.
+g.immediate(fn(cb: int) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe)
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, seta, 0, 0)
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pca)
+    for s in 0..STEPS {
+        vkCmdDispatch(cb, groups, 1, 1)
+        vkCmdPipelineBarrier(cb,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, 0, 0, 0, 0, 0)
+    }
+})
+print("dispatched {STEPS} steps x {groups} workgroups")
+
+// ---------------- verify against the CPU ----------------
+vkcheck(vkMapMemory(g.dev, buf.mem, 0, buf.size, 0, pp.addr()), "vkMapMemory")
+let rb = pp.get64(0)
+var got = Bytes.new(16)
+var checked = 0
+var bad = 0
+for k in 0..6 {
+    let i = k * 250000                       // sample across the whole buffer
+    for j in 0..16 { got.put8(j, load8(rb + i * 16 + j)) }
+    let vx = ((i % 7) as float) * 0.01
+    let vy = ((i % 5) as float) * 0.01
+    let want_x = vx * DT * (STEPS as float)  // no bounce: stays well inside [-1,1]
+    let want_y = vy * DT * (STEPS as float)
+    let gx = got.getf32(0)
+    let gy = got.getf32(4)
+    if abs(gx - want_x) > 0.0001 or abs(gy - want_y) > 0.0001 {
+        print("  MISMATCH i={i}: got ({gx}, {gy}) want ({want_x}, {want_y})")
+        bad += 1
+    }
+    checked += 1
+}
+vkUnmapMemory(g.dev, buf.mem)
+print("verified {checked} sampled particles, {bad} mismatches")
+assert(bad == 0, "compute results disagree with the CPU")
+
+// ---------------- teardown ----------------
+vkDestroyPipeline(g.dev, pipeline, 0)
+vkDestroyPipelineLayout(g.dev, layout, 0)
+vkDestroyShaderModule(g.dev, shader, 0)
+g.destroy_desc_set(ds)
+g.destroy_buffer(buf)
+g.shutdown()
+print("OK")

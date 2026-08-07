@@ -1,0 +1,516 @@
+// Black hole simulation in pure Zephyr -- CPU splat renderer.
+//
+// 24,000 cosmic-matter particles orbit a central black hole under real
+// inverse-square gravity; gas drag makes the orbits decay, so matter spirals
+// in through an accretion disc and is consumed at the event horizon (and
+// recycled at the rim). Six procedurally generated asteroids -- lumpy unions
+// of overlapping rock-particle discs, each with its own spin -- fall in on
+// decaying orbits until tidal forces at the breakup radius tear them apart,
+// scattering their rocks into the disc.
+//
+// Rendering: matter splats additively into an integer grid, tone-mapped
+// through an ember ramp (dim red rim -> white-hot inner disc); rocks splat
+// into a second grid and come out grey. A precomputed photon ring glows just
+// outside the horizon, the horizon itself is forced to pure black, and a
+// static star field sits behind everything.
+//
+//   zc.exe --rt examples\blackhole.zeph blackhole.exe && .\blackhole.exe
+//   .\blackhole.exe 200      (headless: 200 steps, print a checksum)
+
+let PW = 384
+let PH = 216
+let CELLS = PW * PH
+let DT = 0.016
+
+let CX = (PW / 2) as float       // the singularity
+let CY = (PH / 2) as float
+let GM = 360000.0                // gravitational parameter: v_orbit = sqrt(GM/r)
+let EH = 9.0                     // event horizon radius
+let DRAG = 0.9992                // gas drag => orbital decay => accretion
+let RMAX = 260.0                 // escapees past this are recycled
+
+let NM = 24000                   // cosmic matter pool
+let NA = 6                       // asteroids
+let NR = 130                     // rock particles per asteroid
+let BREAK = 55.0                 // tidal breakup radius (plus size term)
+
+// ---- helpers (same tricks as the other particle demos) ----
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)
+}
+fn fzeros(n: int) -> [float] {
+    var a: [float] = []
+    var i = 0
+    while i < n {
+        a.push(0.0)
+        i += 1
+    }
+    return a
+}
+var seed = 88172645463325252
+fn rnd() -> float {
+    var s = seed
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    seed = s
+    return ((s >> 11) & 16777215) as float / 16777216.0
+}
+fn rdir() -> [float] {
+    var dx = 0.0
+    var dy = 0.0
+    var d = 0.0
+    while d < 0.01 or d > 1.0 {
+        dx = rnd() * 2.0 - 1.0
+        dy = rnd() * 2.0 - 1.0
+        d = dx * dx + dy * dy
+    }
+    let inv = 1.0 / sqrt(d)
+    return [dx * inv, dy * inv]
+}
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+fn clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// ---- cosmic matter ----
+var px = fzeros(NM)
+var py = fzeros(NM)
+var pvx = fzeros(NM)
+var pvy = fzeros(NM)
+
+// drop a particle onto a mildly eccentric orbit somewhere in the disc
+fn spawn_matter(i: int, rlo: float, rhi: float) {
+    let u = rdir()
+    let r = rlo + rnd() * (rhi - rlo)
+    px[i] = CX + u[0] * r
+    py[i] = CY + u[1] * r
+    let v = sqrt(GM / r) * (0.86 + rnd() * 0.26)
+    pvx[i] = (0.0 - u[1]) * v - u[0] * v * 0.06 * rnd()
+    pvy[i] = u[0] * v - u[1] * v * 0.06 * rnd()
+}
+
+// ---- asteroids ----
+var acx = fzeros(NA)             // center of mass
+var acy = fzeros(NA)
+var avx = fzeros(NA)
+var avy = fzeros(NA)
+var arc = fzeros(NA)             // accumulated rotation (unit vector)
+var ars = fzeros(NA)
+var acs = fzeros(NA)             // per-frame spin step (cos/sin)
+var asn = fzeros(NA)
+var asize = fzeros(NA)
+var astate = zeros(NA)           // 0 intact, 1 shattered
+var atimer = fzeros(NA)          // seconds since shatter
+
+var rox = fzeros(NA * NR)        // rock offsets in asteroid frame
+var roy = fzeros(NA * NR)
+var rb = fzeros(NA * NR)         // per-rock albedo
+var rpx = fzeros(NA * NR)        // rock world state, used once shattered
+var rpy = fzeros(NA * NR)
+var rvx = fzeros(NA * NR)
+var rvy = fzeros(NA * NR)
+var rlife = fzeros(NA * NR)
+
+// procedurally generate one asteroid: rocks fill the union of three
+// overlapping discs of random size around random sub-centers, which reads as
+// a lumpy irregular body; then it is dropped on a decaying orbit at the rim.
+fn spawn_asteroid(a: int) {
+    let size = 7.0 + rnd() * 5.0
+    asize[a] = size
+    // three lobes make the lump
+    var lx = fzeros(3)
+    var ly = fzeros(3)
+    var lr = fzeros(3)
+    for l in 0..3 {
+        let u = rdir()
+        lx[l] = u[0] * size * 0.45
+        ly[l] = u[1] * size * 0.45
+        lr[l] = size * (0.5 + rnd() * 0.5)
+    }
+    for j in 0..NR {
+        let k = a * NR + j
+        let l = (rnd() * 2.999) as int
+        var d = 2.0
+        var ox = 0.0
+        var oy = 0.0
+        while d > 1.0 {
+            ox = rnd() * 2.0 - 1.0
+            oy = rnd() * 2.0 - 1.0
+            d = ox * ox + oy * oy
+        }
+        rox[k] = lx[l] + ox * lr[l]
+        roy[k] = ly[l] + oy * lr[l]
+        rb[k] = 90.0 + rnd() * 120.0
+        rlife[k] = 1.0
+    }
+    // orbit: far out, mostly tangential, decaying inward
+    let u = rdir()
+    let r = 175.0 + rnd() * 55.0
+    acx[a] = CX + u[0] * r
+    acy[a] = CY + u[1] * r
+    let v = sqrt(GM / r) * (0.78 + rnd() * 0.14)
+    avx[a] = (0.0 - u[1]) * v
+    avy[a] = u[0] * v
+    arc[a] = 1.0
+    ars[a] = 0.0
+    let w = (rnd() - 0.5) * 0.09          // spin, radians per frame
+    acs[a] = 1.0 - w * w * 0.5            // small-angle cos/sin
+    asn[a] = w
+    astate[a] = 0
+    atimer[a] = 0.0
+}
+
+// tear the asteroid apart: every rock becomes a free particle carrying the
+// orbital velocity plus its spin tangential velocity plus a little debris kick
+fn shatter(a: int) {
+    let rc = arc[a]
+    let rs = ars[a]
+    let w = asn[a] / DT                   // spin rate, rad/s
+    for j in 0..NR {
+        let k = a * NR + j
+        let ox = rc * rox[k] - rs * roy[k]
+        let oy = rs * rox[k] + rc * roy[k]
+        rpx[k] = acx[a] + ox
+        rpy[k] = acy[a] + oy
+        rvx[k] = avx[a] - oy * w + (rnd() - 0.5) * 14.0
+        rvy[k] = avy[a] + ox * w + (rnd() - 0.5) * 14.0
+        rlife[k] = 7.0 + rnd() * 9.0
+    }
+    astate[a] = 1
+    atimer[a] = 0.0
+}
+
+fn step() {
+    // matter: inverse-square pull, gas drag, consumed at the horizon
+    let eh2 = EH * EH
+    let rmax2 = RMAX * RMAX
+    var i = 0
+    while i < NM {
+        let rx = CX - px[i]
+        let ry = CY - py[i]
+        let r2 = rx * rx + ry * ry
+        if r2 < eh2 or r2 > rmax2 {
+            spawn_matter(i, 40.0, 190.0)
+        } else {
+            let f = GM / ((r2 + 30.0) * sqrt(r2 + 30.0))
+            let vx = (pvx[i] + rx * f * DT) * DRAG
+            let vy = (pvy[i] + ry * f * DT) * DRAG
+            px[i] = px[i] + vx * DT
+            py[i] = py[i] + vy * DT
+            pvx[i] = vx
+            pvy[i] = vy
+        }
+        i += 1
+    }
+    // asteroids
+    var a = 0
+    while a < NA {
+        if astate[a] == 0 {
+            let rx = CX - acx[a]
+            let ry = CY - acy[a]
+            let r2 = rx * rx + ry * ry
+            let brk = BREAK + asize[a] * 1.5
+            if r2 < brk * brk {
+                shatter(a)
+            } else {
+                let f = GM / ((r2 + 30.0) * sqrt(r2 + 30.0))
+                avx[a] = (avx[a] + rx * f * DT) * 0.99965
+                avy[a] = (avy[a] + ry * f * DT) * 0.99965
+                acx[a] = acx[a] + avx[a] * DT
+                acy[a] = acy[a] + avy[a] * DT
+                // advance the spin
+                let nc = arc[a] * acs[a] - ars[a] * asn[a]
+                let ns = arc[a] * asn[a] + ars[a] * acs[a]
+                let nn = sqrt(nc * nc + ns * ns)
+                arc[a] = nc / nn
+                ars[a] = ns / nn
+            }
+        } else {
+            // free rocks: same gravity as matter, finite life, eaten at horizon
+            var j = 0
+            while j < NR {
+                let k = a * NR + j
+                if rlife[k] > 0.0 {
+                    let rx = CX - rpx[k]
+                    let ry = CY - rpy[k]
+                    let r2 = rx * rx + ry * ry
+                    if r2 < eh2 or r2 > rmax2 {
+                        rlife[k] = 0.0
+                    } else {
+                        let f = GM / ((r2 + 30.0) * sqrt(r2 + 30.0))
+                        rvx[k] = (rvx[k] + rx * f * DT) * DRAG
+                        rvy[k] = (rvy[k] + ry * f * DT) * DRAG
+                        rpx[k] = rpx[k] + rvx[k] * DT
+                        rpy[k] = rpy[k] + rvy[k] * DT
+                        rlife[k] = rlife[k] - DT
+                    }
+                }
+                j += 1
+            }
+            atimer[a] = atimer[a] + DT
+            if atimer[a] > 16.0 { spawn_asteroid(a) }
+        }
+        a += 1
+    }
+}
+
+// ---- rendering ----
+var acc = zeros(CELLS)           // matter (ember)
+var accr = zeros(CELLS)          // rocks (grey)
+var pixels = mem(CELLS * 4)
+var bmi = mem(40)
+
+// photon ring: precomputed additive glow in an annulus just outside the
+// horizon, plus the list of horizon cells to blacken
+var ringc = zeros(1)
+var ringv = zeros(1)
+var nring = 0
+var holec = zeros(1)
+var nhole = 0
+var starc = zeros(1)
+var starv = zeros(1)
+let NSTAR = 150
+
+fn precompute() {
+    ringc = zeros(9000)
+    ringv = zeros(9000)
+    holec = zeros(2000)
+    var yy = 0
+    while yy < PH {
+        var xx = 0
+        while xx < PW {
+            let dx = (xx as float) - CX
+            let dy = (yy as float) - CY
+            let d = sqrt(dx * dx + dy * dy)
+            if d < EH {
+                holec[nhole] = yy * PW + xx
+                nhole += 1
+            } else if d < EH + 14.0 {
+                // sharp inner edge, soft falloff outward
+                let t = (d - EH) / 14.0
+                let g = ((1.0 - t) * (1.0 - t) * 170.0) as int
+                if g > 2 {
+                    ringc[nring] = yy * PW + xx
+                    ringv[nring] = g
+                    nring += 1
+                }
+            }
+            xx += 1
+        }
+        yy += 1
+    }
+    starc = zeros(NSTAR)
+    starv = zeros(NSTAR)
+    for s in 0..NSTAR {
+        starc[s] = (rnd() * ((CELLS - 1) as float)) as int
+        starv[s] = 25 + (rnd() * 90.0) as int
+    }
+}
+
+fn splat() {
+    var k = 0
+    while k < CELLS {
+        acc[k] = 0
+        accr[k] = 0
+        k += 1
+    }
+    // photon ring
+    var q = 0
+    while q < nring {
+        acc[ringc[q]] += ringv[q]
+        q += 1
+    }
+    // matter, brightness by speed: slow rim matter dim red, fast inner white
+    var i = 0
+    while i < NM {
+        let xi = px[i] as int
+        let yi = py[i] as int
+        if xi >= 1 and xi < PW - 1 and yi >= 1 and yi < PH - 1 {
+            let spd = sqrt(pvx[i] * pvx[i] + pvy[i] * pvy[i])
+            let b = clampi((spd * 0.55) as int, 6, 255)
+            let c = yi * PW + xi
+            acc[c] += b
+            let h = b / 3
+            acc[c - 1] += h
+            acc[c + 1] += h
+            acc[c - PW] += h
+            acc[c + PW] += h
+        }
+        i += 1
+    }
+    // rocks
+    var a = 0
+    while a < NA {
+        if astate[a] == 0 {
+            let rc = arc[a]
+            let rs = ars[a]
+            for j in 0..NR {
+                let k2 = a * NR + j
+                let xi = (acx[a] + rc * rox[k2] - rs * roy[k2]) as int
+                let yi = (acy[a] + rs * rox[k2] + rc * roy[k2]) as int
+                if xi >= 0 and xi < PW and yi >= 0 and yi < PH {
+                    accr[yi * PW + xi] += rb[k2] as int
+                }
+            }
+        } else {
+            for j in 0..NR {
+                let k2 = a * NR + j
+                if rlife[k2] > 0.0 {
+                    let xi = rpx[k2] as int
+                    let yi = rpy[k2] as int
+                    if xi >= 0 and xi < PW and yi >= 0 and yi < PH {
+                        var b = rb[k2]
+                        if rlife[k2] < 2.0 { b = b * rlife[k2] * 0.5 }
+                        accr[yi * PW + xi] += b as int
+                    }
+                }
+            }
+        }
+        a += 1
+    }
+}
+
+fn render() {
+    var k = 0
+    while k < CELLS {
+        let v = acc[k]
+        let g2 = clampi(accr[k], 0, 255)
+        let r = clampi(v * 3 + g2, 0, 255)
+        let g = clampi((v - 60) * 2 + g2 * 43 / 50, 0, 255)
+        let b = clampi((v - 170) * 3 + g2 * 7 / 10, 0, 255)
+        store32(pixels + k * 4, r * 65536 | g * 256 | b)
+        k += 1
+    }
+    // stars behind everything: only where the frame is still black
+    var s = 0
+    while s < NSTAR {
+        let c = starc[s]
+        if acc[c] == 0 and accr[c] == 0 {
+            let w = starv[s]
+            store32(pixels + c * 4, w * 65536 | w * 256 | w)
+        }
+        s += 1
+    }
+    // the event horizon eats light
+    var h = 0
+    while h < nhole {
+        store32(pixels + holec[h] * 4, 0)
+        h += 1
+    }
+}
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    splat()
+    render()
+    let sm = win("gdi32!SetStretchBltMode", hdc, 3)
+    let bb = win("gdi32!StretchDIBits", hdc, 0, 0, cw, ch, 0, 0, PW, PH, pixels, bmi, 0, 13369376)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+var f_last = 0
+var f_count = 0
+fn fps_tick() {
+    f_count += 1
+    if f_count >= 60 {
+        let now = win("GetTickCount")
+        let ms = now - f_last
+        if f_last != 0 and ms > 0 { print("{NM + NA * NR} particles, {60000 / ms} fps") }
+        f_last = now
+        f_count = 0
+    }
+}
+
+// ---- init ----
+store32(bmi + 0, 40)
+store32(bmi + 4, PW)
+store32(bmi + 8, 0 - PH)
+store32(bmi + 12, 1 | 32 * 65536)
+store32(bmi + 16, 0)
+
+precompute()
+for i in 0..NM { spawn_matter(i, 25.0, 210.0) }
+for a in 0..NA { spawn_asteroid(a) }
+// stagger the asteroids so they don't all shatter in the same minute
+for a in 0..NA {
+    let r = 120.0 + (a as float) * 22.0
+    let u = rdir()
+    acx[a] = CX + u[0] * r
+    acy[a] = CY + u[1] * r
+    let v = sqrt(GM / r) * (0.8 + rnd() * 0.12)
+    avx[a] = (0.0 - u[1]) * v
+    avy[a] = u[0] * v
+}
+
+var steps = 0
+if args().len() > 1 { steps = args()[1] as int }
+
+if steps > 0 {
+    var s = 0
+    while s < steps {
+        step()
+        s += 1
+    }
+    splat()
+    var chk = 0
+    var k = 0
+    while k < CELLS {
+        chk += acc[k] * k + accr[k] * k * 3
+        k += 1
+    }
+    print(chk)
+} else {
+    let hInst = win("GetModuleHandleA", 0)
+    let clsname = cstr("zephyrBlackHoleWindow")
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+
+    let wc = mem(72)
+    store32(wc + 0, 3)
+    store64(wc + 8, defwp)
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))
+    store64(wc + 48, 0)
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - black hole"),
+        282001408, 80, 60, 1170, 700, 0, 0, hInst, 0)
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let uw = win("user32!UpdateWindow", hwnd)
+
+    let msg = mem(48)
+    var running = 1
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            step()
+            draw(hwnd)
+            fps_tick()
+        }
+    }
+}

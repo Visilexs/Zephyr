@@ -1,0 +1,908 @@
+// A thin Vulkan convenience layer.
+//
+// It deletes repetition, not decisions: instance/device bring-up, memory-type
+// selection, and the begin/submit/wait dance are identical every time, so they
+// live here. Pipeline construction is NOT wrapped -- VkGraphicsPipelineCreateInfo's
+// verbosity is load-bearing, and samples/triangle.zeph is the worked reference.
+//
+// Handles are plain ints and public by design: drop to vk/raw.zeph whenever the
+// wrapper is in the way.
+
+import "std/bytes.zeph"
+import "vk/raw.zeph"
+import "vk/structs.zeph"
+import "vk/win.zeph"
+
+struct Gfx {
+    instance: int,
+    phys: int,
+    dev: int,
+    queue: int,
+    qfam: int,
+    cmdpool: int,
+    memprops: Bytes,       // cached VkPhysicalDeviceMemoryProperties
+    surface: int           // 0 when headless
+}
+
+// One frame's worth of reusable per-frame state. Keeping several of these in
+// rotation is what lets the CPU record frame N+1 while the GPU still works on
+// frame N.
+struct Frame {
+    cb: int,               // command buffer, reset and re-recorded each use
+    acquired: int,         // semaphore: image ready to render into
+    fence: int             // signalled when this frame's submission completes
+}
+
+// A presentable swapchain plus the per-image views and framebuffers.
+struct Swapchain {
+    handle: int,
+    format: int,
+    w: int,
+    h: int,
+    images: [int],
+    views: [int],
+    fbs: [int],
+    frames: [Frame],
+    img_fence: [int],      // fence of the frame last using each image (0 = none)
+    // Render-finished semaphores are per IMAGE, not per frame. A present
+    // operation keeps waiting on its semaphore after the submit fence has
+    // signalled, so reusing a frame's semaphore two frames later can signal one
+    // the presentation engine is still using (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+    // Keying them to the image means a semaphore is only reused once that image
+    // comes back from acquire, which implies its present completed.
+    img_sem: [int],
+    cur: int,              // which Frame to use next
+    // Optional depth attachment, one PER SWAPCHAIN IMAGE. A single shared depth
+    // image would be a real hazard: with FRAMES_IN_FLIGHT > 1 the next frame
+    // starts writing depth while the previous one is still using it, and nothing
+    // orders those two submissions. Keyed to the image, the img_fence wait
+    // already guarantees exclusive use. Empty lists when depth is off.
+    depth_format: int,
+    depth_imgs: [int],
+    depth_mems: [int],
+    depth_views: [int]
+}
+
+let FRAMES_IN_FLIGHT = 2
+
+struct GpuBuffer { buf: int, mem: int, size: int }
+
+// an offscreen colour target: image + view + framebuffer
+struct Target { image: int, mem: int, view: int, fb: int, w: int, h: int }
+
+impl Gfx {
+    fn init(appname: str, layers: [str]) -> Gfx {
+        return Gfx.make(appname, layers, 0, 0)
+    }
+
+    // Same, but able to present into a window: enables the surface/swapchain
+    // extensions and requires the chosen queue family to support presentation.
+    fn init_windowed(appname: str, layers: [str], wnd: Window) -> Gfx {
+        return Gfx.make(appname, layers, wnd.hwnd, wnd.hinst)
+    }
+
+    fn make(appname: str, layers: [str], hwnd: int, hinst: int) -> Gfx {
+        let windowed = hwnd != 0
+        var nameb = cbytes(appname)
+        var app = Bytes.new(VkApplicationInfo_sizeof)
+        app.put32(VkApplicationInfo_sType, VK_STRUCTURE_TYPE_APPLICATION_INFO)
+        app.put64(VkApplicationInfo_pApplicationName, nameb.addr())
+        app.put64(VkApplicationInfo_pEngineName, nameb.addr())
+        app.put32(VkApplicationInfo_apiVersion, VK_API_VERSION_1_0)
+
+        // layer names: an array of char* that must outlive vkCreateInstance
+        var lnames = Bytes.new(8 * (layers.len() + 1))
+        var lbufs: [Bytes] = []
+        for i in 0..layers.len() {
+            var lb = cbytes(layers[i])
+            lbufs.push(lb)
+            lnames.put64(i * 8, lb.addr())
+        }
+
+        // instance extensions: presenting needs the surface pair
+        var exts: [str] = []
+        if windowed {
+            exts.push("VK_KHR_surface")
+            exts.push("VK_KHR_win32_surface")
+        }
+        var enames = Bytes.new(8 * (exts.len() + 1))
+        var ebufs: [Bytes] = []
+        for i in 0..exts.len() {
+            var eb = cbytes(exts[i])
+            ebufs.push(eb)
+            enames.put64(i * 8, eb.addr())
+        }
+
+        var ici = Bytes.new(VkInstanceCreateInfo_sizeof)
+        ici.put32(VkInstanceCreateInfo_sType, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
+        ici.put64(VkInstanceCreateInfo_pApplicationInfo, app.addr())
+        ici.put32(VkInstanceCreateInfo_enabledLayerCount, layers.len())
+        if layers.len() > 0 { ici.put64(VkInstanceCreateInfo_ppEnabledLayerNames, lnames.addr()) }
+        ici.put32(VkInstanceCreateInfo_enabledExtensionCount, exts.len())
+        if exts.len() > 0 { ici.put64(VkInstanceCreateInfo_ppEnabledExtensionNames, enames.addr()) }
+
+        var pinst = Bytes.new(8)
+        vkcheck(vkCreateInstance(ici.addr(), 0, pinst.addr()), "vkCreateInstance")
+        let instance = pinst.get64(0)
+
+        // the surface must exist before device selection so we can require
+        // presentation support on the queue family we pick
+        var surface = 0
+        if windowed {
+            var sci = Bytes.new(VkWin32SurfaceCreateInfoKHR_sizeof)
+            sci.put32(VkWin32SurfaceCreateInfoKHR_sType, VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR)
+            sci.put64(VkWin32SurfaceCreateInfoKHR_hinstance, hinst)
+            sci.put64(VkWin32SurfaceCreateInfoKHR_hwnd, hwnd)
+            var ps = Bytes.new(8)
+            vkcheck(vkCreateWin32SurfaceKHR(instance, sci.addr(), 0, ps.addr()), "vkCreateWin32SurfaceKHR")
+            surface = ps.get64(0)
+        }
+
+        // pick a physical device: prefer a discrete GPU
+        var pcount = Bytes.new(8)
+        vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), 0), "vkEnumeratePhysicalDevices")
+        let ndev = pcount.get32(0)
+        if ndev == 0 { panic("no Vulkan physical devices") }
+        var devs = Bytes.new(8 * ndev)
+        vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), devs.addr()), "vkEnumeratePhysicalDevices")
+        var phys = devs.get64(0)
+        var props = Bytes.new(VkPhysicalDeviceProperties_sizeof)
+        for i in 0..ndev {
+            let d = devs.get64(i * 8)
+            vkGetPhysicalDeviceProperties(d, props.addr())
+            if props.get32(VkPhysicalDeviceProperties_deviceType) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
+                phys = d
+            }
+        }
+
+        // a queue family that can do graphics
+        var qcount = Bytes.new(8)
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), 0)
+        let nq = qcount.get32(0)
+        var qprops = Bytes.new(VkQueueFamilyProperties_sizeof * nq)
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), qprops.addr())
+        var qfam = 0 - 1
+        var psup = Bytes.new(8)
+        for i in 0..nq {
+            let f = qprops.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
+            if qfam < 0 and (f & VK_QUEUE_GRAPHICS_BIT) != 0 {
+                if windowed {
+                    vkcheck(vkGetPhysicalDeviceSurfaceSupportKHR(phys, i, surface, psup.addr()),
+                            "vkGetPhysicalDeviceSurfaceSupportKHR")
+                    if psup.get32(0) != 0 { qfam = i }
+                } else {
+                    qfam = i
+                }
+            }
+        }
+        if qfam < 0 { panic("no graphics queue family that can present") }
+
+        var prio = Bytes.new(4)
+        prio.putf32(0, 1.0)
+        var qci = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
+        qci.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+        qci.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, qfam)
+        qci.put32(VkDeviceQueueCreateInfo_queueCount, 1)
+        qci.put64(VkDeviceQueueCreateInfo_pQueuePriorities, prio.addr())
+
+        var dexts: [str] = []
+        if windowed { dexts.push("VK_KHR_swapchain") }
+        var dnames = Bytes.new(8 * (dexts.len() + 1))
+        var dbufs: [Bytes] = []
+        for i in 0..dexts.len() {
+            var db = cbytes(dexts[i])
+            dbufs.push(db)
+            dnames.put64(i * 8, db.addr())
+        }
+
+        var dci = Bytes.new(VkDeviceCreateInfo_sizeof)
+        dci.put32(VkDeviceCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+        dci.put32(VkDeviceCreateInfo_queueCreateInfoCount, 1)
+        dci.put64(VkDeviceCreateInfo_pQueueCreateInfos, qci.addr())
+        dci.put32(VkDeviceCreateInfo_enabledExtensionCount, dexts.len())
+        if dexts.len() > 0 { dci.put64(VkDeviceCreateInfo_ppEnabledExtensionNames, dnames.addr()) }
+        var pdev = Bytes.new(8)
+        vkcheck(vkCreateDevice(phys, dci.addr(), 0, pdev.addr()), "vkCreateDevice")
+        let dev = pdev.get64(0)
+
+        var pq = Bytes.new(8)
+        vkGetDeviceQueue(dev, qfam, 0, pq.addr())
+
+        var cpci = Bytes.new(VkCommandPoolCreateInfo_sizeof)
+        cpci.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+        cpci.put32(VkCommandPoolCreateInfo_flags, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
+        cpci.put32(VkCommandPoolCreateInfo_queueFamilyIndex, qfam)
+        var pool = Bytes.new(8)
+        vkcheck(vkCreateCommandPool(dev, cpci.addr(), 0, pool.addr()), "vkCreateCommandPool")
+
+        var mp = Bytes.new(VkPhysicalDeviceMemoryProperties_sizeof)
+        vkGetPhysicalDeviceMemoryProperties(phys, mp.addr())
+
+        return Gfx{instance: instance, phys: phys, dev: dev, queue: pq.get64(0),
+                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface}
+    }
+
+    fn shutdown(self) {
+        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
+        vkDestroyCommandPool(self.dev, self.cmdpool, 0)
+        vkDestroyDevice(self.dev, 0)
+        if self.surface != 0 { vkDestroySurfaceKHR(self.instance, self.surface, 0) }
+        vkDestroyInstance(self.instance, 0)
+    }
+
+    fn gpu_name(self) -> str {
+        var props = Bytes.new(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.phys, props.addr())
+        var out: [str] = []
+        var i = 0
+        var going = true
+        while going and i < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE {
+            let c = props.get8(VkPhysicalDeviceProperties_deviceName + i)
+            if c == 0 { going = false }
+            else { out.push(chr(c)) }
+            i += 1
+        }
+        return out.join()
+    }
+
+    // The one genuinely intricate helper: pick a memory type satisfying both the
+    // resource's allowed-type bitmask and the properties we need. Everyone gets
+    // this wrong in raw Vulkan the first time.
+    fn find_mem_type(self, bits: int, flags: int) -> int {
+        let n = self.memprops.get32(VkPhysicalDeviceMemoryProperties_memoryTypeCount)
+        for i in 0..n {
+            let off = VkPhysicalDeviceMemoryProperties_memoryTypes + i * VkMemoryType_sizeof
+            let pf = self.memprops.get32(off + VkMemoryType_propertyFlags)
+            if (bits & (1 << i)) != 0 and (pf & flags) == flags { return i }
+        }
+        panic("no memory type with flags {flags} in mask {bits}")
+        return 0
+    }
+
+    fn alloc(self, size: int, typebits: int, flags: int) -> int {
+        var mai = Bytes.new(VkMemoryAllocateInfo_sizeof)
+        mai.put32(VkMemoryAllocateInfo_sType, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+        mai.put64(VkMemoryAllocateInfo_allocationSize, size)
+        mai.put32(VkMemoryAllocateInfo_memoryTypeIndex, self.find_mem_type(typebits, flags))
+        var pm = Bytes.new(8)
+        vkcheck(vkAllocateMemory(self.dev, mai.addr(), 0, pm.addr()), "vkAllocateMemory")
+        return pm.get64(0)
+    }
+
+    fn buffer(self, size: int, usage: int, memflags: int) -> GpuBuffer {
+        var bci = Bytes.new(VkBufferCreateInfo_sizeof)
+        bci.put32(VkBufferCreateInfo_sType, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+        bci.put64(VkBufferCreateInfo_size, size)
+        bci.put32(VkBufferCreateInfo_usage, usage)
+        bci.put32(VkBufferCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        var pb = Bytes.new(8)
+        vkcheck(vkCreateBuffer(self.dev, bci.addr(), 0, pb.addr()), "vkCreateBuffer")
+        let buf = pb.get64(0)
+
+        var req = Bytes.new(VkMemoryRequirements_sizeof)
+        vkGetBufferMemoryRequirements(self.dev, buf, req.addr())
+        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
+                             req.get32(VkMemoryRequirements_memoryTypeBits), memflags)
+        vkcheck(vkBindBufferMemory(self.dev, buf, mem, 0), "vkBindBufferMemory")
+        return GpuBuffer{buf: buf, mem: mem, size: size}
+    }
+
+    fn destroy_buffer(self, b: GpuBuffer) {
+        vkDestroyBuffer(self.dev, b.buf, 0)
+        vkFreeMemory(self.dev, b.mem, 0)
+    }
+
+    // read a mapped host-visible buffer back into a Bytes
+    fn read_buffer(self, b: GpuBuffer, n: int) -> Bytes {
+        var pp = Bytes.new(8)
+        vkcheck(vkMapMemory(self.dev, b.mem, 0, b.size, 0, pp.addr()), "vkMapMemory")
+        let src = pp.get64(0)
+        var out = Bytes.new(n)
+        for i in 0..n { out.put8(i, load8(src + i)) }
+        vkUnmapMemory(self.dev, b.mem)
+        return out
+    }
+
+    fn shader(self, path: str) -> int {
+        let spv = read_file(path)
+        if spv.len() == 0 { panic("empty or missing shader: {path}") }
+        if spv.len() % 4 != 0 { panic("SPIR-V size not a multiple of 4: {path}") }
+        // pCode must be 4-byte aligned -- Bytes is 16-aligned, so copying in is enough
+        var code = Bytes.new(spv.len())
+        code.put_str(0, spv)
+        var smci = Bytes.new(VkShaderModuleCreateInfo_sizeof)
+        smci.put32(VkShaderModuleCreateInfo_sType, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+        smci.put64(VkShaderModuleCreateInfo_codeSize, spv.len())
+        smci.put64(VkShaderModuleCreateInfo_pCode, code.addr())
+        var pm = Bytes.new(8)
+        vkcheck(vkCreateShaderModule(self.dev, smci.addr(), 0, pm.addr()), "vkCreateShaderModule")
+        return pm.get64(0)
+    }
+
+    // an offscreen RGBA8 colour target, ready to render into and copy out of
+    fn target(self, w: int, h: int, renderpass: int) -> Target {
+        var ici = Bytes.new(VkImageCreateInfo_sizeof)
+        ici.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+        ici.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
+        ici.put32(VkImageCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_width, w)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_height, h)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
+        ici.put32(VkImageCreateInfo_mipLevels, 1)
+        ici.put32(VkImageCreateInfo_arrayLayers, 1)
+        ici.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
+        ici.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
+        ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+        var pi = Bytes.new(8)
+        vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage")
+        let image = pi.get64(0)
+
+        var req = Bytes.new(VkMemoryRequirements_sizeof)
+        vkGetImageMemoryRequirements(self.dev, image, req.addr())
+        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
+                             req.get32(VkMemoryRequirements_memoryTypeBits),
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory")
+
+        var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
+        vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+        vci.put64(VkImageViewCreateInfo_image, image)
+        vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+        vci.put32(VkImageViewCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
+        let sr = VkImageViewCreateInfo_subresourceRange
+        vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
+        vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
+        var pv = Bytes.new(8)
+        vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
+        let view = pv.get64(0)
+
+        var att = Bytes.new(8)
+        att.put64(0, view)
+        var fci = Bytes.new(VkFramebufferCreateInfo_sizeof)
+        fci.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+        fci.put64(VkFramebufferCreateInfo_renderPass, renderpass)
+        fci.put32(VkFramebufferCreateInfo_attachmentCount, 1)
+        fci.put64(VkFramebufferCreateInfo_pAttachments, att.addr())
+        fci.put32(VkFramebufferCreateInfo_width, w)
+        fci.put32(VkFramebufferCreateInfo_height, h)
+        fci.put32(VkFramebufferCreateInfo_layers, 1)
+        var pf = Bytes.new(8)
+        vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
+
+        return Target{image: image, mem: mem, view: view, fb: pf.get64(0), w: w, h: h}
+    }
+
+    fn destroy_target(self, t: Target) {
+        vkDestroyFramebuffer(self.dev, t.fb, 0)
+        vkDestroyImageView(self.dev, t.view, 0)
+        vkDestroyImage(self.dev, t.image, 0)
+        vkFreeMemory(self.dev, t.mem, 0)
+    }
+
+    // Allocate a command buffer, begin it, let `rec` record into it, then end,
+    // submit and wait. The begin/submit/wait is identical every time; what gets
+    // recorded never is -- so only that part is a parameter.
+    fn immediate(self, rec: fn(int)) {
+        var cbai = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
+        cbai.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+        cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
+        cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+        cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
+        var pcb = Bytes.new(8)
+        vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
+        let cb = pcb.get64(0)
+
+        var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
+        bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+        bi.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+        vkcheck(vkBeginCommandBuffer(cb, bi.addr()), "vkBeginCommandBuffer")
+        rec(cb)
+        vkcheck(vkEndCommandBuffer(cb), "vkEndCommandBuffer")
+
+        var pcbs = Bytes.new(8)
+        pcbs.put64(0, cb)
+        var si = Bytes.new(VkSubmitInfo_sizeof)
+        si.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
+        si.put32(VkSubmitInfo_commandBufferCount, 1)
+        si.put64(VkSubmitInfo_pCommandBuffers, pcbs.addr())
+
+        var fci = Bytes.new(VkFenceCreateInfo_sizeof)
+        fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+        var pfence = Bytes.new(8)
+        vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pfence.addr()), "vkCreateFence")
+        let fence = pfence.get64(0)
+
+        vkcheck(vkQueueSubmit(self.queue, 1, si.addr(), fence), "vkQueueSubmit")
+        // 5 second timeout in nanoseconds
+        vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+
+        vkDestroyFence(self.dev, fence, 0)
+        vkFreeCommandBuffers(self.dev, self.cmdpool, 1, pcbs.addr())
+    }
+
+    // copy a rendered target into a host-visible buffer and read it back as RGBA8
+    fn readback(self, t: Target) -> Bytes {
+        let n = t.w * t.h * 4
+        var dst = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        var region = Bytes.new(VkBufferImageCopy_sizeof)
+        let isr = VkBufferImageCopy_imageSubresource
+        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, t.w)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, t.h)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, 1)
+
+        let img = t.image
+        let ra = region.addr()
+        let db = dst.buf
+        self.immediate(fn(cb: int) {
+            vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, db, 1, ra)
+        })
+        var px = self.read_buffer(dst, n)
+        self.destroy_buffer(dst)
+        return px
+    }
+}
+
+// ---- swapchain ----
+impl Gfx {
+    // Pick the surface format: prefer plain BGRA8 UNORM so the colours we write
+    // land on screen unchanged (an _SRGB swapchain would re-encode them).
+    fn surface_format(self) -> int {
+        var pc = Bytes.new(8)
+        vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), 0),
+                "vkGetPhysicalDeviceSurfaceFormatsKHR")
+        let n = pc.get32(0)
+        if n == 0 { panic("surface reports no formats") }
+        var fmts = Bytes.new(VkSurfaceFormatKHR_sizeof * n)
+        vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), fmts.addr()),
+                "vkGetPhysicalDeviceSurfaceFormatsKHR")
+        var chosen = fmts.get32(VkSurfaceFormatKHR_format)
+        for i in 0..n {
+            let f = fmts.get32(i * VkSurfaceFormatKHR_sizeof + VkSurfaceFormatKHR_format)
+            if f == VK_FORMAT_B8G8R8A8_UNORM { chosen = f }
+        }
+        return chosen
+    }
+
+    fn swapchain(self, format: int, renderpass: int, old: int) -> Swapchain {
+        return self.swapchain_depth(format, renderpass, old, 0)
+    }
+
+    // A depth-only image sized to the swapchain, for use as a depth attachment.
+    fn depth_image(self, w: int, h: int, format: int) -> [int] {
+        var ici = Bytes.new(VkImageCreateInfo_sizeof)
+        ici.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+        ici.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
+        ici.put32(VkImageCreateInfo_format, format)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_width, w)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_height, h)
+        ici.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
+        ici.put32(VkImageCreateInfo_mipLevels, 1)
+        ici.put32(VkImageCreateInfo_arrayLayers, 1)
+        ici.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
+        ici.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
+        ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+        ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+        var pi = Bytes.new(8)
+        vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage (depth)")
+        let image = pi.get64(0)
+
+        var req = Bytes.new(VkMemoryRequirements_sizeof)
+        vkGetImageMemoryRequirements(self.dev, image, req.addr())
+        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
+                             req.get32(VkMemoryRequirements_memoryTypeBits),
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory (depth)")
+
+        var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
+        vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+        vci.put64(VkImageViewCreateInfo_image, image)
+        vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+        vci.put32(VkImageViewCreateInfo_format, format)
+        let sr = VkImageViewCreateInfo_subresourceRange
+        vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_DEPTH_BIT)
+        vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
+        vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
+        var pv = Bytes.new(8)
+        vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView (depth)")
+
+        var out: [int] = []
+        out.push(image)
+        out.push(mem)
+        out.push(pv.get64(0))
+        return out
+    }
+
+    // As swapchain(), but each framebuffer also gets a depth attachment in slot
+    // 1. `depth_format` of 0 means no depth, which is what swapchain() passes.
+    // The render pass must agree: attachment 0 colour, attachment 1 depth.
+    fn swapchain_depth(self, format: int, renderpass: int, old: int, depth_format: int) -> Swapchain {
+        var caps = Bytes.new(VkSurfaceCapabilitiesKHR_sizeof)
+        vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+        let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
+        let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        var want = caps.get32(VkSurfaceCapabilitiesKHR_minImageCount) + 1
+        let maxi = caps.get32(VkSurfaceCapabilitiesKHR_maxImageCount)
+        if maxi > 0 and want > maxi { want = maxi }
+
+        var sci = Bytes.new(VkSwapchainCreateInfoKHR_sizeof)
+        sci.put32(VkSwapchainCreateInfoKHR_sType, VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR)
+        sci.put64(VkSwapchainCreateInfoKHR_surface, self.surface)
+        sci.put32(VkSwapchainCreateInfoKHR_minImageCount, want)
+        sci.put32(VkSwapchainCreateInfoKHR_imageFormat, format)
+        sci.put32(VkSwapchainCreateInfoKHR_imageColorSpace, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_width, w)
+        sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_height, h)
+        sci.put32(VkSwapchainCreateInfoKHR_imageArrayLayers, 1)
+        sci.put32(VkSwapchainCreateInfoKHR_imageUsage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        sci.put32(VkSwapchainCreateInfoKHR_imageSharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        sci.put32(VkSwapchainCreateInfoKHR_preTransform, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        sci.put32(VkSwapchainCreateInfoKHR_compositeAlpha, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+        sci.put32(VkSwapchainCreateInfoKHR_presentMode, VK_PRESENT_MODE_FIFO_KHR)   // vsync
+        sci.put32(VkSwapchainCreateInfoKHR_clipped, VK_TRUE)
+        sci.put64(VkSwapchainCreateInfoKHR_oldSwapchain, old)
+
+        var psc = Bytes.new(8)
+        vkcheck(vkCreateSwapchainKHR(self.dev, sci.addr(), 0, psc.addr()), "vkCreateSwapchainKHR")
+        let handle = psc.get64(0)
+
+        var pn = Bytes.new(8)
+        vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), 0), "vkGetSwapchainImagesKHR")
+        let n = pn.get32(0)
+        var imgbuf = Bytes.new(8 * n)
+        vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), imgbuf.addr()), "vkGetSwapchainImagesKHR")
+
+        var images: [int] = []
+        var views: [int] = []
+        var fbs: [int] = []
+        var depth_imgs: [int] = []
+        var depth_mems: [int] = []
+        var depth_views: [int] = []
+        for i in 0..n {
+            let img = imgbuf.get64(i * 8)
+            images.push(img)
+
+            var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
+            vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+            vci.put64(VkImageViewCreateInfo_image, img)
+            vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+            vci.put32(VkImageViewCreateInfo_format, format)
+            let sr = VkImageViewCreateInfo_subresourceRange
+            vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+            vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
+            vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
+            var pv = Bytes.new(8)
+            vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
+            let view = pv.get64(0)
+            views.push(view)
+
+            var nattach = 1
+            var att = Bytes.new(16)
+            att.put64(0, view)
+            if depth_format != 0 {
+                let d = self.depth_image(w, h, depth_format)
+                depth_imgs.push(d[0])
+                depth_mems.push(d[1])
+                depth_views.push(d[2])
+                att.put64(8, d[2])
+                nattach = 2
+            }
+            var fci = Bytes.new(VkFramebufferCreateInfo_sizeof)
+            fci.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+            fci.put64(VkFramebufferCreateInfo_renderPass, renderpass)
+            fci.put32(VkFramebufferCreateInfo_attachmentCount, nattach)
+            fci.put64(VkFramebufferCreateInfo_pAttachments, att.addr())
+            fci.put32(VkFramebufferCreateInfo_width, w)
+            fci.put32(VkFramebufferCreateInfo_height, h)
+            fci.put32(VkFramebufferCreateInfo_layers, 1)
+            var pf = Bytes.new(8)
+            vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
+            fbs.push(pf.get64(0))
+        }
+
+        // per-frame command buffers, semaphores and fences
+        var frames: [Frame] = []
+        for i in 0..FRAMES_IN_FLIGHT {
+            var cbai = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
+            cbai.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+            cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
+            cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+            cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
+            var pcb = Bytes.new(8)
+            vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
+            // created signalled so the first wait on it returns immediately
+            frames.push(Frame{cb: pcb.get64(0), acquired: self.semaphore(),
+                              fence: self.fence(true)})
+        }
+        var img_fence: [int] = []
+        var img_sem: [int] = []
+        for i in 0..n {
+            img_fence.push(0)
+            img_sem.push(self.semaphore())
+        }
+
+        return Swapchain{handle: handle, format: format, w: w, h: h,
+                         images: images, views: views, fbs: fbs,
+                         frames: frames, img_fence: img_fence, img_sem: img_sem, cur: 0,
+                         depth_format: depth_format, depth_imgs: depth_imgs,
+                         depth_mems: depth_mems, depth_views: depth_views}
+    }
+
+    fn fence(self, signalled: bool) -> int {
+        var fci = Bytes.new(VkFenceCreateInfo_sizeof)
+        fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+        if signalled { fci.put32(VkFenceCreateInfo_flags, VK_FENCE_CREATE_SIGNALED_BIT) }
+        var pf = Bytes.new(8)
+        vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFence")
+        return pf.get64(0)
+    }
+
+    fn semaphore(self) -> int {
+        var sci = Bytes.new(VkSemaphoreCreateInfo_sizeof)
+        sci.put32(VkSemaphoreCreateInfo_sType, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+        var ps = Bytes.new(8)
+        vkcheck(vkCreateSemaphore(self.dev, sci.addr(), 0, ps.addr()), "vkCreateSemaphore")
+        return ps.get64(0)
+    }
+
+    fn destroy_swapchain(self, s: Swapchain) {
+        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
+        for sem in s.img_sem { vkDestroySemaphore(self.dev, sem, 0) }
+        for f in s.frames {
+            vkDestroySemaphore(self.dev, f.acquired, 0)
+            vkDestroyFence(self.dev, f.fence, 0)
+            var pcb = Bytes.new(8)
+            pcb.put64(0, f.cb)
+            vkFreeCommandBuffers(self.dev, self.cmdpool, 1, pcb.addr())
+        }
+        for fb in s.fbs { vkDestroyFramebuffer(self.dev, fb, 0) }
+        for v in s.views { vkDestroyImageView(self.dev, v, 0) }
+        for v in s.depth_views { vkDestroyImageView(self.dev, v, 0) }
+        for i in s.depth_imgs { vkDestroyImage(self.dev, i, 0) }
+        for m in s.depth_mems { vkFreeMemory(self.dev, m, 0) }
+        vkDestroySwapchainKHR(self.dev, s.handle, 0)
+    }
+
+    // Rebuild for the surface's current size, reusing the old swapchain so the
+    // driver can hand over its images. Returns none while the window is
+    // minimised (a zero-sized extent cannot back a swapchain).
+    fn rebuild(self, s: Swapchain, renderpass: int) -> Swapchain? {
+        var caps = Bytes.new(VkSurfaceCapabilitiesKHR_sizeof)
+        vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+        let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
+        let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        if w == 0 or h == 0 { return none }
+        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
+        // depth_format carries over, so a depth swapchain stays one across resizes
+        let fresh = self.swapchain_depth(s.format, renderpass, s.handle, s.depth_format)
+        self.destroy_swapchain(s)
+        return fresh
+    }
+
+    // Acquire -> record -> submit -> present, one frame, pipelined
+    // FRAMES_IN_FLIGHT deep so the CPU records ahead while the GPU is still
+    // drawing. Returns false when the swapchain is out of date (resized) and
+    // the caller should rebuild.
+    //
+    // Two distinct waits are needed and both matter:
+    //   * the frame's own fence -- its command buffer and semaphores are about
+    //     to be reused, so the previous submission using them must have retired;
+    //   * the fence of whichever frame last drew into this image -- the
+    //     swapchain hands out images in its own order, so image i can come back
+    //     while a different in-flight frame is still writing it.
+    fn frame(self, s: Swapchain, rec: fn(int, int)) -> bool {
+        let f = s.frames[s.cur]
+        var pfence = Bytes.new(8)
+        pfence.put64(0, f.fence)
+        vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+
+        var pidx = Bytes.new(8)
+        let acq = vkAcquireNextImageKHR(self.dev, s.handle, 5000000000, f.acquired, 0, pidx.addr())
+        if acq == VK_ERROR_OUT_OF_DATE_KHR { return false }
+        if acq != VK_SUCCESS and acq != VK_SUBOPTIMAL_KHR {
+            panic("vkAcquireNextImageKHR: VkResult {acq}")
+        }
+        let idx = pidx.get32(0)
+
+        // another in-flight frame may still be drawing into this image
+        if s.img_fence[idx] != 0 and s.img_fence[idx] != f.fence {
+            var pother = Bytes.new(8)
+            pother.put64(0, s.img_fence[idx])
+            vkcheck(vkWaitForFences(self.dev, 1, pother.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+        }
+        s.img_fence[idx] = f.fence
+
+        // reset only now -- everything that could still be pending has retired
+        vkcheck(vkResetFences(self.dev, 1, pfence.addr()), "vkResetFences")
+        vkcheck(vkResetCommandBuffer(f.cb, 0), "vkResetCommandBuffer")
+
+        var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
+        bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+        bi.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+        vkcheck(vkBeginCommandBuffer(f.cb, bi.addr()), "vkBeginCommandBuffer")
+        rec(f.cb, idx)
+        vkcheck(vkEndCommandBuffer(f.cb), "vkEndCommandBuffer")
+
+        var waitsem = Bytes.new(8)
+        waitsem.put64(0, f.acquired)
+        var sigsem = Bytes.new(8)
+        sigsem.put64(0, s.img_sem[idx])          // per-image: safe to reuse now
+        var stage = Bytes.new(8)
+        stage.put32(0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+        var pcbs = Bytes.new(8)
+        pcbs.put64(0, f.cb)
+
+        var si = Bytes.new(VkSubmitInfo_sizeof)
+        si.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
+        si.put32(VkSubmitInfo_waitSemaphoreCount, 1)
+        si.put64(VkSubmitInfo_pWaitSemaphores, waitsem.addr())
+        si.put64(VkSubmitInfo_pWaitDstStageMask, stage.addr())
+        si.put32(VkSubmitInfo_commandBufferCount, 1)
+        si.put64(VkSubmitInfo_pCommandBuffers, pcbs.addr())
+        si.put32(VkSubmitInfo_signalSemaphoreCount, 1)
+        si.put64(VkSubmitInfo_pSignalSemaphores, sigsem.addr())
+        vkcheck(vkQueueSubmit(self.queue, 1, si.addr(), f.fence), "vkQueueSubmit")
+
+        var pswap = Bytes.new(8)
+        pswap.put64(0, s.handle)
+        var pidxs = Bytes.new(4)
+        pidxs.put32(0, idx)
+        var pi = Bytes.new(VkPresentInfoKHR_sizeof)
+        pi.put32(VkPresentInfoKHR_sType, VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
+        pi.put32(VkPresentInfoKHR_waitSemaphoreCount, 1)
+        pi.put64(VkPresentInfoKHR_pWaitSemaphores, sigsem.addr())
+        pi.put32(VkPresentInfoKHR_swapchainCount, 1)
+        pi.put64(VkPresentInfoKHR_pSwapchains, pswap.addr())
+        pi.put64(VkPresentInfoKHR_pImageIndices, pidxs.addr())
+        let pres = vkQueuePresentKHR(self.queue, pi.addr())
+
+        s.cur = (s.cur + 1) % s.frames.len()
+
+        if pres == VK_ERROR_OUT_OF_DATE_KHR or pres == VK_SUBOPTIMAL_KHR { return false }
+        if pres != VK_SUCCESS { panic("vkQueuePresentKHR: VkResult {pres}") }
+        return true
+    }
+}
+
+// ---- compute + descriptors ----
+
+// A descriptor set together with the layout and pool backing it. The layout is
+// public because pipeline creation needs it.
+struct DescSet { layout: int, pool: int, set: int }
+
+impl Gfx {
+    // One set binding `buffers` as storage buffers at bindings 0..n-1 -- the
+    // shape almost every compute pass wants. The layout/pool/set/update dance is
+    // four objects and an array of writes; getting the lifetimes wrong here is
+    // the classic first-compute-pass bug, so it lives in one place.
+    fn storage_set(self, buffers: [GpuBuffer], stages: int) -> DescSet {
+        let n = buffers.len()
+        if n == 0 { panic("storage_set needs at least one buffer") }
+
+        var binds: [Bytes] = []
+        for i in 0..n {
+            binds.push(VkDescriptorSetLayoutBinding.new()
+                .binding(i)
+                .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                .descriptorCount(1)
+                .stageFlags(stages).raw())
+        }
+        var bindarr = pack(binds)
+        let layout = create_descriptor_set_layout(self.dev,
+            VkDescriptorSetLayoutCreateInfo.new().bindingCount(n).pBindings(bindarr.addr()))
+
+        let psize = VkDescriptorPoolSize.new()
+            .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(n)
+        let pool = create_descriptor_pool(self.dev,
+            VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(psize.addr()))
+
+        var setlayouts = u64s([layout])
+        let set = allocate_descriptor_set(self.dev,
+            VkDescriptorSetAllocateInfo.new()
+                .descriptorPool(pool).descriptorSetCount(1).pSetLayouts(setlayouts.addr()))
+
+        // each write points at its own VkDescriptorBufferInfo, which must stay
+        // alive until vkUpdateDescriptorSets has read it
+        var infos: [Bytes] = []
+        var writes: [Bytes] = []
+        for i in 0..n {
+            let info = VkDescriptorBufferInfo.new()
+                .buffer(buffers[i].buf).offset(0).range(buffers[i].size)
+            infos.push(info.raw())
+            writes.push(VkWriteDescriptorSet.new()
+                .dstSet(set).dstBinding(i).descriptorCount(1)
+                .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                .pBufferInfo(info.addr()).raw())
+        }
+        var warr = pack(writes)
+        vkUpdateDescriptorSets(self.dev, n, warr.addr(), 0, 0)
+
+        return DescSet{layout: layout, pool: pool, set: set}
+    }
+
+    fn destroy_desc_set(self, d: DescSet) {
+        vkDestroyDescriptorPool(self.dev, d.pool, 0)     // frees the set with it
+        vkDestroyDescriptorSetLayout(self.dev, d.layout, 0)
+    }
+
+    // a pipeline layout over some descriptor set layouts, with optional push constants
+    fn pipeline_layout(self, setlayouts: [int], push_size: int, push_stages: int) -> int {
+        var sl = u64s(setlayouts)
+        var ci = VkPipelineLayoutCreateInfo.new().setLayoutCount(setlayouts.len())
+        if setlayouts.len() > 0 { ci = ci.pSetLayouts(sl.addr()) }
+        var pcr = VkPushConstantRange.new().stageFlags(push_stages).offset(0).size(push_size)
+        if push_size > 0 {
+            ci = ci.pushConstantRangeCount(1).pPushConstantRanges(pcr.addr())
+        }
+        return create_pipeline_layout(self.dev, ci)
+    }
+
+    fn compute_pipeline(self, shader: int, layout: int, entry: Bytes) -> int {
+        let ci = VkComputePipelineCreateInfo.new()
+            .stage_sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+            .stage_stage(VK_SHADER_STAGE_COMPUTE_BIT)
+            .stage_module(shader)
+            .stage_pName(entry.addr())
+            .layout(layout)
+            .basePipelineIndex(0 - 1)
+        return create_compute_pipeline(self.dev, ci)
+    }
+}
+
+// ---- BMP output: a 54-byte header plus raw BGRA rows, no dependencies ----
+fn write_bmp(path: str, px: Bytes, w: int, h: int) {
+    var out: [str] = []
+    let rowbytes = w * 4
+    let datasize = rowbytes * h
+    let filesize = 54 + datasize
+    out.push("BM")
+    out.push(le32(filesize))
+    out.push(le32(0))
+    out.push(le32(54))
+    out.push(le32(40))               // DIB header size
+    out.push(le32(w))
+    out.push(le32(0 - h))            // negative height = top-down rows
+    out.push(le16(1))                // planes
+    out.push(le16(32))               // bits per pixel
+    out.push(le32(0))                // BI_RGB
+    out.push(le32(datasize))
+    out.push(le32(2835))
+    out.push(le32(2835))
+    out.push(le32(0))
+    out.push(le32(0))
+    // RGBA -> BGRA
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y * w + x) * 4
+            out.push(chr(px.get8(o + 2)))
+            out.push(chr(px.get8(o + 1)))
+            out.push(chr(px.get8(o)))
+            out.push(chr(px.get8(o + 3)))
+        }
+    }
+    write_file(path, out.join())
+}
+
+fn le16(v: int) -> str {
+    var s: [str] = []
+    s.push(chr(v & 255))
+    s.push(chr((v >> 8) & 255))
+    return s.join()
+}
+
+fn le32(v: int) -> str {
+    var s: [str] = []
+    s.push(chr(v & 255))
+    s.push(chr((v >> 8) & 255))
+    s.push(chr((v >> 16) & 255))
+    s.push(chr((v >> 24) & 255))
+    return s.join()
+}

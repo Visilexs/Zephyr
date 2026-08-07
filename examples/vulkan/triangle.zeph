@@ -1,0 +1,152 @@
+// Headless Vulkan triangle -> out.bmp
+//
+// Every Vulkan struct is built with generated, named setters: `.format(x)` is a
+// real field at a real offset, a typo is a compile error, and new() fills in
+// sType. Nothing is hidden -- this is still the full graphics pipeline, every
+// stage spelled out, just without the offset arithmetic.
+
+import "vk/gfx.zeph"
+
+let W = 512
+let H = 512
+
+var layers: [str] = []
+for a in args() {
+    if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+var g = Gfx.init("zephyr-triangle", layers)
+print("gpu: {g.gpu_name()}")
+
+// ---------------- render pass ----------------
+// One colour attachment: cleared on load, stored on finish, left in
+// TRANSFER_SRC_OPTIMAL so readback can copy straight out of it.
+let attach = VkAttachmentDescription.new()
+    .format(VK_FORMAT_R8G8B8A8_UNORM)
+    .samples(VK_SAMPLE_COUNT_1_BIT)
+    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+    .storeOp(VK_ATTACHMENT_STORE_OP_STORE)
+    .stencilLoadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+    .stencilStoreOp(VK_ATTACHMENT_STORE_OP_DONT_CARE)
+    .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+    .finalLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+
+let ref = VkAttachmentReference.new()
+    .attachment(0)
+    .layout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+
+let subpass = VkSubpassDescription.new()
+    .pipelineBindPoint(VK_PIPELINE_BIND_POINT_GRAPHICS)
+    .colorAttachmentCount(1)
+    .pColorAttachments(ref.addr())
+
+let rpci = VkRenderPassCreateInfo.new()
+    .attachmentCount(1)
+    .pAttachments(attach.addr())
+    .subpassCount(1)
+    .pSubpasses(subpass.addr())
+
+let renderpass = create_render_pass(g.dev, rpci)
+
+var target = g.target(W, H, renderpass)
+
+// ---------------- shaders ----------------
+let vs = g.shader("examples/shaders/triangle.vert.spv")
+let fs = g.shader("examples/shaders/triangle.frag.spv")
+var entry = cbytes("main")
+
+let vstage = VkPipelineShaderStageCreateInfo.new()
+    .stage(VK_SHADER_STAGE_VERTEX_BIT).module(vs).pName(entry.addr())
+let fstage = VkPipelineShaderStageCreateInfo.new()
+    .stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fs).pName(entry.addr())
+var stages = pack([vstage.raw(), fstage.raw()])
+
+// ---------------- fixed function ----------------
+// No vertex buffers: the vertex shader indexes a constant array by gl_VertexIndex.
+let vi = VkPipelineVertexInputStateCreateInfo.new()
+let ia = VkPipelineInputAssemblyStateCreateInfo.new()
+    .topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+
+let viewport = VkViewport.new()
+    .width(W as float).height(H as float).minDepth(0.0).maxDepth(1.0)
+let scissor = VkRect2D.new().extent_width(W).extent_height(H)
+
+let vp = VkPipelineViewportStateCreateInfo.new()
+    .viewportCount(1).pViewports(viewport.addr())
+    .scissorCount(1).pScissors(scissor.addr())
+
+let rs = VkPipelineRasterizationStateCreateInfo.new()
+    .polygonMode(VK_POLYGON_MODE_FILL)
+    .cullMode(VK_CULL_MODE_NONE)
+    .frontFace(VK_FRONT_FACE_CLOCKWISE)
+    .lineWidth(1.0)
+
+let ms = VkPipelineMultisampleStateCreateInfo.new()
+    .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT)
+
+let cba = VkPipelineColorBlendAttachmentState.new()
+    .blendEnable(VK_FALSE)
+    .colorWriteMask(15)                         // R|G|B|A
+
+let cb = VkPipelineColorBlendStateCreateInfo.new()
+    .attachmentCount(1).pAttachments(cba.addr())
+
+let layout = create_pipeline_layout(g.dev, VkPipelineLayoutCreateInfo.new())
+
+let gpci = VkGraphicsPipelineCreateInfo.new()
+    .stageCount(2).pStages(stages.addr())
+    .pVertexInputState(vi.addr())
+    .pInputAssemblyState(ia.addr())
+    .pViewportState(vp.addr())
+    .pRasterizationState(rs.addr())
+    .pMultisampleState(ms.addr())
+    .pColorBlendState(cb.addr())
+    .layout(layout)
+    .renderPass(renderpass)
+    .subpass(0)
+    .basePipelineIndex(0 - 1)
+
+let pipeline = create_graphics_pipeline(g.dev, gpci)
+print("pipeline ok")
+
+// ---------------- record + submit ----------------
+// VkClearValue is a union of four floats: dark grey background.
+let clear = clear_color(0.10, 0.11, 0.13, 1.0)
+
+let rpbi = VkRenderPassBeginInfo.new()
+    .renderPass(renderpass)
+    .framebuffer(target.fb)
+    .renderArea_extent_width(W)
+    .renderArea_extent_height(H)
+    .clearValueCount(1)
+    .pClearValues(clear.addr())
+
+let rpa = rpbi.addr()
+let pipe = pipeline
+g.immediate(fn(c: int) {
+    vkCmdBeginRenderPass(c, rpa, VK_SUBPASS_CONTENTS_INLINE)
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe)
+    vkCmdDraw(c, 3, 1, 0, 0)
+    vkCmdEndRenderPass(c)
+})
+print("drew")
+
+// ---------------- readback + BMP ----------------
+var px = g.readback(target)
+write_bmp("out.bmp", px, W, H)
+
+let cx = ((H / 2) * W + W / 2) * 4
+print("centre rgba = {px.get8(cx)},{px.get8(cx+1)},{px.get8(cx+2)},{px.get8(cx+3)}")
+print("corner rgba = {px.get8(0)},{px.get8(1)},{px.get8(2)},{px.get8(3)}")
+assert(px.get8(cx) > 128, "centre should be red-ish (triangle)")
+assert(px.get8(0) < 60, "corner should be dark (background)")
+
+// ---------------- teardown ----------------
+vkDestroyPipeline(g.dev, pipeline, 0)
+vkDestroyPipelineLayout(g.dev, layout, 0)
+vkDestroyShaderModule(g.dev, vs, 0)
+vkDestroyShaderModule(g.dev, fs, 0)
+g.destroy_target(target)
+vkDestroyRenderPass(g.dev, renderpass, 0)
+g.shutdown()
+print("wrote out.bmp ({W}x{H})")
+print("OK")

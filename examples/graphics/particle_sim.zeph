@@ -1,0 +1,232 @@
+// Shared particle simulation: state, physics and input.
+//
+// Imported by both renderers -- particles.zeph (software rasterizer) and
+// particles_gl.zeph (OpenGL). Everything here is CPU-side and renderer-
+// agnostic: flat float arrays (struct-of-arrays, the layout the optimizer
+// vectorizes best), a fixed pool with recycling, and no trig anywhere.
+
+let PW = 320                     // simulation space, in "grid" units
+let PH = 240
+let DT = 0.016
+let GRAV = 260.0                 // units/s^2, downward (+y is down)
+let DRAG = 0.994                 // per-step velocity damping
+let LIFE = 2.6                   // seconds
+let SPEED = 300.0                // launch speed (apex ~ SPEED^2 / 2*GRAV)
+let WIND = 70.0                  // strength of the swirling side wind
+
+// wind direction is a unit vector rotated a little each frame -- the trig-free
+// spin trick the cube and fluid demos use
+let WCS = 0.99951                // cos(0.0313)
+let WSN = 0.031295               // sin(0.0313)
+
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)      // -> the list's data pointer (never freed)
+}
+fn fzeros(n: int) -> [float] {
+    var a: [float] = []
+    var i = 0
+    while i < n {
+        a.push(0.0)
+        i += 1
+    }
+    return a
+}
+
+var NP = 6000                    // particle pool size; a renderer may raise it
+var px = fzeros(1)
+var py = fzeros(1)
+var pvx = fzeros(1)
+var pvy = fzeros(1)
+var plife = fzeros(1)
+
+var wx = 1.0                     // wind unit vector
+var wy = 0.0
+var seed = 88172645463325252     // xorshift64 state
+
+var mode = 0                     // 0 fountain, 1 burst, 2 vortex  (keys 1/2/3)
+var mx = (PW / 2) as float       // cursor, in simulation coordinates
+var my = (PH / 2) as float
+var pull = 0.0                   // 1.0 while the left mouse button is held
+
+var gcw = 1                      // last known client size, for cursor mapping
+var gch = 1
+var ptbuf = mem(8)               // a POINT, reused every frame
+
+fn rnd() -> float {
+    var s = seed
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    seed = s
+    return ((s >> 11) & 16777215) as float / 16777216.0
+}
+
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+fn clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// a random unit vector, by rejection sampling the unit disc (no trig needed)
+fn rdir() -> [float] {
+    var dx = 0.0
+    var dy = 0.0
+    var d = 0.0
+    while d < 0.01 or d > 1.0 {
+        dx = rnd() * 2.0 - 1.0
+        dy = rnd() * 2.0 - 1.0
+        d = dx * dx + dy * dy
+    }
+    let inv = 1.0 / sqrt(d)
+    return [dx * inv, dy * inv]
+}
+
+// launch a particle -- where and how depends on the current emitter
+fn respawn(i: int) {
+    let sp = SPEED * (0.65 + rnd() * 0.5)
+    if mode == 1 {
+        // burst: a shell fired outward from the cursor
+        let u = rdir()
+        px[i] = mx
+        py[i] = my
+        pvx[i] = u[0] * sp
+        pvy[i] = u[1] * sp
+    } else if mode == 2 {
+        // vortex: spawn on a ring around the cursor, moving tangentially
+        let u = rdir()
+        let r = 20.0 + rnd() * 45.0
+        px[i] = mx + u[0] * r
+        py[i] = my + u[1] * r
+        pvx[i] = 0.0 - u[1] * sp * 0.5        // perpendicular => orbit
+        pvy[i] = u[0] * sp * 0.5
+    } else {
+        // fountain: a narrow upward cone from a fixed nozzle
+        let dx = (rnd() - 0.5) * 0.9
+        let inv = 1.0 / sqrt(dx * dx + 1.0)
+        px[i] = (PW / 2) as float + (rnd() - 0.5) * 4.0
+        py[i] = (PH - 12) as float
+        pvx[i] = dx * inv * sp
+        pvy[i] = 0.0 - inv * sp               // up
+    }
+    plife[i] = LIFE * (0.55 + rnd() * 0.45)
+}
+
+// allocate the pool and stagger the initial lives, so the emitter fills in
+// smoothly instead of pulsing
+fn sim_init(n: int) {
+    NP = n
+    px = fzeros(n)
+    py = fzeros(n)
+    pvx = fzeros(n)
+    pvy = fzeros(n)
+    plife = fzeros(n)
+    for i in 0..n {
+        respawn(i)
+        plife[i] = plife[i] * ((i as float) / (n as float))
+    }
+}
+
+fn step() {
+    // advance the wind
+    let nx = wx * WCS - wy * WSN
+    let ny = wx * WSN + wy * WCS
+    let nn = sqrt(nx * nx + ny * ny)
+    wx = nx / nn
+    wy = ny / nn
+    let fx = wx * WIND * DT
+    let floor = (PH - 3) as float
+    // the vortex orbits the cursor instead of falling, so it gets no gravity
+    var gdt = GRAV * DT
+    if mode == 2 { gdt = 0.0 }
+    // attraction toward the cursor: always on in vortex mode, otherwise while
+    // the left button is held
+    var att = pull * 9000.0
+    if mode == 2 { att = 26000.0 }
+
+    var i = 0
+    while i < NP {
+        var l = plife[i] - DT
+        if l <= 0.0 {
+            respawn(i)
+        } else {
+            var ax = 0.0
+            var ay = 0.0
+            if att > 0.0 {
+                // inverse-square pull, softened so it can't blow up at r -> 0
+                let rx = mx - px[i]
+                let ry = my - py[i]
+                let r2 = rx * rx + ry * ry + 220.0
+                let f = att / (r2 * sqrt(r2))
+                ax = rx * f
+                ay = ry * f
+            }
+            var vx = (pvx[i] + fx + ax * DT) * DRAG
+            var vy = (pvy[i] + gdt + ay * DT) * DRAG
+            var x = px[i] + vx * DT
+            var y = py[i] + vy * DT
+            if y > floor {                    // bounce, losing most of the energy
+                y = floor
+                vy = 0.0 - vy * 0.42
+                vx = vx * 0.75
+            }
+            if x < 1.0 { x = 1.0
+                vx = 0.0 - vx * 0.6 }
+            if x > (PW - 2) as float { x = (PW - 2) as float
+                vx = 0.0 - vx * 0.6 }
+            px[i] = x
+            py[i] = y
+            pvx[i] = vx
+            pvy[i] = vy
+            plife[i] = l
+        }
+        i += 1
+    }
+}
+
+var f_last = 0                   // frame-rate report, every 60 frames
+var f_count = 0
+fn fps_tick() {
+    f_count += 1
+    if f_count >= 60 {
+        let now = win("GetTickCount")
+        let ms = now - f_last
+        if f_last != 0 and ms > 0 { print("{NP} particles, {60000 / ms} fps") }
+        f_last = now
+        f_count = 0
+    }
+}
+
+fn sext32(v: int) -> int {
+    let x = v & 4294967295
+    if x >= 2147483648 { return x - 4294967296 }
+    return x
+}
+fn down(vk: int) -> bool { return (win("user32!GetAsyncKeyState", vk) & 32768) != 0 }
+
+// read the cursor (in simulation coordinates), the mouse button and mode keys
+fn poll_input(hwnd: int) {
+    let g = win("user32!GetCursorPos", ptbuf)
+    let s = win("user32!ScreenToClient", hwnd, ptbuf)
+    let v = load64(ptbuf)
+    let cx = sext32(v)                       // POINT is two 32-bit LONGs
+    let cy = v >> 32
+    mx = (cx as float) * (PW as float) / (gcw as float)
+    my = (cy as float) * (PH as float) / (gch as float)
+    if mx < 0.0 { mx = 0.0 }
+    if mx > (PW - 1) as float { mx = (PW - 1) as float }
+    if my < 0.0 { my = 0.0 }
+    if my > (PH - 1) as float { my = (PH - 1) as float }
+    if down(1) { pull = 1.0 } else { pull = 0.0 }        // VK_LBUTTON
+    if down(49) { mode = 0 }                             // '1'
+    if down(50) { mode = 1 }                             // '2'
+    if down(51) { mode = 2 }                             // '3'
+}

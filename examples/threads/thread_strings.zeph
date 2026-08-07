@@ -1,0 +1,48 @@
+// Concurrent string interpolation.
+//
+// The builder used to be one global buffer, so two threads formatting at once
+// interleaved their bytes and produced garbage. It is now per-thread, reached
+// through TLS once a second thread exists.
+//
+// Each worker builds strings whose exact contents it can verify, so corruption
+// shows up as a mismatch rather than as something that merely looks odd.
+
+import "std/thread.zeph"
+
+let WORKERS = 8
+let ROUNDS = 3000
+
+var bad = win("VirtualAlloc", 0, WORKERS * 8, 12288, 4)
+
+fn work(id: int) {
+    var wrong = 0
+    for r in 0..ROUNDS {
+        // interpolation: the operation that was unsafe
+        let s = "w{id}:{r}:{id * 1000 + r}"
+        // rebuild the same string without the builder, and compare
+        var parts: [str] = []
+        parts.push("w")
+        parts.push(id as str)
+        parts.push(":")
+        parts.push(r as str)
+        parts.push(":")
+        parts.push((id * 1000 + r) as str)
+        if s != parts.join() { wrong += 1 }
+
+        // nested interpolation shares the same buffer via mark/truncate
+        let t = "[{s}|{r * 2}]"
+        if t.len() != s.len() + ((r * 2) as str).len() + 3 { wrong += 1 }
+    }
+    store64(bad + id * 8, wrong)
+}
+
+print("workers: {WORKERS}, interpolations each: {ROUNDS * 2}")
+var ts: [Thread] = []
+for i in 0..WORKERS { ts.push(thread_spawn(work, i)) }
+for t in ts { t.join() }
+
+var total = 0
+for i in 0..WORKERS { total = total + load64(bad + i * 8) }
+print("mismatches: {total}")
+assert(total == 0, "concurrent interpolation produced corrupted strings")
+print("OK")

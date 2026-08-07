@@ -1,0 +1,387 @@
+// A real-time, fully-rasterized ocean in pure Zephyr.
+//
+// This is a per-pixel software ocean renderer, the way real-time graphics does
+// it: the sea surface is the sum of several travelling sine waves, and for
+// every pixel we cast a view ray, intersect the water plane, evaluate the wave
+// slope there to get a surface normal, and shade it -- Fresnel sky reflection,
+// a sharp sun specular glint on wave faces, whitecaps on the tallest crests,
+// and atmospheric haze fading the water into the horizon. Above the horizon a
+// sky gradient with a sun. The whole frame is written into a 32-bit pixel
+// buffer and blitted with one StretchDIBits.
+//
+// No sin/cos builtins exist, so there's a fast polynomial fsin below. Every
+// pixel is float arithmetic -- the part of Zephyr the optimizer accelerates.
+//
+//   zc.exe --rt examples\ocean.zeph ocean.exe && .\ocean.exe   (opens a window)
+//   .\ocean.exe 1                                              (headless frame checksum)
+// Close the window to exit.
+
+let FW = 640                      // framebuffer width  (upscaled to the window)
+let FH = 384                      // framebuffer height
+let NW = 7                        // number of wave components
+
+let PI = 3.141592653589793
+let TWO_PI = 6.283185307179586
+let HALF_PI = 1.5707963267948966
+let INV_TWO_PI = 0.15915494309189535
+
+// --- fast math ---
+fn ffloor(v: float) -> float {
+    let i = v as int
+    var f = i as float
+    if f > v { f = f - 1.0 }
+    return f
+}
+// polynomial sine, |error| < 0.0011 over all inputs (range-reduced to [-PI,PI])
+fn fsin(x0: float) -> float {
+    let x = x0 - TWO_PI * ffloor(x0 * INV_TWO_PI + 0.5)
+    var y = 1.2732395447351628 * x - 0.4052847345693511 * x * abs(x)
+    y = 0.225 * (y * abs(y) - y) + y
+    return y
+}
+fn fcos(x: float) -> float { return fsin(x + HALF_PI) }
+
+// Animated caustics: refracted sunlight forms a shifting bright web on the
+// water. Two sets of moving wave-fronts interfere; `1 - |sin|` turns each into
+// thin bright ridges at its zero crossings, their product makes an irregular
+// cellular network, and squaring twice sharpens it into crisp caustic lines.
+fn fcaustic(px: float, pz: float, t: float) -> float {
+    let a = fsin(px * 1.4 + fsin(pz * 0.9 - t * 1.1) * 2.2 + t * 1.3)
+    let b = fsin(pz * 1.6 - fsin(px * 1.1 + t * 0.9) * 2.2 - t)
+    let c = fsin((px - pz) * 1.0 + t * 0.7)
+    var v = (1.0 - abs(a)) * (1.0 - abs(b)) + (1.0 - abs(c)) * 0.35
+    v = v * v
+    v = v * v
+    if v > 1.0 { v = 1.0 }
+    return v
+}
+// raise to the 2^n power by repeated squaring (sharp specular / sun disk)
+fn pow2n(x: float, n: int) -> float {
+    var r = x
+    var i = 0
+    while i < n {
+        r = r * r
+        i += 1
+    }
+    return r
+}
+fn clamp01(v: float) -> float {
+    if v < 0.0 { return 0.0 }
+    if v > 1.0 { return 1.0 }
+    return v
+}
+fn to255(v: float) -> int {
+    let i = (v * 255.0) as int
+    if i < 0 { return 0 }
+    if i > 255 { return 255 }
+    return i
+}
+
+fn fzeros(n: int) -> [float] {
+    var a: [float] = []
+    var i = 0
+    while i < n {
+        a.push(0.0)
+        i += 1
+    }
+    return a
+}
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)
+}
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+
+// --- wave field (parallel arrays, one entry per component) ---
+var wDX = fzeros(NW)              // direction x
+var wDZ = fzeros(NW)              // direction z
+var wK = fzeros(NW)               // wavenumber (2*PI / wavelength)
+var wA = fzeros(NW)               // amplitude
+var wSp = fzeros(NW)             // angular speed
+
+var pixels = mem(FW * FH * 4)
+var bmi = mem(40)
+var g_time = 0.0
+
+// scratch for the "return three channels" sky helper
+var g_r = 0.0
+var g_g = 0.0
+var g_b = 0.0
+
+// camera: a low vantage looking out to sea, tilted slightly down
+let CAM_Y = 3.0
+let TANF = 0.62                   // half-FOV tangent
+let PITCH_C = 0.98488            // cos(-0.1745)  (~10 deg down)
+let PITCH_S = 0.0 - 0.17365      // sin(-0.1745)
+
+// sun: ahead, low over the water -> a glitter path toward the viewer
+let SUNX = 0.14701
+let SUNY = 0.29401
+let SUNZ = 0.94418               // normalized (0.15, 0.30, 0.963)
+
+fn init_waves() {
+    // directions fanned around the forward (+Z) view; a broad spectrum from long
+    // swell down to fine chop makes a bigger, choppier sea
+    let ang = [0.0 - 0.6, 0.32, 0.0 - 0.18, 0.55, 0.1, 0.0 - 0.42, 0.72]
+    let lambda = [24.0, 13.0, 8.0, 5.0, 3.2, 2.1, 1.4]
+    let amp = [0.52, 0.31, 0.19, 0.115, 0.07, 0.043, 0.027]
+    var i = 0
+    while i < NW {
+        wDX[i] = fsin(ang[i])
+        wDZ[i] = fcos(ang[i])
+        let k = TWO_PI / lambda[i]
+        wK[i] = k
+        wA[i] = amp[i]
+        wSp[i] = sqrt(9.8 * k) * 0.85       // deep-water dispersion, slowed a touch
+        i += 1
+    }
+}
+
+// sky/atmosphere colour for a ray whose upward component is uy -> g_r/g_g/g_b
+fn sky_color(uy: float) {
+    var t = uy * 2.2
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    g_r = 0.70 + (0.0 - 0.48) * t          // pale horizon -> deep blue zenith
+    g_g = 0.80 + (0.0 - 0.34) * t
+    g_b = 0.92 + (0.0 - 0.12) * t
+}
+
+fn render() {
+    let fwf = FW as float
+    let fhf = FH as float
+    let aspect = fwf / fhf
+    var py = 0
+    while py < FH {
+        var px = 0
+        while px < FW {
+            // view ray through this pixel, then pitch the camera down
+            let ndcx = ((px as float) / fwf - 0.5) * aspect * TANF
+            let ndcy = (0.5 - (py as float) / fhf) * TANF
+            var dx = ndcx
+            var dy0 = ndcy
+            var dz0 = 1.0
+            let il = 1.0 / sqrt(dx * dx + dy0 * dy0 + dz0 * dz0)
+            dx = dx * il
+            dy0 = dy0 * il
+            dz0 = dz0 * il
+            let dy = dy0 * PITCH_C - dz0 * PITCH_S
+            let dz = dy0 * PITCH_S + dz0 * PITCH_C
+
+            var cr = 0.0
+            var cg = 0.0
+            var cb = 0.0
+            if dy >= 0.0 - 0.0008 {
+                // --- sky ---
+                sky_color(dy)
+                cr = g_r
+                cg = g_g
+                cb = g_b
+                let sd = dx * SUNX + dy * SUNY + dz * SUNZ
+                if sd > 0.0 {
+                    let disk = pow2n(clamp01(sd), 9)      // sd^512 sharp disk
+                    let glow = pow2n(clamp01(sd), 3)      // sd^8 soft halo
+                    cr = cr + 1.5 * disk + 0.45 * glow
+                    cg = cg + 1.35 * disk + 0.32 * glow
+                    cb = cb + 1.0 * disk + 0.16 * glow
+                }
+            } else {
+                // --- water: intersect the plane y = 0 ---
+                let tHit = (0.0 - CAM_Y) / dy
+                let wx = dx * tHit
+                let wz = dz * tHit
+                // sum the waves: height + slope (dh/dx, dh/dz)
+                var hgt = 0.0
+                var sx = 0.0
+                var sz = 0.0
+                var w = 0
+                while w < NW {
+                    let ph = wK[w] * (wDX[w] * wx + wDZ[w] * wz) - wSp[w] * g_time
+                    let s = fsin(ph)
+                    let c = fcos(ph)
+                    hgt = hgt + wA[w] * s
+                    let ak = wA[w] * wK[w] * c
+                    sx = sx + ak * wDX[w]
+                    sz = sz + ak * wDZ[w]
+                    w = w + 1
+                }
+                // surface normal
+                var nx = 0.0 - sx
+                var ny = 1.0
+                var nz = 0.0 - sz
+                let nl = 1.0 / sqrt(nx * nx + ny * ny + nz * nz)
+                nx = nx * nl
+                ny = ny * nl
+                nz = nz * nl
+                // view vector (surface -> camera) = -ray
+                let vx = 0.0 - dx
+                let vy = 0.0 - dy
+                let vz = 0.0 - dz
+                var ndv = nx * vx + ny * vy + nz * vz
+                if ndv < 0.0 { ndv = 0.0 }
+                // Fresnel (Schlick): 0.02 + 0.98 * (1 - N.V)^5
+                let m = 1.0 - ndv
+                let fres = 0.02 + 0.98 * m * m * m * m * m
+                // reflect the ray about the normal
+                let idn = dx * nx + dy * ny + dz * nz
+                let rrx = dx - 2.0 * idn * nx
+                let rry = dy - 2.0 * idn * ny
+                let rrz = dz - 2.0 * idn * nz
+                // reflected sky
+                sky_color(rry)
+                let skr = g_r
+                let skg = g_g
+                let skb = g_b
+                // deep water base colour
+                let wr = 0.015
+                let wg = 0.11
+                let wbb = 0.17
+                cr = wr + (skr - wr) * fres
+                cg = wg + (skg - wg) * fres
+                cb = wbb + (skb - wbb) * fres
+                // diffuse: direct sunlight on the wave slopes. This is what makes
+                // the waves READ as waves -- faces tilted toward the sun brighten,
+                // faces tilted away darken -- and it works even in the near water
+                // where the surface is too steep to mirror the sky.
+                var diff = nx * SUNX + ny * SUNY + nz * SUNZ
+                if diff < 0.0 { diff = 0.0 }
+                cr = cr + diff * 0.16
+                cg = cg + diff * 0.26
+                cb = cb + diff * 0.34
+                // and a little sky-dome fill so troughs (normals off-vertical)
+                // sit darker than up-facing crests -- extra wave contrast
+                let up = ny * 0.5 + 0.5
+                cr = cr - (1.0 - up) * 0.03
+                cg = cg - (1.0 - up) * 0.05
+                cb = cb - (1.0 - up) * 0.06
+                // caustics: dancing refracted light on the water. Seen through
+                // the transparent (low-Fresnel) part of the surface, brightest in
+                // the troughs where the wavy surface focuses the sun's light.
+                let cau = fcaustic(wx * 0.7, wz * 0.7, g_time * 1.3)
+                var trough = 0.55 - hgt
+                if trough < 0.0 { trough = 0.0 }
+                let cam = cau * (1.0 - fres) * (0.35 + trough)
+                cr = cr + cam * 0.32
+                cg = cg + cam * 0.62
+                cb = cb + cam * 0.72
+                // sun specular glint
+                var sp = rrx * SUNX + rry * SUNY + rrz * SUNZ
+                if sp > 0.0 {
+                    let spec = pow2n(clamp01(sp), 7)      // sp^128 tight glint
+                    cr = cr + spec * 1.6
+                    cg = cg + spec * 1.45
+                    cb = cb + spec * 1.1
+                }
+                // whitecaps on the tallest crests
+                if hgt > 0.72 {
+                    var foam = (hgt - 0.72) * 1.7
+                    if foam > 0.9 { foam = 0.9 }
+                    cr = cr + (0.95 - cr) * foam
+                    cg = cg + (0.97 - cg) * foam
+                    cb = cb + (1.0 - cb) * foam
+                }
+                // atmospheric haze -> fade distant water into the horizon
+                sky_color(0.0)
+                var haze = tHit * 0.010
+                haze = clamp01(haze)
+                haze = haze * haze
+                cr = cr + (g_r - cr) * haze
+                cg = cg + (g_g - cg) * haze
+                cb = cb + (g_b - cb) * haze
+            }
+            store32(pixels + (py * FW + px) * 4, to255(cr) * 65536 | to255(cg) * 256 | to255(cb))
+            px += 1
+        }
+        py += 1
+    }
+}
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    render()
+    let sm = win("gdi32!SetStretchBltMode", hdc, 4)        // HALFTONE: smooth upscale
+    let bo = win("gdi32!SetBrushOrgEx", hdc, 0, 0, 0)
+    let bb = win("gdi32!StretchDIBits", hdc, 0, 0, cw, ch, 0, 0, FW, FH, pixels, bmi, 0, 13369376)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+// BITMAPINFOHEADER: 32-bit, top-down
+store32(bmi + 0, 40)
+store32(bmi + 4, FW)
+store32(bmi + 8, 0 - FH)
+store32(bmi + 12, 1 | 32 * 65536)
+store32(bmi + 16, 0)
+
+init_waves()
+
+var frames = 0
+if args().len() > 1 { frames = args()[1] as int }
+
+if frames > 0 {
+    // headless: render N frames, print a checksum of the last framebuffer
+    var f = 0
+    while f < frames {
+        g_time = (f as float) * 0.05
+        render()
+        f += 1
+    }
+    var chk = 0
+    var i = 0
+    while i < FW * FH * 4 {
+        chk = (chk * 31 + load8(pixels + i)) % 1000000007
+        i += 4
+    }
+    print(chk)
+} else {
+    let hInst = win("GetModuleHandleA", 0)
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+    let clsname = cstr("zephyrOceanWindow")
+
+    let wc = mem(72)
+    store32(wc + 0, 3)
+    store64(wc + 8, defwp)
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))
+    store64(wc + 48, 0)
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - ocean"),
+        282001408, 80, 80, 1120, 700, 0, 0, hInst, 0)
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let uw = win("user32!UpdateWindow", hwnd)
+
+    let msg = mem(48)
+    var running = 1
+    var t = 0.0
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            g_time = t
+            draw(hwnd)
+            t = t + 0.045
+            let sl = win("Sleep", 8)
+        }
+    }
+}

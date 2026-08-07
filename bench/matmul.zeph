@@ -1,0 +1,32 @@
+// Dense integer matrix multiply, N x N, cache-friendly ikj order.
+// Same algorithm and same deterministic fill as matmul.c / matmul.rs, so the
+// checksum must match exactly across all three languages.
+// Usage: matmul [N]   (default 512)
+
+var N = 512
+if args().len() > 1 { N = args()[1] as int }
+
+var A = zeros(N * N)          // preallocated, like C's calloc / Rust's vec![0; n]
+var B = zeros(N * N)
+var C = zeros(N * N)
+for i in 0..N {
+    for j in 0..N {
+        A[i * N + j] = (i * 3 + j * 7 + 1) % 10
+        B[i * N + j] = (i * 5 + j * 2 + 3) % 10
+    }
+}
+
+for i in 0..N {
+    for k in 0..N {
+        let aik = A[i * N + k]
+        for j in 0..N {
+            C[i * N + j] += aik * B[k * N + j]
+        }
+    }
+}
+
+var sum = 0
+for i in 0..N * N {
+    sum += C[i]
+}
+print(sum)

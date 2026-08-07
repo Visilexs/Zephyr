@@ -1,0 +1,442 @@
+// A JetBrains-style IDE, recreated with the Zephyr UI toolkit (ui/ui.zeph):
+// a toolbar, draggable split panes, project + database tree views, a code
+// editor with a line-number gutter and syntax colouring, a bottom Docker/
+// Services tool window, and a status bar. Everything is drawn through GDI in
+// pure Zephyr -- the app imports only kernel32, user32 and gdi32.
+//
+//   zc.exe --rt examples\ide.zeph ide.exe && .\ide.exe
+import "ui/ui.zeph"
+
+// syntax palette
+let C_KW   = rgb(207, 142, 109)     // keywords (orange, Darcula-style)
+let C_FN   = rgb(86, 168, 245)      // function names
+let C_TYPE = rgb(178, 178, 122)     // types
+let C_STR  = rgb(106, 171, 115)     // strings
+let C_NUM  = rgb(42, 172, 184)      // numbers
+let C_CMT  = rgb(122, 126, 133)     // comments
+let C_PUNC = rgb(188, 190, 196)     // punctuation / plain
+let C_MEM  = rgb(199, 125, 187)     // fields / members
+
+// tree icons: ui_icon(kind, colour) -- 1 folder, 2 file, 3 db, 4 table, 5 dot
+let ICON_FOLDER = ui_icon(1, rgb(140, 149, 165))
+let ICON_SRC    = ui_icon(1, rgb(120, 160, 210))
+let ICON_RS     = ui_icon(2, rgb(222, 165, 132))
+let ICON_TOML   = ui_icon(2, rgb(140, 149, 165))
+let ICON_MD     = ui_icon(2, rgb(120, 160, 210))
+let ICON_DB     = ui_icon(3, rgb(87, 167, 115))
+let ICON_SCHEMA = ui_icon(3, rgb(140, 149, 165))
+let ICON_TABLE  = ui_icon(4, rgb(120, 160, 210))
+let ICON_RUN    = ui_icon(5, rgb(95, 190, 110))
+let ICON_STOP   = ui_icon(5, rgb(120, 124, 130))
+let ICON_IMG    = ui_icon(2, rgb(78, 176, 222))
+
+// token separator for the code renderer (must be initialised BEFORE the main
+// loop, since the loop never returns to run later top-level statements)
+let SEP = chr(1)
+var g_gutx = 0
+var g_tabx = 0
+var g_cur_ln = 111                    // "caret" line (highlighted)
+var g_ed_x = 0
+var g_ed_w = 0
+
+// dock layout (adjusted by the splitters)
+var leftW = 260
+var rightW = 260
+var bottomH = 230
+var tab = 0
+var btab = 0
+// scroll state: content height + offset per scrollable region
+var g_lp_off = 0
+var g_lp_h = 400
+var g_rp_off = 0
+var g_rp_h = 700
+var g_code_off = 0
+var g_code_h = 1400
+
+ui_init("textter  -  RustRover (Zephyr UI)", 1420, 860)
+seed_open()
+
+while ui_running() {
+    ui_begin()
+    let cw = ui_w()
+    let ch = ui_h()
+    let TOP = 40
+    let STATUS = 26
+    let workTop = TOP
+    let workBot = ch - STATUS
+    if leftW < 160 { leftW = 160 }
+    if rightW < 160 { rightW = 160 }
+    if bottomH < 90 { bottomH = 90 }
+    let panelBot = workBot - bottomH
+    let centerX = leftW
+    let centerW = cw - leftW - rightW
+    let rightX = cw - rightW
+
+    // ---------- one unified surface ----------
+    fill(0, 0, cw, ch, COL_PANEL)
+
+    // ---------- toolbar ----------
+    icon_burger(14, TOP / 2)
+    fill_rr(38, 9, 22, 22, 8, rgb(120, 90, 200))
+    dtext_c(38, 9, 22, 22, "T", COL_TEXT)
+    let sb = ui_selectb()
+    dtext(70, 12, "textter", COL_TEXT)
+    ui_selectn()
+    let pw = text_w("textter")
+    chev_down(84 + pw, TOP / 2 + 1, COL_DIM)
+    icon_branch(112 + pw, TOP / 2)
+    dtext(126 + pw, 12, "master", COL_DIM)
+    chev_down(140 + pw + text_w("master"), TOP / 2 + 1, COL_DIM)
+    // run configuration + icon strip, right-aligned
+    var rx = cw - 40
+    if ui_flat(9012, rx, 6, 28, 28, "", COL_ITEM) { }
+    icon_gear(rx + 8, TOP / 2)
+    rx -= 34
+    if ui_flat(9011, rx, 6, 28, 28, "", COL_ITEM) { }
+    icon_bell(rx + 9, TOP / 2)
+    rx -= 34
+    if ui_flat(9010, rx, 6, 28, 28, "", COL_ITEM) { }
+    icon_search(rx + 8, TOP / 2)
+    rx -= 130
+    if ui_flat(9001, rx, 6, 118, 28, "", COL_ITEM) { }
+    icon_play(rx + 12, TOP / 2, rgb(95, 190, 110))
+    dtext(rx + 28, 12, "dev", COL_TEXT)
+    chev_down(rx + 104, TOP / 2 + 1, COL_DIM)
+    fill(rx + 88, 12, 1, 16, COL_BORDER)
+    fill(0, TOP - 1, cw, 1, COL_BORDER)
+
+    // ---------- left tool window: project tree ----------
+    dtext(14, workTop + 8, "Project", COL_TEXT)
+    chev_down(30 + text_w("Project"), workTop + 16, COL_DIM)
+    let ltY = workTop + 32
+    let ltH = panelBot - ltY
+    g_lp_off = ui_scroll_begin(3000, 0, ltY, leftW, ltH, g_lp_h, g_lp_off)
+    project_tree()
+    g_lp_h = ui_scroll_end()
+
+    // ---------- right tool window: database tree ----------
+    dtext(rightX + 14, workTop + 8, "Database", COL_TEXT)
+    let rtY = workTop + 32
+    g_rp_off = ui_scroll_begin(4000, rightX, rtY, rightW, panelBot - rtY, g_rp_h, g_rp_off)
+    database_tree()
+    g_rp_h = ui_scroll_end()
+
+    // ---------- center: editor ----------
+    let TABH = 36
+    fill(centerX, workTop + TABH, centerW, panelBot - workTop - TABH, COL_BG)
+    g_tabx = centerX + 6
+    tab = editor_tab(5001, workTop, "main.rs", ICON_RS, tab, 0)
+    tab = editor_tab(5002, workTop, "Cargo.toml", ICON_TOML, tab, 1)
+    let codeY = workTop + TABH
+    let codeAreaH = panelBot - codeY
+    g_code_off = ui_scroll_begin(5100, centerX, codeY, centerW, codeAreaH, g_code_h, g_code_off)
+    ui_mono()
+    if tab == 0 { draw_main_rs(centerX, centerW) } else { draw_cargo(centerX, centerW) }
+    ui_ui()
+    g_code_h = ui_scroll_end()
+
+    // ---------- bottom tool window: Docker / Services ----------
+    let BTABH = 32
+    g_tabx = 6
+    btab = editor_tab(6001, panelBot, "Docker", ui_icon(5, rgb(78, 176, 222)), btab, 0)
+    btab = editor_tab(6002, panelBot, "Services", ui_icon(5, rgb(140, 149, 165)), btab, 1)
+    let bY = panelBot + BTABH
+    ui_scroll_begin(6100, 0, bY, cw, workBot - bY, 700, 0)
+    if btab == 0 { docker_tree() } else { services_tree() }
+    let be = ui_scroll_end()
+
+    // ---------- splitters (dark 1px seams; accent on hover) ----------
+    leftW = ui_vsplit(8001, leftW, workTop, panelBot - workTop, 160, cw - rightW - 220)
+    rightW = cw - ui_vsplit(8002, rightX, workTop, panelBot - workTop, leftW + 220, cw - 160)
+    bottomH = workBot - ui_hsplit(8003, panelBot, 0, cw, TOP + 120, workBot - 70)
+
+    // ---------- status bar ----------
+    fill(0, ch - STATUS, cw, 1, COL_BORDER)
+    var sx = 12
+    dtext(sx, ch - STATUS + 5, "textter-rs", COL_DIM)
+    sx += text_w("textter-rs") + 8
+    dtext(sx, ch - STATUS + 5, ">", COL_FAINT)
+    sx += 14
+    dtext(sx, ch - STATUS + 5, "src", COL_DIM)
+    sx += text_w("src") + 8
+    dtext(sx, ch - STATUS + 5, ">", COL_FAINT)
+    sx += 14
+    dtext(sx, ch - STATUS + 5, "main.rs", COL_DIM)
+    var ex = cw - 12
+    ex = status_item(ex, "4 spaces")
+    ex = status_item(ex, "UTF-8")
+    ex = status_item(ex, "LF")
+    ex = status_item(ex, "111:1")
+    dtext(ex - text_w("Cargo Check") - 24, ch - STATUS + 5, "Cargo Check", COL_DIM)
+
+    ui_end()
+    let s = win("Sleep", 12)
+}
+
+// right-aligned status bar segment; returns the next x to the left of it
+fn status_item(ex: int, s: str) -> int {
+    let w = text_w(s)
+    dtext(ex - w, ui_h() - 21, s, COL_DIM)
+    return ex - w - 24
+}
+
+// ---- toolbar icon drawing ----
+fn icon_burger(x: int, cy: int) {
+    fill(x, cy - 6, 14, 2, COL_DIM)
+    fill(x, cy - 1, 14, 2, COL_DIM)
+    fill(x, cy + 4, 14, 2, COL_DIM)
+}
+fn icon_branch(x: int, cy: int) {
+    fill(x + 2, cy - 4, 2, 8, COL_DIM)
+    fill_rr(x, cy - 8, 6, 6, 6, COL_DIM)
+    fill_rr(x, cy + 3, 6, 6, 6, COL_DIM)
+    fill_rr(x + 7, cy - 3, 6, 6, 6, COL_DIM)
+    fill(x + 4, cy, 4, 2, COL_DIM)
+}
+fn icon_play(x: int, cy: int, col: int) {
+    var i = 0
+    while i < 6 {
+        fill(x + i, cy - 6 + i, 2, 12 - i * 2, col)
+        i += 1
+    }
+}
+fn icon_search(x: int, cy: int) {
+    frame_rr(x, cy - 7, 10, 10, 10, COL_DIM)
+    fill(x + 8, cy + 2, 2, 2, COL_DIM)
+    fill(x + 9, cy + 3, 2, 2, COL_DIM)
+    fill(x + 10, cy + 4, 2, 2, COL_DIM)
+}
+fn icon_bell(x: int, cy: int) {
+    fill_rr(x, cy - 7, 11, 10, 8, COL_DIM)
+    fill(x - 2, cy + 3, 15, 2, COL_DIM)
+    fill(x + 4, cy + 6, 3, 2, COL_DIM)
+}
+fn icon_gear(x: int, cy: int) {
+    frame_rr(x, cy - 7, 13, 13, 13, COL_DIM)
+    fill_rr(x + 4, cy - 3, 5, 5, 5, COL_DIM)
+    fill(x + 5, cy - 9, 3, 3, COL_DIM)
+    fill(x + 5, cy + 5, 3, 3, COL_DIM)
+    fill(x - 2, cy - 2, 3, 3, COL_DIM)
+    fill(x + 12, cy - 2, 3, 3, COL_DIM)
+}
+
+// editor / dock tab: variable width, file icon, accent underline when active
+fn editor_tab(id: int, y: int, label: str, icon: int, cur: int, idx: int) -> int {
+    let h = 36
+    let w = text_w(label) + 48
+    let x = g_tabx
+    let clicked = ui_abtn_flat(id, x, y, w, h, "", false)
+    var r = cur
+    if clicked { r = idx }
+    let kind = icon / 16777216
+    let col = icon % 16777216
+    draw_icon(kind, col, x + 12, y + h / 2)
+    var tc = COL_DIM
+    if r == idx { tc = COL_TEXT }
+    dtext_v(x + 32, y, h, label, tc)
+    if r == idx { fill_rr(x + 8, y + h - 3, w - 16, 3, 3, COL_ACCENT) }
+    g_tabx = x + w
+    return r
+}
+
+// ---- project tree ----
+fn project_tree() {
+    if ui_tree_row(3001, 0, "src", true, ICON_SRC) {
+        if ui_tree_row(3002, 1, "handlers", true, ICON_FOLDER) {
+            let a = ui_tree_row(3020, 2, "feed.rs", false, ICON_RS)
+            let b = ui_tree_row(3021, 2, "texts.rs", false, ICON_RS)
+            let c = ui_tree_row(3022, 2, "users.rs", false, ICON_RS)
+        }
+        if ui_tree_row(3003, 1, "types", true, ICON_FOLDER) {
+            let a = ui_tree_row(3030, 2, "text.rs", false, ICON_RS)
+            let b = ui_tree_row(3031, 2, "user.rs", false, ICON_RS)
+        }
+        let u = ui_tree_row(3004, 1, "utils", true, ICON_FOLDER)
+        let m1 = ui_tree_row(3010, 1, "main.rs", false, ICON_RS)
+        let m2 = ui_tree_row(3011, 1, "handlers.rs", false, ICON_RS)
+        let m3 = ui_tree_row(3012, 1, "schema.rs", false, ICON_RS)
+        let m4 = ui_tree_row(3013, 1, "state.rs", false, ICON_RS)
+        let m5 = ui_tree_row(3014, 1, "textter_store.rs", false, ICON_RS)
+        let m6 = ui_tree_row(3015, 1, "types.rs", false, ICON_RS)
+        let m7 = ui_tree_row(3016, 1, "utils.rs", false, ICON_RS)
+    }
+    let ct = ui_tree_row(3040, 0, "Cargo.toml", false, ICON_TOML)
+    let cl = ui_tree_row(3041, 0, "Cargo.lock", false, ICON_TOML)
+    let rm = ui_tree_row(3042, 0, "README.md", false, ICON_MD)
+}
+
+// ---- database tree ----
+fn database_tree() {
+    if ui_tree_row(4001, 0, "textter-postgres@localhost", true, ICON_DB) {
+        if ui_tree_row(4002, 1, "postgres", true, ICON_DB) {
+            let a = ui_tree_row(4020, 2, "information_schema", false, ICON_SCHEMA)
+            let b = ui_tree_row(4021, 2, "pg_catalog", false, ICON_SCHEMA)
+        }
+        if ui_tree_row(4003, 1, "textter-rs", true, ICON_DB) {
+            let s = ui_tree_row(4030, 2, "information_schema", false, ICON_SCHEMA)
+            let c = ui_tree_row(4031, 2, "pg_catalog", false, ICON_SCHEMA)
+            if ui_tree_row(4032, 2, "public", true, ICON_SCHEMA) {
+                if ui_tree_row(4040, 3, "tables", true, ICON_FOLDER) {
+                    let t1 = ui_tree_row(4050, 4, "subscriptions", false, ICON_TABLE)
+                    let t2 = ui_tree_row(4051, 4, "texts", false, ICON_TABLE)
+                    let t3 = ui_tree_row(4052, 4, "users", false, ICON_TABLE)
+                }
+                let r = ui_tree_row(4041, 3, "routines", true, ICON_FOLDER)
+                let q = ui_tree_row(4042, 3, "sequences", true, ICON_FOLDER)
+            }
+        }
+    }
+}
+
+// ---- docker / services ----
+fn docker_tree() {
+    if ui_tree_row(6200, 0, "Containers", true, ICON_FOLDER) {
+        let c1 = ui_tree_row(6210, 1, "dapr_placement", false, ICON_RUN)
+        let c2 = ui_tree_row(6211, 1, "dapr_redis", false, ICON_RUN)
+        let c3 = ui_tree_row(6212, 1, "dapr_zipkin", false, ICON_RUN)
+        let c4 = ui_tree_row(6213, 1, "focused_heyrovsky", false, ICON_STOP)
+        let c5 = ui_tree_row(6214, 1, "mystifying_dijkstra", false, ICON_STOP)
+    }
+    if ui_tree_row(6201, 0, "Images", true, ICON_FOLDER) {
+        let i1 = ui_tree_row(6220, 1, "daprio/dapr:1.10.7", false, ICON_IMG)
+        let i2 = ui_tree_row(6221, 1, "openzipkin/zipkin:latest", false, ICON_IMG)
+        let i3 = ui_tree_row(6222, 1, "postgres:latest", false, ICON_IMG)
+        let i4 = ui_tree_row(6223, 1, "redis:6", false, ICON_IMG)
+        let i5 = ui_tree_row(6224, 1, "rust:latest", false, ICON_IMG)
+    }
+}
+fn services_tree() {
+    if ui_tree_row(6300, 0, "HTTP Request", true, ICON_FOLDER) {
+        let a = ui_tree_row(6310, 1, "Health check   200 OK   63ms", false, ICON_RUN)
+        let b = ui_tree_row(6311, 1, "Register User ann", false, ICON_STOP)
+        let c = ui_tree_row(6312, 1, "Register User mary", false, ICON_STOP)
+    }
+}
+
+// ---- code rendering: each line is one token-string, split into colored runs ----
+// a token = <SEP><colour-digit><text>; palette 0..7 below. (SEP is defined up top.)
+fn tk(c: int, t: str) -> str { return SEP + (c as str) + t }
+fn palcol(i: int) -> int {
+    if i == 1 { return C_KW }
+    if i == 2 { return C_FN }
+    if i == 3 { return C_TYPE }
+    if i == 4 { return C_STR }
+    if i == 5 { return C_NUM }
+    if i == 6 { return C_CMT }
+    if i == 7 { return C_MEM }
+    return C_PUNC
+}
+fn code_line(x0: int, y: int, s: str) {
+    let parts = s.split(SEP)
+    var cx = x0
+    for p in parts {
+        if p.len() > 0 {
+            let ci = p.byte(0) - 48
+            let w = ui_run(cx, y, p.sub(1, p.len()), palcol(ci))
+            cx = cx + w
+        }
+    }
+}
+fn cl(y: int, ln: int, s: str) {
+    var nc = COL_FAINT
+    if ln == g_cur_ln {
+        fill(g_ed_x, y - 2, g_ed_w, 21, rgb(38, 40, 45))
+        fill(g_gutx + 12, y - 1, 2, 18, COL_TEXT)
+        nc = COL_DIM
+    }
+    if ln > 0 {
+        let num = ln as str
+        dtext(g_gutx - num.len() * 8, y, num, nc)
+    }
+    code_line(g_gutx + 12, y, s)
+}
+fn draw_main_rs(cx: int, cwid: int) {
+    g_gutx = cx + 52
+    g_ed_x = cx
+    g_ed_w = cwid
+    let lh = 20
+    var y = g_cy
+    cl(y, 103, tk(1, "let ") + tk(0, "with_auth_protection = ") + tk(3, "Router") + tk(0, "::new();"))
+    y += lh
+    cl(y, 104, tk(1, "let ") + tk(0, "app = ") + tk(3, "Router") + tk(0, "::new()"))
+    y += lh
+    cl(y, 105, tk(0, "    .route(") + tk(4, "\"/texts/feed\"") + tk(0, ", ") + tk(2, "get") + tk(0, "(") + tk(2, "get_feed") + tk(0, "))"))
+    y += lh
+    cl(y, 106, tk(0, "    .route(") + tk(4, "\"/texts/write\"") + tk(0, ", ") + tk(2, "post") + tk(0, "(") + tk(2, "write_text") + tk(0, "))"))
+    y += lh
+    cl(y, 107, tk(0, "    .route(") + tk(4, "\"/users/subscribe\"") + tk(0, ", ") + tk(2, "post") + tk(0, "(") + tk(2, "subscribe") + tk(0, "))"))
+    y += lh
+    cl(y, 108, tk(0, "    .route(") + tk(4, "\"/users/logout\"") + tk(0, ", ") + tk(2, "post") + tk(0, "(") + tk(2, "logout") + tk(0, "))"))
+    y += lh
+    cl(y, 109, tk(0, "    .layer(") + tk(2, "from_fn_with_state") + tk(0, "(state, ") + tk(2, "jwt_auth") + tk(0, "));"))
+    y += lh
+    cl(y, 110, "")
+    y += lh
+    cl(y, 111, tk(1, "let ") + tk(0, "app: ") + tk(3, "Router") + tk(0, " = ") + tk(3, "Router") + tk(0, "::new()"))
+    y += lh
+    cl(y, 112, tk(0, "    .merge(") + tk(3, "SwaggerUi") + tk(0, "::new(") + tk(4, "\"/swagger-ui\"") + tk(0, "))"))
+    y += lh
+    cl(y, 113, tk(0, "    .merge(with_auth_protection)"))
+    y += lh
+    cl(y, 114, tk(0, "    .route(") + tk(4, "\"/healthcheck\"") + tk(0, ", ") + tk(2, "get") + tk(0, "(") + tk(2, "healthcheck") + tk(0, "))"))
+    y += lh
+    cl(y, 115, tk(0, "    .route(") + tk(4, "\"/texts/all\"") + tk(0, ", ") + tk(2, "get") + tk(0, "(") + tk(2, "get_all_texts") + tk(0, "))"))
+    y += lh
+    cl(y, 116, tk(0, "    .route(") + tk(4, "\"/users/view\"") + tk(0, ", ") + tk(2, "get") + tk(0, "(") + tk(2, "get_users") + tk(0, "))"))
+    y += lh
+    cl(y, 117, tk(0, "    .route(") + tk(4, "\"/users/register\"") + tk(0, ", ") + tk(2, "post") + tk(0, "(") + tk(2, "register_user") + tk(0, "))"))
+    y += lh
+    cl(y, 118, tk(0, "    .route(") + tk(4, "\"/users/login\"") + tk(0, ", ") + tk(2, "post") + tk(0, "(") + tk(2, "login_user") + tk(0, "))"))
+    y += lh
+    cl(y, 119, tk(0, "    .fallback(") + tk(2, "fallback") + tk(0, ")"))
+    y += lh
+    cl(y, 120, tk(0, "    .layer("))
+    y += lh
+    cl(y, 121, tk(0, "        ") + tk(3, "TraceLayer") + tk(0, "::new_for_http()"))
+    y += lh
+    cl(y, 122, tk(0, "            ") + tk(6, "// span + tracing for every request"))
+    y += lh
+    cl(y, 123, tk(0, "            .make_span_with(trace::") + tk(3, "DefaultMakeSpan") + tk(0, "::new())"))
+    y += lh
+    cl(y, 124, tk(0, "    );"))
+    g_cy = y + lh
+}
+fn draw_cargo(cx: int, cwid: int) {
+    g_gutx = cx + 44
+    g_ed_x = cx
+    g_ed_w = cwid
+    let lh = 20
+    var y = g_cy
+    cl(y, 1, tk(3, "[package]"))
+    y += lh
+    cl(y, 2, tk(7, "name") + tk(0, " = ") + tk(4, "\"textter\""))
+    y += lh
+    cl(y, 3, tk(7, "version") + tk(0, " = ") + tk(4, "\"0.1.0\""))
+    y += lh
+    cl(y, 4, tk(7, "edition") + tk(0, " = ") + tk(4, "\"2021\""))
+    y += lh
+    cl(y, 5, "")
+    y += lh
+    cl(y, 6, tk(3, "[dependencies]"))
+    y += lh
+    cl(y, 7, tk(7, "axum") + tk(0, " = ") + tk(4, "\"0.7\""))
+    y += lh
+    cl(y, 8, tk(7, "tokio") + tk(0, " = \{ features = [") + tk(4, "\"full\"") + tk(0, "] \}"))
+    y += lh
+    cl(y, 9, tk(7, "serde") + tk(0, " = \{ features = [") + tk(4, "\"derive\"") + tk(0, "] \}"))
+    y += lh
+    cl(y, 10, tk(7, "diesel") + tk(0, " = ") + tk(4, "\"2.1\""))
+    g_cy = y + lh
+}
+
+fn seed_open() {
+    set_open(3001, true)
+    set_open(3002, true)
+    set_open(4001, true)
+    set_open(4003, true)
+    set_open(4032, true)
+    set_open(4040, true)
+    set_open(6200, true)
+    set_open(6201, true)
+    set_open(6300, true)
+}

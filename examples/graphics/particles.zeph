@@ -1,0 +1,151 @@
+// A real-time particle engine in pure Zephyr -- CPU renderer.
+//
+// The simulation lives in particle_sim.zeph (shared with particles_gl.zeph,
+// which draws the same particles on the GPU). This file is the software
+// rasterizer: particles splat additively into an integer accumulation grid (a
+// plus-shaped kernel, so they glow instead of aliasing), the grid is tone-
+// mapped through an ember palette into a 32-bit BGRA buffer, and the whole
+// frame goes to the window in one StretchDIBits call. No per-pixel GDI, no
+// flicker, no blending readback.
+//
+//   zc.exe --rt examples\particles.zeph particles.exe && .\particles.exe
+//   .\particles.exe 200        (headless: 200 steps, print a brightness checksum)
+//
+// Controls: 1 fountain, 2 burst, 3 vortex; hold the left mouse button to drag
+// the particles toward the cursor. Close the window to exit.
+
+import "particle_sim.zeph"
+
+let COUNT = 6000                 // what a software rasterizer keeps up with
+let CELLS = PW * PH
+
+var acc = zeros(CELLS)           // additive brightness accumulator
+var pixels = mem(CELLS * 4)      // BGRA framebuffer
+var bmi = mem(40)                // BITMAPINFOHEADER
+
+// splat every particle additively into the accumulation grid
+fn splat() {
+    var k = 0
+    while k < CELLS {
+        acc[k] = 0
+        k += 1
+    }
+    var i = 0
+    while i < NP {
+        let l = plife[i]
+        if l > 0.0 {
+            let xi = px[i] as int
+            let yi = py[i] as int
+            if xi >= 1 and xi < PW - 1 and yi >= 1 and yi < PH - 1 {
+                // brightness fades as the particle ages
+                let b = (l * (255.0 / LIFE)) as int
+                let c = yi * PW + xi
+                acc[c] += b
+                let h = b / 3
+                acc[c - 1] += h
+                acc[c + 1] += h
+                acc[c - PW] += h
+                acc[c + PW] += h
+            }
+        }
+        i += 1
+    }
+}
+
+// tone-map the accumulator through an ember ramp: black -> deep red -> orange
+// -> yellow -> white core
+fn render() {
+    var k = 0
+    while k < CELLS {
+        let v = acc[k]
+        let r = clampi(v * 3, 0, 255)
+        let g = clampi((v - 60) * 2, 0, 255)
+        let b = clampi((v - 170) * 3, 0, 255)
+        store32(pixels + k * 4, r * 65536 | g * 256 | b)
+        k += 1
+    }
+}
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(24)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))
+    let ch = lo32(load64(rc + 12))
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    gcw = cw
+    gch = ch
+    splat()
+    render()
+    let sm = win("gdi32!SetStretchBltMode", hdc, 3)        // COLORONCOLOR
+    let bb = win("gdi32!StretchDIBits", hdc, 0, 0, cw, ch, 0, 0, PW, PH, pixels, bmi, 0, 13369376)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+// ---- BITMAPINFOHEADER for a 32-bit top-down DIB ----
+store32(bmi + 0, 40)                     // biSize
+store32(bmi + 4, PW)                     // biWidth
+store32(bmi + 8, 0 - PH)                 // biHeight < 0 => top-down rows
+store32(bmi + 12, 1 | 32 * 65536)        // biPlanes=1, biBitCount=32
+store32(bmi + 16, 0)                     // biCompression = BI_RGB
+
+sim_init(COUNT)
+
+var steps = 0
+if args().len() > 1 { steps = args()[1] as int }
+
+if steps > 0 {
+    // headless: run the sim and print a brightness checksum (no window)
+    var s = 0
+    while s < steps {
+        step()
+        s += 1
+    }
+    splat()
+    var chk = 0
+    var k = 0
+    while k < CELLS {
+        chk += acc[k] * k
+        k += 1
+    }
+    print(chk)
+} else {
+    let hInst = win("GetModuleHandleA", 0)
+    let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+    let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+    let clsname = cstr("zephyrParticleWindow")
+
+    let wc = mem(72)                       // WNDCLASSA
+    store32(wc + 0, 3)                     // CS_HREDRAW|CS_VREDRAW
+    store64(wc + 8, defwp)
+    store64(wc + 24, hInst)
+    store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // IDC_ARROW
+    store64(wc + 48, 0)                    // no background brush; we paint every pixel
+    store64(wc + 64, clsname)
+    let atom = win("user32!RegisterClassA", wc)
+
+    let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - particles"),
+        282001408, 120, 100, 900, 720, 0, 0, hInst, 0)     // WS_OVERLAPPEDWINDOW|WS_VISIBLE
+    let sw = win("user32!ShowWindow", hwnd, 5)
+    let uw = win("user32!UpdateWindow", hwnd)
+
+    let msg = mem(48)
+    var running = 1
+    while running == 1 {
+        while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+            if lo32(load64(msg + 8)) == 18 { running = 0 }     // WM_QUIT
+            let tr = win("user32!TranslateMessage", msg)
+            let dp = win("user32!DispatchMessageA", msg)
+        }
+        if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+        if running == 1 {
+            poll_input(hwnd)
+            step()
+            draw(hwnd)
+            fps_tick()
+        }
+    }
+}

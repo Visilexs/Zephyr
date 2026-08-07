@@ -1,0 +1,117 @@
+// spin67 — "67" as a 3D extruded solid, spinning about the Y axis.
+// Point cloud -> Y-rotation -> fixed X tilt -> perspective projection with a
+// z-buffer -> depth-shaded luminance ramp. No sin/cos in the language: the
+// spin angle is a unit vector (c, s) advanced each frame by angle addition.
+// Usage: spin67 [frames]   (default 400)
+
+let ART = [
+    "   6666     77777777",
+    "  66             777",
+    " 66             77  ",
+    " 66            77   ",
+    " 6666666      77    ",
+    " 66    66    77     ",
+    " 66    66   77      ",
+    "  666666   77       "
+]
+let BW = 20
+let BH = 8
+let W = 64
+let H = 30
+let RAMP = [".", ":", "-", "=", "+", "*", "#", "%", "@"]
+
+// extrude the glyph into 3D: 2x2 supersamples per filled cell, 3 depth layers
+var px: [float] = []
+var py: [float] = []
+var pz: [float] = []
+for by in 0..BH {
+    for bx in 0..BW {
+        if ART[by].byte(bx) != 32 {
+            for ox in 0..2 {
+                for oy in 0..2 {
+                    for lz in 0..3 {
+                        px.push(((bx as float) + (ox as float) * 0.5 - 10.0) * 0.55)
+                        py.push((by as float) + (oy as float) * 0.5 - 4.0)
+                        pz.push((lz as float) * 0.4 - 0.4)
+                    }
+                }
+            }
+        }
+    }
+}
+
+var zbuf: [float] = []
+var grid: [int] = []
+for i in 0..W * H {
+    zbuf.push(0.0)
+    grid.push(-1)
+}
+
+fn render(c: float, s: float) -> str {
+    for i in 0..W * H {
+        zbuf[i] = 1000000.0
+        grid[i] = -1
+    }
+    for i in 0..px.len() {
+        let x = px[i]
+        let y = py[i]
+        let z = pz[i]
+        // spin about Y
+        let rx = x * c + z * s
+        let rz = z * c - x * s
+        // camera tilt about X: cos(0.35)=0.939373, sin(0.35)=0.342898
+        let ry = y * 0.939373 - rz * 0.342898
+        let rz2 = y * 0.342898 + rz * 0.939373
+        let depth = rz2 + 16.0
+        let sc = 30.0 / depth
+        let sxi = (32.0 + rx * sc * 2.0 + 0.5) as int   // chars are half as wide as tall
+        let syi = (15.0 + ry * sc + 0.5) as int
+        if sxi >= 0 and sxi < W and syi >= 0 and syi < H {
+            let idx = syi * W + sxi
+            if depth < zbuf[idx] {
+                zbuf[idx] = depth
+                var b = ((6.0 - rz2) * 0.7) as int      // nearer = brighter
+                if b < 0 { b = 0 }
+                if b > 8 { b = 8 }
+                grid[idx] = b
+            }
+        }
+    }
+    var parts: [str] = []
+    parts.push(chr(27) + "[H")
+    for yy in 0..H {
+        for xx in 0..W {
+            let g = grid[yy * W + xx]
+            if g < 0 { parts.push(" ") }
+            else { parts.push(RAMP[g]) }
+        }
+        parts.push("\n")
+    }
+    return parts.join()
+}
+
+fn pause() {
+    var sink = 0
+    for k in 0..25000000 {
+        sink += k % 3
+    }
+    if sink == 42 { print("") } // ponytail: busy-wait frame timer; a sleep() builtin would replace this
+}
+
+var frames = 400
+if args().len() > 1 { frames = args()[1] as int }
+
+print(chr(27) + "[2J" + chr(27) + "[?25l")
+var c = 1.0
+var s = 0.0
+for f in 0..frames {
+    print(render(c, s))
+    pause()
+    // advance the spin by ~5.7 degrees: cos(0.1)=0.995004, sin(0.1)=0.099833
+    let nc = c * 0.995004 - s * 0.099833
+    let ns = s * 0.995004 + c * 0.099833
+    let n = sqrt(nc * nc + ns * ns)
+    c = nc / n
+    s = ns / n
+}
+print(chr(27) + "[?25h")

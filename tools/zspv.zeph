@@ -1,0 +1,608 @@
+// zspv -- a shader compiler, written in Zephyr, emitting SPIR-V.
+//
+// Zephyr already compiles itself to x86-64 and writes its own PE files. This
+// targets the other processor in the machine: the same frontend shape (lex,
+// parse, emit) against SPIR-V, so the GPU code driving vk/gfx.zeph can be
+// written in Zephyr instead of GLSL.
+//
+//   zspv.exe shader.zsh out.spv
+//
+// SPIR-V is a much softer target than x86: no relocations, no ABI, no register
+// allocation. A module is a 5-word header followed by instructions, each of
+// which is (wordCount << 16) | opcode. Results are SSA ids, so "allocation" is
+// a counter.
+
+import "std/bytes.zeph"
+
+// ---------------- opcodes and enums (SPIR-V 1.0 spec) ----------------
+let OP_EXT_INST_IMPORT = 11
+let OP_MEMORY_MODEL = 14
+let OP_ENTRY_POINT = 15
+let OP_EXECUTION_MODE = 16
+let OP_CAPABILITY = 17
+let OP_TYPE_VOID = 19
+let OP_TYPE_FLOAT = 22
+let OP_TYPE_VECTOR = 23
+let OP_TYPE_POINTER = 32
+let OP_TYPE_FUNCTION = 33
+let OP_CONSTANT = 43
+let OP_CONSTANT_COMPOSITE = 44
+let OP_FUNCTION = 54
+let OP_FUNCTION_END = 56
+let OP_VARIABLE = 59
+let OP_LOAD = 61
+let OP_STORE = 62
+let OP_DECORATE = 71
+let OP_COMPOSITE_CONSTRUCT = 80
+let OP_COMPOSITE_EXTRACT = 81
+let OP_FNEGATE = 127
+let OP_FADD = 129
+let OP_FSUB = 131
+let OP_FMUL = 133
+let OP_FDIV = 136
+let OP_VECTOR_TIMES_SCALAR = 142
+let OP_LABEL = 248
+let OP_RETURN = 253
+
+let CAP_SHADER = 1
+let ADDRESSING_LOGICAL = 0
+let MEMORY_GLSL450 = 1
+let EXEC_VERTEX = 0
+let EXEC_FRAGMENT = 4
+let MODE_ORIGIN_UPPER_LEFT = 7
+let DECOR_LOCATION = 30
+let DECOR_BUILTIN = 11
+let BUILTIN_POSITION = 0
+let STORAGE_INPUT = 1
+let STORAGE_OUTPUT = 3
+let FN_CONTROL_NONE = 0
+
+// ---------------- module sections ----------------
+// SPIR-V fixes the order: capabilities, memory model, entry points, execution
+// modes, decorations, then all types/constants/globals, then functions.
+var g_caps: [int] = []
+var g_entry: [int] = []
+var g_modes: [int] = []
+var g_decor: [int] = []
+var g_types: [int] = []
+var g_code: [int] = []
+
+var g_next_id = 1
+
+fn new_id() -> int {
+    let i = g_next_id
+    g_next_id += 1
+    return i
+}
+
+fn ins(buf: [int], op: int, ops: [int]) {
+    buf.push((ops.len() + 1) * 65536 + op)
+    for o in ops { buf.push(o) }
+}
+
+// SPIR-V literal strings: bytes packed little-endian into words, NUL-terminated,
+// zero-padded out to a word boundary.
+fn str_words(s: str) -> [int] {
+    var w: [int] = []
+    var acc = 0
+    var n = 0
+    for i in 0..s.len() {
+        acc = acc | (s.byte(i) << (8 * n))
+        n += 1
+        if n == 4 {
+            w.push(acc)
+            acc = 0
+            n = 0
+        }
+    }
+    w.push(acc)        // carries the NUL; a full zero word when already aligned
+    return w
+}
+
+// ---------------- interned types and constants ----------------
+// A type is identified by its component count: 1 = float, 2..4 = vecN.
+var g_tid_void = 0
+var g_tid_fn = 0
+var g_vec_n: [int] = []
+var g_vec_id: [int] = []
+var g_ptr_sc: [int] = []
+var g_ptr_ty: [int] = []
+var g_ptr_id: [int] = []
+var g_const_bits: [int] = []
+var g_const_id: [int] = []
+
+fn type_void() -> int {
+    if g_tid_void == 0 {
+        g_tid_void = new_id()
+        ins(g_types, OP_TYPE_VOID, [g_tid_void])
+    }
+    return g_tid_void
+}
+
+fn type_vec(n: int) -> int {
+    for i in 0..g_vec_n.len() {
+        if g_vec_n[i] == n { return g_vec_id[i] }
+    }
+    var id = 0
+    if n == 1 {
+        id = new_id()
+        ins(g_types, OP_TYPE_FLOAT, [id, 32])
+    } else {
+        let base = type_vec(1)
+        id = new_id()
+        ins(g_types, OP_TYPE_VECTOR, [id, base, n])
+    }
+    g_vec_n.push(n)
+    g_vec_id.push(id)
+    return id
+}
+
+fn type_ptr(storage: int, ty: int) -> int {
+    for i in 0..g_ptr_sc.len() {
+        if g_ptr_sc[i] == storage and g_ptr_ty[i] == ty { return g_ptr_id[i] }
+    }
+    let id = new_id()
+    ins(g_types, OP_TYPE_POINTER, [id, storage, ty])
+    g_ptr_sc.push(storage)
+    g_ptr_ty.push(ty)
+    g_ptr_id.push(id)
+    return id
+}
+
+fn type_fn_void() -> int {
+    if g_tid_fn == 0 {
+        let v = type_void()
+        g_tid_fn = new_id()
+        ins(g_types, OP_TYPE_FUNCTION, [g_tid_fn, v])
+    }
+    return g_tid_fn
+}
+
+fn const_float(v: float) -> int {
+    let fb = f32_bits(v)
+    for i in 0..g_const_bits.len() {
+        if g_const_bits[i] == fb { return g_const_id[i] }
+    }
+    let ft = type_vec(1)
+    let id = new_id()
+    ins(g_types, OP_CONSTANT, [ft, id, fb])
+    g_const_bits.push(fb)
+    g_const_id.push(id)
+    return id
+}
+
+// ---------------- lexer ----------------
+// The shader language is free-form: newlines are just whitespace, so there is
+// none of the statement-terminator handling the host language needs.
+let TK_EOF = 0
+let TK_IDENT = 1
+let TK_NUM = 2
+let TK_PUNCT = 3
+
+struct Tok { k: int, s: str, f: float, line: int }
+
+var T: [Tok] = []
+var P = 0
+var g_src_name = ""
+
+fn is_dig(c: int) -> bool { return c >= 48 and c <= 57 }
+fn is_alpha(c: int) -> bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+}
+
+fn die(line: int, msg: str) {
+    panic("{g_src_name}:{line}: {msg}")
+}
+
+fn lex(src: str) {
+    var i = 0
+    var line = 1
+    let n = src.len()
+    while i < n {
+        let c = src.byte(i)
+        if c == 10 {
+            line += 1
+            i += 1
+        } else if c == 32 or c == 9 or c == 13 {
+            i += 1
+        } else if c == 47 and i + 1 < n and src.byte(i + 1) == 47 {
+            while i < n and src.byte(i) != 10 { i += 1 }
+        } else if is_alpha(c) {
+            var j = i
+            while j < n and (is_alpha(src.byte(j)) or is_dig(src.byte(j))) { j += 1 }
+            T.push(Tok{k: TK_IDENT, s: src.sub(i, j), f: 0.0, line: line})
+            i = j
+        } else if is_dig(c) {
+            var j = i
+            while j < n and is_dig(src.byte(j)) { j += 1 }
+            if j < n and src.byte(j) == 46 {
+                j += 1
+                while j < n and is_dig(src.byte(j)) { j += 1 }
+            }
+            T.push(Tok{k: TK_NUM, s: src.sub(i, j), f: src.sub(i, j) as float, line: line})
+            i = j
+        } else {
+            T.push(Tok{k: TK_PUNCT, s: src.sub(i, i + 1), f: 0.0, line: line})
+            i += 1
+        }
+    }
+    T.push(Tok{k: TK_EOF, s: "", f: 0.0, line: line})
+}
+
+fn peek() -> Tok { return T[P] }
+fn next() -> Tok {
+    let t = T[P]
+    P += 1
+    return t
+}
+fn at_punct(s: str) -> bool {
+    return T[P].k == TK_PUNCT and T[P].s == s
+}
+fn at_ident(s: str) -> bool {
+    return T[P].k == TK_IDENT and T[P].s == s
+}
+fn expect_punct(s: str) {
+    if not at_punct(s) { die(T[P].line, "expected '{s}', got '{T[P].s}'") }
+    P += 1
+}
+fn expect_ident() -> str {
+    if T[P].k != TK_IDENT { die(T[P].line, "expected a name, got '{T[P].s}'") }
+    let s = T[P].s
+    P += 1
+    return s
+}
+
+// ---------------- symbols ----------------
+// Every declared in/out variable, plus any `let` inside main.
+var g_sym_name: [str] = []
+var g_sym_id: [int] = []
+var g_sym_comps: [int] = []
+var g_sym_storage: [int] = []      // 0 = an SSA value from `let`, else Input/Output
+var g_iface: [int] = []            // in/out ids, for OpEntryPoint
+
+fn sym_find(name: str) -> int {
+    for i in 0..g_sym_name.len() {
+        if g_sym_name[i] == name { return i }
+    }
+    return 0 - 1
+}
+
+fn type_comps(name: str, line: int) -> int {
+    if name == "float" { return 1 }
+    if name == "vec2" { return 2 }
+    if name == "vec3" { return 3 }
+    if name == "vec4" { return 4 }
+    die(line, "unknown type '{name}'")
+    return 0
+}
+
+// ---------------- expressions ----------------
+struct Val { id: int, comps: int }
+
+// Break a value into its scalar components, so vec4(v3, 1.0) can be assembled.
+fn scalars(v: Val, out: [int]) {
+    if v.comps == 1 {
+        out.push(v.id)
+        return
+    }
+    let ft = type_vec(1)
+    for i in 0..v.comps {
+        let id = new_id()
+        ins(g_code, OP_COMPOSITE_EXTRACT, [ft, id, v.id, i])
+        out.push(id)
+    }
+}
+
+fn gen_expr() -> Val { return gen_add() }
+
+fn gen_add() -> Val {
+    var l = gen_mul()
+    var going = true
+    while going {
+        if at_punct("+") or at_punct("-") {
+            let op = next().s
+            let r = gen_mul()
+            if l.comps != r.comps { die(T[P].line, "cannot add vec{l.comps} and vec{r.comps}") }
+            let t = type_vec(l.comps)
+            let id = new_id()
+            var code = OP_FADD
+            if op == "-" { code = OP_FSUB }
+            ins(g_code, code, [t, id, l.id, r.id])
+            l = Val{id: id, comps: l.comps}
+        } else {
+            going = false
+        }
+    }
+    return l
+}
+
+fn gen_mul() -> Val {
+    var l = gen_unary()
+    var going = true
+    while going {
+        if at_punct("*") or at_punct("/") {
+            let op = next().s
+            let r = gen_unary()
+            let id = new_id()
+            if op == "*" and l.comps > 1 and r.comps == 1 {
+                // vector * scalar has its own opcode
+                let t = type_vec(l.comps)
+                ins(g_code, OP_VECTOR_TIMES_SCALAR, [t, id, l.id, r.id])
+                l = Val{id: id, comps: l.comps}
+            } else if op == "*" and l.comps == 1 and r.comps > 1 {
+                let t = type_vec(r.comps)
+                ins(g_code, OP_VECTOR_TIMES_SCALAR, [t, id, r.id, l.id])
+                l = Val{id: id, comps: r.comps}
+            } else {
+                if l.comps != r.comps { die(T[P].line, "cannot combine vec{l.comps} and vec{r.comps}") }
+                let t = type_vec(l.comps)
+                var code = OP_FMUL
+                if op == "/" { code = OP_FDIV }
+                ins(g_code, code, [t, id, l.id, r.id])
+                l = Val{id: id, comps: l.comps}
+            }
+        } else {
+            going = false
+        }
+    }
+    return l
+}
+
+fn gen_unary() -> Val {
+    if at_punct("-") {
+        let m = next()
+        let v = gen_unary()
+        let t = type_vec(v.comps)
+        let id = new_id()
+        ins(g_code, OP_FNEGATE, [t, id, v.id])
+        return Val{id: id, comps: v.comps}
+    }
+    return gen_primary()
+}
+
+fn gen_primary() -> Val {
+    let t = peek()
+    if t.k == TK_NUM {
+        let x = next()
+        return Val{id: const_float(x.f), comps: 1}
+    }
+    if at_punct("(") {
+        let a = next()
+        let v = gen_expr()
+        expect_punct(")")
+        return v
+    }
+    if t.k == TK_IDENT {
+        let name = next().s
+        // vecN(...) constructor
+        if name == "vec2" or name == "vec3" or name == "vec4" or name == "float" {
+            let want = type_comps(name, t.line)
+            expect_punct("(")
+            var parts: [int] = []
+            var more = true
+            while more {
+                let a = gen_expr()
+                scalars(a, parts)
+                if at_punct(",") { let c = next() }
+                else { more = false }
+            }
+            expect_punct(")")
+            if parts.len() == 1 and want > 1 {
+                // splat: vec3(0.5) fills every component
+                for k in 1..want { parts.push(parts[0]) }
+            }
+            if parts.len() != want {
+                die(t.line, "{name}() needs {want} components, got {parts.len()}")
+            }
+            if want == 1 { return Val{id: parts[0], comps: 1} }
+            let ty = type_vec(want)
+            let id = new_id()
+            var ops: [int] = []
+            ops.push(ty)
+            ops.push(id)
+            for c in parts { ops.push(c) }
+            ins(g_code, OP_COMPOSITE_CONSTRUCT, ops)
+            return Val{id: id, comps: want}
+        }
+        // a declared variable
+        let si = sym_find(name)
+        if si < 0 { die(t.line, "unknown name '{name}'") }
+        var v = Val{id: g_sym_id[si], comps: g_sym_comps[si]}
+        if g_sym_storage[si] != 0 {
+            // in/out variables are pointers; reading one is a load
+            let ty = type_vec(g_sym_comps[si])
+            let id = new_id()
+            ins(g_code, OP_LOAD, [ty, id, g_sym_id[si]])
+            v = Val{id: id, comps: g_sym_comps[si]}
+        }
+        // swizzle / component select: .x .y .z .w
+        if at_punct(".") {
+            let d = next()
+            let sw = expect_ident()
+            var picked: [int] = []
+            var comps: [int] = []
+            scalars(v, comps)
+            for i in 0..sw.len() {
+                let c = sw.byte(i)
+                var idx = 0 - 1
+                if c == 120 { idx = 0 }          // x
+                if c == 121 { idx = 1 }          // y
+                if c == 122 { idx = 2 }          // z
+                if c == 119 { idx = 3 }          // w
+                if c == 114 { idx = 0 }          // r
+                if c == 103 { idx = 1 }          // g
+                if c == 98 { idx = 2 }           // b
+                if c == 97 { idx = 3 }           // a
+                if idx < 0 or idx >= v.comps { die(t.line, "bad swizzle '{sw}' on vec{v.comps}") }
+                picked.push(comps[idx])
+            }
+            if picked.len() == 1 { return Val{id: picked[0], comps: 1} }
+            let ty = type_vec(picked.len())
+            let id = new_id()
+            var ops: [int] = []
+            ops.push(ty)
+            ops.push(id)
+            for c in picked { ops.push(c) }
+            ins(g_code, OP_COMPOSITE_CONSTRUCT, ops)
+            return Val{id: id, comps: picked.len()}
+        }
+        return v
+    }
+    die(t.line, "expected an expression, got '{t.s}'")
+    return Val{id: 0, comps: 0}
+}
+
+// ---------------- declarations and statements ----------------
+var g_loc_in = 0
+var g_loc_out = 0
+
+fn decl_io(storage: int) {
+    let tyname = expect_ident()
+    let line = T[P].line
+    let comps = type_comps(tyname, line)
+    let name = expect_ident()
+    let vt = type_vec(comps)
+    let pt = type_ptr(storage, vt)
+    let id = new_id()
+    ins(g_types, OP_VARIABLE, [pt, id, storage])
+    var loc = g_loc_out
+    if storage == STORAGE_INPUT {
+        loc = g_loc_in
+        g_loc_in += 1
+    } else {
+        g_loc_out += 1
+    }
+    ins(g_decor, OP_DECORATE, [id, DECOR_LOCATION, loc])
+    g_sym_name.push(name)
+    g_sym_id.push(id)
+    g_sym_comps.push(comps)
+    g_sym_storage.push(storage)
+    g_iface.push(id)
+}
+
+fn gen_stmt() {
+    if at_ident("let") {
+        let k = next()
+        let name = expect_ident()
+        expect_punct("=")
+        let v = gen_expr()
+        g_sym_name.push(name)
+        g_sym_id.push(v.id)
+        g_sym_comps.push(v.comps)
+        g_sym_storage.push(0)
+        return
+    }
+    let t = peek()
+    let name = expect_ident()
+    let si = sym_find(name)
+    if si < 0 { die(t.line, "unknown name '{name}'") }
+    if g_sym_storage[si] != STORAGE_OUTPUT { die(t.line, "'{name}' is not an out variable") }
+    expect_punct("=")
+    let v = gen_expr()
+    if v.comps != g_sym_comps[si] {
+        die(t.line, "'{name}' is vec{g_sym_comps[si]}, got vec{v.comps}")
+    }
+    ins(g_code, OP_STORE, [g_sym_id[si], v.id])
+}
+
+// ---------------- driver ----------------
+let argv = args()
+if argv.len() < 3 {
+    print("usage: zspv <shader.zsh> <out.spv> [--vert]")
+    panic("missing arguments")
+}
+let inpath = argv[1]
+let outpath = argv[2]
+var stage = EXEC_FRAGMENT
+for a in argv {
+    if a == "--vert" { stage = EXEC_VERTEX }
+}
+g_src_name = inpath
+
+let src = read_file(inpath)
+if src.len() == 0 { panic("cannot read {inpath}") }
+lex(src)
+
+// The function id must exist before OpEntryPoint names it.
+let main_id = new_id()
+
+// declarations first, so every in/out is known before main's body
+var saw_main = false
+var scanning = true
+while scanning {
+    let t = peek()
+    if t.k == TK_EOF {
+        scanning = false
+    } else if at_ident("in") {
+        let k = next()
+        decl_io(STORAGE_INPUT)
+    } else if at_ident("out") {
+        let k = next()
+        decl_io(STORAGE_OUTPUT)
+    } else if at_ident("fn") {
+        let k = next()
+        let name = expect_ident()
+        if name != "main" { die(t.line, "only 'fn main' is supported, got '{name}'") }
+        expect_punct("(")
+        expect_punct(")")
+        expect_punct("\{")
+        // body is emitted into g_code between OpLabel and OpReturn
+        let label = new_id()
+        ins(g_code, OP_LABEL, [label])
+        while not at_punct("\}") {
+            if peek().k == TK_EOF { die(t.line, "unterminated fn main") }
+            gen_stmt()
+        }
+        expect_punct("\}")
+        saw_main = true
+    } else {
+        die(t.line, "expected 'in', 'out' or 'fn', got '{t.s}'")
+    }
+}
+if not saw_main { panic("{inpath}: no fn main") }
+
+// ---------------- assemble the module ----------------
+ins(g_caps, OP_CAPABILITY, [CAP_SHADER])
+ins(g_caps, OP_MEMORY_MODEL, [ADDRESSING_LOGICAL, MEMORY_GLSL450])
+var ep: [int] = []
+ep.push(stage)
+ep.push(main_id)
+for w in str_words("main") { ep.push(w) }
+for v in g_iface { ep.push(v) }
+ins(g_entry, OP_ENTRY_POINT, ep)
+if stage == EXEC_FRAGMENT {
+    ins(g_modes, OP_EXECUTION_MODE, [main_id, MODE_ORIGIN_UPPER_LEFT])
+}
+
+// function wrapper around the recorded body
+var fnbuf: [int] = []
+let vt = type_void()
+let ft = type_fn_void()
+ins(fnbuf, OP_FUNCTION, [vt, main_id, FN_CONTROL_NONE, ft])
+for w in g_code { fnbuf.push(w) }
+ins(fnbuf, OP_RETURN, [])
+ins(fnbuf, OP_FUNCTION_END, [])
+
+var mod: [int] = []
+mod.push(119734787)          // 0x07230203 magic
+mod.push(65536)              // version 1.0
+mod.push(0)                  // generator
+mod.push(g_next_id)          // id bound
+mod.push(0)                  // schema
+for w in g_caps { mod.push(w) }
+for w in g_entry { mod.push(w) }
+for w in g_modes { mod.push(w) }
+for w in g_decor { mod.push(w) }
+for w in g_types { mod.push(w) }
+for w in fnbuf { mod.push(w) }
+
+// words out as little-endian bytes
+var out: [str] = []
+for w in mod {
+    out.push(chr(w & 255))
+    out.push(chr((w >> 8) & 255))
+    out.push(chr((w >> 16) & 255))
+    out.push(chr((w >> 24) & 255))
+}
+write_file(outpath, out.join())
+print("{outpath}: {mod.len()} words, {g_next_id - 1} ids")

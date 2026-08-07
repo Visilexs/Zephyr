@@ -1,0 +1,117 @@
+// A hollow wireframe cube (edges only) spinning about the Y axis, animated in
+// the terminal. Same renderer as bench/cube.zeph, but it draws each frame with
+// ANSI cursor moves instead of accumulating a checksum. No sin/cos: the spin is
+// a unit vector (c, s) advanced by a fixed rotation each frame, renormalized.
+// Usage: cube [frames]   (default 400)
+
+let W = 70
+let H = 32
+let VX = [0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0]
+let VY = [0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0]
+let VZ = [0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 1.0, 1.0]
+let E0 = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]
+let E1 = [1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7]
+
+var grid: [int] = zeros(W * H)
+var sx: [int] = zeros(8)
+var sy: [int] = zeros(8)
+
+fn draw_line(x0: int, y0: int, x1: int, y1: int) {
+    var dx = x1 - x0
+    if dx < 0 { dx = 0 - dx }
+    var dy = y1 - y0
+    if dy < 0 { dy = 0 - dy }
+    var stepx = 0 - 1
+    if x0 < x1 { stepx = 1 }
+    var stepy = 0 - 1
+    if y0 < y1 { stepy = 1 }
+    var err = dx - dy
+    var x = x0
+    var y = y0
+    while true {
+        if x >= 0 and x < W and y >= 0 and y < H {
+            grid[y * W + x] = 1
+        }
+        if x == x1 and y == y1 { break }
+        let e2 = 2 * err
+        if e2 > 0 - dy {
+            err -= dy
+            x += stepx
+        }
+        if e2 < dx {
+            err += dx
+            y += stepy
+        }
+    }
+}
+
+fn frame(c: float, s: float) -> str {
+    for i in 0..W * H { grid[i] = 0 }
+    let tc = 0.8775825618903728          // cos(0.5) fixed X tilt
+    let ts = 0.479425538604203           // sin(0.5)
+    for v in 0..8 {
+        let x = VX[v]
+        let y = VY[v]
+        let z = VZ[v]
+        let rx = x * c + z * s
+        let rz = z * c - x * s
+        let ry = y * tc - rz * ts
+        let rz2 = y * ts + rz * tc
+        let depth = rz2 + 4.0
+        let sc = 22.0 / depth
+        sx[v] = (35.0 + rx * sc * 2.0 + 0.5) as int   // *2: chars are ~half as wide as tall
+        sy[v] = (16.0 + ry * sc + 0.5) as int
+    }
+    for e in 0..12 {
+        draw_line(sx[E0[e]], sy[E0[e]], sx[E1[e]], sy[E1[e]])
+    }
+    var parts: [str] = []
+    parts.push(chr(27) + "[H")
+    for yy in 0..H {
+        for xx in 0..W {
+            if grid[yy * W + xx] == 1 { parts.push("#") }
+            else { parts.push(" ") }
+        }
+        parts.push("\n")
+    }
+    return parts.join()
+}
+
+fn pause() {
+    var sink = 0
+    for k in 0..8000000 {
+        sink += k % 3
+    }
+    if sink == 42 { print("") } // ponytail: busy-wait frame timer; a sleep() builtin would replace this
+}
+
+// block until the user presses Enter, so double-clicking the exe keeps the
+// window open. Reads stdin into a small list-backed scratch buffer via kernel32.
+fn wait_enter() {
+    let hin = win("GetStdHandle", 0 - 10)   // STD_INPUT_HANDLE
+    var buf = zeros(4)                       // 32 bytes of scratch
+    let p = load64(addr(buf) + 16)           // -> the list's data pointer
+    let r = win("ReadFile", hin, p, 8, p + 8, 0)
+}
+
+var frames = 400
+if args().len() > 1 { frames = args()[1] as int }
+
+print(chr(27) + "[2J" + chr(27) + "[?25l")   // clear screen, hide cursor
+// spin step about Y: cos(0.08), sin(0.08); renormalized each frame
+let stc = 0.9968017063026194
+let sts = 0.07991469396917269
+var c = 1.0
+var s = 0.0
+for f in 0..frames {
+    emit(frame(c, s))
+    pause()
+    let nc = c * stc - s * sts
+    let ns = s * stc + c * sts
+    let nn = sqrt(nc * nc + ns * ns)
+    c = nc / nn
+    s = ns / nn
+}
+print(chr(27) + "[?25h")                       // show cursor
+print("Press Enter to exit...")
+wait_enter()

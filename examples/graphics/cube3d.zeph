@@ -1,0 +1,132 @@
+// A real graphical spinning wireframe cube: an actual Win32 window with the 12
+// edges drawn as GDI vector lines (MoveToEx/LineTo), double-buffered so it does
+// not flicker. Pure Zephyr — it talks straight to user32.dll and gdi32.dll through
+// the win() FFI, builds the WNDCLASS / MSG / RECT structs in raw memory with the
+// store/load intrinsics, and pumps its own message loop. Close the window to
+// exit. No sin/cos: the spin is a unit vector advanced each frame, renormalized.
+
+let VX = [0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0]
+let VY = [0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0]
+let VZ = [0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 1.0, 1.0]
+let E0 = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]
+let E1 = [1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7]
+
+var sx: [int] = zeros(8)
+var sy: [int] = zeros(8)
+
+// --- raw memory helpers (bump-allocated, never freed, so pointers stay valid) ---
+fn mem(nbytes: int) -> int {
+    var b = zeros(nbytes / 8 + 2)
+    return load64(addr(b) + 16)          // -> the list's data pointer
+}
+fn cstr(s: str) -> int {
+    let n = s.len()
+    let p = mem(n + 1)
+    for i in 0..n { store8(p + i, s.byte(i)) }
+    store8(p + n, 0)
+    return p
+}
+fn lo32(v: int) -> int { return v & 4294967295 }
+
+// spin state and camera tilt
+let tc = 0.8775825618903728              // cos(0.5)
+let ts = 0.479425538604203               // sin(0.5)
+let stc = 0.9968017063026194             // cos(0.08)  per-frame step
+let sts = 0.07991469396917269            // sin(0.08)
+var cc = 1.0
+var ss = 0.0
+
+fn draw(hwnd: int) {
+    let hdc = win("user32!GetDC", hwnd)
+    let rc = mem(32)
+    let g = win("user32!GetClientRect", hwnd, rc)
+    let cw = lo32(load64(rc + 8))         // right
+    let ch = lo32(load64(rc + 12))        // bottom
+    if cw < 2 or ch < 2 {
+        let r0 = win("user32!ReleaseDC", hwnd, hdc)
+        return
+    }
+    // off-screen buffer
+    let mdc = win("gdi32!CreateCompatibleDC", hdc)
+    let bmp = win("gdi32!CreateCompatibleBitmap", hdc, cw, ch)
+    let oldbmp = win("gdi32!SelectObject", mdc, bmp)
+    let pb = win("gdi32!PatBlt", mdc, 0, 0, cw, ch, 66)          // BLACKNESS
+    let pen = win("gdi32!CreatePen", 0, 2, 65280)               // PS_SOLID, RGB(0,255,0)
+    let oldpen = win("gdi32!SelectObject", mdc, pen)
+    // project the 8 corners
+    let cx = (cw / 2) as float
+    let cy = (ch / 2) as float
+    let focal = (cw as float) * 0.5
+    for v in 0..8 {
+        let x = VX[v]
+        let y = VY[v]
+        let z = VZ[v]
+        let rx = x * cc + z * ss
+        let rz = z * cc - x * ss
+        let ry = y * tc - rz * ts
+        let rz2 = y * ts + rz * tc
+        let depth = rz2 + 4.0
+        let f = focal / depth
+        sx[v] = (cx + rx * f) as int
+        sy[v] = (cy + ry * f) as int
+    }
+    // stroke the 12 edges as vector lines
+    for e in 0..12 {
+        let mv = win("gdi32!MoveToEx", mdc, sx[E0[e]], sy[E0[e]], 0)
+        let ln = win("gdi32!LineTo", mdc, sx[E1[e]], sy[E1[e]])
+    }
+    let bb = win("gdi32!BitBlt", hdc, 0, 0, cw, ch, mdc, 0, 0, 13369376)  // SRCCOPY
+    // release GDI objects
+    let s1 = win("gdi32!SelectObject", mdc, oldpen)
+    let d1 = win("gdi32!DeleteObject", pen)
+    let s2 = win("gdi32!SelectObject", mdc, oldbmp)
+    let d2 = win("gdi32!DeleteObject", bmp)
+    let dd = win("gdi32!DeleteDC", mdc)
+    let rr = win("user32!ReleaseDC", hwnd, hdc)
+}
+
+fn advance() {
+    let nc = cc * stc - ss * sts
+    let ns = ss * stc + cc * sts
+    let nn = sqrt(nc * nc + ns * ns)
+    cc = nc / nn
+    ss = ns / nn
+}
+
+let hInst = win("GetModuleHandleA", 0)
+// DefWindowProcA address for the window class
+let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+let clsname = cstr("zephyrCubeWindow")
+
+// WNDCLASSA (72 bytes)
+let wc = mem(72)
+store32(wc + 0, 3)                       // style = CS_HREDRAW|CS_VREDRAW
+store64(wc + 8, defwp)                    // lpfnWndProc = DefWindowProcA
+store64(wc + 24, hInst)                   // hInstance
+store64(wc + 40, win("user32!LoadCursorA", 0, 32512))   // hCursor = IDC_ARROW
+store64(wc + 48, win("gdi32!GetStockObject", 4))        // hbrBackground = BLACK_BRUSH
+store64(wc + 64, clsname)                 // lpszClassName
+let atom = win("user32!RegisterClassA", wc)
+
+// WS_OVERLAPPEDWINDOW | WS_VISIBLE
+let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - spinning cube"),
+    282001408, 140, 140, 900, 680, 0, 0, hInst, 0)
+let sw = win("user32!ShowWindow", hwnd, 5)
+let uw = win("user32!UpdateWindow", hwnd)
+
+let msg = mem(48)
+var running = 1
+while running == 1 {
+    while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+        if lo32(load64(msg + 8)) == 18 { running = 0 }   // WM_QUIT
+        let tr = win("user32!TranslateMessage", msg)
+        let di = win("user32!DispatchMessageA", msg)
+    }
+    if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+    if running == 1 {
+        draw(hwnd)
+        advance()
+        let sl = win("Sleep", 16)
+    }
+}

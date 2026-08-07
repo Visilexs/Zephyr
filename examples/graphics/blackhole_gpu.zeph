@@ -1,0 +1,879 @@
+// A live, turbulent accretion flow around a black hole -- 1,500,000 particles
+// simulated and rendered entirely on the GPU, in pure Zephyr.
+//
+// GEOMETRY. Everything is in geometrized units where the gravitational radius
+// r_g = GM/c^2 = 1 and c = 1, which makes the Schwarzschild geometry exact and
+// dimensionless:
+//
+//   event horizon        r = 2 r_g          (2GM/c^2)
+//   photon sphere        r = 3 r_g          (unstable circular photon orbit)
+//   ISCO                 r = 6 r_g          (innermost stable circular orbit)
+//   shadow radius        b = sqrt(27) r_g   (the APPARENT size: bigger than the
+//                                            horizon, because light bends)
+//
+// The startup banner converts those to physical units for M87* (EHT 2019:
+// M = 6.5e9 solar masses, D = 16.8 Mpc) and predicts a 39.7 microarcsecond
+// shadow from nothing but G, c, M and D. EHT measured 42 +/- 3.
+//
+// DYNAMICS. Three real ingredients, all emergent rather than scripted:
+//
+//  1. Paczynski-Wiita gravity, Phi = -GM/(r - r_s). Newtonian in form but it
+//     reproduces the Schwarzschild ISCO at 6M and the horizon at 2M exactly,
+//     which is why it is the standard potential in accretion-disc work. Matter
+//     orbits stably outside 6 r_g, then crosses the ISCO and PLUNGES.
+//  2. Shakura-Sunyaev alpha viscosity. Angular momentum is removed at the rate
+//     that yields the textbook inflow speed v_r = -alpha (H/R)^2 v_K, applied
+//     as a torque: a_phi = -(1/2) alpha (H/R)^2 Omega v_phi.
+//  3. MRI turbulence. The magnetorotational instability is what actually makes
+//     discs accrete, and it drives velocity fluctuations of order sqrt(alpha)
+//     times the sound speed, c_s = (H/R) v_K, decorrelating on an orbital
+//     time. Modelled as an Ornstein-Uhlenbeck random walk at exactly that
+//     amplitude. This is what makes the flow LIVE: it shears into spiral
+//     streamers and clumps, and the clumps orbit as bright knots -- the same
+//     mechanism behind the flares seen at Sgr A*.
+//
+// EMISSION. Each particle is a blackbody at the Novikov-Thorne thin-disc
+// temperature, T(r) ~ [(1 - sqrt(r_isco/r)) / r^3]^(1/4), which peaks at
+// (49/36) r_isco = 8.17 r_g. Then relativity, per particle:
+//   dtau/dt = sqrt(1 - 3M/r)      exact for a circular geodesic
+//   Doppler = 1/(1 - beta_los)    from the line-of-sight velocity
+//   g       = the product; I_obs = g^4 I_emit (Liouville: I/nu^3 invariant),
+//             and a blackbody stays a blackbody at T_obs = g T_emit
+// So the approaching side is brighter AND bluer, straight out of the velocity
+// field. Colour comes from a fit to the Planck blackbody locus.
+//
+// RENDERING. Particles accumulate additively into a 16-bit FLOATING POINT
+// framebuffer, which is then tone-mapped in a second pass. This matters: an
+// 8-bit additive buffer cannot hold the ~10^4 brightness range across the
+// disc, and a particle contributing ~1/255 has its colour ratio destroyed by
+// rounding -- red and green land on 1, blue on 0, and dark red turns olive.
+// That is what caused the colour banding in the earlier version. Accumulating
+// in float and tone-mapping once at the end fixes it at the source, so the
+// true I ~ T^4 law can be used with no display stretch at all.
+//
+// NOT MODELLED: light bending (the shadow is drawn at its true lensed radius
+// and occludes correctly, but the far side of the disc is not lifted into a
+// halo -- that needs per-pixel geodesic integration, i.e. a ray-tracer), and
+// black hole spin (Schwarzschild, a = 0; M87* is thought to spin near 0.9,
+// which would drag the ISCO inward and power a jet).
+//
+//   zc.exe --rt examples\blackhole_gpu.zeph blackhole_gpu.exe && .\blackhole_gpu.exe
+//   .\blackhole_gpu.exe 4000000     (different particle count)
+//
+// Camera: drag with the left mouse button to orbit, mouse wheel to zoom.
+
+import "particle_sim.zeph"          // mem/cstr/lo32/sext32/down/fps_tick helpers
+
+var COUNT = 1500000
+let STRIDE = 24                     // pos.xyz + vel.xyz
+
+// ---- Schwarzschild geometry, in units of r_g = GM/c^2 = 1 ----
+let BH_M = 1.0
+let R_HOR = 2.0                     // event horizon
+let R_ISCO = 6.0                    // innermost stable circular orbit
+let B_CRIT = 5.19615242270663       // sqrt(27) -- photon capture / shadow radius
+let R_DISC_OUT = 42.0               // outer edge of the modelled disc
+let R_ESCAPE = 160.0
+
+// ---- accretion flow ----
+let DTS = 0.035                     // timestep, in r_g/c
+let ALPHA = 0.4                     // Shakura-Sunyaev viscosity parameter
+let HR = 0.10                       // disc aspect ratio H/R
+let TURB = 1.2                      // MRI fluctuation amplitude, in sqrt(alpha)*c_s
+let TDECAY = 1.0                    // turbulent decorrelation rate, in orbits
+
+// The SHAPE of the temperature profile is physical; its absolute normalisation
+// is a display choice. A real thin disc around a 6.5e9 solar mass hole peaks
+// near 1e5 K -- far ultraviolet, invisible -- so the profile is remapped into
+// the visible band. Everything downstream follows from real blackbody physics.
+let T_PEAK = 4200.0                 // K at the profile peak, r = 8.17 r_g
+let T_REF = 4200.0
+let EXPO = 0.075                    // HDR exposure, applied before tone mapping
+
+// ---- GL constants ----
+let GL_ARRAY_BUFFER = 34962
+let GL_TRANSFORM_FEEDBACK_BUFFER = 35982
+let GL_STREAM_COPY = 35042
+let GL_FLOATC = 5126
+let GL_POINTS = 0
+let GL_TRIANGLES = 4
+let GL_TRIANGLE_STRIP = 5
+let GL_COLOR_BUFFER_BIT = 16384
+let GL_DEPTH_BUFFER_BIT = 256
+let GL_BLEND = 3042
+let GL_ONE = 1
+let GL_DEPTH_TEST = 2929
+let GL_VERTEX_SHADER = 35633
+let GL_FRAGMENT_SHADER = 35632
+let GL_COMPILE_STATUS = 35713
+let GL_LINK_STATUS = 35714
+let GL_INTERLEAVED_ATTRIBS = 35980
+let GL_RASTERIZER_DISCARD = 35977
+let GL_PROGRAM_POINT_SIZE = 34370
+let GL_TEXTURE_2D = 3553
+let GL_RGBA16F = 34842
+let GL_RGBA = 6408
+let GL_LINEARF = 9729
+let GL_CLAMP_TO_EDGE = 33071
+let GL_TEXTURE_MIN_FILTER = 10241
+let GL_TEXTURE_MAG_FILTER = 10240
+let GL_TEXTURE_WRAP_S = 10242
+let GL_TEXTURE_WRAP_T = 10243
+let GL_FRAMEBUFFER = 36160
+let GL_COLOR_ATTACHMENT0 = 36064
+let GL_DEPTH_ATTACHMENT = 36096
+let GL_RENDERBUFFER = 36161
+let GL_DEPTH_COMPONENT24 = 33190
+let GL_FRAMEBUFFER_COMPLETE = 36053
+
+var pCreateShader = 0
+var pShaderSource = 0
+var pCompileShader = 0
+var pGetShaderiv = 0
+var pGetShaderInfoLog = 0
+var pCreateProgram = 0
+var pAttachShader = 0
+var pBindAttribLocation = 0
+var pTransformFeedbackVaryings = 0
+var pLinkProgram = 0
+var pGetProgramiv = 0
+var pGetProgramInfoLog = 0
+var pUseProgram = 0
+var pGenBuffers = 0
+var pBindBuffer = 0
+var pBufferData = 0
+var pVertexAttribPointer = 0
+var pEnableVertexAttribArray = 0
+var pDisableVertexAttribArray = 0
+var pBindBufferBase = 0
+var pBeginTransformFeedback = 0
+var pEndTransformFeedback = 0
+var pGetUniformLocation = 0
+var pUniform4fv = 0
+var pUniform1i = 0
+var pGenFramebuffers = 0
+var pBindFramebuffer = 0
+var pFramebufferTexture2D = 0
+var pGenRenderbuffers = 0
+var pBindRenderbuffer = 0
+var pRenderbufferStorage = 0
+var pFramebufferRenderbuffer = 0
+var pCheckFramebufferStatus = 0
+
+fn gp(name: str) -> int {
+    let p = win("opengl32!wglGetProcAddress", cstr(name))
+    assert(p > 3, "this GPU/driver has no {name} (OpenGL 3.3 required)")
+    return p
+}
+
+fn f32(x: float) -> int {
+    let b = bits(x)
+    let s = (b >> 63) & 1
+    let e = (b >> 52) & 2047
+    let m = b & 4503599627370495
+    if e == 0 { return s << 31 }
+    let ne = e - 1023 + 127
+    if ne <= 0 { return s << 31 }
+    if ne >= 255 { return (s << 31) | (255 << 23) }
+    return (s << 31) | (ne << 23) | (m >> 29)
+}
+
+fn from_cstr(p: int) -> str {
+    var s = ""
+    var i = 0
+    while i < 1024 {
+        let c = load8(p + i)
+        if c == 0 { return s }
+        s = s + chr(c)
+        i += 1
+    }
+    return s
+}
+
+// the float literal parser has no exponent notation, so powers of ten are built
+fn p10(n: int) -> float {
+    var v = 1.0
+    var i = 0
+    while i < n {
+        v = v * 10.0
+        i += 1
+    }
+    return v
+}
+
+fn banner() {
+    let GRAV = 6.6743 / p10(11)               // m^3 kg^-1 s^-2  (CODATA 2018)
+    let CLIGHT = 299792458.0                  // m/s             (exact)
+    let MSUN = 1.98892 * p10(30)              // kg
+    let AU = 1.495978707 * p10(11)            // m               (exact)
+    let PARSEC = 3.0856775814913673 * p10(16) // m
+    let PI = 3.141592653589793
+
+    let MASS = 6.5 * p10(9) * MSUN            // M87*, EHT 2019
+    let DIST = 16.8 * p10(6) * PARSEC
+
+    let rg = GRAV * MASS / (CLIGHT * CLIGHT)
+    let uas = (2.0 * B_CRIT * rg / DIST) * (180.0 / PI) * 3600.0 * p10(6)
+    let tisco = 2.0 * PI * 6.0 * sqrt(6.0) * rg / CLIGHT
+
+    print("Schwarzschild black hole, scaled to M87* (EHT 2019)")
+    print("  gravitational radius {rg / AU} AU")
+    print("  event horizon  2 r_g {2.0 * rg / AU} AU")
+    print("  ISCO           6 r_g {6.0 * rg / AU} AU")
+    print("  shadow    2*sqrt(27) {uas} uas   (EHT measured 42 +/- 3)")
+    print("  ISCO orbital period  {tisco / 86400.0} days")
+    print("  accretion: alpha = {ALPHA}, H/R = {HR}, MRI turbulence on")
+}
+
+// ---- the update shader IS the simulation ----
+fn update_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec3 iPos; in vec3 iVel;\n")
+    p.push("out vec3 oPos; out vec3 oVel;\n")
+    p.push("uniform vec4 A;   // dt, M, alpha, seed\n")
+    p.push("uniform vec4 B;   // r_horizon, r_isco, r_disc_out, r_escape\n")
+    p.push("uniform vec4 C;   // H/R, turbulence amplitude, decorrelation rate, 0\n")
+    // sequential vertex IDs fed straight into an LCG stay correlated, which
+    // printed as moire rings across the disc -- mix them properly first
+    p.push("uint hash(uint h) \{ h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16; return h; \}\n")
+    p.push("float rnd(inout uint s) \{ s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFFFFu) / 16777216.0; \}\n")
+    // Turbulence has to be SPATIALLY CORRELATED to form structure: independent
+    // per-particle noise only diffuses the gas into a featureless cloud. This
+    // is a value-noise field on an eddy scale of one disc scale height H, so
+    // neighbouring particles are kicked together and orbital shear draws the
+    // result out into spiral streamers and clumps.
+    p.push("float h31(vec3 p) \{ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); \}\n")
+    p.push("float vn(vec3 x) \{\n")
+    p.push("  vec3 i = floor(x); vec3 f = fract(x);\n")
+    p.push("  f = f * f * (3.0 - 2.0 * f);\n")
+    p.push("  float a = mix(h31(i + vec3(0,0,0)), h31(i + vec3(1,0,0)), f.x);\n")
+    p.push("  float b = mix(h31(i + vec3(0,1,0)), h31(i + vec3(1,1,0)), f.x);\n")
+    p.push("  float c = mix(h31(i + vec3(0,0,1)), h31(i + vec3(1,0,1)), f.x);\n")
+    p.push("  float d = mix(h31(i + vec3(0,1,1)), h31(i + vec3(1,1,1)), f.x);\n")
+    p.push("  return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);\n")
+    p.push("\}\n")
+    p.push("void main() \{\n")
+    p.push("  uint s = hash(uint(gl_VertexID) ^ hash(uint(A.w)));\n")
+    p.push("  vec3 p = iPos; vec3 v = iVel;\n")
+    p.push("  float r = length(p);\n")
+    p.push("  if (r < B.x * 1.08 || r > B.w) \{\n")
+    p.push("    // swallowed or escaped: re-inject at uniform surface density\n")
+    p.push("    float rad = sqrt(mix(B.y * B.y, B.z * B.z, rnd(s)));\n")
+    p.push("    float a = rnd(s) * 6.2831853;\n")
+    p.push("    float ca = cos(a); float sa = sin(a);\n")
+    p.push("    float h = C.x * rad * (rnd(s) + rnd(s) - 1.0);\n")
+    p.push("    p = vec3(ca * rad, h, sa * rad);\n")
+    p.push("    float vc = sqrt(A.y * rad) / (rad - B.x);   // Paczynski-Wiita circular speed\n")
+    p.push("    v = vec3(-sa, 0.0, ca) * vc;\n")
+    p.push("  \} else \{\n")
+    p.push("    vec3 rh = p / r;\n")
+    p.push("    float Om = sqrt(A.y / (r * r * r));         // Keplerian angular frequency\n")
+    p.push("    // 1. Paczynski-Wiita gravity: diverging at the horizon is what\n")
+    p.push("    //    makes the plunge inside the ISCO happen by itself\n")
+    p.push("    float rr = max(r - B.x, 0.05);\n")
+    p.push("    v -= rh * (A.y / (rr * rr)) * A.x;\n")
+    p.push("    // 2. Shakura-Sunyaev alpha viscosity: strip angular momentum at\n")
+    p.push("    //    the rate giving v_r = -alpha (H/R)^2 v_K\n")
+    p.push("    vec3 vt = v - rh * dot(v, rh);\n")
+    p.push("    v -= vt * (0.5 * A.z * C.x * C.x * Om * A.x);\n")
+    p.push("    // 3. MRI turbulence: fluctuations of order sqrt(alpha)*c_s with\n")
+    p.push("    //    c_s = (H/R) v_K, as an OU walk decorrelating in an orbit\n")
+    p.push("    if (r > B.y) \{\n")
+    p.push("      float cs = C.x * sqrt(A.y / r);\n")
+    p.push("      float f = clamp(C.z * Om * A.x, 0.0, 0.5);\n")
+    p.push("      // A COHERENT field drives the same way every step, so the kick\n")
+    p.push("      // must balance the decorrelation rate f (not sqrt(f), which is\n")
+    p.push("      // the uncorrelated random-walk scaling) -- otherwise velocity\n")
+    p.push("      // grows linearly and the disc is blown apart.\n")
+    p.push("      float dv = C.y * sqrt(A.z) * cs * f;\n")
+    p.push("      // eddies one scale height across, drifting on an orbital time\n")
+    p.push("      vec3 xn = p / max(C.x * r, 0.5);\n")
+    p.push("      float tt = A.w * A.x * 0.05;\n")
+    p.push("      vec3 kick = vec3(vn(xn + vec3(tt, 0.0, 0.0)),\n")
+    p.push("                       vn(xn + vec3(0.0, tt, 11.3)),\n")
+    p.push("                       vn(xn + vec3(5.2, 0.0, tt))) * 2.0 - 1.0;\n")
+    p.push("      // keep the kick in the radial/vertical plane -- those are the\n")
+    p.push("      // components the decorrelation below damps, so it stays bounded\n")
+    p.push("      vec3 ph = normalize(vec3(-p.z, 0.0, p.x));\n")
+    p.push("      kick -= ph * dot(kick, ph);\n")
+    p.push("      v += kick * dv;\n")
+    p.push("      // decorrelate the non-orbital components; left alone inside the\n")
+    p.push("      // ISCO so the plunge stays free\n")
+    p.push("      vec3 Rh = vec3(p.x, 0.0, p.z);\n")
+    p.push("      float Rl = length(Rh);\n")
+    p.push("      if (Rl > 0.001) \{\n")
+    p.push("        Rh /= Rl;\n")
+    p.push("        v -= Rh * (dot(v, Rh) * f);\n")
+    p.push("        v.y -= v.y * f;\n")
+    p.push("      \}\n")
+    p.push("    \}\n")
+    p.push("    p += v * A.x;\n")
+    p.push("    float sp = length(v);\n")
+    p.push("    if (sp > 0.99) v *= 0.99 / sp;              // nothing outruns light\n")
+    p.push("  \}\n")
+    p.push("  oPos = p; oVel = v;\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+// ---- the draw shader IS the radiative transfer ----
+fn draw_vs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec3 iPos; in vec3 iVel;\n")
+    p.push("uniform vec4 CR; uniform vec4 CU; uniform vec4 CF; uniform vec4 CE;\n")
+    p.push("uniform vec4 P;   // M, r_isco, T_scale, 0\n")
+    p.push("uniform vec4 Q;   // T_ref, exposure, 0, 0\n")
+    p.push("out vec3 vCol;\n")
+    // Planck blackbody locus -> sRGB (fit to Mitchell Charity's tabulated data)
+    p.push("vec3 blackbody(float K) \{\n")
+    p.push("  float t = clamp(K, 1000.0, 40000.0) / 100.0;\n")
+    p.push("  float r, g, b;\n")
+    p.push("  if (t <= 66.0) \{ r = 255.0; \} else \{ r = 329.698727446 * pow(t - 60.0, -0.1332047592); \}\n")
+    p.push("  if (t <= 66.0) \{ g = 99.4708025861 * log(t) - 161.1195681661; \}\n")
+    p.push("  else \{ g = 288.1221695283 * pow(t - 60.0, -0.0755148492); \}\n")
+    p.push("  if (t >= 66.0) \{ b = 255.0; \} else if (t <= 19.0) \{ b = 0.0; \}\n")
+    p.push("  else \{ b = 138.5177312231 * log(t - 10.0) - 305.0447927307; \}\n")
+    p.push("  return clamp(vec3(r, g, b) / 255.0, 0.0, 1.0);\n")
+    p.push("\}\n")
+    p.push("void main() \{\n")
+    p.push("  vec3 q = iPos - CE.xyz;\n")
+    p.push("  float ds = length(q);\n")
+    p.push("  vec3 n = q / ds;\n")
+    p.push("  float vz = dot(q, CF.xyz);\n")
+    p.push("  if (vz < 0.05) \{ gl_Position = vec4(0.0, 0.0, -2.0, 1.0); gl_PointSize = 0.0; return; \}\n")
+    p.push("  float zc = (vz * (2000.0 + 1.0) - 2.0 * 2000.0) / (2000.0 - 1.0);\n")
+    p.push("  gl_Position = vec4(dot(q, CR.xyz) * CR.w, dot(q, CU.xyz) * CU.w, zc, vz);\n")
+    p.push("  gl_PointSize = clamp(CF.w * 1.1 / vz, 1.0, 4.0);\n")
+    p.push("  // Novikov-Thorne thin-disc blackbody temperature\n")
+    p.push("  float r = length(iPos);\n")
+    p.push("  float fr = max(1.0 - sqrt(P.y / max(r, P.y)), 0.0);\n")
+    p.push("  float Te = P.z * pow(fr / (r * r * r), 0.25);\n")
+    p.push("  // relativity: gravitational redshift + time dilation, then Doppler\n")
+    p.push("  float dtau = sqrt(max(1.0 - 3.0 * P.x / r, 0.0025));\n")
+    p.push("  float blos = dot(iVel, -n);\n")
+    p.push("  float g = dtau / max(1.0 - blos, 0.05);\n")
+    p.push("  float To = g * Te;\n")
+    p.push("  // I_obs = g^4 I_emit and I ~ T^4, so observed brightness is T_obs^4.\n")
+    p.push("  // No display stretch: the float framebuffer holds the full range.\n")
+    p.push("  float x = max(To, 1.0) / Q.x;\n")
+    p.push("  float I = x * x * x * x * Q.y;\n")
+    p.push("  vCol = blackbody(To) * I;\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+fn draw_fs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("in vec3 vCol;\n")
+    p.push("out vec4 oCol;\n")
+    p.push("void main() \{ oCol = vec4(vCol, 1.0); \}\n")
+    return p.join()
+}
+
+// The shadow and photon ring, as a screen-aligned quad centred on the hole --
+// a quad rather than a point sprite because the shadow can cover hundreds of
+// pixels when zoomed in, well past any driver's point-size cap.
+fn hole_vs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("uniform vec4 CR; uniform vec4 CU; uniform vec4 CF; uniform vec4 CE;\n")
+    p.push("uniform vec4 H;   // b_crit, extent (in b_crit), mode, 0\n")
+    p.push("out vec2 vUV;\n")
+    p.push("void main() \{\n")
+    p.push("  vec3 L = -CE.xyz;\n")
+    p.push("  float dl = length(L);\n")
+    p.push("  float vz = dot(L, CF.xyz);\n")
+    p.push("  float ox = -1.0; float oy = -1.0;\n")
+    p.push("  if (gl_VertexID == 1 || gl_VertexID == 3) \{ ox = 1.0; \}\n")
+    p.push("  if (gl_VertexID >= 2) \{ oy = 1.0; \}\n")
+    p.push("  float rad = H.x * H.y;\n")
+    p.push("  float cx = dot(L, CR.xyz) * CR.w / vz;\n")
+    p.push("  float cy = dot(L, CU.xyz) * CU.w / vz;\n")
+    p.push("  float hx = rad * CR.w / dl;\n")
+    p.push("  float hy = rad * CU.w / dl;\n")
+    p.push("  float zc = (vz * (2000.0 + 1.0) - 2.0 * 2000.0) / (2000.0 - 1.0);\n")
+    p.push("  gl_Position = vec4((cx + ox * hx) * vz, (cy + oy * hy) * vz, zc, vz);\n")
+    p.push("  vUV = vec2(ox, oy) * H.y;\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+fn hole_fs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("uniform vec4 H;\n")
+    p.push("in vec2 vUV;\n")
+    p.push("out vec4 oCol;\n")
+    p.push("void main() \{\n")
+    p.push("  float r = length(vUV);        // in units of b_crit = sqrt(27) r_g\n")
+    p.push("  if (H.z < 0.5) \{\n")
+    p.push("    if (r > 1.0) discard;\n")
+    p.push("    oCol = vec4(0.0, 0.0, 0.0, 1.0);\n")
+    p.push("  \} else \{\n")
+    p.push("    // photon ring: light that orbited the hole before escaping,\n")
+    p.push("    // piling up just outside the capture radius\n")
+    p.push("    if (r < 1.0 || r > 1.7) discard;\n")
+    p.push("    float t = (r - 1.0) / 0.7;\n")
+    p.push("    oCol = vec4(1.0, 0.80, 0.56, 1.0) * exp(-t * 7.0) * 2.4;\n")
+    p.push("  \}\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+// ---- tone mapping: HDR accumulation -> displayable sRGB ----
+fn tone_vs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("out vec2 vT;\n")
+    p.push("void main() \{\n")
+    p.push("  vec2 c = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n")
+    p.push("  vT = c;\n")
+    p.push("  gl_Position = vec4(c * 2.0 - 1.0, 0.0, 1.0);\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+fn tone_fs_src() -> str {
+    var p: [str] = []
+    p.push("#version 330\n")
+    p.push("uniform sampler2D S;\n")
+    p.push("uniform vec4 T;   // frame counter (dither), 0, 0, 0\n")
+    p.push("in vec2 vT;\n")
+    p.push("out vec4 oCol;\n")
+    // ACES filmic curve (Narkowicz 2015): rolls highlights off to white while
+    // keeping colour ratios, instead of clipping each channel independently
+    p.push("vec3 aces(vec3 x) \{\n")
+    p.push("  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);\n")
+    p.push("\}\n")
+    p.push("void main() \{\n")
+    p.push("  vec3 c = aces(texture(S, vT).rgb);\n")
+    p.push("  c = pow(c, vec3(1.0 / 2.2));     // linear -> sRGB\n")
+    p.push("  // one step of dither: the OUTPUT is still 8-bit, and smooth dim\n")
+    p.push("  // gradients would otherwise quantise into visible rings\n")
+    p.push("  float d = fract(sin(dot(gl_FragCoord.xy + T.x, vec2(12.9898, 78.233))) * 43758.5453);\n")
+    p.push("  oCol = vec4(c + (d - 0.5) / 255.0, 1.0);\n")
+    p.push("\}\n")
+    return p.join()
+}
+
+// ---- shader plumbing ----
+var srcbuf = mem(16)
+var intbuf = mem(16)
+var logbuf = mem(2048)
+
+fn compile(kind: int, src: str) -> int {
+    let sh = callptr(pCreateShader, kind)
+    store64(srcbuf, cstr(src))
+    let s1 = callptr(pShaderSource, sh, 1, srcbuf, 0)
+    let s2 = callptr(pCompileShader, sh)
+    let s3 = callptr(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
+    if lo32(load64(intbuf)) == 0 {
+        let s4 = callptr(pGetShaderInfoLog, sh, 2047, 0, logbuf)
+        print("shader compile failed:")
+        print(from_cstr(logbuf))
+        assert(false, "shader compile failed")
+    }
+    return sh
+}
+fn bind_attrs(prog: int) {
+    let b0 = callptr(pBindAttribLocation, prog, 0, cstr("iPos"))
+    let b1 = callptr(pBindAttribLocation, prog, 1, cstr("iVel"))
+}
+fn link(prog: int) {
+    let l1 = callptr(pLinkProgram, prog)
+    let l2 = callptr(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
+    if lo32(load64(intbuf)) == 0 {
+        let l3 = callptr(pGetProgramInfoLog, prog, 2047, 0, logbuf)
+        print("program link failed:")
+        print(from_cstr(logbuf))
+        assert(false, "program link failed")
+    }
+}
+fn attach_buffer(buf: int) {
+    let b1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, buf)
+    let e0 = callptr(pEnableVertexAttribArray, 0)
+    let e1 = callptr(pEnableVertexAttribArray, 1)
+    let v0 = callptr(pVertexAttribPointer, 0, 3, GL_FLOATC, 0, STRIDE, 0)
+    let v1 = callptr(pVertexAttribPointer, 1, 3, GL_FLOATC, 0, STRIDE, 12)
+}
+var ubuf = mem(16)
+fn set4(loc: int, x: float, y: float, z: float, w: float) {
+    if loc < 0 { return }
+    store32(ubuf + 0, f32(x))
+    store32(ubuf + 4, f32(y))
+    store32(ubuf + 8, f32(z))
+    store32(ubuf + 12, f32(w))
+    let u = callptr(pUniform4fv, loc, 1, ubuf)
+}
+fn uloc(prog: int, name: str) -> int { return callptr(pGetUniformLocation, prog, cstr(name)) }
+
+// ---- HDR framebuffer ----
+var fbo = 0
+var fbtex = 0
+var fbdepth = 0
+var fbw = 0
+var fbh = 0
+var idbuf = mem(16)
+
+fn ensure_fbo(w: int, h: int) {
+    if w == fbw and h == fbh { return }
+    if fbo == 0 {
+        let g1 = callptr(pGenFramebuffers, 1, idbuf)
+        fbo = lo32(load64(idbuf))
+        let g2 = win("opengl32!glGenTextures", 1, idbuf)
+        fbtex = lo32(load64(idbuf))
+        let g3 = callptr(pGenRenderbuffers, 1, idbuf)
+        fbdepth = lo32(load64(idbuf))
+    }
+    let b1 = win("opengl32!glBindTexture", GL_TEXTURE_2D, fbtex)
+    // RGBA16F: the whole point -- additive accumulation in float, so a
+    // particle worth 1/1000 of a step keeps its colour instead of rounding
+    let t1 = win("opengl32!glTexImage2D", GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOATC, 0)
+    let t2 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEARF)
+    let t3 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEARF)
+    let t4 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    let t5 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    let r1 = callptr(pBindRenderbuffer, GL_RENDERBUFFER, fbdepth)
+    let r2 = callptr(pRenderbufferStorage, GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
+    let f1 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
+    let f2 = callptr(pFramebufferTexture2D, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbtex, 0)
+    let f3 = callptr(pFramebufferRenderbuffer, GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fbdepth)
+    let st = callptr(pCheckFramebufferStatus, GL_FRAMEBUFFER)
+    assert(st == GL_FRAMEBUFFER_COMPLETE, "HDR framebuffer incomplete ({st}) -- no RGBA16F support?")
+    let f4 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, 0)
+    fbw = w
+    fbh = h
+}
+
+// ---- camera: drag to orbit, wheel to zoom, idle drift otherwise ----
+var ocx = 1.0
+var ocz = 0.0
+let OS = 0.0009
+var psin = 0.30
+var orad = 90.0
+let FOV = 1.6
+let SENS = 0.0055
+let PMAX = 0.94
+let RMIN = 22.0
+let RMAXC = 900.0
+
+var dragging = 0
+var lastx = 0
+var lasty = 0
+var wheel = 0
+
+// Scratch the OS writes into must live outside the GC heap: mem() returns an
+// interior pointer into a zeros() list, and a collection can reclaim it.
+fn vmem(n: int) -> int {
+    let p = win("VirtualAlloc", 0, n, 12288, 4)
+    assert(p != 0, "VirtualAlloc failed")
+    return p
+}
+var ptb = vmem(64)
+var rcb = vmem(64)
+
+fn yaw_by(t: float) {
+    let nx = ocx - ocz * t
+    let nz = ocz + ocx * t
+    let n = sqrt(nx * nx + nz * nz)
+    ocx = nx / n
+    ocz = nz / n
+}
+
+var curx = 0
+var cury = 0
+fn cursor(hwnd: int) {
+    let g = win("user32!GetCursorPos", ptb)
+    let s = win("user32!ScreenToClient", hwnd, ptb)
+    let v = load64(ptb)
+    curx = sext32(v)
+    cury = sext32(v >> 32)
+}
+
+fn camera_input(hwnd: int) {
+    cursor(hwnd)
+    let cx2 = curx
+    let cy2 = cury
+    if down(1) {
+        if dragging == 1 {
+            yaw_by(((cx2 - lastx) as float) * SENS)
+            psin = psin + ((cy2 - lasty) as float) * SENS * 0.6
+            if psin > PMAX { psin = PMAX }
+            if psin < 0.0 - PMAX { psin = 0.0 - PMAX }
+        }
+        dragging = 1
+        lastx = cx2
+        lasty = cy2
+    } else {
+        dragging = 0
+        yaw_by(OS)
+    }
+    if wheel != 0 {
+        var f = 1.0
+        var w = wheel
+        while w > 0 {
+            f = f * 0.88
+            w -= 1
+        }
+        while w < 0 {
+            f = f * 1.136
+            w += 1
+        }
+        orad = orad * f
+        if orad < RMIN { orad = RMIN }
+        if orad > RMAXC { orad = RMAXC }
+        wheel = 0
+    }
+}
+
+if args().len() > 1 { COUNT = args()[1] as int }
+banner()
+
+// ---- window ----
+let hInst = win("GetModuleHandleA", 0)
+let u32mod = win("GetModuleHandleA", cstr("user32.dll"))
+let defwp = win("GetProcAddress", u32mod, cstr("DefWindowProcA"))
+let clsname = cstr("zephyrBlackHoleGPUWindow")
+
+let wc = mem(72)
+store32(wc + 0, 3 | 32)
+store64(wc + 8, defwp)
+store64(wc + 24, hInst)
+store64(wc + 40, win("user32!LoadCursorA", 0, 32512))
+store64(wc + 48, 0)
+store64(wc + 64, clsname)
+let atom = win("user32!RegisterClassA", wc)
+
+let hwnd = win("user32!CreateWindowExA", 0, clsname, cstr("Zephyr - black hole (turbulent accretion, GPU)"),
+    282001408, 40, 30, 1720, 1000, 0, 0, hInst, 0)
+let sw = win("user32!ShowWindow", hwnd, 5)
+let hdc = win("user32!GetDC", hwnd)
+
+let pfd = mem(40)
+store32(pfd + 0, 40 | 1 * 65536)
+store32(pfd + 4, 4 | 32 | 1)
+store8(pfd + 8, 0)
+store8(pfd + 9, 32)
+store8(pfd + 23, 24)
+store8(pfd + 26, 0)
+let pf = win("gdi32!ChoosePixelFormat", hdc, pfd)
+assert(pf != 0, "no suitable pixel format")
+let spf = win("gdi32!SetPixelFormat", hdc, pf, pfd)
+let ctx = win("opengl32!wglCreateContext", hdc)
+assert(ctx != 0, "wglCreateContext failed")
+let mc = win("opengl32!wglMakeCurrent", hdc, ctx)
+
+pCreateShader = gp("glCreateShader")
+pShaderSource = gp("glShaderSource")
+pCompileShader = gp("glCompileShader")
+pGetShaderiv = gp("glGetShaderiv")
+pGetShaderInfoLog = gp("glGetShaderInfoLog")
+pCreateProgram = gp("glCreateProgram")
+pAttachShader = gp("glAttachShader")
+pBindAttribLocation = gp("glBindAttribLocation")
+pTransformFeedbackVaryings = gp("glTransformFeedbackVaryings")
+pLinkProgram = gp("glLinkProgram")
+pGetProgramiv = gp("glGetProgramiv")
+pGetProgramInfoLog = gp("glGetProgramInfoLog")
+pUseProgram = gp("glUseProgram")
+pGenBuffers = gp("glGenBuffers")
+pBindBuffer = gp("glBindBuffer")
+pBufferData = gp("glBufferData")
+pVertexAttribPointer = gp("glVertexAttribPointer")
+pEnableVertexAttribArray = gp("glEnableVertexAttribArray")
+pDisableVertexAttribArray = gp("glDisableVertexAttribArray")
+pBindBufferBase = gp("glBindBufferBase")
+pBeginTransformFeedback = gp("glBeginTransformFeedback")
+pEndTransformFeedback = gp("glEndTransformFeedback")
+pGetUniformLocation = gp("glGetUniformLocation")
+pUniform4fv = gp("glUniform4fv")
+pUniform1i = gp("glUniform1i")
+pGenFramebuffers = gp("glGenFramebuffers")
+pBindFramebuffer = gp("glBindFramebuffer")
+pFramebufferTexture2D = gp("glFramebufferTexture2D")
+pGenRenderbuffers = gp("glGenRenderbuffers")
+pBindRenderbuffer = gp("glBindRenderbuffer")
+pRenderbufferStorage = gp("glRenderbufferStorage")
+pFramebufferRenderbuffer = gp("glFramebufferRenderbuffer")
+pCheckFramebufferStatus = gp("glCheckFramebufferStatus")
+
+let uprog = callptr(pCreateProgram)
+let a1 = callptr(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
+bind_attrs(uprog)
+let vary = mem(16)
+store64(vary + 0, cstr("oPos"))
+store64(vary + 8, cstr("oVel"))
+let tf = callptr(pTransformFeedbackVaryings, uprog, 2, vary, GL_INTERLEAVED_ATTRIBS)
+link(uprog)
+
+let dprog = callptr(pCreateProgram)
+let a2 = callptr(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
+let a3 = callptr(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
+bind_attrs(dprog)
+link(dprog)
+
+let hprog = callptr(pCreateProgram)
+let a4 = callptr(pAttachShader, hprog, compile(GL_VERTEX_SHADER, hole_vs_src()))
+let a5 = callptr(pAttachShader, hprog, compile(GL_FRAGMENT_SHADER, hole_fs_src()))
+link(hprog)
+
+let tprog = callptr(pCreateProgram)
+let a6 = callptr(pAttachShader, tprog, compile(GL_VERTEX_SHADER, tone_vs_src()))
+let a7 = callptr(pAttachShader, tprog, compile(GL_FRAGMENT_SHADER, tone_fs_src()))
+link(tprog)
+
+let bufs = mem(16)
+let gb = callptr(pGenBuffers, 2, bufs)
+var bufA = lo32(load64(bufs))
+var bufB = load64(bufs) >> 32
+let zero = mem(COUNT * STRIDE)
+let d1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufA)
+let d2 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d3 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufB)
+let d4 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+
+let uA = uloc(uprog, "A")
+let uB = uloc(uprog, "B")
+let uC = uloc(uprog, "C")
+let dCR = uloc(dprog, "CR")
+let dCU = uloc(dprog, "CU")
+let dCF = uloc(dprog, "CF")
+let dCE = uloc(dprog, "CE")
+let dP = uloc(dprog, "P")
+let dQ = uloc(dprog, "Q")
+let hCR = uloc(hprog, "CR")
+let hCU = uloc(hprog, "CU")
+let hCF = uloc(hprog, "CF")
+let hCE = uloc(hprog, "CE")
+let hH = uloc(hprog, "H")
+let tS = uloc(tprog, "S")
+let tT = uloc(tprog, "T")
+
+// temperature normalisation: T_PEAK at the profile peak, r = (49/36) r_isco
+let RPK = R_ISCO * 49.0 / 36.0
+let FPK = sqrt(sqrt((1.0 - sqrt(R_ISCO / RPK)) / (RPK * RPK * RPK)))
+let TSCALE = T_PEAK / FPK
+
+let en1 = win("opengl32!glEnable", GL_PROGRAM_POINT_SIZE)
+
+let msg = mem(48)
+var frame = 0
+var running = 1
+while running == 1 {
+    while win("user32!PeekMessageA", msg, 0, 0, 0, 1) != 0 {
+        let m = lo32(load64(msg + 8))
+        if m == 18 { running = 0 }                     // WM_QUIT
+        if m == 522 {                                  // WM_MOUSEWHEEL
+            var d = (load64(msg + 16) >> 16) & 65535
+            if d >= 32768 { d = d - 65536 }
+            wheel += d / 120
+        }
+        let tr = win("user32!TranslateMessage", msg)
+        let dp = win("user32!DispatchMessageA", msg)
+    }
+    if win("user32!IsWindow", hwnd) == 0 { running = 0 }
+    if running == 1 {
+        let g = win("user32!GetClientRect", hwnd, rcb)
+        let cw = lo32(load64(rcb + 8))
+        let ch = lo32(load64(rcb + 12))
+        if cw > 1 and ch > 1 {
+            frame += 1
+            ensure_fbo(cw, ch)
+
+            camera_input(hwnd)
+            let pc = sqrt(1.0 - psin * psin)
+            let ex = ocx * pc * orad
+            let ey = psin * orad
+            let ez = ocz * pc * orad
+            let el = sqrt(ex * ex + ey * ey + ez * ez)
+            let fx = (0.0 - ex) / el
+            let fy = (0.0 - ey) / el
+            let fz2 = (0.0 - ez) / el
+            var rx = fz2
+            var rz = 0.0 - fx
+            let rl = sqrt(rx * rx + rz * rz)
+            rx = rx / rl
+            rz = rz / rl
+            let upx = fy * rz
+            let upy = fz2 * rx - fx * rz
+            let upz = 0.0 - fy * rx
+            let aspect = (cw as float) / (ch as float)
+            let kpx = FOV * (ch as float) * 0.5
+
+            // pass 1: advance the accretion flow on the GPU
+            let up = callptr(pUseProgram, uprog)
+            set4(uA, DTS, BH_M, ALPHA, frame as float)
+            set4(uB, R_HOR, R_ISCO, R_DISC_OUT, R_ESCAPE)
+            set4(uC, HR, TURB, TDECAY, 0.0)
+            attach_buffer(bufA)
+            let bb = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
+            let rd = win("opengl32!glEnable", GL_RASTERIZER_DISCARD)
+            let bt = callptr(pBeginTransformFeedback, GL_POINTS)
+            let dr = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
+            let et = callptr(pEndTransformFeedback)
+            let rd2 = win("opengl32!glDisable", GL_RASTERIZER_DISCARD)
+            let bb0 = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
+
+            // ---- render the scene into the HDR buffer ----
+            let fb1 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
+            let vp = win("opengl32!glViewport", 0, 0, cw, ch)
+            let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            let de1 = win("opengl32!glEnable", GL_DEPTH_TEST)
+
+            // pass 2: the shadow, opaque and depth-writing, so the flow behind
+            // it is correctly hidden
+            let da0 = callptr(pDisableVertexAttribArray, 0)
+            let da1 = callptr(pDisableVertexAttribArray, 1)
+            let hp = callptr(pUseProgram, hprog)
+            set4(hCR, rx, 0.0, rz, FOV / aspect)
+            set4(hCU, upx, upy, upz, FOV)
+            set4(hCF, fx, fy, fz2, kpx)
+            set4(hCE, ex, ey, ez, 0.0)
+            set4(hH, B_CRIT, 1.0, 0.0, 0.0)
+            let hd = win("opengl32!glDrawArrays", GL_TRIANGLE_STRIP, 0, 4)
+
+            // pass 3: everything luminous, additive into float, depth-tested
+            let be = win("opengl32!glEnable", GL_BLEND)
+            let bf = win("opengl32!glBlendFunc", GL_ONE, GL_ONE)
+            let dm = win("opengl32!glDepthMask", 0)
+            set4(hH, B_CRIT, 1.7, 1.0, 0.0)                // photon ring
+            let hd2 = win("opengl32!glDrawArrays", GL_TRIANGLE_STRIP, 0, 4)
+
+            let dp2 = callptr(pUseProgram, dprog)
+            set4(dCR, rx, 0.0, rz, FOV / aspect)
+            set4(dCU, upx, upy, upz, FOV)
+            set4(dCF, fx, fy, fz2, kpx)
+            set4(dCE, ex, ey, ez, 0.0)
+            set4(dP, BH_M, R_ISCO, TSCALE, 0.0)
+            set4(dQ, T_REF, EXPO, 0.0, 0.0)
+            attach_buffer(bufB)
+            let dr2 = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
+            let dm2 = win("opengl32!glDepthMask", 1)
+
+            // ---- pass 4: tone-map the HDR buffer to the window ----
+            let fb2 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, 0)
+            let bd = win("opengl32!glDisable", GL_BLEND)
+            let de2 = win("opengl32!glDisable", GL_DEPTH_TEST)
+            let da2 = callptr(pDisableVertexAttribArray, 0)
+            let da3 = callptr(pDisableVertexAttribArray, 1)
+            let tp = callptr(pUseProgram, tprog)
+            let bt2 = win("opengl32!glBindTexture", GL_TEXTURE_2D, fbtex)
+            let u1 = callptr(pUniform1i, tS, 0)
+            set4(tT, (frame % 1024) as float, 0.0, 0.0, 0.0)
+            let dr3 = win("opengl32!glDrawArrays", GL_TRIANGLES, 0, 3)
+
+            let sb = win("gdi32!SwapBuffers", hdc)
+
+            let t = bufA
+            bufA = bufB
+            bufB = t
+            NP = COUNT
+            fps_tick()
+        }
+    }
+}
+let mc0 = win("opengl32!wglMakeCurrent", 0, 0)
+let dl = win("opengl32!wglDeleteContext", ctx)

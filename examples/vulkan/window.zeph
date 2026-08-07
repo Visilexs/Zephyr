@@ -1,0 +1,250 @@
+// Stage 6: a spinning triangle in a real window, presented through a swapchain.
+//
+// The window has no Zephyr-written window procedure -- the class installs
+// user32's DefWindowProcA and we poll with PeekMessageA (see vk/win.zeph), so
+// no native callback ever has to point back into Zephyr code.
+//
+// Rotation is driven by a push constant, which avoids descriptor sets entirely.
+
+import "vk/gfx.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+
+let WIDTH = 900
+let HEIGHT = 700
+
+var layers: [str] = []
+for a in args() {
+    if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+if layers.len() > 0 { print("validation enabled") }
+
+var wnd = window_open("Zephyr - Vulkan", WIDTH, HEIGHT)
+var g = Gfx.init_windowed("zephyr-window", layers, wnd)
+print("gpu: {g.gpu_name()}")
+
+let format = g.surface_format()
+
+// ---------------- render pass (ends in PRESENT_SRC so it can be shown) ----------------
+var attach = Bytes.new(VkAttachmentDescription_sizeof)
+attach.put32(VkAttachmentDescription_format, format)
+attach.put32(VkAttachmentDescription_samples, VK_SAMPLE_COUNT_1_BIT)
+attach.put32(VkAttachmentDescription_loadOp, VK_ATTACHMENT_LOAD_OP_CLEAR)
+attach.put32(VkAttachmentDescription_storeOp, VK_ATTACHMENT_STORE_OP_STORE)
+attach.put32(VkAttachmentDescription_stencilLoadOp, VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_stencilStoreOp, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+attach.put32(VkAttachmentDescription_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+attach.put32(VkAttachmentDescription_finalLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+
+var ref = Bytes.new(VkAttachmentReference_sizeof)
+ref.put32(VkAttachmentReference_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+
+var subpass = Bytes.new(VkSubpassDescription_sizeof)
+subpass.put32(VkSubpassDescription_pipelineBindPoint, VK_PIPELINE_BIND_POINT_GRAPHICS)
+subpass.put32(VkSubpassDescription_colorAttachmentCount, 1)
+subpass.put64(VkSubpassDescription_pColorAttachments, ref.addr())
+
+var rpci = Bytes.new(VkRenderPassCreateInfo_sizeof)
+rpci.put32(VkRenderPassCreateInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO)
+rpci.put32(VkRenderPassCreateInfo_attachmentCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pAttachments, attach.addr())
+rpci.put32(VkRenderPassCreateInfo_subpassCount, 1)
+rpci.put64(VkRenderPassCreateInfo_pSubpasses, subpass.addr())
+var prp = Bytes.new(8)
+vkcheck(vkCreateRenderPass(g.dev, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
+let renderpass = prp.get64(0)
+
+var swap = g.swapchain(format, renderpass, 0)
+print("swapchain: {swap.w}x{swap.h}, {swap.images.len()} images")
+
+// ---------------- pipeline ----------------
+let vs = g.shader("examples/shaders/spin.vert.spv")
+let fs = g.shader("examples/shaders/triangle.frag.spv")
+var entry = cbytes("main")
+
+var stages = Bytes.new(VkPipelineShaderStageCreateInfo_sizeof * 2)
+stages.put32(VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_VERTEX_BIT)
+stages.put64(VkPipelineShaderStageCreateInfo_module, vs)
+stages.put64(VkPipelineShaderStageCreateInfo_pName, entry.addr())
+let s1 = VkPipelineShaderStageCreateInfo_sizeof
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+stages.put32(s1 + VkPipelineShaderStageCreateInfo_stage, VK_SHADER_STAGE_FRAGMENT_BIT)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_module, fs)
+stages.put64(s1 + VkPipelineShaderStageCreateInfo_pName, entry.addr())
+
+var vi = Bytes.new(VkPipelineVertexInputStateCreateInfo_sizeof)
+vi.put32(VkPipelineVertexInputStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
+
+var ia = Bytes.new(VkPipelineInputAssemblyStateCreateInfo_sizeof)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+ia.put32(VkPipelineInputAssemblyStateCreateInfo_topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+
+// Viewport and scissor are DYNAMIC: set per frame from the current swapchain
+// extent, so a resize rebuilds the swapchain without touching the pipeline.
+var viewport = Bytes.new(VkViewport_sizeof)
+var scissor = Bytes.new(VkRect2D_sizeof)
+
+var dynstates = Bytes.new(8)
+dynstates.put32(0, VK_DYNAMIC_STATE_VIEWPORT)
+dynstates.put32(4, VK_DYNAMIC_STATE_SCISSOR)
+var dyn = Bytes.new(VkPipelineDynamicStateCreateInfo_sizeof)
+dyn.put32(VkPipelineDynamicStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+dyn.put32(VkPipelineDynamicStateCreateInfo_dynamicStateCount, 2)
+dyn.put64(VkPipelineDynamicStateCreateInfo_pDynamicStates, dynstates.addr())
+
+var vp = Bytes.new(VkPipelineViewportStateCreateInfo_sizeof)
+vp.put32(VkPipelineViewportStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+vp.put32(VkPipelineViewportStateCreateInfo_viewportCount, 1)
+vp.put32(VkPipelineViewportStateCreateInfo_scissorCount, 1)
+
+var rs = Bytes.new(VkPipelineRasterizationStateCreateInfo_sizeof)
+rs.put32(VkPipelineRasterizationStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+rs.put32(VkPipelineRasterizationStateCreateInfo_polygonMode, VK_POLYGON_MODE_FILL)
+rs.put32(VkPipelineRasterizationStateCreateInfo_cullMode, VK_CULL_MODE_NONE)
+rs.put32(VkPipelineRasterizationStateCreateInfo_frontFace, VK_FRONT_FACE_CLOCKWISE)
+rs.putf32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
+
+var ms = Bytes.new(VkPipelineMultisampleStateCreateInfo_sizeof)
+ms.put32(VkPipelineMultisampleStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+ms.put32(VkPipelineMultisampleStateCreateInfo_rasterizationSamples, VK_SAMPLE_COUNT_1_BIT)
+
+var cba = Bytes.new(VkPipelineColorBlendAttachmentState_sizeof)
+cba.put32(VkPipelineColorBlendAttachmentState_colorWriteMask, 15)
+
+var cbs = Bytes.new(VkPipelineColorBlendStateCreateInfo_sizeof)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
+cbs.put32(VkPipelineColorBlendStateCreateInfo_attachmentCount, 1)
+cbs.put64(VkPipelineColorBlendStateCreateInfo_pAttachments, cba.addr())
+
+// two floats of push constants: angle + aspect ratio
+var pcr = Bytes.new(VkPushConstantRange_sizeof)
+pcr.put32(VkPushConstantRange_stageFlags, VK_SHADER_STAGE_VERTEX_BIT)
+pcr.put32(VkPushConstantRange_offset, 0)
+pcr.put32(VkPushConstantRange_size, 8)
+
+var plci = Bytes.new(VkPipelineLayoutCreateInfo_sizeof)
+plci.put32(VkPipelineLayoutCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+plci.put32(VkPipelineLayoutCreateInfo_pushConstantRangeCount, 1)
+plci.put64(VkPipelineLayoutCreateInfo_pPushConstantRanges, pcr.addr())
+var ppl = Bytes.new(8)
+vkcheck(vkCreatePipelineLayout(g.dev, plci.addr(), 0, ppl.addr()), "vkCreatePipelineLayout")
+let layout = ppl.get64(0)
+
+var gpci = Bytes.new(VkGraphicsPipelineCreateInfo_sizeof)
+gpci.put32(VkGraphicsPipelineCreateInfo_sType, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+gpci.put32(VkGraphicsPipelineCreateInfo_stageCount, 2)
+gpci.put64(VkGraphicsPipelineCreateInfo_pStages, stages.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pVertexInputState, vi.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pInputAssemblyState, ia.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pViewportState, vp.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pRasterizationState, rs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pMultisampleState, ms.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pColorBlendState, cbs.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_pDynamicState, dyn.addr())
+gpci.put64(VkGraphicsPipelineCreateInfo_layout, layout)
+gpci.put64(VkGraphicsPipelineCreateInfo_renderPass, renderpass)
+gpci.put32(VkGraphicsPipelineCreateInfo_basePipelineIndex, 0 - 1)
+var ppipe = Bytes.new(8)
+vkcheck(vkCreateGraphicsPipelines(g.dev, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
+let pipeline = ppipe.get64(0)
+
+// ---------------- frame loop ----------------
+var clear = Bytes.new(VkClearValue_sizeof)
+clear.putf32(0, 0.07)
+clear.putf32(4, 0.08)
+clear.putf32(8, 0.11)
+clear.putf32(12, 1.0)
+
+var rpbi = Bytes.new(VkRenderPassBeginInfo_sizeof)
+rpbi.put32(VkRenderPassBeginInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+rpbi.put64(VkRenderPassBeginInfo_renderPass, renderpass)
+rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
+rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+rpbi.put32(VkRenderPassBeginInfo_clearValueCount, 1)
+rpbi.put64(VkRenderPassBeginInfo_pClearValues, clear.addr())
+
+var pushc = Bytes.new(8)
+
+var qpc = Bytes.new(8)
+var qpf = Bytes.new(8)
+let qf = QueryPerformanceFrequency(qpf.addr())
+let freq = qpf.get64(0)
+let q0 = QueryPerformanceCounter(qpc.addr())
+let t0 = qpc.get64(0)
+
+// how long to run: default 6 seconds, or forever with --forever
+var seconds = 6.0
+for a in args() {
+    if a == "--forever" { seconds = 1000000.0 }
+}
+
+let rpa = rpbi.addr()
+let pipe = pipeline
+let pla = layout
+let pusha = pushc.addr()
+let vpa = viewport.addr()
+let sca = scissor.addr()
+
+var frames = 0
+var resizes = 0
+var running = true
+while running {
+    if not wnd.poll() { running = false }
+    if running {
+        let q = QueryPerformanceCounter(qpc.addr())
+        let t = ((qpc.get64(0) - t0) as float) / (freq as float)
+        if t > seconds { running = false }
+        pushc.putf32(0, t * 1.2)
+        pushc.putf32(4, (swap.w as float) / (swap.h as float))
+
+        // dynamic state follows the current swapchain extent
+        viewport.putf32(VkViewport_width, swap.w as float)
+        viewport.putf32(VkViewport_height, swap.h as float)
+        viewport.putf32(VkViewport_maxDepth, 1.0)
+        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.w)
+        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.h)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+
+        let fbs = swap.fbs
+        let ok = g.frame(swap, fn(cb: int, idx: int) {
+            store64(rpa + VkRenderPassBeginInfo_framebuffer, fbs[idx])
+            vkCmdBeginRenderPass(cb, rpa, VK_SUBPASS_CONTENTS_INLINE)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe)
+            vkCmdSetViewport(cb, 0, 1, vpa)
+            vkCmdSetScissor(cb, 0, 1, sca)
+            vkCmdPushConstants(cb, pla, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, pusha)
+            vkCmdDraw(cb, 3, 1, 0, 0)
+            vkCmdEndRenderPass(cb)
+        })
+
+        if running and not ok {
+            // window resized: rebuild for the new extent. `none` means the
+            // window is minimised, so wait for it to come back.
+            let fresh = g.rebuild(swap, renderpass)
+            if fresh.has() {
+                swap = fresh.get()
+                resizes += 1
+            }
+        }
+        frames += 1
+    }
+}
+
+let q1 = QueryPerformanceCounter(qpc.addr())
+let elapsed = ((qpc.get64(0) - t0) as float) / (freq as float)
+print("{frames} frames in {elapsed}s, {resizes} swapchain rebuilds")
+
+// ---------------- teardown ----------------
+vkcheck(vkDeviceWaitIdle(g.dev), "vkDeviceWaitIdle")
+vkDestroyPipeline(g.dev, pipeline, 0)
+vkDestroyPipelineLayout(g.dev, layout, 0)
+vkDestroyShaderModule(g.dev, vs, 0)
+vkDestroyShaderModule(g.dev, fs, 0)
+g.destroy_swapchain(swap)
+vkDestroyRenderPass(g.dev, renderpass, 0)
+g.shutdown()
+wnd.close()
+print("OK")

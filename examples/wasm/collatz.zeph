@@ -1,0 +1,25 @@
+// Longest Collatz chain under a bound: integer division, modulo, nested loops,
+// break and continue -- the control-flow shapes wasm has to express with
+// block/loop/br instead of jumps.
+fn chain(n0: int) -> int {
+    var n = n0
+    var steps = 0
+    while n != 1 {
+        if n % 2 == 0 { n = n / 2 } else { n = 3 * n + 1 }
+        steps = steps + 1
+    }
+    return steps
+}
+
+var best = 0
+var arg = 0
+for i in 1..100000 {
+    if i % 2 == 0 { continue }
+    let c = chain(i)
+    if c > best {
+        best = c
+        arg = i
+    }
+}
+print(arg)
+print(best)
