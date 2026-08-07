@@ -1,3 +1,0 @@
-// Zide plugin: uppercase every line of the file passed as args()[1].
-let text = read_file(args()[1])
-emit(text.upper())
