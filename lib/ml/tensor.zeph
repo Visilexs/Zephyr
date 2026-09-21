@@ -1,0 +1,402 @@
+// Tensor descriptors and storage for the ML stack -- milestone M2a.
+// Acceptance A02 (checked dimensions, bytes, strides, overflow and range)
+// and A03 (owner/view lifetime, mutation versions, allocation accounting).
+//
+// Runtime descriptors over the existing Bytes buffer, deliberately: the
+// specification stages first-class tensor types and scalar complex types as
+// later compiler work, after the storage and AD semantics are settled here.
+// Nothing in this file needs a parser change.
+//
+// Structs are reference types on Zephyr's counted heap, so a view holding a
+// Storage keeps the buffer alive on its own and sees the owner's mutation
+// version. Lifetime for CPU storage therefore needs no explicit free; the
+// byte counters below are diagnostics, and matter mainly for the GPU path
+// later, where completion has to be waited on before recycling.
+import "std/bytes.zeph"
+
+enum DType { F32, F64, C32, C64, I32, I64, Bool }
+
+// Component-width naming, per the specification and NOT PyTorch's:
+// C32 is two f32 components (8 bytes) and maps to torch.complex64.
+// C64 is two f64 components (16 bytes) and maps to torch.complex128.
+fn dtype_size(d: DType) -> int {
+    if d == DType.F32 { return 4 }
+    if d == DType.F64 { return 8 }
+    if d == DType.C32 { return 8 }
+    if d == DType.C64 { return 16 }
+    if d == DType.I32 { return 4 }
+    if d == DType.I64 { return 8 }
+    return 1
+}
+
+fn dtype_name(d: DType) -> str {
+    if d == DType.F32 { return "f32" }
+    if d == DType.F64 { return "f64" }
+    if d == DType.C32 { return "c32_components" }
+    if d == DType.C64 { return "c64_components" }
+    if d == DType.I32 { return "i32" }
+    if d == DType.I64 { return "i64" }
+    return "bool"
+}
+
+fn dtype_is_complex(d: DType) -> bool {
+    return d == DType.C32 or d == DType.C64
+}
+
+fn dtype_is_float(d: DType) -> bool {
+    return d == DType.F32 or d == DType.F64
+}
+
+// Component dtype of a complex dtype, so paired-real code can share a path.
+fn dtype_component(d: DType) -> DType {
+    if d == DType.C32 { return DType.F32 }
+    if d == DType.C64 { return DType.F64 }
+    return d
+}
+
+// Two caps with two different jobs.
+//
+// MAX_ELEMS is the overflow guard: 2^40 elements times the widest dtype (16
+// bytes) is 2^44, so checking it before each multiply is what makes the byte
+// product provably unable to wrap i64, rather than merely unlikely to.
+//
+// MAX_BYTES is a sanity cap, 128 GiB, comfortably above anything this project
+// will allocate on a 32 GB machine and far below the absurd. Without it a
+// nonsense request reaches the allocator and comes back as a bare "heap
+// full", which says nothing about what was asked for. Raise it if a machine
+// ever justifies that; it is deliberately not derived from MAX_ELEMS, which
+// would make it unreachable.
+let MAX_ELEMS = 1099511627776
+let MAX_BYTES = 137438953472
+
+// ---- allocation accounting (A03) -------------------------------------------
+// Live bytes only decreases when a caller explicitly releases. CPU buffers are
+// also reclaimed by the counted heap when the last handle goes, so release is
+// for accounting and for the later GPU allocator, not for correctness here.
+var ML_LIVE_BYTES = 0
+var ML_PEAK_BYTES = 0
+var ML_ALLOCS = 0
+var ML_RELEASES = 0
+
+fn ml_live_bytes() -> int { return ML_LIVE_BYTES }
+fn ml_peak_bytes() -> int { return ML_PEAK_BYTES }
+fn ml_allocs() -> int { return ML_ALLOCS }
+fn ml_releases() -> int { return ML_RELEASES }
+
+fn ml_reset_accounting() {
+    ML_LIVE_BYTES = 0
+    ML_PEAK_BYTES = 0
+    ML_ALLOCS = 0
+    ML_RELEASES = 0
+}
+
+struct Storage {
+    buf: Bytes,
+    nbytes: int,
+    version: int,
+    released: bool,
+}
+
+fn storage_new(nbytes: int) -> Storage {
+    if nbytes < 0 { panic("storage_new: negative byte count") }
+    if nbytes > MAX_BYTES {
+        panic("storage_new: request of {nbytes} bytes exceeds the {MAX_BYTES} byte cap")
+    }
+    ML_LIVE_BYTES += nbytes
+    ML_ALLOCS += 1
+    if ML_LIVE_BYTES > ML_PEAK_BYTES { ML_PEAK_BYTES = ML_LIVE_BYTES }
+    return Storage{buf: Bytes.new(nbytes), nbytes: nbytes, version: 0, released: false}
+}
+
+// Accounting only. The buffer itself stays valid until the last handle drops,
+// so this cannot create a dangling view.
+fn storage_release(s: Storage) {
+    if s.released { panic("storage_release: already released") }
+    s.released = true
+    ML_LIVE_BYTES -= s.nbytes
+    ML_RELEASES += 1
+}
+
+fn storage_bump(s: Storage) { s.version += 1 }
+
+// ---- tensor descriptor -----------------------------------------------------
+// strides and off are counted in ELEMENTS, never bytes; the byte conversion
+// happens once, at the access site.
+struct Tensor {
+    st: Storage,
+    dt: DType,
+    shape: [int],
+    stride: [int],
+    off: int,
+}
+
+fn shape_numel(shape: [int]) -> int {
+    var n = 1
+    for i in 0..shape.len() {
+        let d = shape[i]
+        if d < 0 { panic("shape: negative dimension") }
+        if d != 0 and n > MAX_ELEMS / d { panic("shape: element count overflows") }
+        n = n * d
+    }
+    return n
+}
+
+fn contiguous_strides(shape: [int]) -> [int] {
+    let r = shape.len()
+    var s: [int] = []
+    for i in 0..r { s.push(0) }
+    var acc = 1
+    var i = r
+    while i > 0 {
+        i -= 1
+        s[i] = acc
+        acc = acc * shape[i]
+    }
+    return s
+}
+
+// Dimensions align from the right. Equal sizes agree; a 1 takes the other
+// size, and that includes 1 against 0, which yields 0. Anything else is an
+// error rather than a guess. Shape only -- no data is moved here.
+fn broadcast_shape(a: [int], b: [int]) -> [int] {
+    let ra = a.len()
+    let rb = b.len()
+    var r = ra
+    if rb > r { r = rb }
+    var out: [int] = []
+    for i in 0..r { out.push(0) }
+    var i = 0
+    while i < r {
+        var da = 1
+        var db = 1
+        if i < ra { da = a[ra - 1 - i] }
+        if i < rb { db = b[rb - 1 - i] }
+        var d = 0
+        if da == db {
+            d = da
+        } else {
+            if da == 1 {
+                d = db
+            } else {
+                if db == 1 {
+                    d = da
+                } else {
+                    panic("broadcast: incompatible dimensions")
+                }
+            }
+        }
+        out[r - 1 - i] = d
+        i += 1
+    }
+    return out
+}
+
+fn shapes_equal(a: [int], b: [int]) -> bool {
+    if a.len() != b.len() { return false }
+    for i in 0..a.len() {
+        if a[i] != b[i] { return false }
+    }
+    return true
+}
+
+fn t_rank(t: Tensor) -> int { return t.shape.len() }
+fn t_numel(t: Tensor) -> int { return shape_numel(t.shape) }
+fn t_dtype(t: Tensor) -> DType { return t.dt }
+fn t_version(t: Tensor) -> int { return t.st.version }
+
+// Rank zero is a scalar and holds one element; an empty dimension is legal
+// and makes the tensor hold none.
+fn t_zeros(d: DType, shape: [int]) -> Tensor {
+    let n = shape_numel(shape)
+    let esz = dtype_size(d)
+    if n != 0 and esz > MAX_BYTES / n {
+        panic("t_zeros: {n} elements of {esz} bytes exceeds the {MAX_BYTES} byte cap")
+    }
+    let st = storage_new(n * esz)
+    return Tensor{st: st, dt: d, shape: shape, stride: contiguous_strides(shape), off: 0}
+}
+
+fn t_is_contiguous(t: Tensor) -> bool {
+    let c = contiguous_strides(t.shape)
+    for i in 0..c.len() {
+        // a dimension of length 1 can carry any stride without changing layout
+        if t.shape[i] != 1 and t.stride[i] != c[i] { return false }
+    }
+    return true
+}
+
+// The single place an index becomes a byte offset. Every read and write goes
+// through it, so the range check cannot be bypassed.
+fn t_elem_offset(t: Tensor, idx: [int]) -> int {
+    if idx.len() != t.shape.len() { panic("index: wrong rank") }
+    var off = t.off
+    for i in 0..idx.len() {
+        let k = idx[i]
+        if k < 0 or k >= t.shape[i] { panic("index: out of range") }
+        off += k * t.stride[i]
+    }
+    return off
+}
+
+fn t_byte_offset(t: Tensor, idx: [int]) -> int {
+    let e = t_elem_offset(t, idx)
+    let b = e * dtype_size(t.dt)
+    if b < 0 or b + dtype_size(t.dt) > t.st.nbytes { panic("index: outside storage") }
+    return b
+}
+
+// ---- element access --------------------------------------------------------
+// Real dtypes read and write through float (f64). Reading an f32 widens;
+// writing an f32 rounds at the store, which is where the specification wants
+// the rounding to be explicit.
+fn t_get(t: Tensor, idx: [int]) -> float {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.F64 { return t.st.buf.getf64(b) }
+    if t.dt == DType.F32 { return t.st.buf.getf32(b) }
+    if t.dt == DType.I64 { return t.st.buf.get64(b) as float }
+    if t.dt == DType.I32 { return t.st.buf.get32(b) as float }
+    if t.dt == DType.Bool { return t.st.buf.get8(b) as float }
+    panic("t_get: complex dtype needs t_get_re / t_get_im")
+    return 0.0
+}
+
+fn t_set(t: Tensor, idx: [int], v: float) {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.F64 {
+        t.st.buf.putf64(b, v)
+    } else {
+        if t.dt == DType.F32 {
+            t.st.buf.putf32(b, v)
+        } else {
+            panic("t_set: not a real float dtype")
+        }
+    }
+    storage_bump(t.st)
+}
+
+fn t_get_int(t: Tensor, idx: [int]) -> int {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.I64 { return t.st.buf.get64(b) }
+    if t.dt == DType.I32 { return t.st.buf.get32(b) }
+    if t.dt == DType.Bool { return t.st.buf.get8(b) }
+    panic("t_get_int: not an integer dtype")
+    return 0
+}
+
+fn t_set_int(t: Tensor, idx: [int], v: int) {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.I64 {
+        t.st.buf.put64(b, v)
+    } else {
+        if t.dt == DType.I32 {
+            t.st.buf.put32(b, v)
+        } else {
+            if t.dt == DType.Bool {
+                if v == 0 { t.st.buf.put8(b, 0) } else { t.st.buf.put8(b, 1) }
+            } else {
+                panic("t_set_int: not an integer dtype")
+            }
+        }
+    }
+    storage_bump(t.st)
+}
+
+// Complex is stored interleaved, real then imaginary, which is the canonical
+// external layout the checkpoint format also uses.
+fn t_get_re(t: Tensor, idx: [int]) -> float {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.C64 { return t.st.buf.getf64(b) }
+    if t.dt == DType.C32 { return t.st.buf.getf32(b) }
+    panic("t_get_re: not a complex dtype")
+    return 0.0
+}
+
+fn t_get_im(t: Tensor, idx: [int]) -> float {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.C64 { return t.st.buf.getf64(b + 8) }
+    if t.dt == DType.C32 { return t.st.buf.getf32(b + 4) }
+    panic("t_get_im: not a complex dtype")
+    return 0.0
+}
+
+fn t_set_c(t: Tensor, idx: [int], re: float, im: float) {
+    let b = t_byte_offset(t, idx)
+    if t.dt == DType.C64 {
+        t.st.buf.putf64(b, re)
+        t.st.buf.putf64(b + 8, im)
+    } else {
+        if t.dt == DType.C32 {
+            t.st.buf.putf32(b, re)
+            t.st.buf.putf32(b + 4, im)
+        } else {
+            panic("t_set_c: not a complex dtype")
+        }
+    }
+    storage_bump(t.st)
+}
+
+// ---- views -----------------------------------------------------------------
+// All of these change metadata only and share the owner's Storage, so a write
+// through one is visible through the others and bumps the same version.
+
+fn t_transpose(t: Tensor, a: int, b: int) -> Tensor {
+    let r = t.shape.len()
+    if a < 0 or b < 0 or a >= r or b >= r { panic("transpose: axis out of range") }
+    var sh: [int] = []
+    var sd: [int] = []
+    for i in 0..r {
+        sh.push(t.shape[i])
+        sd.push(t.stride[i])
+    }
+    sh[a] = t.shape[b]
+    sh[b] = t.shape[a]
+    sd[a] = t.stride[b]
+    sd[b] = t.stride[a]
+    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off}
+}
+
+// half-open [start, stop), matching the language's own range convention
+fn t_slice(t: Tensor, dim: int, start: int, stop: int) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("slice: dim out of range") }
+    if start < 0 or stop > t.shape[dim] or start > stop { panic("slice: bounds out of range") }
+    var sh: [int] = []
+    var sd: [int] = []
+    for i in 0..r {
+        sh.push(t.shape[i])
+        sd.push(t.stride[i])
+    }
+    sh[dim] = stop - start
+    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off + start * t.stride[dim]}
+}
+
+// Aliases only when the layout permits. No hidden copy: a non-contiguous
+// input is an error the caller has to resolve with an explicit copy, which
+// keeps the cost visible.
+fn t_reshape(t: Tensor, shape: [int]) -> Tensor {
+    if not t_is_contiguous(t) { panic("reshape: tensor is not contiguous") }
+    if shape_numel(shape) != t_numel(t) { panic("reshape: element count differs") }
+    return Tensor{st: t.st, dt: t.dt, shape: shape, stride: contiguous_strides(shape), off: t.off}
+}
+
+// ---- saved tensors ---------------------------------------------------------
+// The autograd tape will save forward values and use them during backward. A
+// write through any view in between invalidates them, and that must be an
+// error rather than a silently wrong gradient.
+struct Saved {
+    t: Tensor,
+    ver: int,
+}
+
+fn t_save(t: Tensor) -> Saved {
+    return Saved{t: t, ver: t.st.version}
+}
+
+fn saved_get(s: Saved) -> Tensor {
+    if s.t.st.version != s.ver { panic("saved tensor used after its storage was mutated") }
+    return s.t
+}
+
+fn saved_is_stale(s: Saved) -> bool {
+    return s.t.st.version != s.ver
+}

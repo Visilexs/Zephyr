@@ -289,6 +289,44 @@ if (-not $mathBuilt) { Write-Host "  math build output: $mathBuild" -ForegroundC
 $mathOut = if ($mathBuilt) { (cmd /c "`"$tmp\math_fns.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "std-math-fns" ($mathBuilt -and $mathOut -eq "math: 213 checks passed") "got: $mathOut"
 
+# ---- lib/ml tensor descriptors and storage: acceptance A02 and A03 ----
+Remove-Item "$tmp\tensor_test.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt tests\ml\tensor_test.zeph "$tmp\tensor_test.exe" 2>&1 | Out-Null
+$tenBuilt = Test-Path "$tmp\tensor_test.exe"
+$tenOut = if ($tenBuilt) { (cmd /c "`"$tmp\tensor_test.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+Check "ml-tensor" ($tenBuilt -and $tenOut -eq "tensor: 73 checks passed") "got: $tenOut"
+
+# ---- and the inputs that must be REJECTED, one process each: a rejection is
+# ---- a panic, so it cannot be asserted from inside the positive suite ----
+$mlNeg = [ordered]@{
+    "negdim"      = 'let t = t_zeros(DType.F64, [0 - 2, 3])'
+    "overflow"    = 'let t = t_zeros(DType.F64, [3000000000, 3000000000])'
+    "bytecap"     = 'let t = t_zeros(DType.C64, [500000000000])'
+    "idx-high"    = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [2, 0])}`")"
+    "idx-neg"     = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [0 - 1, 0])}`")"
+    "idx-rank"    = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [1])}`")"
+    "reshape-n"   = "let t = t_zeros(DType.F64, [2, 3])`nlet r = t_reshape(t, [4, 2])"
+    "reshape-nc"  = "let t = t_zeros(DType.F64, [2, 3])`nlet r = t_reshape(t_transpose(t, 0, 1), [6])"
+    "slice-oob"   = "let t = t_zeros(DType.F64, [2, 3])`nlet s = t_slice(t, 1, 1, 9)"
+    "axis-oob"    = "let t = t_zeros(DType.F64, [2, 3])`nlet x = t_transpose(t, 0, 5)"
+    "bcast-bad"   = 'let s = broadcast_shape([2, 3], [4, 3])'
+    "stale-save"  = "let t = t_zeros(DType.F64, [2])`nlet s = t_save(t)`nt_set(t, [0], 1.0)`nlet b = saved_get(s)"
+    "dbl-release" = "let t = t_zeros(DType.F64, [2])`nstorage_release(t.st)`nstorage_release(t.st)"
+    "cplx-get"    = "let t = t_zeros(DType.C32, [2])`nprint(`"{t_get(t, [0])}`")"
+    "int-set"     = "let t = t_zeros(DType.I64, [2])`nt_set(t, [0], 1.5)"
+}
+foreach ($nm in $mlNeg.Keys) {
+    $src = "import `"ml/tensor.zeph`"`n" + $mlNeg[$nm]
+    $f = Join-Path $tmp "mlneg_$nm.zeph"
+    $x = Join-Path $tmp "mlneg_$nm.exe"
+    Set-Content -Path $f -Value $src -Encoding ascii
+    Remove-Item $x -ErrorAction SilentlyContinue
+    & .\zc.exe --rt $f $x 2>&1 | Out-Null
+    if (-not (Test-Path $x)) { Check "ml-reject:$nm" $false "did not compile"; continue }
+    $o = (cmd /c "`"$x`" 2>&1" | Out-String).Trim()
+    Check "ml-reject:$nm" ($LASTEXITCODE -ne 0 -and $o -match "panic:") "expected panic, got($LASTEXITCODE): $o"
+}
+
 # ---- modules: import splices declarations, once, resolved relative to the importer ----
 $moddir = Join-Path $tmp "mod"
 New-Item -ItemType Directory -Force "$moddir\sub" | Out-Null

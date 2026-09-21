@@ -1,0 +1,170 @@
+// Positive-path regression for lib/ml/tensor.zeph -- acceptance A02 and A03.
+// The cases that must FAIL are separate one-line programs driven by
+// tests/run_tests.ps1, because a rejection here is a panic and takes the
+// process with it.
+import "ml/tensor.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+// A view created inside a function outlives the owner handle: the counted
+// heap keeps the Storage alive because the view still references it.
+fn make_orphan_view() -> Tensor {
+    let owner = t_zeros(DType.F64, [3, 4])
+    t_set(owner, [2, 3], 9.75)
+    return t_slice(owner, 0, 1, 3)
+}
+
+var n = 0
+
+// ---- A02: dtype and size contracts
+n += ck(dtype_size(DType.F32) == 4, "f32 is 4 bytes")
+n += ck(dtype_size(DType.F64) == 8, "f64 is 8 bytes")
+n += ck(dtype_size(DType.C32) == 8, "c32 is two f32 components")
+n += ck(dtype_size(DType.C64) == 16, "c64 is two f64 components")
+n += ck(dtype_name(DType.C32) == "c32_components", "c32 name is unambiguous")
+n += ck(dtype_name(DType.C64) == "c64_components", "c64 name is unambiguous")
+n += ck(dtype_is_complex(DType.C32), "c32 is complex")
+n += ck(not dtype_is_complex(DType.F64), "f64 is not complex")
+n += ck(dtype_component(DType.C32) == DType.F32, "c32 component is f32")
+n += ck(dtype_component(DType.C64) == DType.F64, "c64 component is f64")
+
+// ---- A02: shape, stride, scalar and empty
+n += ck(shape_numel([]) == 1, "rank zero holds one element")
+n += ck(shape_numel([0]) == 0, "empty dimension holds none")
+n += ck(shape_numel([2, 3, 4]) == 24, "numel is the product")
+n += ck(shape_numel([5, 0, 3]) == 0, "any zero dimension empties the tensor")
+
+let cs = contiguous_strides([2, 3, 4])
+n += ck(cs[0] == 12 and cs[1] == 4 and cs[2] == 1, "row-major strides")
+let cs1 = contiguous_strides([7])
+n += ck(cs1[0] == 1, "rank one stride is 1")
+n += ck(contiguous_strides([]).len() == 0, "rank zero has no strides")
+
+let sc = t_zeros(DType.F64, [])
+n += ck(t_rank(sc) == 0, "scalar has rank zero")
+n += ck(t_numel(sc) == 1, "scalar holds one element")
+t_set(sc, [], 2.5)
+n += ck(t_get(sc, []) == 2.5, "scalar round trip")
+
+let emp = t_zeros(DType.F64, [0, 4])
+n += ck(t_numel(emp) == 0, "empty tensor holds none")
+n += ck(t_is_contiguous(emp), "empty tensor is contiguous")
+
+// ---- A02: broadcasting
+n += ck(shapes_equal(broadcast_shape([2, 1, 3], [1, 4, 1]), [2, 4, 3]), "broadcast [2,1,3]+[1,4,1]")
+n += ck(shapes_equal(broadcast_shape([3], [2, 3]), [2, 3]), "broadcast aligns from the right")
+n += ck(shapes_equal(broadcast_shape([], [2, 2]), [2, 2]), "scalar broadcasts to anything")
+n += ck(shapes_equal(broadcast_shape([1], [0]), [0]), "1 against 0 gives 0")
+n += ck(shapes_equal(broadcast_shape([5, 1], [5, 9]), [5, 9]), "broadcast keeps the non-unit size")
+n += ck(shapes_equal(broadcast_shape([4, 4], [4, 4]), [4, 4]), "equal shapes are unchanged")
+
+// ---- A02: indexing and layout
+let a = t_zeros(DType.F64, [2, 3])
+n += ck(t_is_contiguous(a), "fresh tensor is contiguous")
+n += ck(ml_live_bytes() > 0, "allocation is accounted")
+t_set(a, [0, 0], 1.0)
+t_set(a, [1, 2], 6.0)
+n += ck(t_get(a, [0, 0]) == 1.0, "write then read [0,0]")
+n += ck(t_get(a, [1, 2]) == 6.0, "write then read [1,2]")
+n += ck(t_get(a, [0, 1]) == 0.0, "untouched element is zero")
+
+// ---- A03: views share storage, and see each other's writes
+let tr = t_transpose(a, 0, 1)
+n += ck(t_rank(tr) == 2, "transpose keeps rank")
+n += ck(tr.shape[0] == 3 and tr.shape[1] == 2, "transpose swaps extents")
+n += ck(t_get(tr, [2, 1]) == 6.0, "transposed view reads the same element")
+n += ck(not t_is_contiguous(tr), "transpose of a 2x3 is not contiguous")
+t_set(tr, [0, 0], 42.0)
+n += ck(t_get(a, [0, 0]) == 42.0, "write through a view is visible in the owner")
+
+let sl = t_slice(a, 1, 1, 3)
+n += ck(sl.shape[0] == 2 and sl.shape[1] == 2, "slice narrows one dimension")
+n += ck(t_get(sl, [1, 1]) == 6.0, "slice offsets correctly")
+t_set(sl, [0, 0], 7.5)
+n += ck(t_get(a, [0, 1]) == 7.5, "write through a slice reaches the owner")
+
+let rs = t_reshape(a, [3, 2])
+n += ck(rs.shape[0] == 3 and rs.shape[1] == 2, "reshape changes extents")
+n += ck(t_numel(rs) == t_numel(a), "reshape preserves element count")
+n += ck(t_get(rs, [0, 1]) == 7.5, "reshape aliases the same bytes")
+
+// a length-1 dimension may carry any stride and still be contiguous
+let one = t_zeros(DType.F64, [1, 5])
+n += ck(t_is_contiguous(t_transpose(one, 0, 1)), "transposing a unit axis stays contiguous")
+
+// ---- A03: a view keeps its storage alive after the owner handle is gone
+let orph = make_orphan_view()
+n += ck(orph.shape[0] == 2 and orph.shape[1] == 4, "orphan view has the sliced shape")
+n += ck(t_get(orph, [1, 3]) == 9.75, "orphan view still reads valid memory")
+t_set(orph, [0, 0], 1.25)
+n += ck(t_get(orph, [0, 0]) == 1.25, "orphan view is still writable")
+
+// ---- A03: mutation versions and stale saved tensors
+let m = t_zeros(DType.F64, [2, 2])
+let v0 = t_version(m)
+let saved = t_save(m)
+n += ck(not saved_is_stale(saved), "freshly saved tensor is current")
+n += ck(t_version(saved_get(saved)) == v0, "saved_get returns the tensor while current")
+t_set(m, [0, 0], 1.0)
+n += ck(t_version(m) == v0 + 1, "a write bumps the version")
+n += ck(saved_is_stale(saved), "the save is stale after a write")
+
+// a write through a VIEW must invalidate a save taken on the owner
+let m2 = t_zeros(DType.F64, [2, 2])
+let saved2 = t_save(m2)
+let view2 = t_transpose(m2, 0, 1)
+t_set(view2, [1, 0], 3.0)
+n += ck(saved2.t.st.version != saved2.ver, "a write through a view staleness the owner's save")
+n += ck(t_get(m2, [0, 1]) == 3.0, "and the write landed")
+
+// ---- A03: repeated allocation returns to a baseline
+ml_reset_accounting()
+n += ck(ml_live_bytes() == 0, "accounting resets to zero")
+var loops = 0
+while loops < 50 {
+    let tmp = t_zeros(DType.F64, [16, 16])
+    t_set(tmp, [0, 0], 1.0)
+    storage_release(tmp.st)
+    loops += 1
+}
+n += ck(ml_live_bytes() == 0, "50 allocate/release cycles return to baseline")
+n += ck(ml_allocs() == 50, "every allocation was counted")
+n += ck(ml_releases() == 50, "every release was counted")
+n += ck(ml_peak_bytes() == 2048, "peak is one 16x16 f64 buffer, not fifty")
+
+// ---- complex layout: interleaved, real then imaginary
+let c = t_zeros(DType.C32, [3])
+t_set_c(c, [0], 1.5, 0.0 - 2.25)
+t_set_c(c, [2], 0.0 - 0.5, 4.0)
+n += ck(t_get_re(c, [0]) == 1.5, "c32 real component")
+n += ck(t_get_im(c, [0]) == 0.0 - 2.25, "c32 imaginary component")
+n += ck(t_get_re(c, [2]) == 0.0 - 0.5, "c32 real at another index")
+n += ck(t_get_im(c, [2]) == 4.0, "c32 imaginary at another index")
+n += ck(t_get_re(c, [1]) == 0.0 and t_get_im(c, [1]) == 0.0, "untouched complex is zero")
+
+let c64 = t_zeros(DType.C64, [2])
+t_set_c(c64, [1], 0.125, 0.0 - 0.375)
+n += ck(t_get_re(c64, [1]) == 0.125, "c64 real component")
+n += ck(t_get_im(c64, [1]) == 0.0 - 0.375, "c64 imaginary component")
+n += ck(c64.st.nbytes == 32, "c64[2] occupies 32 bytes")
+
+// ---- integer and bool dtypes
+let ii = t_zeros(DType.I64, [3])
+t_set_int(ii, [1], 0 - 7)
+n += ck(t_get_int(ii, [1]) == 0 - 7, "i64 round trip including sign")
+let bb = t_zeros(DType.Bool, [2])
+t_set_int(bb, [0], 1)
+n += ck(t_get_int(bb, [0]) == 1, "bool true")
+n += ck(t_get_int(bb, [1]) == 0, "bool false")
+n += ck(bb.st.nbytes == 2, "bool is one byte per element")
+
+// f32 rounds at the store, and the rounding is visible rather than hidden
+let f = t_zeros(DType.F32, [1])
+t_set(f, [0], 0.1)
+n += ck(t_get(f, [0]) != 0.1, "f32 store rounds, and we do not pretend otherwise")
+n += ck(t_get(f, [0]) > 0.09999 and t_get(f, [0]) < 0.10001, "f32 store is still close")
+
+print("tensor: {n} checks passed")
