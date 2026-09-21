@@ -391,6 +391,19 @@ if (-not $hasNumpy) {
         $ok = ($LASTEXITCODE -eq 0) -and ($parity -match "148/148 quantities passed")
         Check "ml-phase-parity" $ok "got tail: $($parity -split "`n" | Select-Object -Last 1)"
     }
+
+    $gradExe = Join-Path $tmp "phase_grad_dump.exe"
+    $gradTxt = Join-Path $tmp "phase_grad_dump.txt"
+    Remove-Item $gradExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tools\ml_reference\phase_grad_dump.zeph $gradExe 2>&1 | Out-Null
+    if (-not (Test-Path $gradExe)) {
+        Check "ml-phase-grad" $false "phase_grad_dump.zeph did not compile"
+    } else {
+        cmd /c "`"$gradExe`" > `"$gradTxt`" 2>&1" | Out-Null
+        $gr = (& python tools\ml_reference\check_phase_grad.py $gradTxt | Out-String).Trim()
+        $gok = ($LASTEXITCODE -eq 0) -and ($gr -match "18/18 quantities agree")
+        Check "ml-phase-grad" $gok "got tail: $($gr -split "`n" | Select-Object -Last 1)"
+    }
 }
 
 $opNeg = [ordered]@{
