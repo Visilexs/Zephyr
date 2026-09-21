@@ -209,6 +209,22 @@ impl VkPhysicalDeviceProperties {
     }
     fn deviceName_at(self) -> int { return self.b.addr() + 20 }
     fn limits_at(self) -> int { return self.b.addr() + 296 }
+    fn limits_maxImageDimension2D(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(300, v)
+        return self
+    }
+    fn limits_maxImageDimension3D(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(304, v)
+        return self
+    }
+    fn limits_maxComputeWorkGroupInvocations(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(528, v)
+        return self
+    }
+    fn limits_maxPushConstantsSize(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(328, v)
+        return self
+    }
 }
 
 struct VkQueueFamilyProperties { b: Bytes }

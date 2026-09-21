@@ -38,10 +38,17 @@ fn window_open(title: str, w: int, h: int) -> Window {
     // LoadLibraryA, not GetModuleHandleA: every user32 entry point here is
     // resolved lazily through `extern fn`, so user32 may not be mapped yet and
     // GetModuleHandleA would hand back 0.
-    let u32mod = win("LoadLibraryA", cbytes("user32.dll").addr())
+    // Both names are bound to locals first. `cbytes(x).addr()` hands out the
+    // address of a temporary whose last reference dies with the expression, so
+    // reference counting frees the buffer before the call reads it -- it only
+    // appeared to work when nothing else had allocated yet and the freed block
+    // still held its bytes.
+    var u32name = cbytes("user32.dll")
+    let u32mod = win("LoadLibraryA", u32name.addr())
     if u32mod == 0 { panic("could not load user32.dll") }
     // the window procedure is user32's own default handler
-    let defwp = win("GetProcAddress", u32mod, cbytes("DefWindowProcA").addr())
+    var dwpname = cbytes("DefWindowProcA")
+    let defwp = win("GetProcAddress", u32mod, dwpname.addr())
     if defwp == 0 { panic("could not resolve DefWindowProcA") }
 
     var name = cbytes("zephyrVulkanWindow")
