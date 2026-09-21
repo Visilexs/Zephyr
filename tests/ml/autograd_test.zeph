@@ -22,7 +22,7 @@ fn rel_close(a: float, b: float, tol: float) -> bool {
 // ---- case definitions ------------------------------------------------------
 // 0..15 real, 16..27 complex in x.
 
-fn case_complex(c: int) -> bool { return c >= 16 }
+fn case_complex(c: int) -> bool { return c >= 16 and c <= 27 }
 
 fn shape_x(c: int) -> [int] {
     if c == 12 { return [2, 3] }
@@ -86,6 +86,14 @@ fn build(c: int, x: int, y: int) -> int {
     if c == 14 { return av_sum_all(av_slice(x, 1, 1, 3)) }
     // broadcasting: y is a single row reused across every row of x
     if c == 15 { return av_sum_all(av_mul(x, y)) }
+    if c == 28 { return av_sum_all(av_cos(x)) }
+    if c == 29 { return av_sum_all(av_sin(x)) }
+    if c == 30 { return av_sum_all(av_mul(av_cos(x), av_sin(x))) }
+    if c == 31 { return av_sum_all(av_ln(x)) }
+    if c == 32 { return av_sum_all(av_mul(av_ln(x), av_ln(y))) }
+    if c == 33 { return av_sum_all(av_neg(av_ln(av_div(x, av_sum_dim(x, 1))))) }
+    if c == 34 { return av_sum_all(av_exp(x)) }
+    if c == 35 { return av_sum_all(av_exp(av_mul(av_ln(x), y))) }
 
     if c == 16 { return av_sum_all(av_abs2(x)) }
     if c == 17 { return av_sum_all(av_abs2(av_conj(x))) }
@@ -115,7 +123,7 @@ fn loss_of(c: int, xt: Tensor, yt: Tensor) -> float {
 var n = 0
 
 // ---- every VJP against central differences --------------------------------
-for c in 0..28 {
+for c in 0..36 {
     let xt = make_x(c)
     let yt = make_y(c)
 

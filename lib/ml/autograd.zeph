@@ -41,6 +41,10 @@ let OP_RESHAPE = 21
 let OP_SLICE = 22
 let OP_CAST = 23
 let OP_EXPAND = 24
+let OP_COS = 25
+let OP_SIN = 26
+let OP_LN = 27
+let OP_EXP = 28
 
 // A node's inputs are variable handles, never tensors: a handle cannot go
 // stale and cannot alias, and the graph stays a plain integer DAG.
@@ -203,6 +207,28 @@ fn av_matmul(x: int, y: int) -> int {
 fn av_tanh(x: int) -> int {
     let out = t_tanh(av_value(x))
     return record(out, OP_TANH, x, 0 - 1, [t_save(out)], [], [])
+}
+
+// cos and sin keep their own input rather than their output, because each
+// one's derivative is the other function, not an expression in its own value.
+fn av_cos(x: int) -> int {
+    let out = t_cos(av_value(x))
+    return record(out, OP_COS, x, 0 - 1, [t_save(av_value(x))], [], [])
+}
+
+fn av_sin(x: int) -> int {
+    let out = t_sin(av_value(x))
+    return record(out, OP_SIN, x, 0 - 1, [t_save(av_value(x))], [], [])
+}
+
+fn av_ln(x: int) -> int {
+    let out = t_ln(av_value(x))
+    return record(out, OP_LN, x, 0 - 1, [t_save(av_value(x))], [], [])
+}
+
+fn av_exp(x: int) -> int {
+    let out = t_exp(av_value(x))
+    return record(out, OP_EXP, x, 0 - 1, [t_save(out)], [], [])
 }
 
 fn av_sum_dim(x: int, dim: int) -> int {
@@ -430,6 +456,22 @@ fn backward_node(nd: ANode, g: Tensor) {
     if nd.op == OP_TANH {
         let out = saved_get(nd.saved[0])
         accumulate(a, t_mul(g, t_sub(t_ones(out.dt, out.shape), t_mul(out, out))))
+        return
+    }
+    if nd.op == OP_COS {
+        accumulate(a, t_neg(t_mul(g, t_sin(saved_get(nd.saved[0])))))
+        return
+    }
+    if nd.op == OP_SIN {
+        accumulate(a, t_mul(g, t_cos(saved_get(nd.saved[0]))))
+        return
+    }
+    if nd.op == OP_LN {
+        accumulate(a, t_div(g, saved_get(nd.saved[0])))
+        return
+    }
+    if nd.op == OP_EXP {
+        accumulate(a, t_mul(g, saved_get(nd.saved[0])))
         return
     }
     if nd.op == OP_SUM_DIM {

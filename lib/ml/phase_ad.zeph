@@ -1,0 +1,169 @@
+// The Phase Reasoner v1 forward pass expressed on the autograd tape, so the
+// model can be trained natively.
+//
+// This is a second expression of the same function as lib/ml/phase.zeph, and
+// two expressions of one function are a maintenance hazard unless the
+// agreement is checked. tests/ml/phase_ad_test.zeph asserts that this forward
+// pass reproduces phase.zeph's state and probabilities to the last ulp, which
+// turns the hazard into a checked invariant -- the same arrangement the
+// reference uses for its paired-real port.
+//
+// Three differences from phase.zeph, all forced by differentiability:
+//
+//   * A Givens stage cannot write its results in place. t_index_copy mutates
+//     storage, which the tape's saved-tensor version check correctly refuses.
+//     The stage instead concatenates the two halves and applies the inverse
+//     permutation with one index_select, which is the same map expressed
+//     functionally.
+//   * PAD rows are masked arithmetically rather than skipped. A skipped row
+//     is a control-flow decision the tape cannot see; multiplying by a 0/1
+//     mask is equivalent, keeps the graph static, and still contributes
+//     exactly nothing to the controller's gradient, because the contribution
+//     is scaled by zero.
+//   * The norm is reached through exp(-0.5*ln(sum)) rather than sqrt, since
+//     ln and exp already carry VJPs and sqrt would need another primitive for
+//     no gain.
+import "ml/autograd.zeph"
+import "ml/phase.zeph"
+
+struct PhaseAD {
+    cfg: PhaseConfig,
+    embedding: int,
+    think: int,
+    W1: int,
+    b1: int,
+    W2: int,
+    b2: int,
+    z_init: int,
+    M: int,
+}
+
+// Leaves are created in a fixed order so a caller can rely on the handles.
+fn pad_params(p: PhaseParams, req: bool) -> PhaseAD {
+    let e = av_leaf(p.embedding, req)
+    let th = av_leaf(p.think, req)
+    let w1 = av_leaf(p.W1, req)
+    let bb1 = av_leaf(p.b1, req)
+    let w2 = av_leaf(p.W2, req)
+    let bb2 = av_leaf(p.b2, req)
+    let zi = av_leaf(p.z_init, req)
+    let m = av_leaf(p.M, req)
+    return PhaseAD{cfg: p.config, embedding: e, think: th, W1: w1, b1: bb1, W2: w2, b2: bb2, z_init: zi, M: m}
+}
+
+fn pad_scalar(v: float) -> int { return av_leaf(t_full(DType.F64, [], v), false) }
+
+// abs2(z), Re(conj(z_j) z_{j+1}), Im of the same -- invariant under a global
+// phase, sensitive to a relative one.
+fn pad_features(z: int) -> int {
+    let neighbor = av_mul(av_conj(z), av_roll(z, 1, 0 - 1))
+    let first = av_concat(av_abs2(z), av_real(neighbor), 1)
+    return av_concat(first, av_imag(neighbor), 1)
+}
+
+// One stage, built functionally. combined holds [new_a | new_b] and perm maps
+// each output coordinate back to its place in that concatenation.
+fn pad_givens(z: int, theta: int, phi: int, stage: int, d: int) -> int {
+    var left: [int] = []
+    var right: [int] = []
+    for j in 0..(d / 2) {
+        left.push(2 * j + stage)
+        right.push((2 * j + stage + 1) % d)
+    }
+    var perm: [int] = []
+    for j in 0..d { perm.push(0) }
+    for k in 0..(d / 2) {
+        perm[left[k]] = k
+        perm[right[k]] = d / 2 + k
+    }
+    let a = av_index_select(z, 1, left)
+    let b = av_index_select(z, 1, right)
+    let c = av_cast(av_cos(theta), DType.C64)
+    let s = av_cast(av_sin(theta), DType.C64)
+    let q = av_expi(phi, DType.C64)
+    let new_a = av_add(av_mul(c, a), av_mul(s, av_mul(q, b)))
+    let new_b = av_add(av_neg(av_mul(s, av_mul(av_conj(q), a))), av_mul(c, b))
+    return av_index_select(av_concat(new_a, new_b, 1), 1, perm)
+}
+
+// All 3D angles come from the pre-update state, then phase, even pairs, odd
+// cyclic pairs, in that order.
+fn pad_update(m: PhaseAD, z: int, embedding: int) -> int {
+    let d = m.cfg.D
+    let inputs = av_concat(embedding, pad_features(z), 1)
+    let hidden = av_tanh(av_add(av_matmul(inputs, av_transpose(m.W1, 0, 1)), m.b1))
+    let bounded = av_tanh(av_add(av_matmul(hidden, av_transpose(m.W2, 0, 1)), m.b2))
+    let angles = av_mul(bounded, pad_scalar(PI))
+    let phased = av_mul(z, av_expi(av_slice(angles, 1, 0, d), DType.C64))
+    let th0 = av_slice(angles, 1, d, d + d / 2)
+    let ph0 = av_slice(angles, 1, d + d / 2, 2 * d)
+    let even = pad_givens(phased, th0, ph0, 0, d)
+    let th1 = av_slice(angles, 1, 2 * d, 2 * d + d / 2)
+    let ph1 = av_slice(angles, 1, 2 * d + d / 2, 3 * d)
+    return pad_givens(even, th1, ph1, 1, d)
+}
+
+// z_init normalized once, then one independent copy per batch row.
+fn pad_initial(m: PhaseAD, batch: int) -> int {
+    let total = av_sum_all(av_abs2(m.z_init))
+    let inv = av_exp(av_mul(av_ln(total), pad_scalar(0.0 - 0.5)))
+    let unit = av_mul(m.z_init, av_cast(inv, DType.C64))
+    return av_expand(av_reshape(unit, [1, m.cfg.D]), [batch, m.cfg.D])
+}
+
+// probabilities = (|Mz|^2 + eps) normalized, denominator sum(w) + V*eps
+fn pad_readout(m: PhaseAD, z: int) -> int {
+    let amp = av_matmul(z, av_transpose(m.M, 0, 1))
+    let w = av_abs2(amp)
+    let s = av_add(w, pad_scalar(m.cfg.eps))
+    return av_div(s, av_sum_dim(s, 1))
+}
+
+// A 0/1 column mask per step; PAD rows keep their previous state exactly.
+fn pad_mask(tokens: Tensor, step: int, pad: int, batch: int) -> Tensor {
+    let mask = t_zeros(DType.F64, [batch, 1])
+    for row in 0..batch {
+        if t_get_int(tokens, [row, step]) != pad { t_set(mask, [row, 0], 1.0) }
+    }
+    return mask
+}
+
+fn pad_forward(m: PhaseAD, tokens: Tensor) -> int {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    let d = m.cfg.D
+    var z = pad_initial(m, batch)
+    for step in 0..(length + m.cfg.K) {
+        var embedding = av_expand(av_reshape(m.think, [1, m.cfg.E]), [batch, m.cfg.E])
+        if step < length {
+            var ids: [int] = []
+            for row in 0..batch { ids.push(t_get_int(tokens, [row, step])) }
+            embedding = av_index_select(m.embedding, 0, ids)
+        }
+        let updated = pad_update(m, z, embedding)
+        if step < length {
+            let keep = av_leaf(pad_mask(tokens, step, m.cfg.pad, batch), false)
+            let drop = av_leaf(t_sub(t_ones(DType.F64, [batch, 1]), pad_mask(tokens, step, m.cfg.pad, batch)), false)
+            let kc = av_cast(keep, DType.C64)
+            let dc = av_cast(drop, DType.C64)
+            z = av_add(av_mul(updated, kc), av_mul(z, dc))
+        } else {
+            z = updated
+        }
+    }
+    return z
+}
+
+// Mean negative log likelihood. The target is selected by a one-hot mask and
+// a sum rather than by indexing, so the selection stays on the tape.
+fn pad_loss(m: PhaseAD, tokens: Tensor, targets: [int]) -> int {
+    let batch = tokens.shape[0]
+    let probs = pad_readout(m, pad_forward(m, tokens))
+    let hot = t_zeros(DType.F64, [batch, m.cfg.output_vocab])
+    for row in 0..batch {
+        if targets[row] < 0 or targets[row] >= m.cfg.output_vocab { panic("phase_ad: target out of range") }
+        t_set(hot, [row, targets[row]], 1.0)
+    }
+    let picked = av_sum_dim(av_mul(probs, av_leaf(hot, false)), 1)
+    return av_mean_all(av_neg(av_ln(picked)))
+}

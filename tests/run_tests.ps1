@@ -334,6 +334,22 @@ $opsBuilt = Test-Path "$tmp\ops_test.exe"
 $opsOut = if ($opsBuilt) { (cmd /c "`"$tmp\ops_test.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 107 checks passed") "got: $opsOut"
 
+# ---- autograd and the differentiable phase forward: A06, A07, A14 ----
+$adSuites = [ordered]@{
+    "ml-autograd" = @("tests\ml\autograd_test.zeph", "autograd: 674 checks passed")
+    "ml-phase-ad" = @("tests\ml\phase_ad_test.zeph", "phase ad: 180 checks passed")
+}
+foreach ($nm in $adSuites.Keys) {
+    $src = $adSuites[$nm][0]
+    $want = $adSuites[$nm][1]
+    $exe = Join-Path $tmp "$nm.exe"
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt $src $exe 2>&1 | Out-Null
+    $built = Test-Path $exe
+    $out = if ($built) { (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+    Check $nm ($built -and $out -eq $want) "got: $out"
+}
+
 # ---- phase forward port: acceptance A13, and A10 at the gate level ----
 # phase_test.zeph runs its own rejection cases by relaunching itself, because
 # a panic cannot be caught in-process; no separate entries are needed here.
