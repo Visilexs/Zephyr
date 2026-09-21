@@ -16,17 +16,15 @@ Actual HEAD / branch / dirty files:
 
 Approved milestone and remaining scope:
   M0 complete. M1a complete. M1b complete. M2a complete. M2b complete.
-  M3 complete. M4 in progress: the tape, its VJPs and the differentiable
-  phase forward are done and verified; optimizers and checkpointing (A08,
-  A09) are delegated and not yet collected; the 32-example overfit (A14)
-  waits on them.
+  M3 complete. M4 complete.
   M1 as a whole is complete except its tiny-overfit clause, which needs the
   optimizer from M4. A PyTorch oracle is still absent; numpy carries the
   reference, and the substitution is justified per-acceptance in RESULTS.md
   rather than waved through -- for the operators it covers, both are IEEE-754
   double arithmetic, and the one thing that could differ, complex memory
   layout, is checked at the byte level instead of assumed.
-  Not started: M5 onward.
+  Not started: M5 onward. M5 has been scoped but not begun -- see the GPU
+  probe and compute-surface survey in .agent/env-ledger.md.
 
 Decisions made and reasons:
   See DESIGN.md, D1..D18. The load-bearing ones: lib/ml is library code and
@@ -71,6 +69,16 @@ Implemented files / interfaces:
   tools/ml_reference/phase_grad_dump.zeph + check_phase_grad.py
                                 native gradients vs the analytic reference,
                                 18 quantities (A06, A14)
+  lib/ml/optim.zeph             SGD with momentum, AdamW with decoupled decay
+                                and per-component complex moments, joint
+                                gradient-norm clipping (Codex; verified here)
+  lib/ml/checkpoint.zeph        versioned, checksummed, validated-before-
+                                allocating format; atomic save via temp file
+                                and MoveFileEx (Codex; verified here)
+  tests/ml/optim_test.zeph      82 checks + 11 rejection processes (A08, A09)
+  tests/ml/overfit_test.zeph    132 checks, native 32-example overfit (A14)
+  tools/ml_reference/optim_dump.zeph + check_optim.py
+                                77 quantities vs paired-real numpy (A08)
   tests/run_tests.ps1           + ml-tensor/ml-ops/ml-phase/ml-phase-gates and
                                 ml-phase-parity blocks, 15 ml-reject and 26
                                 ops-reject cases
@@ -119,6 +127,11 @@ Commands actually run, exit codes, log paths:
   tests/ml/autograd_test.zeph                 0, "autograd: 674 checks passed"
   tests/ml/phase_ad_test.zeph                 0, "phase ad: 180 checks passed"
   python tools/ml_reference/check_phase_grad.py  0, 18/18 vs analytic
+  tests/ml/optim_test.zeph                    0, "optim: 82 checks passed"
+  tests/ml/overfit_test.zeph                  0, loss 1.4006 -> 0.0460
+  python tools/ml_reference/check_optim.py    0, 77/77 quantities
+  extracted ad + parity blocks standalone     0, 33 passed, 0 failed
+  vulkaninfo                                  0, shaderFloat64 = true
   extracted autograd block from run_tests     0, 2 passed, 0 failed
   extracted parity+reject block               0, 28 passed, 0 failed
   zc --linux + wsl, tensor/ops/phase_gates    0, same counts as Windows
@@ -132,8 +145,7 @@ Commands actually run, exit codes, log paths:
 Acceptance IDs: pass / fail / blocked / not_run:
   A00 pass, A02 pass, A03 pass, A04 pass, A05 pass, A10 pass, A11 pass,
   A06 pass, A07 pass, A12 pass, A13 pass, A30 pass, A31 pass
-  A14 partial: native forward and backward verified against the analytic
-  reference; the bounded overfit needs the optimizer from A08
+  A08 pass, A09 pass, A14 pass
   A01 partial: fixpoint and both crosschecks pass, the bootstrap suite is
   blocked. The blocker is structural, not a missing package -- see below.
   everything else not_run. See RESULTS.md for the evidence behind each.
@@ -165,24 +177,28 @@ Known failure with exact reproduction:
       line, after the fixpoint has already passed.
 
 Next one concrete action:
-  Collect and verify the delegated A08/A09 work (optimizers and
-  checkpointing), the same way the earlier agent output was verified: re-run
-  it, read the AdamW update against the decoupled-weight-decay definition
-  rather than trusting the report, and confirm the complex moments really are
-  kept separately per component and not shared or taken of a magnitude. Both
-  wrong forms still appear to train, which is why they need an explicit test.
+  M5. GPU feasibility comparison and one complete training backend. The
+  groundwork is already recorded in .agent/env-ledger.md and it narrows the
+  milestone considerably:
 
-  Then finish A14: a bounded 32-example overfit run entirely in Zephyr. A14
-  requires no Python runtime dependency for that run, so the loss curve has
-  to come out of the native binary, not a harness. Assert the loss falls
-  monotonically enough to be evidence and that the model reaches a stated
-  accuracy on those 32 examples -- and record it as an implementation result,
-  not as evidence about the architecture, which it is not.
+    * The Vulkan compute path exists and works -- storage buffers, descriptor
+      sets, compute pipelines, dispatch, barriers, readback -- and
+      examples/vulkan/compute.zeph proves it end to end on 1.5M elements.
+    * tools/zspv.zeph CANNOT emit compute shaders (vertex/fragment only,
+      float32 only, no storage buffers, no control flow), so kernels are
+      hand-written GLSL compiled with glslc, which is present. No script
+      automates that step yet; one is trivial to add.
+    * shaderFloat64 is true on this device, so an fp64 path is possible at
+      all. Whether it is affordable is unmeasured, and that measurement is
+      the heart of the milestone: everything in lib/ml is float64 and both
+      cross-check harnesses compare bit-identical float64 fixtures, so an
+      fp32 backend would cost the parity evidence built over M2 to M4.
 
-  M5 after that: the GPU feasibility comparison. Note the environment ledger
-  before planning it -- nvcuda.dll is present but NVRTC, cuBLAS and the CUDA
-  toolkit are ABSENT, while the Vulkan SDK and glslc are present. That likely
-  decides the backend for us.
+  Start with the smallest honest probe: one matmul kernel, fp64 and fp32,
+  timed against the CPU implementation at the shapes the phase model
+  actually uses, with correctness checked against lib/ml/ops. Report the
+  fp64/fp32 ratio as a measurement. Do not commit to a backend before that
+  number exists -- the whole milestone turns on it.
 
 Rollback / preserved seed path:
   bootstrap/ untouched; no stage binary was ever promoted by hand. Every

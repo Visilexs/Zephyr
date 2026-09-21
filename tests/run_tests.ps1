@@ -338,6 +338,7 @@ Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 107 checks passed") "got: $opsO
 $adSuites = [ordered]@{
     "ml-autograd" = @("tests\ml\autograd_test.zeph", "autograd: 674 checks passed")
     "ml-phase-ad" = @("tests\ml\phase_ad_test.zeph", "phase ad: 180 checks passed")
+    "ml-optim"    = @("tests\ml\optim_test.zeph", "optim: 82 checks passed")
     "ml-overfit"  = @("tests\ml\overfit_test.zeph", "overfit: 132 checks passed")
 }
 foreach ($nm in $adSuites.Keys) {
@@ -405,6 +406,19 @@ if (-not $hasNumpy) {
         $gr = (& python tools\ml_reference\check_phase_grad.py $gradTxt | Out-String).Trim()
         $gok = ($LASTEXITCODE -eq 0) -and ($gr -match "18/18 quantities agree")
         Check "ml-phase-grad" $gok "got tail: $($gr -split "`n" | Select-Object -Last 1)"
+    }
+
+    $optExe = Join-Path $tmp "optim_dump.exe"
+    $optTxt = Join-Path $tmp "optim_dump.txt"
+    Remove-Item $optExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tools\ml_reference\optim_dump.zeph $optExe 2>&1 | Out-Null
+    if (-not (Test-Path $optExe)) {
+        Check "ml-optim-parity" $false "optim_dump.zeph did not compile"
+    } else {
+        cmd /c "`"$optExe`" > `"$optTxt`" 2>&1" | Out-Null
+        $op = (& python tools\ml_reference\check_optim.py $optTxt | Out-String).Trim()
+        $ook = ($LASTEXITCODE -eq 0) -and ($op -match "77/77 quantities passed")
+        Check "ml-optim-parity" $ook "got tail: $($op -split "`n" | Select-Object -Last 1)"
     }
 }
 
