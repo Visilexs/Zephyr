@@ -12,6 +12,7 @@
 //
 // Headless. Build the GLSL with glslangValidator, not zspv.
 import "vk/gfx.zeph"
+import "world.zeph"
 
 let VOXEL = 0.125         // world units per voxel; must match voxel.zeph
 let VX = 512
@@ -20,61 +21,6 @@ let VZ = 512
 let W = 320
 let H = 180
 let PCSIZE = 192
-
-// World units, not cells, so the scene is the same shape at any voxel size.
-fn ifloor(a: float) -> int {
-    let i = a as int
-    if (a < 0.0) and ((i as float) != a) { return i - 1 }
-    return i
-}
-
-// ---------------------------------------------------------------- terrain
-// Value noise off the same 32-bit hash the shader uses. World generation runs
-// only on the CPU, so this never has to agree with GLSL bit-for-bit -- but it
-// does have to be deterministic, because the mirror traces the same volume.
-fn vhash2(xi: int, zi: int) -> float {
-    var h = (xi * 374761393 + zi * 668265263) & 4294967295
-    h = (h ^ (h >> 13)) & 4294967295
-    h = (h * 1274126177) & 4294967295
-    h = (h ^ (h >> 16)) & 4294967295
-    return (h as float) / 4294967296.0
-}
-
-fn smoothf(t: float) -> float { return t * t * (3.0 - 2.0 * t) }
-
-fn vnoise(x: float, z: float) -> float {
-    let xi = ifloor(x)
-    let zi = ifloor(z)
-    let fx = smoothf(x - (xi as float))
-    let fz = smoothf(z - (zi as float))
-    let a = vhash2(xi, zi)
-    let b = vhash2(xi + 1, zi)
-    let c = vhash2(xi, zi + 1)
-    let d = vhash2(xi + 1, zi + 1)
-    let top = a + (b - a) * fx
-    let bot = c + (d - c) * fx
-    return top + (bot - top) * fz
-}
-
-// Two octaves is enough to put features below one world unit, which is the
-// whole point of halving VOXEL: at 1.0 these bumps would be invisible.
-fn terrain_height(wx: float, wz: float) -> float {
-    var h = 4.6
-    h = h + 1.1 * (vnoise(wx * 0.055, wz * 0.055) - 0.5) * 2.0
-    h = h + 0.45 * (vnoise(wx * 0.17, wz * 0.17) - 0.5) * 2.0
-    h = h + 0.18 * (vnoise(wx * 0.51, wz * 0.51) - 0.5) * 2.0
-    h = h + 0.07 * (vnoise(wx * 1.6, wz * 1.6) - 0.5) * 2.0
-    return h
-}
-
-fn feature_at(wx: float, wy: float, wz: float) -> int {
-    if wx >= 20.0 and wx < 28.0 and wz >= 20.0 and wz < 28.0 and wy >= 6.0 and wy < 18.0 {
-        if wy >= 11.0 and wy < 13.0 { return 5 }
-        return 1
-    }
-    if wx >= 40.0 and wx < 46.0 and wz >= 34.0 and wz < 40.0 and wy >= 6.0 and wy < 11.0 { return 1 }
-    return 0
-}
 
 var layers: [str] = []
 for arg in args() {
@@ -85,21 +31,8 @@ var g = Gfx.make("zephyr-voxel-reproject", layers, 0, 0)
 print("gpu: {g.gpu_name()}")
 
 var vox = Bytes.new(VX * VY * VZ)
-for z in 0..VZ {
-    let wz = ((z as float) + 0.5) * VOXEL
-    for x in 0..VX {
-        let wx = ((x as float) + 0.5) * VOXEL
-        let gh = terrain_height(wx, wz)
-        for y in 0..VY {
-            let wy = ((y as float) + 0.5) * VOXEL
-            var m = 0
-            if wy < gh - VOXEL { m = 2 }
-            else if wy < gh { m = 3 }
-            else { m = feature_at(wx, wy, wz) }
-            vox.put8((z * VY + y) * VX + x, m)
-        }
-    }
-}
+let ws = build_world(vox, VX, VY, VZ, VOXEL)
+print("world {VX}x{VY}x{VZ}, {ws.solid} solid voxels")
 let vol = g.storage_image_3d(VX, VY, VZ, VK_FORMAT_R8_UINT)
 g.write_volume(vol, vox, 1)
 

@@ -1,0 +1,226 @@
+// World generation for the voxel tracer.
+//
+// Shared by voxel.zeph, voxel_reproject.zeph and voxel_live.zeph so there is
+// one generator rather than three that drift. It runs only on the CPU and
+// never has to agree with GLSL bit-for-bit -- but it does have to be
+// deterministic, because voxel.zeph traces the same volume on both sides and
+// compares every pixel.
+//
+// Everything here is in WORLD units, never cells. That is the whole reason
+// eighth-unit voxels buy anything: a 0.2 unit grass blade or a 0.22 unit trunk
+// exists at this scale and does not at 1.0. Changing `voxel` refines the
+// geometry and leaves the scene the same size.
+import "std/bytes.zeph"
+import "std/math.zeph"
+
+// Materials, matching palette() in examples/shaders/voxel.comp. Add to both or
+// the CPU mirror in voxel.zeph will fail, which is the point of it.
+let M_STONE = 1
+let M_DIRT = 2
+let M_GRASS = 3
+let M_SAND = 4
+let M_ORE = 5
+let M_LAMP = 6
+let M_ROCK = 7
+let M_WATER = 8
+let M_WOOD = 9
+let M_LEAF = 10
+
+// Terrain ranges roughly 2.8 to 6.4, so this floods the lower basins and
+// leaves the ridges dry. It is the one knob that decides how much of the map
+// is lake: build_world prints the coverage it actually produced rather than
+// leaving it to be assumed.
+let WATER_LEVEL = 4.30
+let SHORE = 0.38            // sand band above the water line
+let TREE_CELL = 3.5         // world units between tree slots
+
+fn ifloor(a: float) -> int {
+    let i = a as int
+    if (a < 0.0) and ((i as float) != a) { return i - 1 }
+    return i
+}
+
+fn vhash2(xi: int, zi: int) -> float {
+    var h = (xi * 374761393 + zi * 668265263) & 4294967295
+    h = (h ^ (h >> 13)) & 4294967295
+    h = (h * 1274126177) & 4294967295
+    h = (h ^ (h >> 16)) & 4294967295
+    return (h as float) / 4294967296.0
+}
+
+// A third input, so one cell can draw several independent numbers -- whether a
+// tree stands there, where in the cell, how tall, how wide the crown.
+fn vhash3(xi: int, zi: int, salt: int) -> float {
+    var h = (xi * 374761393 + zi * 668265263 + salt * 2246822519) & 4294967295
+    h = (h ^ (h >> 13)) & 4294967295
+    h = (h * 1274126177) & 4294967295
+    h = (h ^ (h >> 16)) & 4294967295
+    return (h as float) / 4294967296.0
+}
+
+fn smoothf(t: float) -> float { return t * t * (3.0 - 2.0 * t) }
+
+fn vnoise(x: float, z: float) -> float {
+    let xi = ifloor(x)
+    let zi = ifloor(z)
+    let fx = smoothf(x - (xi as float))
+    let fz = smoothf(z - (zi as float))
+    let a = vhash2(xi, zi)
+    let b = vhash2(xi + 1, zi)
+    let c = vhash2(xi, zi + 1)
+    let d = vhash2(xi + 1, zi + 1)
+    let top = a + (b - a) * fx
+    let bot = c + (d - c) * fx
+    return top + (bot - top) * fz
+}
+
+fn terrain_height(wx: float, wz: float) -> float {
+    var h = 4.6
+    h = h + 1.1 * (vnoise(wx * 0.055, wz * 0.055) - 0.5) * 2.0
+    h = h + 0.45 * (vnoise(wx * 0.17, wz * 0.17) - 0.5) * 2.0
+    // These last two are the reason for the smaller cells: 0.18 and 0.07 unit
+    // features are invisible on a 0.5 grid and barely exist on a 1.0 one.
+    h = h + 0.18 * (vnoise(wx * 0.51, wz * 0.51) - 0.5) * 2.0
+    h = h + 0.07 * (vnoise(wx * 1.6, wz * 1.6) - 0.5) * 2.0
+    return h
+}
+
+// The pillar, its ore seam, and the second block. Kept separate from the
+// terrain so the fill can hoist the height per column.
+fn feature_at(wx: float, wy: float, wz: float) -> int {
+    if wx >= 20.0 and wx < 28.0 and wz >= 20.0 and wz < 28.0 and wy >= 6.0 and wy < 18.0 {
+        if wy >= 11.0 and wy < 13.0 { return M_ORE }
+        return M_STONE
+    }
+    if wx >= 40.0 and wx < 46.0 and wz >= 34.0 and wz < 40.0 and wy >= 6.0 and wy < 11.0 { return M_STONE }
+    return 0
+}
+
+// Everything about one vertical column that does not vary with height, so the
+// inner loop over 256 cells is float comparisons and nothing else. At 67
+// million voxels this is the difference between a second and a minute.
+struct Column {
+    ground: float,        // terrain surface, world units
+    surface: int,         // material of the topmost solid terrain voxel
+    blade: float,         // top of the grass tuft; equals ground when there is none
+    trunk_d2: float,      // squared horizontal distance to the trunk axis
+    trunk_r2: float,
+    tree_base: float,
+    tree_top: float,      // where the trunk ends and the crown centre sits
+    crown_d2: float,      // squared horizontal distance to the crown centre
+    crown_r: float
+}
+
+// Does a tree stand in cell (cx, cz), and if so where? Returns the crown
+// radius, or 0 when the slot is empty. Trees only take on grass that is clear
+// of the water line, so nothing grows out of a lake.
+fn column_at(wx: float, wz: float, voxel: float) -> Column {
+    let ground = terrain_height(wx, wz)
+
+    var surface = M_GRASS
+    if ground < WATER_LEVEL + SHORE { surface = M_SAND }
+
+    // Grass tufts: one to four voxels of blade on about half the dry columns.
+    // Thin vertical wisps rather than a carpet, which is what sub-unit cells
+    // are for.
+    var blade = ground
+    let xi = ifloor(wx / voxel)
+    let zi = ifloor(wz / voxel)
+    if surface == M_GRASS {
+        let g = vhash3(xi, zi, 7)
+        if g < 0.55 { blade = ground + voxel * (1.0 + 3.0 * vhash3(xi, zi, 11)) }
+    }
+
+    // Trees. Only the 3x3 neighbouring slots can reach this column, since a
+    // crown reaches at most 1.8 units and slots are 3.5 apart. The nearest
+    // one wins; overlapping crowns are rare enough not to be worth blending.
+    var best = 1000000.0
+    var trunk_d2 = 1000000.0
+    var trunk_r2 = 0.0
+    var tree_base = 0.0
+    var tree_top = 0.0
+    var crown_r = 0.0
+    let ccx = ifloor(wx / TREE_CELL)
+    let ccz = ifloor(wz / TREE_CELL)
+    for oz in 0..3 {
+        for ox in 0..3 {
+            let cx = ccx + ox - 1
+            let cz = ccz + oz - 1
+            if vhash3(cx, cz, 1) >= 0.45 { continue }
+            let tx = ((cx as float) + 0.15 + 0.7 * vhash3(cx, cz, 2)) * TREE_CELL
+            let tz = ((cz as float) + 0.15 + 0.7 * vhash3(cx, cz, 3)) * TREE_CELL
+            let base = terrain_height(tx, tz)
+            // No trees in the water or on the sand, and none on the pillar.
+            if base < WATER_LEVEL + SHORE { continue }
+            if feature_at(tx, base + 0.5, tz) != 0 { continue }
+            let dx = wx - tx
+            let dz = wz - tz
+            let d2 = dx * dx + dz * dz
+            if d2 >= best { continue }
+            let height = 2.8 + 2.2 * vhash3(cx, cz, 4)
+            let radius = 1.15 + 0.65 * vhash3(cx, cz, 5)
+            if d2 > radius * radius { continue }
+            best = d2
+            trunk_d2 = d2
+            let tr = 0.16 + 0.08 * vhash3(cx, cz, 6)
+            trunk_r2 = tr * tr
+            tree_base = base - 0.4          // sink the trunk so it never floats
+            tree_top = base + height
+            crown_r = radius
+        }
+    }
+
+    return Column{ground: ground, surface: surface, blade: blade,
+                  trunk_d2: trunk_d2, trunk_r2: trunk_r2,
+                  tree_base: tree_base, tree_top: tree_top,
+                  crown_d2: trunk_d2, crown_r: crown_r}
+}
+
+fn material_at(c: Column, wx: float, wy: float, wz: float, voxel: float) -> int {
+    if wy < c.ground - voxel { return M_DIRT }
+    if wy < c.ground { return c.surface }
+
+    // Trunk first: it runs through the crown, so wood wins over leaves.
+    if c.crown_r > 0.0 {
+        if wy < c.tree_top and wy >= c.tree_base and c.trunk_d2 <= c.trunk_r2 { return M_WOOD }
+        // The crown is a sphere squashed slightly so it reads as a canopy
+        // rather than a ball on a stick.
+        let dy = (wy - c.tree_top) / 0.82
+        if c.crown_d2 + dy * dy <= c.crown_r * c.crown_r { return M_LEAF }
+    }
+
+    if wy < c.blade { return M_GRASS }
+    // Water fills to a flat level, so it pools in basins and leaves ridges
+    // dry without any flood-fill pass.
+    if wy < WATER_LEVEL { return M_WATER }
+    return feature_at(wx, wy, wz)
+}
+
+struct WorldStats { solid: int, water: int, wood: int, leaf: int, grass: int }
+
+// Fill an R8_UINT volume, laid out as the shader indexes it: (z * vy + y) * vx + x.
+fn build_world(vox: Bytes, vx: int, vy: int, vz: int, voxel: float) -> WorldStats {
+    var solid = 0
+    var water = 0
+    var wood = 0
+    var leaf = 0
+    var grass = 0
+    for z in 0..vz {
+        let wz = ((z as float) + 0.5) * voxel
+        for x in 0..vx {
+            let wx = ((x as float) + 0.5) * voxel
+            let col = column_at(wx, wz, voxel)
+            for y in 0..vy {
+                let wy = ((y as float) + 0.5) * voxel
+                let m = material_at(col, wx, wy, wz, voxel)
+                if m != 0 { solid += 1 }
+                if m == M_WATER { water += 1 }
+                if m == M_WOOD { wood += 1 }
+                if m == M_LEAF { leaf += 1 }
+                if m == M_GRASS { grass += 1 }
+                vox.put8((z * vy + y) * vx + x, m)
+            }
+        }
+    }
+    return WorldStats{solid: solid, water: water, wood: wood, leaf: leaf, grass: grass}
+}

@@ -13,6 +13,7 @@
 //
 // Headless. Build the GLSL with glslangValidator, not zspv.
 import "vk/gfx.zeph"
+import "world.zeph"
 
 // Eighth-unit voxels. The grid is 8x finer on every axis than the original
 // 64x32x64 while covering the same world extent, so the scene is unchanged in
@@ -28,65 +29,6 @@ let VZ = 512
 let W = 320
 let H = 180
 
-// ---------------------------------------------------------------- terrain
-// Value noise off the same 32-bit hash the shader uses. World generation runs
-// only on the CPU, so this never has to agree with GLSL bit-for-bit -- but it
-// does have to be deterministic, because the mirror traces the same volume.
-fn vhash2(xi: int, zi: int) -> float {
-    var h = (xi * 374761393 + zi * 668265263) & 4294967295
-    h = (h ^ (h >> 13)) & 4294967295
-    h = (h * 1274126177) & 4294967295
-    h = (h ^ (h >> 16)) & 4294967295
-    return (h as float) / 4294967296.0
-}
-
-fn smoothf(t: float) -> float { return t * t * (3.0 - 2.0 * t) }
-
-fn vnoise(x: float, z: float) -> float {
-    let xi = ifloor(x)
-    let zi = ifloor(z)
-    let fx = smoothf(x - (xi as float))
-    let fz = smoothf(z - (zi as float))
-    let a = vhash2(xi, zi)
-    let b = vhash2(xi + 1, zi)
-    let c = vhash2(xi, zi + 1)
-    let d = vhash2(xi + 1, zi + 1)
-    let top = a + (b - a) * fx
-    let bot = c + (d - c) * fx
-    return top + (bot - top) * fz
-}
-
-// Two octaves is enough to put features below one world unit, which is the
-// whole point of halving VOXEL: at 1.0 these bumps would be invisible.
-fn terrain_height(wx: float, wz: float) -> float {
-    var h = 4.6
-    h = h + 1.1 * (vnoise(wx * 0.055, wz * 0.055) - 0.5) * 2.0
-    h = h + 0.45 * (vnoise(wx * 0.17, wz * 0.17) - 0.5) * 2.0
-    // These last two are the reason for the smaller cells: 0.18 and 0.07 unit
-    // features are invisible on a 0.5 grid and barely exist on a 1.0 one.
-    h = h + 0.18 * (vnoise(wx * 0.51, wz * 0.51) - 0.5) * 2.0
-    h = h + 0.07 * (vnoise(wx * 1.6, wz * 1.6) - 0.5) * 2.0
-    return h
-}
-
-// ---------------------------------------------------------------- world
-// Materials match palette() in the shader: 1 stone, 2 dirt, 3 grass, 5 ore.
-//
-// Thresholds are in WORLD units, not cells, so halving VOXEL refines the
-// geometry instead of shrinking the scene. The grass layer is one voxel thick
-// whatever the scale, which is why it is expressed as a band rather than an
-// equality test.
-// Everything above the ground line: the pillar, its ore seam, the second
-// block. Separate from the terrain so the volume fill can hoist the height.
-fn feature_at(wx: float, wy: float, wz: float) -> int {
-    if wx >= 20.0 and wx < 28.0 and wz >= 20.0 and wz < 28.0 and wy >= 6.0 and wy < 18.0 {
-        if wy >= 11.0 and wy < 13.0 { return 5 }
-        return 1
-    }
-    if wx >= 40.0 and wx < 46.0 and wz >= 34.0 and wz < 40.0 and wy >= 6.0 and wy < 11.0 { return 1 }
-    return 0
-}
-
 var layers: [str] = []
 for arg in args() {
     if arg == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
@@ -95,27 +37,16 @@ for arg in args() {
 var g = Gfx.make("zephyr-voxel", layers, 0, 0)
 print("gpu: {g.gpu_name()}")
 
-// 67 million cells, so the height field is evaluated once per column rather
-// than once per voxel. The inner loop then only compares against it.
 var vox = Bytes.new(VX * VY * VZ)
-var solid = 0
-for z in 0..VZ {
-    let wz = ((z as float) + 0.5) * VOXEL
-    for x in 0..VX {
-        let wx = ((x as float) + 0.5) * VOXEL
-        let gh = terrain_height(wx, wz)
-        for y in 0..VY {
-            let wy = ((y as float) + 0.5) * VOXEL
-            var m = 0
-            if wy < gh - VOXEL { m = 2 }
-            else if wy < gh { m = 3 }
-            else { m = feature_at(wx, wy, wz) }
-            if m != 0 { solid += 1 }
-            vox.put8((z * VY + y) * VX + x, m)
-        }
-    }
-}
-print("world {VX}x{VY}x{VZ}, {solid} solid voxels")
+let ws = build_world(vox, VX, VY, VZ, VOXEL)
+print("world {VX}x{VY}x{VZ}, {ws.solid} solid voxels")
+print("  water {ws.water}, wood {ws.wood}, leaves {ws.leaf}, grass {ws.grass}")
+// Generation is only interesting if it generated something. A regression that
+// stopped placing trees would otherwise still pass every pixel comparison
+// below, because both sides would agree on the emptier world.
+assert(ws.water > 0, "no water was placed")
+assert(ws.wood > 0, "no tree trunks were placed")
+assert(ws.leaf > ws.wood, "leaves should outnumber trunk voxels")
 
 let vol = g.storage_image_3d(VX, VY, VZ, VK_FORMAT_R8_UINT)
 g.write_volume(vol, vox, 1)
@@ -321,12 +252,6 @@ fn vox_at(v: Bytes, x: int, y: int, z: int) -> int {
     return v.get8((z * VY + y) * VX + x)
 }
 
-fn ifloor(a: float) -> int {
-    let i = a as int
-    if (a < 0.0) and ((i as float) != a) { return i - 1 }
-    return i
-}
-
 fn trace_vox(v: Bytes, ox: float, oy: float, oz: float,
              dx: float, dy: float, dz: float, tmax: float) -> Hit {
     var px = ifloor(ox)
@@ -467,7 +392,23 @@ fn pal(m: int) -> [float] {
     if m == 5 { return [1.00, 0.70, 0.22] }
     if m == 6 { return [1.00, 0.94, 0.84] }
     if m == 7 { return [0.68, 0.70, 0.78] }
+    if m == 8 { return [0.09, 0.27, 0.42] }
+    if m == 9 { return [0.31, 0.21, 0.12] }
+    if m == 10 { return [0.17, 0.41, 0.13] }
     return [0.0, 0.0, 0.0]
+}
+
+// Mirrors surface() in the shader: roughness and specular albedo per material.
+fn surface_rough(m: int) -> float {
+    if m == 8 { return 0.09 }
+    if m == 10 { return 0.86 }
+    return 1.0
+}
+
+fn surface_spec(m: int) -> float {
+    if m == 8 { return 0.32 }
+    if m == 10 { return 0.05 }
+    return 0.04
 }
 
 // IEEE half. Zephyr has no 16-bit float, and the motion buffer is rgba16f,
@@ -757,7 +698,10 @@ for y in 0..H {
                 if motion_bad == 1 { motion_first = "({x},{y}) got ({gmx},{gmy}) want ({wmx},{wmy})" }
             }
         }
-        if abs(gr.get8(o) - 255) > 2 or abs(gr.get8(o + 1) - lin(0.04)) > 2 { rough_bad += 1 }
+        var rmat = 0
+        if h.hit { rmat = h.mat }
+        if abs(gr.get8(o) - lin(surface_rough(rmat))) > 2 { rough_bad += 1 }
+        if abs(gr.get8(o + 1) - lin(surface_spec(rmat))) > 2 { rough_bad += 1 }
 
         // Aggregate brightness of the bounce, both sides, for the statistical
         // check on pass 2.

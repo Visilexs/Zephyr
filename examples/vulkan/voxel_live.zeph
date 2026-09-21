@@ -15,6 +15,7 @@
 // luma, then exits. `--play` keeps the window open and takes WASD to move and
 // the arrow keys to look. Nothing here captures the mouse.
 import "vk/gfx.zeph"
+import "world.zeph"
 import "std/math.zeph"
 
 let VOXEL = 0.125
@@ -27,56 +28,6 @@ let RH = 540
 let PCSIZE = 192
 let SPP = 2
 let tan_half = 0.5773502691896258
-
-// ---------------------------------------------------------------- terrain
-// Identical to voxel.zeph, which is where it is verified against the GPU.
-fn vhash2(xi: int, zi: int) -> float {
-    var h = (xi * 374761393 + zi * 668265263) & 4294967295
-    h = (h ^ (h >> 13)) & 4294967295
-    h = (h * 1274126177) & 4294967295
-    h = (h ^ (h >> 16)) & 4294967295
-    return (h as float) / 4294967296.0
-}
-
-fn ifloor(a: float) -> int {
-    let i = a as int
-    if (a < 0.0) and ((i as float) != a) { return i - 1 }
-    return i
-}
-
-fn smoothf(t: float) -> float { return t * t * (3.0 - 2.0 * t) }
-
-fn vnoise(x: float, z: float) -> float {
-    let xi = ifloor(x)
-    let zi = ifloor(z)
-    let fx = smoothf(x - (xi as float))
-    let fz = smoothf(z - (zi as float))
-    let a = vhash2(xi, zi)
-    let b = vhash2(xi + 1, zi)
-    let c = vhash2(xi, zi + 1)
-    let d = vhash2(xi + 1, zi + 1)
-    let top = a + (b - a) * fx
-    let bot = c + (d - c) * fx
-    return top + (bot - top) * fz
-}
-
-fn terrain_height(wx: float, wz: float) -> float {
-    var h = 4.6
-    h = h + 1.1 * (vnoise(wx * 0.055, wz * 0.055) - 0.5) * 2.0
-    h = h + 0.45 * (vnoise(wx * 0.17, wz * 0.17) - 0.5) * 2.0
-    h = h + 0.18 * (vnoise(wx * 0.51, wz * 0.51) - 0.5) * 2.0
-    h = h + 0.07 * (vnoise(wx * 1.6, wz * 1.6) - 0.5) * 2.0
-    return h
-}
-
-fn feature_at(wx: float, wy: float, wz: float) -> int {
-    if wx >= 20.0 and wx < 28.0 and wz >= 20.0 and wz < 28.0 and wy >= 6.0 and wy < 18.0 {
-        if wy >= 11.0 and wy < 13.0 { return 5 }
-        return 1
-    }
-    if wx >= 40.0 and wx < 46.0 and wz >= 34.0 and wz < 40.0 and wy >= 6.0 and wy < 11.0 { return 1 }
-    return 0
-}
 
 fn halton(index: int, base: int) -> float {
     var f = 1.0
@@ -107,24 +58,9 @@ print("gpu: {g.gpu_name()}")
 
 // ---------------------------------------------------------------- world
 var vox = Bytes.new(VX * VY * VZ)
-var solid = 0
-for z in 0..VZ {
-    let wz = ((z as float) + 0.5) * VOXEL
-    for x in 0..VX {
-        let wx = ((x as float) + 0.5) * VOXEL
-        let gh = terrain_height(wx, wz)
-        for y in 0..VY {
-            let wy = ((y as float) + 0.5) * VOXEL
-            var m = 0
-            if wy < gh - VOXEL { m = 2 }
-            else if wy < gh { m = 3 }
-            else { m = feature_at(wx, wy, wz) }
-            if m != 0 { solid += 1 }
-            vox.put8((z * VY + y) * VX + x, m)
-        }
-    }
-}
-print("world {VX}x{VY}x{VZ}, {solid} solid voxels")
+let ws = build_world(vox, VX, VY, VZ, VOXEL)
+print("world {VX}x{VY}x{VZ}, {ws.solid} solid voxels")
+print("  water {ws.water}, wood {ws.wood}, leaves {ws.leaf}, grass {ws.grass}")
 
 let vol = g.storage_image_3d(VX, VY, VZ, VK_FORMAT_R8_UINT)
 g.write_volume(vol, vox, 1)

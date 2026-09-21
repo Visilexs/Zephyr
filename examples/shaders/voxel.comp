@@ -91,7 +91,21 @@ vec3 palette(int m)
     if (m == 5) return vec3(1.00, 0.70, 0.22);
     if (m == 6) return vec3(1.00, 0.94, 0.84);
     if (m == 7) return vec3(0.68, 0.70, 0.78);
+    if (m == 8) return vec3(0.09, 0.27, 0.42);
+    if (m == 9) return vec3(0.31, 0.21, 0.12);
+    if (m == 10) return vec3(0.17, 0.41, 0.13);
     return vec3(0.0);
+}
+
+// x = roughness, y = specular albedo. Voxels were uniformly matte until the
+// world grew water, which is the one surface where that reads as wrong. Ray
+// Reconstruction consumes both, so they are guide-buffer outputs rather than
+// anything the shading here uses yet.
+vec2 surface(int m)
+{
+    if (m == 8) return vec2(0.09, 0.32);
+    if (m == 10) return vec2(0.86, 0.05);
+    return vec2(1.0, 0.04);
 }
 
 // Radiant power of a material. Ore seams light the caves, lamps light the loot
@@ -273,7 +287,6 @@ void main()
     imageStore(gNormal, q, vec4(gn * 0.5 + 0.5, 1.0));
     imageStore(gAlbedo, q, vec4(albedo, 1.0));
     imageStore(gMotion, q, vec4(motion, 0.0, 0.0));
-    // Voxels are matte. Roughness is 1 and the specular albedo is the usual
-    // dielectric 0.04; both are constants until materials grow a spec term.
-    imageStore(gRough,  q, vec4(1.0, 0.04, 0.0, 1.0));
+    vec2 sf = surface(m);
+    imageStore(gRough,  q, vec4(sf.x, sf.y, 0.0, 1.0));
 }
