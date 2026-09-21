@@ -406,6 +406,21 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 `contains`, `index_of`, `reverse` and `slice` are **not** builtins — they are
 generic library functions in `std/list.zeph` (§3.0.5).
 
+`sqrt` is the only transcendental builtin, because it is one instruction.
+Everything else lives in `std/math.zeph`, written in ordinary Zephyr for a
+runtime with no libm: `fexp`, `fln`, `fsin`, `fcos`, `ftan` and the reciprocals
+`fcsc`, `fsec`, `fcot`; the inverses `fatan`, `fasin`, `facos`, `facot`,
+`fasec`, `facsc`; `sinh`, `cosh`, `tanh`; the gudermannian `gd` and `gd_inv`;
+`gamma`, `lgamma` and `digamma`; a `d_`-prefixed analytic derivative for each;
+and `integrate` / `integrate_p` for definite integrals by adaptive Simpson.
+Constants `PI`, `TWO_PI`, `HALF_PI`, `LN2`, `NAN` and `INF` come with it.
+
+Two conventions worth knowing before you use them. Arguments outside a
+function's domain yield `NAN`, as `sqrt(-1.0)` already does, so test results
+with `is_nan(x)` rather than comparing against a sentinel. And `facot` is the
+continuous branch with range `(0, pi)` — the calculus convention — not the
+`atan(1/x)` one that jumps at the origin.
+
 The math builtins and `assert` work with any backend; the string and list
 methods above are provided by the Zephyr-written runtime, so compile with `--rt`.
 

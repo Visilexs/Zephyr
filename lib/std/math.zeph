@@ -6,9 +6,9 @@
 //
 // Domain errors return NAN, matching the sqrt builtin, which already does.
 // Poles return INF where the limit is +inf, NAN where it is undefined.
-// fln is the exception: it predates this and keeps its -1e30 sentinel.
 //
 //   fn              domain             outside it
+//   fln             x > 0              NAN below zero, -INF at zero
 //   fasin facos     -1 <= x <= 1       NAN
 //   fasec facsc     |x| >= 1           NAN
 //   gd_inv          |y| < pi/2         NAN
@@ -58,7 +58,10 @@ fn fexp(x: float) -> float {
 
 // ln(x) = e*ln2 + 2*atanh((m-1)/(m+1)), where x = m * 2^e, m in [1,2)
 fn fln(x: float) -> float {
-    if x <= 0.0 { return 0.0 - 1000000000000000000000000000000.0 }
+    // was a -1e30 sentinel; NAN/-INF is what the rest of the file and the
+    // sqrt builtin do, and -INF is the actual limit at zero
+    if x < 0.0 { return NAN }
+    if x == 0.0 { return 0.0 - INF }
     let b = bits(x)
     let e = ((b >> 52) & 2047) - 1023
     let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
