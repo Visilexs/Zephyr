@@ -1,0 +1,144 @@
+// GRU controls composed entirely from the existing autograd operators.
+import "ml/autograd.zeph"
+
+struct GruConfig {
+    input_vocab: int,
+    output_vocab: int,
+    E: int,
+    Hn: int,
+    head: int,
+    pad: int,
+    eps: float,
+}
+
+struct GruParams {
+    config: GruConfig,
+    embedding: Tensor,
+    Wz: Tensor,
+    bz: Tensor,
+    Wr: Tensor,
+    br: Tensor,
+    Wn: Tensor,
+    bn: Tensor,
+    Wo: Tensor,
+    bo: Tensor,
+    h0: Tensor,
+}
+
+struct GruAD {
+    config: GruConfig,
+    embedding: int,
+    Wz: int,
+    bz: int,
+    Wr: int,
+    br: int,
+    Wn: int,
+    bn: int,
+    Wo: int,
+    bo: int,
+    h0: int,
+}
+
+// This order is also the leaf allocation order used by optimizers.
+fn gru_param_list(p: GruParams) -> [Tensor] {
+    return [p.embedding, p.Wz, p.bz, p.Wr, p.br, p.Wn, p.bn, p.Wo, p.bo, p.h0]
+}
+
+// Reject incompatible parameters before allocating any tape leaves.
+fn gru_params(p: GruParams, req: bool) -> GruAD {
+    let c = p.config
+    if c.input_vocab <= 0 or c.output_vocab <= 0 or c.E <= 0 or c.Hn <= 0 { panic("gru: dimensions must be positive") }
+    if c.head != 0 and c.head != 1 { panic("gru: unknown head") }
+    if c.pad < 0 or c.pad >= c.input_vocab { panic("gru: PAD out of range") }
+    if not (c.eps > 0.0) or c.eps - c.eps != 0.0 { panic("gru: eps must be finite and positive") }
+    let ps = gru_param_list(p)
+    let shapes = [[c.input_vocab, c.E], [c.Hn, c.E + c.Hn], [c.Hn],
+                  [c.Hn, c.E + c.Hn], [c.Hn], [c.Hn, c.E + c.Hn], [c.Hn],
+                  [c.output_vocab, c.Hn], [c.output_vocab], [c.Hn]]
+    var ids: [int] = []
+    for i in 0..ps.len() {
+        if ps[i].dt != DType.F64 or not shapes_equal(ps[i].shape, shapes[i]) { panic("gru: parameter shape or dtype mismatch") }
+    }
+    for i in 0..ps.len() { ids.push(av_leaf(ps[i], req)) }
+    return GruAD{config: c, embedding: ids[0], Wz: ids[1], bz: ids[2], Wr: ids[3], br: ids[4],
+                 Wn: ids[5], bn: ids[6], Wo: ids[7], bo: ids[8], h0: ids[9]}
+}
+
+fn gru_scalar(v: float) -> int { return av_leaf(t_full(DType.F64, [], v), false) }
+
+// sigmoid(x) = (tanh(x / 2) + 1) / 2, with no new tape primitive.
+fn gru_sigmoid(x: int) -> int {
+    let half = gru_scalar(0.5)
+    return av_mul(half, av_add(av_tanh(av_mul(half, x)), gru_scalar(1.0)))
+}
+
+// Standard reset-before-candidate GRU recurrence on [batch, features].
+fn gru_update(m: GruAD, h: int, x: int) -> int {
+    let c = av_concat(x, h, 1)
+    let z = gru_sigmoid(av_add(av_matmul(c, av_transpose(m.Wz, 0, 1)), m.bz))
+    let r = gru_sigmoid(av_add(av_matmul(c, av_transpose(m.Wr, 0, 1)), m.br))
+    let cn = av_concat(x, av_mul(r, h), 1)
+    let n = av_tanh(av_add(av_matmul(cn, av_transpose(m.Wn, 0, 1)), m.bn))
+    return av_add(av_mul(av_sub(gru_scalar(1.0), z), n), av_mul(z, h))
+}
+
+// Each batch row starts from the same trainable state; PAD is a tape mask.
+fn gru_forward(m: GruAD, tokens: Tensor) -> int {
+    if tokens.dt != DType.I64 or tokens.shape.len() != 2 { panic("gru: tokens must be a rank-2 I64 tensor") }
+    let batch = tokens.shape[0]
+    if batch <= 0 { panic("gru: empty batch") }
+    var h = av_expand(av_reshape(m.h0, [1, m.config.Hn]), [batch, m.config.Hn])
+    for step in 0..tokens.shape[1] {
+        var ids: [int] = []
+        let mask = t_zeros(DType.F64, [batch, 1])
+        for row in 0..batch {
+            let id = t_get_int(tokens, [row, step])
+            if id < 0 or id >= m.config.input_vocab { panic("gru: token out of range") }
+            ids.push(id)
+            if id != m.config.pad { t_set(mask, [row, 0], 1.0) }
+        }
+        let updated = gru_update(m, h, av_index_select(m.embedding, 0, ids))
+        let keep = av_leaf(mask, false)
+        h = av_add(av_mul(keep, updated), av_mul(av_sub(gru_scalar(1.0), keep), h))
+    }
+    return h
+}
+
+// Quadratic normalization matches pad_readout, including eps per class.
+// Softmax uses a detached row shift: translation invariance makes its
+// derivative cancel, so treating this numerical stabilizer as constant is exact.
+fn gru_readout(m: GruAD, h: int) -> int {
+    let u = av_add(av_matmul(h, av_transpose(m.Wo, 0, 1)), m.bo)
+    var s = 0
+    if m.config.head == 1 {
+        s = av_add(av_mul(u, u), gru_scalar(m.config.eps))
+    } else {
+        let v = av_value(u)
+        let shift = t_zeros(DType.F64, [v.shape[0], 1])
+        for row in 0..v.shape[0] {
+            var largest = t_get(v, [row, 0])
+            for col in 1..m.config.output_vocab {
+                let value = t_get(v, [row, col])
+                if value > largest { largest = value }
+            }
+            t_set(shift, [row, 0], largest)
+        }
+        s = av_exp(av_sub(u, av_leaf(shift, false)))
+    }
+    return av_div(s, av_sum_dim(s, 1))
+}
+
+// Match pad_loss: one-hot selection, then mean negative log likelihood.
+fn gru_loss(m: GruAD, tokens: Tensor, targets: [int]) -> int {
+    if tokens.shape.len() != 2 { panic("gru: tokens must be rank-2") }
+    let batch = tokens.shape[0]
+    if targets.len() != batch { panic("gru: target count must match batch") }
+    let hot = t_zeros(DType.F64, [batch, m.config.output_vocab])
+    for row in 0..batch {
+        if targets[row] < 0 or targets[row] >= m.config.output_vocab { panic("gru: target out of range") }
+        t_set(hot, [row, targets[row]], 1.0)
+    }
+    let probs = gru_readout(m, gru_forward(m, tokens))
+    let picked = av_sum_dim(av_mul(probs, av_leaf(hot, false)), 1)
+    return av_mean_all(av_neg(av_ln(picked)))
+}
