@@ -36,7 +36,12 @@ layout(push_constant) uniform P {
     vec4  prevRight;
     vec4  prevUp;
     vec4  prevFwd;
-    vec4  jitter;    // xy = subpixel offset in pixels, already Halton
+    // xy = subpixel offset in pixels, already Halton.
+    // z  = world units per voxel. The DDA steps whole cells, so traversal runs
+    //      in voxel space: the ray origin is divided by this and the resulting
+    //      t multiplied back. Everything leaving this shader, depth and motion
+    //      included, is in world units.
+    vec4  jitter;
 } pc;
 
 // ---------------------------------------------------------------- rng
@@ -119,7 +124,9 @@ bool traceVox(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nrm, out in
     float t = 0.0;
     int axis = 1;
 
-    for (int i = 0; i < 700; i++)
+    // VX+VY+VZ cells can be crossed on one diagonal; 700 was sized for a
+    // 64x32x64 grid and truncates rays on anything finer.
+    for (int i = 0; i < 2048; i++)
     {
         if (t > tmax) return false;
 
@@ -165,37 +172,42 @@ void main()
                       + pc.up.xyz    * (uv.y * pc.misc.x)
                       + pc.fwd.xyz);
 
+    // Voxel space: one unit is one cell, which is what the DDA needs.
+    float vs = pc.jitter.z;
+    vec3 roV = pc.camPos.xyz / vs;
+    float tmaxV = 8192.0;
+
     float t; vec3 n; int m;
     vec3 col;
     vec3 albedo = vec3(0.0);
     float depth = 0.0;
     vec3 gn = vec3(0.0);
-    if (traceVox(pc.camPos.xyz, rd, 512.0, t, n, m))
+    if (traceVox(roV, rd, tmaxV, t, n, m))
     {
         albedo = palette(m);
-        depth = t;
+        depth = t * vs;          // world units, for the depth guide buffer
         gn = n;
         vec3 sun = normalize(pc.misc.yzw);
         float lam = max(0.0, dot(n, sun));
         float shade = 0.0;
+        // Start just off the face. Any smaller and the shadow ray starts
+        // inside the voxel it just hit and every surface shadows itself.
+        // This is in voxel units, so it scales with the cells automatically.
+        vec3 hp = roV + rd * t + n * 0.001;
         if (lam > 0.0)
         {
-            // Start just off the face. Any smaller and the shadow ray starts
-            // inside the voxel it just hit and every surface shadows itself.
-            vec3 hp = pc.camPos.xyz + rd * t + n * 0.001;
             float st; vec3 sn; int sm;
-            if (!traceVox(hp, sun, 512.0, st, sn, sm)) { shade = lam; }
+            if (!traceVox(hp, sun, tmaxV, st, sn, sm)) { shade = lam; }
         }
         // One diffuse bounce. Cosine-weighted sampling cancels the 1/pi and
         // the cosine term, so the bounce radiance is just averaged.
-        vec3 hp = pc.camPos.xyz + rd * t + n * 0.001;
         vec3 ind = vec3(0.0);
         int spp = pc.res.z;
         for (int i = 0; i < spp; i++)
         {
             vec3 bd = cosineHemisphere(n);
             float bt; vec3 bn; int bm;
-            if (traceVox(hp, bd, 512.0, bt, bn, bm))
+            if (traceVox(hp, bd, tmaxV, bt, bn, bm))
             {
                 float blam = max(0.0, dot(bn, sun));
                 float bshade = 0.0;
@@ -203,7 +215,7 @@ void main()
                 {
                     vec3 bp = hp + bd * bt + bn * 0.001;
                     float st2; vec3 sn2; int sm2;
-                    if (!traceVox(bp, sun, 512.0, st2, sn2, sm2)) { bshade = blam; }
+                    if (!traceVox(bp, sun, tmaxV, st2, sn2, sm2)) { bshade = blam; }
                 }
                 ind += palette(bm) * (0.25 + 0.75 * bshade + emissive(bm));
             }

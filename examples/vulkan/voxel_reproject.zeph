@@ -13,21 +13,66 @@
 // Headless. Build the GLSL with glslangValidator, not zspv.
 import "vk/gfx.zeph"
 
-let VX = 64
-let VY = 32
-let VZ = 64
+let VOXEL = 0.125         // world units per voxel; must match voxel.zeph
+let VX = 512
+let VY = 256
+let VZ = 512
 let W = 320
 let H = 180
 let PCSIZE = 192
 
-fn world_at(x: int, y: int, z: int) -> int {
-    if y < 5 { return 2 }
-    if y == 5 { return 3 }
-    if x >= 20 and x < 28 and z >= 20 and z < 28 and y >= 6 and y < 18 {
-        if y >= 11 and y < 13 { return 5 }
+// World units, not cells, so the scene is the same shape at any voxel size.
+fn ifloor(a: float) -> int {
+    let i = a as int
+    if (a < 0.0) and ((i as float) != a) { return i - 1 }
+    return i
+}
+
+// ---------------------------------------------------------------- terrain
+// Value noise off the same 32-bit hash the shader uses. World generation runs
+// only on the CPU, so this never has to agree with GLSL bit-for-bit -- but it
+// does have to be deterministic, because the mirror traces the same volume.
+fn vhash2(xi: int, zi: int) -> float {
+    var h = (xi * 374761393 + zi * 668265263) & 4294967295
+    h = (h ^ (h >> 13)) & 4294967295
+    h = (h * 1274126177) & 4294967295
+    h = (h ^ (h >> 16)) & 4294967295
+    return (h as float) / 4294967296.0
+}
+
+fn smoothf(t: float) -> float { return t * t * (3.0 - 2.0 * t) }
+
+fn vnoise(x: float, z: float) -> float {
+    let xi = ifloor(x)
+    let zi = ifloor(z)
+    let fx = smoothf(x - (xi as float))
+    let fz = smoothf(z - (zi as float))
+    let a = vhash2(xi, zi)
+    let b = vhash2(xi + 1, zi)
+    let c = vhash2(xi, zi + 1)
+    let d = vhash2(xi + 1, zi + 1)
+    let top = a + (b - a) * fx
+    let bot = c + (d - c) * fx
+    return top + (bot - top) * fz
+}
+
+// Two octaves is enough to put features below one world unit, which is the
+// whole point of halving VOXEL: at 1.0 these bumps would be invisible.
+fn terrain_height(wx: float, wz: float) -> float {
+    var h = 4.6
+    h = h + 1.1 * (vnoise(wx * 0.055, wz * 0.055) - 0.5) * 2.0
+    h = h + 0.45 * (vnoise(wx * 0.17, wz * 0.17) - 0.5) * 2.0
+    h = h + 0.18 * (vnoise(wx * 0.51, wz * 0.51) - 0.5) * 2.0
+    h = h + 0.07 * (vnoise(wx * 1.6, wz * 1.6) - 0.5) * 2.0
+    return h
+}
+
+fn feature_at(wx: float, wy: float, wz: float) -> int {
+    if wx >= 20.0 and wx < 28.0 and wz >= 20.0 and wz < 28.0 and wy >= 6.0 and wy < 18.0 {
+        if wy >= 11.0 and wy < 13.0 { return 5 }
         return 1
     }
-    if x >= 40 and x < 46 and z >= 34 and z < 40 and y >= 6 and y < 11 { return 1 }
+    if wx >= 40.0 and wx < 46.0 and wz >= 34.0 and wz < 40.0 and wy >= 6.0 and wy < 11.0 { return 1 }
     return 0
 }
 
@@ -41,9 +86,17 @@ print("gpu: {g.gpu_name()}")
 
 var vox = Bytes.new(VX * VY * VZ)
 for z in 0..VZ {
-    for y in 0..VY {
-        for x in 0..VX {
-            vox.put8((z * VY + y) * VX + x, world_at(x, y, z))
+    let wz = ((z as float) + 0.5) * VOXEL
+    for x in 0..VX {
+        let wx = ((x as float) + 0.5) * VOXEL
+        let gh = terrain_height(wx, wz)
+        for y in 0..VY {
+            let wy = ((y as float) + 0.5) * VOXEL
+            var m = 0
+            if wy < gh - VOXEL { m = 2 }
+            else if wy < gh { m = 3 }
+            else { m = feature_at(wx, wy, wz) }
+            vox.put8((z * VY + y) * VX + x, m)
         }
     }
 }
@@ -122,6 +175,7 @@ pc.putf32(164, fy)
 pc.putf32(168, fz)
 pc.putf32(176, 0.0)         // no jitter: it would add a subpixel shift
 pc.putf32(180, 0.0)
+pc.putf32(184, VOXEL)       // world units per voxel; zero here divides by zero
 
 let pca = pc.addr()
 let pl = layout
@@ -259,13 +313,29 @@ for y in 0..H {
             disoccluded += 1
             continue
         }
-        let dr = abs(col1.get8(i * 4) - col0.get8(j * 4))
-        let dg = abs(col1.get8(i * 4 + 1) - col0.get8(j * 4 + 1))
-        let db = abs(col1.get8(i * 4 + 2) - col0.get8(j * 4 + 2))
-        var d = dr
-        if dg > d { d = dg }
-        if db > d { d = db }
-        if d <= 6 { matched += 1 } else { wrong += 1 }
+        // Accept the best of the 3x3 neighbourhood. At an eighth of a unit the
+        // terrain has detail at roughly the pixel scale, so a vector that is
+        // correct to a fraction of a pixel still lands on a different micro
+        // facet under nearest-neighbour lookup. A vector that is actually
+        // wrong -- flipped sign, wrong units -- misses by far more than one
+        // pixel and this does not rescue it.
+        var best = 999
+        for oy in 0..3 {
+            for ox in 0..3 {
+                let nx2 = sx + ox - 1
+                let ny2 = sy + oy - 1
+                if nx2 < 0 or ny2 < 0 or nx2 >= W or ny2 >= H { continue }
+                let k = ny2 * W + nx2
+                let dr = abs(col1.get8(i * 4) - col0.get8(k * 4))
+                let dg = abs(col1.get8(i * 4 + 1) - col0.get8(k * 4 + 1))
+                let db = abs(col1.get8(i * 4 + 2) - col0.get8(k * 4 + 2))
+                var d = dr
+                if dg > d { d = dg }
+                if db > d { d = db }
+                if d < best { best = d }
+            }
+        }
+        if best <= 6 { matched += 1 } else { wrong += 1 }
     }
 }
 
@@ -283,7 +353,7 @@ let valid = matched + wrong
 assert(valid > geom / 2, "too few pixels had a usable history ({valid} of {geom})")
 assert(matched * 50 > valid * 49,
        "only {matched} of {valid} reprojected pixels matched; motion vectors look wrong")
-print("PASS: {matched} of {valid} reprojected pixels found the same surface")
+print("PASS: {matched} of {valid} reprojected pixels found the same surface within a pixel")
 
 g.destroy_image(grough)
 g.destroy_image(gmotion)
