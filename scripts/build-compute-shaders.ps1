@@ -14,7 +14,7 @@ if (-not $glslc) {
 }
 
 $fail = 0
-foreach ($f in @("matmul_f32.comp", "matmul_f64.comp")) {
+foreach ($f in @("matmul_f32.comp", "matmul_f64.comp", "matmul_c64.comp")) {
     $in  = Join-Path $src $f
     $out = "$in.spv"
     & glslc --target-env=vulkan1.2 -O $in -o $out

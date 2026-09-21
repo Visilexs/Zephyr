@@ -1,0 +1,191 @@
+// Vulkan compute backend for the one operation that dominates the phase
+// model's cost: matmul, real float64 and complex float64.
+//
+// Scope is deliberately one operation. The backward pass of a matmul is two
+// more matmuls against conjugate-transposed operands (see OP_MATMUL in
+// autograd.zeph), and the transposes are O(n^2) against the matmul's O(n^3),
+// so covering matmul alone puts both the forward and the backward of the
+// expensive part on the device. Everything else stays on the CPU, where it is
+// already verified against numpy and PyTorch.
+//
+// Precision is float64 only. float32 is measurably faster -- see the table in
+// .agent/env-ledger.md -- but every cross-check harness in this repository
+// compares bit-identical float64 fixtures, and an fp32 path would cost that
+// evidence to buy a speedup on a kernel that is bandwidth-bound anyway.
+//
+// Pipelines are built per call. Measured cold build is 0.2-0.3 ms against a
+// 49 ms host upload at n=1024, so caching them would optimise the wrong end.
+// ponytail: rebuild per call; cache pipelines if upload ever gets a bulk path.
+import "vk/gfx.zeph"
+import "ml/ops.zeph"
+
+let GPU_SPV_F64 = "examples/shaders/matmul_f64.comp.spv"
+let GPU_SPV_C64 = "examples/shaders/matmul_c64.comp.spv"
+
+// Returns "" when the backend can run, and otherwise a message that says what
+// is missing and what to do about it. Callers should print it verbatim: a
+// backend that is unavailable for a fixable reason should not look like a bug.
+// read_file dies on a missing path rather than returning empty, so existence
+// has to be asked before the read -- the whole point here is to report the
+// absence with a fix, not to abort on it.
+fn gpu_file_exists(path: str) -> bool {
+    var cp = cbytes(path)
+    let attrs = win("GetFileAttributesA", cp.addr())
+    return attrs != 4294967295 and attrs != 0 - 1
+}
+
+fn gpu_kernel_missing(path: str) -> str {
+    if not gpu_file_exists(path) {
+        return "gpu backend unavailable: compiled kernel {path} is missing. Run scripts\\build-compute-shaders.ps1 to build it (needs glslc from the Vulkan SDK on PATH)."
+    }
+    return ""
+}
+
+fn gpu_unavailable() -> str {
+    let a = gpu_kernel_missing(GPU_SPV_F64)
+    if a != "" { return a }
+    return gpu_kernel_missing(GPU_SPV_C64)
+}
+
+struct GpuMM { g: Gfx }
+
+// Bring the device up. Panics with the actionable text from gpu_unavailable()
+// rather than letting the failure surface as a Vulkan error code.
+fn gpu_init() -> GpuMM {
+    let why = gpu_unavailable()
+    if why != "" { panic(why) }
+    let g = Gfx.init("zephyr-ml", [])
+    return GpuMM{ g: g }
+}
+
+fn gpu_done(m: GpuMM) { m.g.shutdown() }
+
+fn gpu_device_name(m: GpuMM) -> str { return m.g.gpu_name() }
+
+// Number of float64 lanes per element: 1 real, 2 complex.
+fn gpu_lanes(d: DType) -> int {
+    if dtype_is_complex(d) { return 2 }
+    return 1
+}
+
+// Host-visible upload of a 2-D tensor, element by element through t_get, so
+// non-contiguous views (transposes, slices) upload correctly without a repack.
+fn gpu_upload(m: GpuMM, t: Tensor, rows: int, cols: int, lanes: int) -> GpuBuffer {
+    let buf = m.g.buffer(rows * cols * lanes * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    var pp = Bytes.new(8)
+    var cell = Bytes.new(8)
+    vkcheck(vkMapMemory(m.g.dev, buf.mem, 0, buf.size, 0, pp.addr()), "gpu_upload: vkMapMemory")
+    let base = pp.get64(0)
+    for i in 0..rows {
+        for j in 0..cols {
+            let e = (i * cols + j) * lanes
+            if lanes == 2 {
+                cell.putf64(0, t_get_re(t, [i, j]))
+                for b in 0..8 { store8(base + (e + 0) * 8 + b, cell.get8(b)) }
+                cell.putf64(0, t_get_im(t, [i, j]))
+                for b in 0..8 { store8(base + (e + 1) * 8 + b, cell.get8(b)) }
+            } else {
+                cell.putf64(0, t_get(t, [i, j]))
+                for b in 0..8 { store8(base + e * 8 + b, cell.get8(b)) }
+            }
+        }
+    }
+    vkUnmapMemory(m.g.dev, buf.mem)
+    return buf
+}
+
+// C = A @ B on the device. Shapes and dtypes are checked here rather than in
+// the shader, which has no way to report a mismatch -- it would just read
+// garbage inside its bounds and return a plausible wrong answer.
+fn gpu_matmul(m: GpuMM, a: Tensor, b: Tensor) -> Tensor {
+    if t_rank(a) != 2 or t_rank(b) != 2 { panic("gpu_matmul: both operands must be rank 2") }
+    if a.dt != b.dt { panic("gpu_matmul: dtype mismatch") }
+    if a.dt != DType.F64 and a.dt != DType.C64 {
+        panic("gpu_matmul: only F64 and C64 are supported on the device; got {a.dt}. Use t_matmul on the CPU for other dtypes.")
+    }
+    let M = a.shape[0]
+    let K = a.shape[1]
+    if b.shape[0] != K { panic("gpu_matmul: inner dimensions disagree, {K} against {b.shape[0]}") }
+    let N = b.shape[1]
+    let lanes = gpu_lanes(a.dt)
+
+    let bufA = gpu_upload(m, a, M, K, lanes)
+    let bufB = gpu_upload(m, b, K, N, lanes)
+    let bufC = m.g.buffer(M * N * lanes * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+
+    var bufs: [GpuBuffer] = []
+    bufs.push(bufA)
+    bufs.push(bufB)
+    bufs.push(bufC)
+    let ds = m.g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT)
+    var path = GPU_SPV_F64
+    if lanes == 2 { path = GPU_SPV_C64 }
+    let sh = m.g.shader(path)
+    var sl: [int] = []
+    sl.push(ds.layout)
+    let lay = m.g.pipeline_layout(sl, 12, VK_SHADER_STAGE_COMPUTE_BIT)
+    let pipe = m.g.compute_pipeline(sh, lay, cbytes("main"))
+
+    var pc = Bytes.new(12)
+    pc.put32(0, M)
+    pc.put32(4, K)
+    pc.put32(8, N)
+    var sets = u64s([ds.set])
+    let gx = (N + 15) / 16
+    let gy = (M + 15) / 16
+    let pl = lay
+    let pi = pipe
+    let sa = sets.addr()
+    let pa = pc.addr()
+    m.g.immediate(fn(cb: int) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pi)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, sa, 0, 0)
+        vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pa)
+        vkCmdDispatch(cb, gx, gy, 1)
+    })
+
+    let out = t_zeros(a.dt, [M, N])
+    var pp = Bytes.new(8)
+    var got = Bytes.new(8)
+    vkcheck(vkMapMemory(m.g.dev, bufC.mem, 0, bufC.size, 0, pp.addr()), "gpu_matmul: vkMapMemory readback")
+    let rb = pp.get64(0)
+    for i in 0..M {
+        for j in 0..N {
+            let e = (i * N + j) * lanes
+            if lanes == 2 {
+                for b in 0..8 { got.put8(b, load8(rb + (e + 0) * 8 + b)) }
+                let re = got.getf64(0)
+                for b in 0..8 { got.put8(b, load8(rb + (e + 1) * 8 + b)) }
+                t_set_c(out, [i, j], re, got.getf64(0))
+            } else {
+                for b in 0..8 { got.put8(b, load8(rb + e * 8 + b)) }
+                t_set(out, [i, j], got.getf64(0))
+            }
+        }
+    }
+    vkUnmapMemory(m.g.dev, bufC.mem)
+
+    vkDestroyPipeline(m.g.dev, pipe, 0)
+    vkDestroyPipelineLayout(m.g.dev, lay, 0)
+    vkDestroyShaderModule(m.g.dev, sh, 0)
+    m.g.destroy_desc_set(ds)
+    m.g.destroy_buffer(bufA)
+    m.g.destroy_buffer(bufB)
+    m.g.destroy_buffer(bufC)
+    return out
+}
+
+// The backward of C = A @ B, on the device: dA = dC @ B^H, dB = A^H @ dC.
+// This mirrors the OP_MATMUL case in autograd.zeph exactly -- plain transpose
+// for real operands, conjugate transpose for complex -- so the two can be
+// compared directly. The transposes are O(n^2) and stay on the host.
+fn gpu_matmul_backward(m: GpuMM, a: Tensor, b: Tensor, gc: Tensor) -> [Tensor] {
+    var bt = t_copy(t_transpose(b, 0, 1))
+    var at = t_copy(t_transpose(a, 0, 1))
+    if dtype_is_complex(b.dt) { bt = t_conj_transpose(b) }
+    if dtype_is_complex(a.dt) { at = t_conj_transpose(a) }
+    var out: [Tensor] = []
+    out.push(gpu_matmul(m, gc, bt))
+    out.push(gpu_matmul(m, at, gc))
+    return out
+}

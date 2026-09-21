@@ -371,6 +371,31 @@ foreach ($nm in $phaseSuites.Keys) {
     Check $nm ($built -and $out -eq $want) "got: $out"
 }
 
+# ---- GPU compute backend (A20) ----
+# Skipped rather than failed when no Vulkan device is present: the backend is
+# optional and its absence is an environment fact, not a defect. The kernels
+# are also skipped over if they have not been built, since building them needs
+# glslc from the Vulkan SDK, which is not required to work on the compiler.
+$spvF64 = Join-Path $root "examples\shaders\matmul_f64.comp.spv"
+$spvC64 = Join-Path $root "examples\shaders\matmul_c64.comp.spv"
+if (-not ((Test-Path $spvF64) -and (Test-Path $spvC64))) {
+    Write-Host "SKIP ml-gpu -- compute kernels not built (run scripts\build-compute-shaders.ps1)"
+} else {
+    $gpuExe = Join-Path $tmp "gpu_test.exe"
+    Remove-Item $gpuExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tests\ml\gpu_test.zeph $gpuExe 2>&1 | Out-Null
+    if (-not (Test-Path $gpuExe)) {
+        Check "ml-gpu" $false "gpu_test.zeph did not compile"
+    } else {
+        $gout = (& $gpuExe 2>&1 | Out-String)
+        if ($gout -match "vkCreateInstance" -or $gout -match "no Vulkan") {
+            Write-Host "SKIP ml-gpu -- no Vulkan device available"
+        } else {
+            Check "ml-gpu" ($gout -match "gpu: 277 checks passed") "got tail: $($gout.Trim() -split "`n" | Select-Object -Last 1)"
+        }
+    }
+}
+
 # ---- phase parity against the float64 numpy reference (A13) ----
 # Skipped rather than failed when numpy is absent: it is a reference-side
 # dependency, and its absence is not a defect in the compiler or the port.

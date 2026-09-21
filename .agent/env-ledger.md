@@ -110,6 +110,23 @@ a purely bandwidth-bound kernel predicts. The ALU ratio on consumer NVIDIA
 parts is about 1/64, and none of it is visible here because the ALUs are idle
 waiting on memory.
 
+### Correction: fp64 on the device is not bit-identical to fp64 on the host
+
+The earlier justification for an fp64 path -- that it preserves the
+bit-identical float64 fixtures the cross-check harnesses compare -- is wrong,
+and measurement showed it. Re-running `tests/ml/gpu_test.zeph` with every
+tolerance set to exactly 0.0 fails 80 of its 272 numeric comparisons. The
+disagreements are all around 1e-15 relative, consistent with the driver
+contracting multiply-add pairs into FMA, which changes the rounding of the
+accumulation.
+
+So the honest statement is narrower: **fp64 on the device preserves float64
+accuracy, not bit-identity.** The bit-exact `t_hex`-against-numpy comparisons
+are inherently CPU-side and stay that way. fp64 is still the right choice for
+the backend, but for the weaker and sufficient reason that 1e-15 agreement
+keeps the GPU path meaningfully comparable to the verified CPU path, where
+fp32's 6.6e-6 would not.
+
 The consequence runs the wrong way from the comfortable reading: **the ratio
 is favourable only because the kernel is slow.** Any tiling work that makes
 the fp32 kernel approach its ceiling will widen the gap toward 64x, because
