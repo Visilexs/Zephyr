@@ -59,6 +59,52 @@ happens; do not install one merely to claim a pass.
 | Self-hosted example + stdlib checks | 12/12, driven directly by `zc.exe --rt` |
 | `tests\run_tests.ps1` | **BLOCKED, not passed** — no C compiler. Never reached its first assertion. |
 
+## GPU compute probe, for M5
+
+Measured with `vulkaninfo` from the installed SDK. Only what was read back is
+recorded; nothing here is inferred from the part number.
+
+| Property | Value |
+|---|---|
+| deviceName | NVIDIA GeForce RTX 5090 |
+| shaderFloat64 | **true** |
+| shaderInt64 | true |
+| maxComputeSharedMemorySize | 49152 bytes |
+| maxComputeWorkGroupInvocations | 1024 |
+| maxStorageBufferRange | 4294967295 bytes |
+
+`shaderFloat64` being true is the finding that matters, because everything in
+`lib/ml` is float64 and both cross-check harnesses compare against a float64
+reference with bit-identical fixtures. A float32-only compute path would have
+forced either a second numerical standard or the abandonment of those
+comparisons.
+
+What this does **not** establish is throughput. Consumer NVIDIA parts have
+historically run FP64 at a small fraction of their FP32 rate, and no rate has
+been measured here. Support and speed are different questions and M5 asks for
+measured step timings, so the tradeoff between an fp64 path that preserves
+the existing parity evidence and an fp32 path that does not must be measured
+rather than assumed.
+
+## Existing compute surface in this repository
+
+Surveyed before planning M5, so the milestone starts from what is actually
+here.
+
+| Capability | State |
+|---|---|
+| Vulkan compute pipelines, storage buffers, descriptor sets, dispatch, barriers | present in `lib/vk/gfx.zeph`, proven end to end |
+| A working numeric compute kernel | `examples/vulkan/compute.zeph`: 1.5M-element integration over 8 dispatches, read back and checked against a CPU closed form |
+| Host-visible upload and readback | present |
+| matmul, reduction, or any training kernel | **absent** |
+| `tools/zspv.zeph` emitting compute shaders | **cannot** -- vertex and fragment only, float32 only, no storage buffers, no control flow |
+| GLSL `.comp` to SPIR-V automation | **absent**; existing `.comp.spv` files were built out of band. `glslc` is present, so a script is straightforward |
+| Regenerating Vulkan bindings via `tools/vkgen.c` | **blocked**, needs gcc. Existing generated coverage is broad, so new bindings would be hand-added instead |
+
+So the plumbing exists and the gap is at the kernel-authoring layer. Kernels
+would be hand-written GLSL compiled with `glslc`, as `particles.comp` already
+is, rather than written in Zephyr through `zspv`.
+
 The fixpoint was verified by hand rather than by trusting `selfbuild.ps1`'s
 exit code, using the staged procedure in `zephyr-ml/15_BOOTSTRAP_PLAN.md`:
 `embed-gen`, then `zc.exe` → stage-a → stage-b → stage-c, comparing SHA-256.
