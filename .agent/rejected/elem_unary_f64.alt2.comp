@@ -1,0 +1,339 @@
+#version 450
+// Elementwise unary map on strided float64 tensors.
+//
+// Bindings 0 = in, 1 = out. Operand strides come from pc.astr / pc.offs.x,
+// output strides from pc.ostr / pc.offs.z. pc.meta.z is the op; codes 0..4
+// are the MAP_ constants in lib/ml/ops.zeph and must not be renumbered.
+//
+//   0 tanh   1 cos    2 sin    3 exp    4 ln    5 neg    6 abs2   7 conj
+//   8 real   9 imag  10 expi  11 cast  12 copy
+//
+// The complex bits in pc.meta.w are independent on purpose: ops 6, 8 and 9
+// take a complex input and produce a REAL output, op 10 takes a real input
+// and produces a COMPLEX one, and op 11 converts either way. Bit 0 is read
+// as "the input buffer is interleaved", bit 2 as "the output buffer is
+// interleaved", and neither is inferred from the other. (Bit 1 is operand B
+// and is unused in this kernel.)
+//
+// Strides and offsets are in ELEMENTS, not doubles: a complex element is an
+// interleaved re,im pair, so its double index is twice the element index --
+// the same layout as examples/shaders/matmul_c64.comp. A zero stride is a
+// broadcast axis and is not special-cased: it simply makes every index along
+// that axis land on the same element.
+//
+// The tanh/cos/sin/exp/log/atan built-ins in GLSL are float32 only, so the
+// block below implements them for double. Computing in float and widening
+// would lose ten significant digits; nothing here touches the float type.
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer BufA { double a[]; };
+layout(std430, binding = 1) writeonly buffer BufO { double o[]; };
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = numel (output elements), z = op, w = flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // strides of the operand, in elements
+    uvec4 bstr;    // unused in this kernel
+    uvec4 ostr;    // strides of the output, in elements
+    uvec4 offs;    // x = operand offset, z = output offset, y/w unused
+} pc;
+
+// ---- shared index helpers --------------------------------------------------
+
+// Linear output index -> 4-component index vector, row-major (last axis
+// fastest). Entries at or beyond pc.meta.x stay 0; the caller sets those
+// shapes to 1 and their strides to 0, so they never contribute.
+uvec4 out_index(uint lin) {
+    uvec4 idx = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        uint s = pc.oshape[d - 1u];
+        idx[d - 1u] = lin % s;
+        lin /= s;
+    }
+    return idx;
+}
+
+// Index vector + strides + offset -> index into the double[] buffer. Doubles
+// the element index for complex tensors, which is where the interleaving is
+// accounted for exactly once.
+uint buf_index(uvec4 idx, uvec4 str, uint off, bool cplx) {
+    uint e = off;
+    for (uint d = 0u; d < pc.meta.x; ++d) { e += idx[d] * str[d]; }
+    return cplx ? 2u * e : e;
+}
+
+// All arithmetic below is float64. Error targets include rounding, not just
+// polynomial truncation; GPU validation compares against System.Math/Complex.
+const double LN2_HI = 0.693147180559945286lf;
+const double LN2_LO = 2.319046813846299558e-17lf;
+const double PI = 3.141592653589793238462643383279502884lf;
+const double HALF_PI = 1.57079632679489655800lf;
+const double PIO2_MID = 6.12323399573676603587e-17lf;
+const double PIO2_LO = -1.49738490485916983294e-33lf;
+
+double d_nan() { return packDouble2x32(uvec2(0u, 0x7ff80000u)); }
+double d_inf() { return packDouble2x32(uvec2(0u, 0x7ff00000u)); }
+bool signbit_f64(double x) { return (unpackDouble2x32(x).y & 0x80000000u) != 0u; }
+double copysign_f64(double x, double y) { return signbit_f64(y) ? -abs(x) : abs(x); }
+
+// Exact normal power of two; callers keep e in [-1022, 1023].
+double pow2_f64(int e) { return packDouble2x32(uvec2(0u, uint(e + 1023) << 20)); }
+
+// Degree 16: omitted term < 1e-22 for |r| <= ln(2)/2. Factoring r avoids
+// cancellation near zero; floating-point evaluation targets a few ulps.
+double expm1_poly(double r) {
+    double p = 1.0lf;
+    for (int n = 16; n >= 2; --n) { p = fma(p, r / double(n), 1.0lf); }
+    return r * p;
+}
+
+// Targets a few ulps for normal results, with explicit overflow/underflow.
+double exp_f64(double x) {
+    if (isnan(x)) { return x; }
+    if (x > 709.782712893383973096lf) { return d_inf(); }
+    if (x < -745.13321910194110842lf) { return 0.0lf; }
+    int k = int(roundEven(x / LN2_HI));
+    // precise makes the explicit fma reductions single-rounding operations.
+    precise double r = fma(-double(k), LN2_HI, x);
+    r = fma(-double(k), LN2_LO, r);
+    double p = 1.0lf + expm1_poly(r);
+    if (k > 1023) { return (p * 2.0lf) * pow2_f64(k - 1); }
+    if (k < -1022) { return (p * pow2_f64(k + 54)) * pow2_f64(-54); }
+    return p * pow2_f64(k);
+}
+
+// Targets a few ulps, including small x where exp(x)-1 loses digits.
+double expm1_f64(double x) {
+    if (abs(x) <= 0.34657359027997265471lf) { return expm1_poly(x); }
+    return exp_f64(x) - 1.0lf;
+}
+
+// Atanh series through s^23: truncation < 2e-21 on the reduced interval.
+// Complete log targets a few ulps; frexp also handles subnormal inputs.
+double log_f64(double x) {
+    if (isnan(x)) { return x; }
+    if (x == 0.0lf) { return -d_inf(); }
+    if (x < 0.0lf) { return d_nan(); }
+    if (isinf(x)) { return x; }
+    int e;
+    double m = frexp(x, e);
+    if (m < 0.70710678118654752440lf) { m *= 2.0lf; --e; }
+    double s = (m - 1.0lf) / (m + 1.0lf);
+    double w = s * s;
+    double p = 1.0lf / 23.0lf;
+    for (int n = 21; n >= 3; n -= 2) { p = fma(p, w, 1.0lf / double(n)); }
+    double lm = 2.0lf * fma(s * w, p, s);
+    return fma(double(e), LN2_HI, fma(double(e), LN2_LO, lm));
+}
+
+/* Sine/cosine/atan minimax coefficients are from fdlibm:
+ * https://netlib.org/fdlibm/{k_sin.c,k_cos.c,s_atan.c}
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunSoft, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this software is freely
+ * granted, provided that this notice is preserved.
+ */
+
+// Three-part pi/2 reduction and minimax polynomials target ~3e-16 absolute.
+// ponytail: |x| <= 2^52; full-range Payne-Hanek reduction is needed beyond it.
+// Return NaN outside that range rather than silently emit an incorrect phase.
+void sincos_f64(double x, out double sn, out double cs) {
+    if (isnan(x) || isinf(x) || abs(x) > 4503599627370496.0lf) {
+        sn = d_nan(); cs = d_nan(); return;
+    }
+    if (x == 0.0lf) { sn = x; cs = 1.0lf; return; }
+    double n = roundEven(x * 0.63661977236758134308lf);
+    precise double r = fma(-n, HALF_PI, x);
+    r = fma(-n, PIO2_MID, r);
+    r = fma(-n, PIO2_LO, r);
+    // The rounded reciprocal can choose a neighboring quadrant at large x.
+    if (r > PI * 0.25lf) {
+        r = ((r - HALF_PI) - PIO2_MID) - PIO2_LO; n += 1.0lf;
+    } else if (r < -PI * 0.25lf) {
+        r = ((r + HALF_PI) + PIO2_MID) + PIO2_LO; n -= 1.0lf;
+    }
+    double w = r * r;
+    double sp = 1.58969099521155010221e-10lf;
+    sp = fma(sp, w, -2.50507602534068634195e-08lf);
+    sp = fma(sp, w, 2.75573137070700676789e-06lf);
+    sp = fma(sp, w, -1.98412698298579493134e-04lf);
+    sp = fma(sp, w, 8.33333333332248946124e-03lf);
+    sp = fma(sp, w, -1.66666666666666324348e-01lf);
+    sn = fma(r * w, sp, r);
+    double cp = -1.13596475577881948265e-11lf;
+    cp = fma(cp, w, 2.08757232129817482790e-09lf);
+    cp = fma(cp, w, -2.75573143513906633035e-07lf);
+    cp = fma(cp, w, 2.48015872894767294178e-05lf);
+    cp = fma(cp, w, -1.38888888888741095749e-03lf);
+    cp = fma(cp, w, 4.16666666666666019037e-02lf);
+    cs = fma(w * w, cp, fma(-0.5lf, w, 1.0lf));
+    int q = int(n - 4.0lf * floor(n * 0.25lf));
+    double s = sn;
+    if (q == 1) { sn = cs; cs = -s; }
+    else if (q == 2) { sn = -sn; cs = -cs; }
+    else if (q == 3) { sn = -cs; cs = s; }
+}
+
+// Same accuracy and range as sincos_f64.
+double sin_f64(double x) { double s; double c; sincos_f64(x, s, c); return s; }
+double cos_f64(double x) { double s; double c; sincos_f64(x, s, c); return c; }
+
+// Argument reduction to |r| <= 0.4375; fdlibm minimax targets a few ulps.
+double atan_f64(double x) {
+    if (isnan(x) || x == 0.0lf) { return x; }
+    double r = abs(x);
+    double hi = 0.0lf;
+    double lo = 0.0lf;
+    if (r >= 2.4375lf) {
+        r = -1.0lf / r; hi = HALF_PI; lo = PIO2_MID;
+    } else if (r >= 1.1875lf) {
+        r = (r - 1.5lf) / (1.0lf + 1.5lf * r);
+        hi = 9.82793723247329054082e-01lf; lo = 1.39033110312309984516e-17lf;
+    } else if (r >= 0.6875lf) {
+        r = (r - 1.0lf) / (r + 1.0lf);
+        hi = 7.85398163397448278999e-01lf; lo = 3.06161699786838301793e-17lf;
+    } else if (r >= 0.4375lf) {
+        r = (2.0lf * r - 1.0lf) / (2.0lf + r);
+        hi = 4.63647609000806093515e-01lf; lo = 2.26987774529616870924e-17lf;
+    }
+    double w = r * r;
+    double p = 1.62858201153657823623e-02lf;
+    p = fma(p, w, -3.65315727442169155270e-02lf);
+    p = fma(p, w, 4.97687799461593236017e-02lf);
+    p = fma(p, w, -5.83357013379057348645e-02lf);
+    p = fma(p, w, 6.66107313738753120669e-02lf);
+    p = fma(p, w, -7.69187620504482999495e-02lf);
+    p = fma(p, w, 9.09088713343650656196e-02lf);
+    p = fma(p, w, -1.11111104054623557880e-01lf);
+    p = fma(p, w, 1.42857142725034663711e-01lf);
+    p = fma(p, w, -1.99999999998764832476e-01lf);
+    p = fma(p, w, 3.33333333333329318027e-01lf);
+    return copysign_f64(hi - ((r * w * p - lo) - r), x);
+}
+
+// Targets a few ulps in radians, including signed-zero branch cuts/infinities.
+double atan2_f64(double y, double x) {
+    if (isnan(x) || isnan(y)) { return x + y; }
+    if (y == 0.0lf) { return signbit_f64(x) ? copysign_f64(PI, y) : y; }
+    if (x == 0.0lf) { return copysign_f64(HALF_PI, y); }
+    if (isinf(x) && isinf(y)) {
+        return copysign_f64(signbit_f64(x) ? 0.75lf * PI : 0.25lf * PI, y);
+    }
+    double ax = abs(x);
+    double ay = abs(y);
+    double angle = ay > ax ? HALF_PI - (atan_f64(ax / ay) - PIO2_MID)
+                           : atan_f64(ay / ax);
+    if (signbit_f64(x)) { angle = PI - angle; }
+    return copysign_f64(angle, y);
+}
+
+// Targets a few ulps; use the magnitude so negative x cannot cancel t+2.
+double tanh_f64(double x) {
+    if (abs(x) > 20.0lf) { return copysign_f64(1.0lf, x); }
+    if (abs(x) < 1.0e-8lf) { return x; }
+    double t = expm1_f64(2.0lf * abs(x));
+    return copysign_f64(t / (t + 2.0lf), x);
+}
+
+// Targets a few ulps; expm1 retains small x, half-exponents delay overflow.
+double sinh_f64(double x) {
+    double ax = abs(x);
+    if (ax < 1.0lf) {
+        double t = expm1_f64(ax);
+        return copysign_f64(0.5lf * (t + t / (t + 1.0lf)), x);
+    }
+    precise double h = exp_f64(ax * 0.5lf);
+    h = (0.5lf * h) * h;
+    return copysign_f64(h - 0.25lf / h, x);
+}
+
+// Targets a few ulps; positive terms avoid cancellation.
+double cosh_f64(double x) {
+    double ax = abs(x);
+    if (ax < 1.0lf) {
+        double t = expm1_f64(ax);
+        return 1.0lf + 0.5lf * t * (t / (t + 1.0lf));
+    }
+    precise double h = exp_f64(ax * 0.5lf);
+    h = (0.5lf * h) * h;
+    return h + 0.25lf / h;
+}
+
+// Complex helpers target ~1e-14 relative away from zeros, poles and overflow.
+dvec2 complex_exp_f64(dvec2 z) {
+    double s; double c; sincos_f64(z.y, s, c);
+    return exp_f64(z.x) * dvec2(c, s);
+}
+
+// Equivalent to 0.5*log(re^2+im^2), scaled to avoid squaring overflow.
+// Targets ~1e-14 absolute in each component away from the branch cut.
+dvec2 complex_log_f64(dvec2 z) {
+    double hi = max(abs(z.x), abs(z.y));
+    double lo = min(abs(z.x), abs(z.y));
+    double magnitude;
+    if (isnan(z.x) || isnan(z.y)) { magnitude = d_nan(); }
+    else if (hi == 0.0lf || isinf(hi)) { magnitude = log_f64(hi); }
+    else {
+        double ratio = lo / hi;
+        magnitude = log_f64(hi) + 0.5lf * log_f64(1.0lf + ratio * ratio);
+    }
+    return dvec2(magnitude, atan2_f64(z.y, z.x));
+}
+
+// Accuracy follows sincos_f64 and the hyperbolic helpers, away from overflow.
+dvec2 complex_sin_f64(dvec2 z) {
+    double s; double c; sincos_f64(z.x, s, c);
+    return dvec2(s * cosh_f64(z.y), c * sinh_f64(z.y));
+}
+
+// Accuracy follows sincos_f64 and the hyperbolic helpers, away from overflow.
+dvec2 complex_cos_f64(dvec2 z) {
+    double s; double c; sincos_f64(z.x, s, c);
+    return dvec2(c * cosh_f64(z.y), -s * sinh_f64(z.y));
+}
+
+// Equivalent double-angle formula, scaled for large re and stable near poles.
+// Relative accuracy necessarily deteriorates close to the poles.
+dvec2 complex_tanh_f64(dvec2 z) {
+    if (z.y == 0.0lf) { return dvec2(tanh_f64(z.x), z.y); }
+    double s; double c; sincos_f64(z.y, s, c);
+    double ax = abs(z.x);
+    if (ax > 20.0lf) {
+        double t = exp_f64(-2.0lf * ax);
+        double den = 1.0lf + t * t + 2.0lf * t * (c * c - s * s);
+        return dvec2(copysign_f64((1.0lf - t * t) / den, z.x), 4.0lf * t * s * c / den);
+    }
+    double sh = sinh_f64(z.x);
+    double den = sh * sh + c * c;
+    return dvec2(sh * cosh_f64(z.x) / den, s * c / den);
+}
+
+// One invocation owns one logical output element.
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+    bool ac = (pc.meta.w & 1u) != 0u;
+    bool oc = (pc.meta.w & 4u) != 0u;
+    uvec4 idx = out_index(gid);
+    uint ia = buf_index(idx, pc.astr, pc.offs.x, ac);
+    uint io = buf_index(idx, pc.ostr, pc.offs.z, oc);
+    dvec2 z = dvec2(a[ia], ac ? a[ia + 1u] : 0.0lf);
+    dvec2 result = z;
+    switch (pc.meta.z) {
+        case 0u: result = ac ? complex_tanh_f64(z) : dvec2(tanh_f64(z.x), 0.0lf); break;
+        case 1u: result = ac ? complex_cos_f64(z) : dvec2(cos_f64(z.x), 0.0lf); break;
+        case 2u: result = ac ? complex_sin_f64(z) : dvec2(sin_f64(z.x), 0.0lf); break;
+        case 3u: result = ac ? complex_exp_f64(z) : dvec2(exp_f64(z.x), 0.0lf); break;
+        case 4u: result = ac ? complex_log_f64(z) : dvec2(log_f64(z.x), 0.0lf); break;
+        case 5u: result = dvec2(0.0lf) - z; break;
+        case 6u: result = dvec2(z.x * z.x + z.y * z.y, 0.0lf); break;
+        case 7u: result = dvec2(z.x, 0.0lf - z.y); break;
+        case 8u: result = dvec2(z.x, 0.0lf); break;
+        case 9u: result = dvec2(z.y, 0.0lf); break;
+        case 10u: sincos_f64(z.x, result.y, result.x); break;
+        case 11u: break; // Independent load/store flags implement both casts.
+        case 12u: break;
+    }
+    o[io] = result.x;
+    if (oc) { o[io + 1u] = result.y; }
+}
+

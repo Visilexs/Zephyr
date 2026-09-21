@@ -1,0 +1,106 @@
+#version 450
+// Elementwise binary op on strided float64 tensors, real or complex.
+//
+// Bindings 0 = A, 1 = B, 2 = out. pc.meta.z selects the op and the codes are
+// fixed by t_binary in lib/ml/ops.zeph: 0 add, 1 sub, 2 mul, 3 div.
+//
+// Strides and offsets are in ELEMENTS, not doubles: a complex element is an
+// interleaved re,im pair so its double index is twice the element index, the
+// same layout as examples/shaders/matmul_c64.comp. A zero stride is a
+// broadcast axis and needs no special case -- it simply makes every index
+// along that axis land on the same element.
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer BufA { double a[]; };
+layout(std430, binding = 1) readonly  buffer BufB { double b[]; };
+layout(std430, binding = 2) writeonly buffer BufO { double o[]; };
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = numel (output elements), z = op, w = flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // strides of operand A, in elements
+    uvec4 bstr;    // strides of operand B, in elements
+    uvec4 ostr;    // strides of the output, in elements
+    uvec4 offs;    // x = A offset, y = B offset, z = output offset, w unused
+} pc;
+
+// ---- shared index helpers --------------------------------------------------
+
+// Linear output index -> 4-component index vector, row-major (last axis
+// fastest). Entries at or beyond pc.meta.x stay 0; the caller sets those
+// shapes to 1 and their strides to 0, so they never contribute.
+uvec4 out_index(uint lin) {
+    uvec4 idx = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        uint s = pc.oshape[d - 1u];
+        idx[d - 1u] = lin % s;
+        lin /= s;
+    }
+    return idx;
+}
+
+// Index vector + strides + offset -> index into the double[] buffer. Doubles
+// the element index for complex tensors, which is where the interleaving is
+// accounted for exactly once.
+uint buf_index(uvec4 idx, uvec4 str, uint off, bool cplx) {
+    uint e = off;
+    for (uint d = 0u; d < pc.meta.x; ++d) { e += idx[d] * str[d]; }
+    return cplx ? 2u * e : e;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+
+    bool ac = (pc.meta.w & 1u) != 0u;
+    bool bc = (pc.meta.w & 2u) != 0u;
+    bool oc = (pc.meta.w & 4u) != 0u;
+
+    uvec4 idx = out_index(gid);
+    uint ia = buf_index(idx, pc.astr, pc.offs.x, ac);
+    uint ib = buf_index(idx, pc.bstr, pc.offs.y, bc);
+    uint io = buf_index(idx, pc.ostr, pc.offs.z, oc);
+
+    double ar = a[ia];
+    double ai = 0.0lf;
+    if (ac) { ai = a[ia + 1u]; }
+    double br = b[ib];
+    double bi = 0.0lf;
+    if (bc) { bi = b[ib + 1u]; }
+
+    precise double rr = 0.0lf;
+    precise double ri = 0.0lf;
+    uint op = pc.meta.z;
+    if (op == 0u) {
+        rr = ar + br;
+        ri = ai + bi;
+    } else if (op == 1u) {
+        rr = ar - br;
+        ri = ai - bi;
+    } else if (op == 2u) {
+        rr = ac ? ar * br - ai * bi : ar * br;
+        ri = ar * bi + ai * br;
+    } else if (bc) {
+        // Smith's algorithm, matching cdiv_re/cdiv_im in lib/ml/ops.zeph. The
+        // brief's naive (ar*br + ai*bi)/(br*br + bi*bi) overflows for large
+        // components where this does not, and the Zephyr code is the
+        // reference the tolerance gate compares against.
+        if (abs(br) >= abs(bi)) {
+            precise double r = bi / br;
+            precise double den = br + bi * r;
+            rr = (ar + ai * r) / den;
+            ri = (ai - ar * r) / den;
+        } else {
+            precise double r = br / bi;
+            precise double den = br * r + bi;
+            rr = (ar * r + ai) / den;
+            ri = (ai * r - ar) / den;
+        }
+    } else {
+        // ew_real does a plain divide; going through Smith here would turn
+        // x/0 into NaN instead of the infinity the CPU reference produces.
+        rr = ar / br;
+    }
+
+    o[io] = rr;
+    if (oc) { o[io + 1u] = ri; }
+}
