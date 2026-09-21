@@ -48,8 +48,9 @@ let y  = pt.get32(4)
 
 > One rule that matters: a buffer the OS or GPU **writes into** across time (a
 > swapchain image, a cursor `POINT` read every frame) must be `VirtualAlloc`'d,
-> not a `Bytes`/list allocation, because the conservative collector can reclaim
-> the latter. See spec.md §3.6.
+> not a `Bytes`/list allocation. The address you hand the GPU is not a reference,
+> so the last Zephyr variable holding that allocation going out of scope frees it
+> underneath the device. See spec.md §3.6.
 
 ## The Vulkan wrapper — `lib/vk`
 

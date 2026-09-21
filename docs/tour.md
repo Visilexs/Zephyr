@@ -134,7 +134,8 @@ print(q)                 // Point{x: 6, y: 8}
 ```
 
 Struct literals must initialize every field. Structs are reference types
-allocated on the GC heap.
+allocated on the heap and freed by reference counting the compiler inserts —
+you never write it, and there is nothing to free by hand.
 
 ## Globals
 

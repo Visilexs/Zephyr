@@ -313,8 +313,8 @@ mutated.
 
 Declarations at statement depth 0 of the program are **globals**: they are
 visible inside every function that appears after them in the source, and they
-are GC roots. Declarations nested in any block (including top-level `if`/
-`for`/`while` bodies) are locals. Top-level code executes in source order.
+are roots for the backstop collector (§4). Declarations nested in any block
+(including top-level `if`/`for`/`while` bodies) are locals. Top-level code executes in source order.
 
 ### 3.2 Conversions
 
@@ -442,7 +442,7 @@ extern fn MessageBoxA(hwnd: int, text: int, cap: int, flags: int) -> i32 from "u
 ```
 
 **Raw memory.** Addresses are plain `int`s; there is no bounds checking and the
-garbage collector does not track them (see the caution below).
+runtime does not count or trace them (see the caution below).
 
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
@@ -455,8 +455,11 @@ garbage collector does not track them (see the caution below).
 Off-heap memory is obtained by calling the OS directly, e.g.
 `win("VirtualAlloc", 0, n, 12288, 4)` (MEM_RESERVE|COMMIT, PAGE_READWRITE).
 Buffers the OS writes into (a `POINT`, a `RECT`, a swapchain image) **must**
-live off-heap this way: the conservative collector (§4) can move or reclaim a
-`zeros()`/list allocation, but never a `VirtualAlloc` region.
+live off-heap this way: a `zeros()`/list allocation is reclaimed as soon as the
+last reference to it goes away (§4), and the address you handed the OS does not
+count as one; a `VirtualAlloc` region is never reclaimed. The heap itself never
+moves an object, so a raw address stays valid exactly as long as some Zephyr
+variable still holds the value.
 
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
 to the kernel shim `k32_Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
@@ -469,19 +472,43 @@ All native interop requires the Zephyr runtime (`--rt`).
 
 ## 4. Memory model
 
-All composite values (str, list, struct) are references to garbage-collected
-heap objects; assignment and argument passing copy the reference. int, float,
-and bool are values. Memory safety guarantees:
+All composite values (str, list, struct) are references to heap objects;
+assignment and argument passing copy the reference. int, float, and bool are
+values. Memory safety guarantees:
 
-1. no dangling references — the GC frees only unreachable objects
+1. no dangling references — an object outlives every reference to it
 2. no out-of-bounds access — every index is checked (panic on failure)
 3. no null and no uninitialized reads — construction requires all values
 4. no manual deallocation — there is nothing to double-free
 
-The runtime uses a conservative mark-sweep collector triggered by allocation
-pressure: it scans the machine stack and the globals array for anything that
-looks like a heap pointer, so it can only ever over-retain, never over-free —
-safety is preserved in all cases.
+**Reference counting.** Memory is reclaimed by counting, and the compiler
+writes the counting for you — there is no `retain`, no `release`, and no
+annotation. Every heap object carries a count; each slot holding a reference
+(local, parameter, field, element, global) owns one, storing over a slot
+releases what it held, and a function releases its locals as it returns. An
+object is freed at the instant its last reference goes away, so reclamation is
+spread through the program rather than pooled into a pause, and peak memory
+tracks the live set rather than twice it. This is an implementation guarantee,
+not a language-visible one: a program cannot observe *when* an object is freed.
+
+The heap is **non-moving**. An object stays at the address it was allocated at
+for its whole life, which is what makes `addr()` (§3.6) usable at all.
+
+**Cycles and the backstop.** Counting alone cannot reclaim a cycle — a struct
+reachable from itself keeps its own count above zero. A conservative mark-sweep
+collector therefore stays linked underneath: it scans the machine stack and the
+globals array for anything that looks like a heap pointer, so it can only ever
+over-retain, never over-free. It runs only when allocation cannot be satisfied
+past a growth target, which counting makes rare. A cycle is a leak rather than a
+safety break — none of the four guarantees above depends on the collector — but
+it is a leak the backstop eventually clears, at the cost of a pause. That pause
+is the reason to avoid cyclic structures in latency-sensitive code.
+
+Counts are **not atomic**, which is why a heap reference may never cross a
+thread boundary (§8).
+
+On the `--wasm` target the compiler emits no counting; that backend reclaims
+with the collector alone.
 
 ## 5. Formatting
 
@@ -513,7 +540,7 @@ The same source compiles to three targets, selected by a flag:
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
 | `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `k32_*` |
-| `--wasm` | WebAssembly | `.wasm` module | runtime and GC included; prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
+| `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 
 Not every feature reaches every target. WebAssembly currently omits file I/O,
 closures, interfaces and threads; native interop (§3.6) via `extern fn … from`
@@ -529,7 +556,7 @@ zc.exe [flags] input.zeph [output]
 
 | Flag | Effect |
 |------|--------|
-| `--rt` | Link the Zephyr-written runtime (GC, strings, threads, native interop). Output depends only on the target's kernel interface. Required for anything in §3.5/§3.6/§8. |
+| `--rt` | Link the Zephyr-written runtime (memory management, strings, threads, native interop). Output depends only on the target's kernel interface. Required for anything in §3.5/§3.6/§8. |
 | `--linux` / `--wasm` | Select the target (§7.1); default is Windows. |
 | `-g` / `--debug` | Emit a `.zdbg` debug-info sidecar (native-exe output only). |
 | `--version` | Print the compiler version; compiles nothing if given alone. |
@@ -551,12 +578,15 @@ Threads are available on the Windows target through `lib/std/thread.zeph`
 | `cpu_count()` | → int | Logical processor count. |
 
 The worker argument is deliberately an `int` — a worker index or a raw buffer
-address — never a heap reference, because it travels through memory the
-collector does not scan. Share data by passing an off-heap buffer address (§3.6)
-and partitioning it by index.
+address — **never a heap reference**. Two reasons, either sufficient: it
+travels through memory the collector does not scan, and reference counts are
+not atomic (§4), so two threads adjusting the same count would race and free an
+object that is still in use. Share data by passing an off-heap buffer address
+(§3.6) and partitioning it by index.
 
-There is **no user-facing mutex or atomics API**. The garbage collector is
-stop-the-world: it suspends every registered thread and scans each one's
-register context and stack, so collection is safe under concurrency without any
-locking in user code. String interpolation is thread-safe (a per-thread
+There is **no user-facing mutex or atomics API**. None is needed while that
+rule is kept: threads share no counted object. The backstop collector is
+stop-the-world — it suspends every registered thread and scans each one's
+register context and stack — so the rare collection is safe under concurrency
+without any locking in user code. String interpolation is thread-safe (a per-thread
 builder). Threads are not available on `--linux` or `--wasm`.

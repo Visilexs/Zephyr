@@ -24,7 +24,7 @@ obvious from a `.zeph` file, check `docs/spec.md` — don't assume Rust semantic
 powershell -File tests\run_tests.ps1
 .\zc.exe --linux --rt app.zeph app  # static ELF64: no libc, no interpreter, syscalls only
 wsl ./app
-.\zc.exe --wasm --rt app.zeph app.wasm   # WebAssembly, runtime and GC included
+.\zc.exe --wasm --rt app.zeph app.wasm   # WebAssembly (the one target reclaiming by collection)
 node scripts\wasm-run.js app.wasm
 .\scripts\build-wasm-demo.ps1       # same module inlined into one HTML page
 .\scripts\crosscheck-linux.ps1      # same sources both targets, output must match
@@ -45,8 +45,10 @@ Editing the compiler = editing `compiler\zc.zeph` then `.\scripts\selfbuild.ps1`
 - **Ranges are half-open:** `for i in 1..101` iterates 1..100. (`0..xs.len()` is the idiom.)
 - **No null.** Absence is the optional type `T?` with `none`; use `.or(default)`,
   `.has()`, `.get(key)`. `let zero: int? = 0` is a value, not none.
-- **Every value is 64 bits;** composites live on a GC heap (conservative mark-sweep).
-  Lists are bounds-checked. No pointers, no manual memory, no use-after-free.
+- **Every value is 64 bits;** composites live on a reference-counted, non-moving
+  heap — the compiler inserts the counting, and a mark-sweep collector stays
+  linked underneath only to catch cycles. Lists are bounds-checked. No pointers,
+  no manual memory, no use-after-free.
 - **Method-call sugar:** `b.dist(a)` == `dist(b, a)`. `impl` blocks add methods;
   `fn new(...)` (no `self`) is an associated constructor called `Point.new(...)`.
 - **Enums print their member name** and compare by identity: `print(Color.Green)` → `Green`.
@@ -68,7 +70,7 @@ Roughly the order you meet things in:
 | `zc.exe` | the compiler. Must stay at the root: it resolves `lib/` and `compiler/runtime.zeph` relative to itself |
 | `examples/` | `basics/` `graphics/` `vulkan/` `threads/`, plus `shaders/` (GLSL + `.zsh` + compiled `.spv`) |
 | `lib/` | libraries importable as `std/â€¦`, `vk/â€¦`, `ui/â€¦`; `os/linux.zeph` is the syscall shim `--linux` links in |
-| `compiler/` | `zc.zeph` (the compiler, in Zephyr) and `runtime.zeph` (GC, strings, threads) |
+| `compiler/` | `zc.zeph` (the compiler, in Zephyr) and `runtime.zeph` (allocation + counting, strings, threads) |
 | `scripts/` | `selfbuild` `package` `clean` `embed-gen` `build-shaders` |
 | `tools/` | `vkgen.c` (Vulkan bindings from the SDK headers), `zspv.zeph` (Zephyr â†’ SPIR-V) |
 | `tests/` `bench/` `docs/` | suite, benchmarks vs C/Rust, spec and tour |
@@ -81,7 +83,7 @@ against `zc.exe`'s directory, so nesting an example deeper does not change them.
 ## Constraints
 
 - **Three targets.** Windows x86-64 (PE, kernel32), Linux x86-64 (static ELF, raw
-  syscalls), and WebAssembly (`--wasm`, runtime + GC included). Not yet on any
+  syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Not yet on any
   non-native target: threads. Not on wasm: files, closures and interfaces.
   wasm frames live in a shadow stack in linear memory so the conservative GC can
   scan them — see the memory-map comment above `write_wasm` in `zc.zeph`.
