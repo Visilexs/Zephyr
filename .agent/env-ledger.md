@@ -575,3 +575,66 @@ backward, gradient clip and an AdamW update.
 Cost scales close to linearly in D and in T, and batching to 64 buys only
 15% per example, so the schedule for M7 is set by D and by the number of
 runs, not by batch tuning.
+
+## A runtime bug that made training impossible, and its fix
+
+Any training loop longer than about 150 steps died with
+`out of memory (heap full)`. Forward-only loops survived indefinitely.
+Batches of 8, 16 and 32 all died at the same *iteration* despite four-fold
+differences in bytes per step, which ruled out peak memory and pointed at
+something counted per step rather than per byte.
+
+Measured with an instrumented scratch copy of the runtime, not inferred:
+
+| step | `__live` | `__leaked` | `__hbump` | free blocks in `__flbig` | bytes free |
+|---|---|---|---|---|---|
+| 10 | 8.7 MB | 0 | 64 MB | 13,824 | 51 MB |
+| 100 | 12.3 MB | 0 | 551 MB | 146,042 | 535 MB |
+| 180 | 9.5 MB | 0 | 985 MB | 263,568 | 965 MB |
+
+The live set is flat and nothing leaks. What grows is the free list: at the
+point of death 98% of the heap was free and unusable. `rx_take_free` splits a
+large block and pushes the remainder back, and nothing ever merged two
+neighbours again, so a workload that allocates the same set of shapes every
+iteration -- a training step is exactly that -- grinds the pool into slivers
+that no longer fit the sizes still being requested. About one large request
+in seventeen missed first-fit and extended the bump pointer instead, until
+the 1 GiB reservation ran out.
+
+The fix is coalescing in the sweep of `rx_collect`, which already walks the
+heap in address order: a run of consecutive dead objects becomes one free
+block, with the interior start bits cleared so conservative marking does not
+treat those addresses as object starts. `rx_take_free`'s split path already
+re-sets that bit for any remainder, so the two halves stay consistent.
+
+Afterwards the same loop runs 400 iterations without growth, and a full
+1,000-step training run completes in 8m47s.
+
+### Re-verification after the runtime change
+
+The compiler embeds `runtime.zeph`, so `embed-gen` was rerun and the
+fixpoint re-established. **The first attempt at that was wrong and is worth
+recording.** Staged compilers were run from a scratch directory that has no
+`lib/` or `compiler/` beside them, so they fell back to their *embedded*
+sources while a root-located compiler reads the on-disk ones; the two agreed
+with each other and disagreed with the real thing. Redone with every stage
+at the repository root, three stages are byte-identical:
+
+    e137bc52f347ba7ed6f53698dc59a9f09a0cad3d445a25ae7e684aeab75c8f04
+
+Also re-run after the change: all seventeen ML suites, the four GPU suites,
+the Linux crosscheck (7/7, including its own self-build fixpoint) and the
+wasm crosscheck (7/7).
+
+## M7 apparatus, measured
+
+A single run at the declared reduced preset: **8m47s**, 1,000 steps, 507s of
+training, 63 examples/second. The planned sweep is 66 tuning runs plus up to
+44 seed runs, so roughly 16 hours. It has not been run.
+
+One pilot (phase, task A, seed 1, lr 1e-3) reached validation accuracy 0.484
+against chance 0.125, with composition 0.783 and length 0.150. Those last two
+numbers came from the frozen splits, which the protocol says are read once
+after selection -- reading them in a pipeline check was a protocol slip, it
+is disclosed in RESULTS.md, and a `smoke` mode now makes it impossible to
+repeat by accident.
