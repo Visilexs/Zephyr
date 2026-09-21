@@ -1,9 +1,8 @@
 # Zephyr
 
-A small, statically-typed, memory-safe programming language that compiles to
-native machine code — Windows x86-64, Linux x86-64 (static ELF), and
-WebAssembly — from one self-hosted toolchain with no external assembler,
-linker, or C compiler in the loop.
+A small, statically typed, memory-safe language that compiles to native code —
+Windows x86-64, Linux x86-64 (static ELF), and WebAssembly — from one
+self-hosted toolchain. No external assembler, linker, or C compiler in the loop.
 
 ```zephyr
 struct Point { x: float, y: float }
@@ -22,322 +21,279 @@ print(b.dist(a))                    // same call, method syntax
 
 ## Why
 
-- **Memory safe, with no collector pauses.** No pointers, no manual memory, no
-  null. Memory is reclaimed by **reference counting the compiler inserts for
-  you** — every list access is bounds-checked, and every variable must be
-  initialized. There is no way to write a use-after-free, double-free, buffer
-  overrun, or null dereference, and no thread ever stops for a collection: a
-  50 MB live set churning 585 MB over 3,000 frames shows a **29 µs** worst-case
-  pause, where the old tracing collector spiked to ~4 ms.
-- **Statically typed, but concise.** Types are inferred for locals
-  (`let x = 3`), required only on function signatures and struct fields.
-  `int` widens to `float` implicitly; every other conversion is explicit
-  and visible: `n as str`, `"3.14" as float`.
-- **Native performance, measured honestly.** Programs compile to x86-64
-  assembly and link into a standalone `.exe`. `bench\run_suite.ps1` runs eight
-  workload areas as the *same algorithm* in Zephyr, C (`gcc -O2`) and Rust
-  (`rustc -O`), and verifies the output checksum is byte-identical across all
-  three before trusting a single number. Current standing (best-of-7, Windows
-  x86-64, a Zen5 desktop):
+**Memory safe, without collector pauses.** No pointers, no manual memory, no
+null. Memory is reclaimed by reference counting the compiler inserts; every
+index is bounds-checked and every variable is initialized at creation. Nothing
+stops for a collection: the worst-case pause under heavy churn is 29 µs, against
+~4 ms for the tracing collector it replaced. See
+[reference counting](#reference-counting).
 
-  | Area | Zephyr | C `-O2` | Rust `-O` | |
-  |------|-------:|--------:|----------:|---|
-  | integer SIMD (matmul) | **42 ms** | 72 | 70 | wins both |
-  | rasterization (cube) | **8 ms** | 10 | 11 | wins both |
-  | bignum (pi) | **66 ms** | 84 | 91 | wins both |
-  | allocation churn (strings) | **132 ms** | 172 | 148 | wins both |
-  | sorting | **139 ms** | 276 | 43 | 2× faster than C |
-  | recursion (fib) | 21 ms | 12 | 21 | ties Rust |
-  | hash map | 83 ms | 32 | 69 | ties Rust |
-  | float compute (mandel) | 109 ms | 88 | 90 | 1.2× |
+**Statically typed, lightly annotated.** Locals infer (`let x = 3`); signatures
+and struct fields are declared. `int` widens to `float` implicitly. Every other
+conversion is written out: `n as str`, `"3.14" as float`.
 
-  Zephyr beats **both** compilers outright on integer SIMD, rasterization,
-  bignum, and allocation churn (a single-allocation string builder vs C's and
-  Rust's per-format heap strings), beats C by 2× on sorting (a
-  branchless-partition introsort — the pdqsort technique — against C's
-  `qsort`), ties Rust on recursion and hash maps, and is within ~1.2× on
-  float. **Peak memory is the lowest of the three on most rows.** Every row
-  also *compiles* ~10× faster than gcc or rustc on the same program.
+**Native performance.** `bench\run_suite.ps1` runs each workload as the same
+algorithm in Zephyr, C (`gcc -O2`) and Rust (`rustc -O`), and checks the output
+checksums match across all three before reporting a number. Best-of-7 on a Zen5
+desktop, Windows x86-64:
 
-  **Caveat: that Zephyr column was measured before reference counting
-  replaced the collector.** The C and Rust columns are unaffected. Re-running
-  every benchmark against both compilers, same machine, same checksums, gives
-  the cost of the change:
+| Area | Zephyr | C `-O2` | Rust `-O` | |
+|------|-------:|--------:|----------:|---|
+| integer SIMD (matmul) | **42 ms** | 72 | 70 | wins both |
+| rasterization (cube) | **8 ms** | 10 | 11 | wins both |
+| bignum (pi) | **66 ms** | 84 | 91 | wins both |
+| allocation churn (strings) | **132 ms** | 172 | 148 | wins both |
+| sorting | **139 ms** | 276 | 43 | 2× faster than C |
+| recursion (fib) | 21 ms | 12 | 21 | ties Rust |
+| hash map | 83 ms | 32 | 69 | ties Rust |
+| float compute (mandel) | 109 ms | 88 | 90 | 1.2× |
 
-  | | fib | matmul | mandel | sort | strings | hashmap | cube | pi | liquid |
-  |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-  | ref-counting vs collector | 0.85× | 1.10× | 0.95× | 1.04× | 1.15× | 1.20× | 1.23× | 1.10× | 1.05× |
+The sorting win is a branchless-partition introsort (the pdqsort technique)
+against C's `qsort`. The allocation win is a single-allocation string builder
+against per-format heap strings. Peak memory is the lowest of the three on most
+rows, and every row compiles about 10× faster than gcc or rustc.
 
-  Median ~1.1×, and the allocation row pays the most — so its win over Rust is
-  now inside the noise, while the rest of the table stands. Peak memory on that
-  row **falls from 14 MB to 3 MB**, because nothing waits for a collection to
-  come around. The compiler itself, the heaviest Zephyr program there is, runs
-  at 1.36× its collector-era self.
+That Zephyr column predates reference counting. The C and Rust columns are
+unaffected. Re-running each benchmark against both compilers, same machine,
+same checksums:
 
-- **A real optimizer — including things gcc and LLVM don't do.** The
-  self-hosted compiler carries: a function **inliner**, **register promotion**
-  of loop-hot locals into callee-saved registers (integers into GPRs, floats
-  into callee-saved `xmm6`–`xmm11`), an **xmm-native float expression
-  evaluator**, compare-and-branch fusion (integer *and* float, threaded through
-  `and`/`or` short-circuits), immediate-operand folding, push/pop-free leaf
-  operands and array indexing, a peephole pass, and **AVX2 auto-vectorization**
-  of the AXPY, fill, and index-weighted-reduction idioms (where gcc/LLVM emit
-  2-wide SSE2 or leave the loop scalar entirely).
+| | fib | matmul | mandel | sort | strings | hashmap | cube | pi | liquid |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| counting vs collector | 0.85× | 1.10× | 0.95× | 1.04× | 1.15× | 1.20× | 1.23× | 1.10× | 1.05× |
 
-- **Runtime-reciprocal division.** Mainstream compilers turn division into
-  multiply-by-reciprocal *only* when the divisor is a compile-time constant.
-  Zephyr also does it when the divisor is merely **loop-invariant at runtime**
-  (a `%1000000007`, a variable that isn't reassigned in the loop): at loop
-  entry it computes the magic reciprocal `M = (2⁶⁴−1)/d` with one hardware
-  divide, then each div/mod site runs `mulhi` + one conditional fixup — ~2×
-  faster than `idiv` — and falls back to exact `idiv` for negative operands, so
-  results are bit-for-bit identical. This is what programmers reach for
-  `libdivide` to do by hand; Zephyr does it automatically, and it alone flipped
-  the pi benchmark from losing to C (93 ms) to winning (68 ms).
+Median about 1.1×. The allocation row pays the most, so its win over Rust is now
+inside the noise; the rest of the table stands. Peak memory on that row drops
+from 14 MB to 3 MB. The compiler itself, the heaviest Zephyr program there is,
+runs at 1.36× its collector-era self.
 
-- **Fast compiler.** The whole frontend (lex, parse, typecheck) does
-  **10,000 lines in ~18 ms**; total build time is dominated by the ~0.2 s
-  assemble/link step.
-- **Readable.** `and`/`or`/`not` instead of symbol soup, string interpolation
-  (`"hello {name}"`), no semicolons, `let` vs `var` for immutability.
-- **Batteries included.** Lists `[T]`, hash maps `[K: V]`, `struct`s, `enum`s
-  (which print their member name), optionals `T?`, closures, generics,
-  interfaces (structural, dynamic dispatch), and `import "other.zeph"` for
-  multi-file programs.
-- **Three targets, one source.** The same program compiles to a Windows PE
-  (`.exe`, kernel32 only), a static Linux ELF (`--linux`, raw syscalls, no
-  libc), or a WebAssembly module (`--wasm`, runtime included — this is the one
-  target that still reclaims with the tracing collector rather than counting).
-  `crosscheck` scripts compile both native targets from the same sources and
-  require byte-identical output.
-- **Talks to the machine when it needs to.** A native-interop layer —
-  `win("user32!GetDC", …)`, the `callptr` intrinsic, `extern fn … from "x.dll"`,
-  and raw-memory builtins — lets pure Zephyr call the OS and the GPU directly.
-  On top of it the repo ships a **Vulkan wrapper** (`lib/vk`, with a
-  Zephyr→SPIR-V shader compiler in `tools/zspv.zeph`), an immediate-mode **GUI
-  toolkit** (`lib/ui`), and **threads** (`lib/std/thread.zeph`,
-  `parallel_for`). The `examples/graphics` directory drives all of it — from a
-  software particle rasterizer to a real-time, geodesic-ray-traced black hole.
-  See [docs/graphics.md](docs/graphics.md).
-- **A standard library written in Zephyr, not welded into the compiler.**
-  `contains`, `map`, `filter`, `fold`, `sort_by` and friends live in
-  `lib/std/list.zeph` as ordinary generic code:
+**The optimizer.** Function inliner, register promotion of loop-hot locals into
+callee-saved registers (integers into GPRs, floats into `xmm6`–`xmm11`), an
+xmm-native float expression evaluator, compare-and-branch fusion (integer and
+float, threaded through `and`/`or` short-circuits), immediate-operand folding,
+push/pop-free leaf operands and array indexing, a peephole pass, and AVX2
+auto-vectorization of the AXPY, fill, and index-weighted-reduction idioms, where
+gcc and LLVM emit 2-wide SSE2 or leave the loop scalar.
 
-  ```zephyr
-  fn contains[T](xs: [T], x: T) -> bool {
-      for v in xs { if v == x { return true } }
-      return false
-  }
-  ```
+**Runtime-reciprocal division.** Mainstream compilers turn division into
+multiply-by-reciprocal only when the divisor is a compile-time constant. Zephyr
+also does it when the divisor is merely loop-invariant at runtime — a
+`%1000000007`, or a variable not reassigned in the loop. At loop entry it
+computes the magic reciprocal `M = (2⁶⁴−1)/d` with one hardware divide, then
+each div/mod site runs `mulhi` plus a conditional fixup, about 2× faster than
+`idiv`. Negative operands fall back to exact `idiv`, so results are bit-for-bit
+identical. This is what `libdivide` does by hand. It alone flipped the pi
+benchmark from losing to C (93 ms) to winning (68 ms).
 
-  Type parameters are inferred from the arguments, and each instantiation is
-  type-checked with `T` bound — so `contains` gets the right `==` for `int`,
-  `str` or an enum, with no trait system anywhere.
+**Fast compiler.** Lex, parse and typecheck run 10,000 lines in ~18 ms; build
+time is dominated by the ~0.2 s assemble/link step.
 
-## Install & self-build
+**Readable.** `and`/`or`/`not` rather than symbol soup, string interpolation
+(`"hello {name}"`), no semicolons, `let` versus `var`.
 
-The live compiler is `zc.exe` — the Zephyr compiler, **written in Zephyr**. It
-contains its own x86-64 assembler and PE linker and depends on nothing but
-`kernel32.dll`. To rebuild it from source you use it to compile itself — no
-gcc, no C:
+**Batteries included.** Lists `[T]`, hash maps `[K: V]`, structs, enums (which
+print their member name), optionals `T?`, closures, generics, structural
+interfaces with dynamic dispatch, and `import "other.zeph"`.
 
-```powershell
-.\scripts\selfbuild.ps1     # zc.exe recompiles compiler\zc.zeph into a new zc.exe
-.\zc.exe --rt app.zeph app.exe   # compile a program (kernel32-only output)
+**Three targets, one source.** A Windows PE (kernel32 only), a static Linux ELF
+(`--linux`, raw syscalls, no libc), or a WebAssembly module (`--wasm`, the one
+target still reclaiming by collection rather than counting). The `crosscheck`
+scripts compile both native targets from the same sources and require identical
+output.
+
+**Talks to the machine.** A native-interop layer — `win("user32!GetDC", …)`, the
+`callptr` intrinsic, `extern fn … from "x.dll"`, and raw-memory builtins — lets
+pure Zephyr call the OS and the GPU. On top of it the repo ships a Vulkan
+wrapper (`lib/vk`, with a Zephyr→SPIR-V shader compiler in `tools/zspv.zeph`),
+an immediate-mode GUI toolkit (`lib/ui`), and threads (`lib/std/thread.zeph`,
+`parallel_for`). `examples/graphics` drives all of it, from a software particle
+rasterizer to a real-time geodesic-ray-traced black hole. See
+[docs/graphics.md](docs/graphics.md).
+
+**A standard library in Zephyr, not welded into the compiler.** `contains`,
+`map`, `filter`, `fold`, `sort_by` and the rest live in `lib/std/list.zeph` as
+ordinary generic code:
+
+```zephyr
+fn contains[T](xs: [T], x: T) -> bool {
+    for v in xs { if v == x { return true } }
+    return false
+}
 ```
 
-`scripts\selfbuild.ps1` also checks the classic bootstrap invariant: the new compiler
-must reproduce itself byte-for-byte. Editing the compiler is just editing
-`compiler\zc.zeph` and running `scripts\selfbuild.ps1` again — Zephyr compiling Zephyr.
+Type parameters are inferred from the arguments, and each instantiation is
+type-checked with `T` bound, so `contains` gets the right `==` for `int`, `str`
+or an enum without a trait system.
 
-### The one-time seed (historical)
+## Build
 
-A self-hosted compiler is a binary that builds itself, so it needs a starting
-binary — exactly like `rustc` or the Go toolchain. Everything C lives in
-`bootstrap\`, isolated from the live source. Zephyr's first `zc.exe` was
-produced **once** from that C seed:
+`zc.exe` is the compiler, written in Zephyr. It carries its own x86-64 assembler
+and PE linker and depends on nothing but `kernel32.dll`. Rebuilding it means
+compiling it with itself:
 
 ```powershell
-.\bootstrap\build.ps1     # gcc builds the C seed and emits the first zc.exe
+.\scripts\selfbuild.ps1          # recompiles compiler\zc.zeph into a new zc.exe
+.\zc.exe --rt app.zeph app.exe   # compile a program
 ```
 
-After that, gcc and the C sources (`bootstrap\zephyr.c`, `bootstrap\runtime.c`)
-are no longer part of the toolchain — they're the fossil seed, kept only so
-the compiler can be reconstructed from nothing if the binary is ever lost.
-`bootstrap\nocc.ps1` proves the loop needs neither.
+`selfbuild.ps1` checks the bootstrap invariant: the new compiler must reproduce
+itself byte-for-byte. Editing the compiler is editing `compiler\zc.zeph` and
+running it again.
 
 ## Use
 
 ```powershell
-.\zc.exe --rt app.zeph app.exe     # compile app.zeph to a kernel32-only exe
-.\app.exe                             # run it
+.\zc.exe --rt app.zeph app.exe   # kernel32-only exe
+.\app.exe
+.\zc.exe --rt app.zeph app.s     # generated assembly instead
 ```
 
-`zc.exe` is **single-file**: `runtime.zeph` and the `std/` library are embedded
-in the binary (regenerated by `tools\embed-gen.ps1`, which `scripts\selfbuild.ps1` runs
-automatically). A `runtime.zeph` or `std\` found next to the exe — or in the
-current directory — overrides the embedded copy, so the edit-and-rebuild dev
-workflow in this repo is unchanged, while a copied-out `zc.exe` works alone.
+`zc.exe` is single-file: `runtime.zeph` and `std/` are embedded in the binary,
+regenerated by `scripts\embed-gen.ps1`, which `selfbuild.ps1` runs for you. A
+`runtime.zeph` or `std\` next to the exe, or in the current directory, overrides
+the embedded copy — so the dev loop in this repo works against the on-disk
+sources while a copied-out `zc.exe` still works alone.
 
 ### Packaging
 
-`.\package.ps1` assembles the end-user distribution in `dist\zephyr-<version>\`
-(and a `.zip`): the single-file `zc.exe` plus docs and examples — no bootstrap
-sources, tests, or benchmarks. It self-checks by copying `zc.exe` into a bare
-directory and compiling a std-importing program there before zipping.
-
-`zc.exe` is the self-hosted compiler; its output ends in `.s` instead of
-`.exe` if you want to read the generated assembly. It carries the full
-optimizer described above — inliner, register promotion, runtime-reciprocal
-division, the AVX2 auto-vectorizers, and the rest — so it, not the historical C
-seed, produces the benchmark numbers. The C seed (`bootstrap\zephyr.exe`)
-additionally offers `run` / `check` conveniences during development.
+`.\scripts\package.ps1` assembles `dist\zephyr-<version>\` and a `.zip`: the
+single-file `zc.exe` plus docs and examples, no bootstrap sources, tests or
+benchmarks. It self-checks by copying `zc.exe` into a bare directory and
+compiling a std-importing program there before zipping.
 
 ## Documentation
 
-- [Language tour](docs/tour.md) — learn Zephyr in ten minutes.
-- [Language specification](docs/spec.md) — grammar, type rules, conversion
-  table, runtime semantics, native interop, targets, concurrency.
+- [Language tour](docs/tour.md) — Zephyr in ten minutes.
+- [Language specification](docs/spec.md) — grammar, type rules, conversions,
+  runtime semantics, native interop, targets, concurrency.
 - [Graphics & GPU](docs/graphics.md) — the FFI, the Vulkan wrapper, the
   Zephyr→SPIR-V shader compiler, and the `examples/graphics` walkthrough.
 
 ## Self-hosting
 
-The compiler exists twice: the bootstrap compiler in C (`bootstrap/zephyr.c`)
-and the **self-hosted compiler written in Zephyr itself** (`compiler/zc.zeph`,
-~6,200 lines of Zephyr — a complete lexer, parser, type checker, optimizer,
-x86-64 code generator, **assembler, and PE linker**). `bootstrap\bootstrap.ps1`
-proves the fixpoint two ways:
+The compiler exists twice: a bootstrap compiler in C (`bootstrap/zephyr.c`) and
+the self-hosted one in Zephyr (`compiler/zc.zeph`, ~13,500 lines — lexer,
+parser, type checker, optimizer, x86-64 code generator, assembler, PE linker).
 
-- **gcc path**: `zc` emits assembly, gcc assembles/links it.
-- **native path**: `zc` assembles and PE-links its own `.exe` with no
-  external tools, then does it again — byte-identical output.
-
-Any change to code generation is promoted through a three-stage bootstrap (the
-old compiler builds one with the new codegen, which then rebuilds itself to a
-byte-identical fixpoint), so the compiler that ships is always one that
-reproduces itself exactly.
+A self-hosted compiler needs a starting binary, like rustc or the Go toolchain.
+Everything C lives in `bootstrap\`, isolated from the live source, and produced
+the first `zc.exe` once:
 
 ```powershell
-powershell -File bootstrap\bootstrap.ps1       # verifies both fixpoints
-.\zc.exe --rt app.zeph app.exe              # Zephyr compiling Zephyr to a native exe, zero C tools
+.\bootstrap\build.ps1        # gcc builds the C seed, which emits the first zc.exe
 ```
+
+After that gcc and the C sources are out of the toolchain, kept only so the
+compiler can be reconstructed from nothing if the binary is lost.
+
+```powershell
+powershell -File bootstrap\bootstrap.ps1   # verifies both fixpoints
+powershell -File bootstrap\nocc.ps1        # verifies the loop with no gcc and no C
+```
+
+`bootstrap.ps1` proves the fixpoint two ways: gcc assembling and linking `zc`'s
+assembly output, and `zc` assembling and PE-linking its own `.exe` with no
+external tools, twice, byte-identical. `nocc.ps1` goes further — the C seed
+builds a kernel32-only `zc`, that `zc` compiles `zc.zeph` with `--rt` into
+another kernel32-only `zc`, byte-identical on the second round, and the
+C-free-built compiler then compiles and runs ordinary programs. After the seed,
+gcc and the C runtime can be discarded.
+
+Any change to code generation is promoted through a three-stage bootstrap: the
+old compiler builds one carrying the new codegen, which rebuilds itself to a
+byte-identical fixpoint. The compiler that ships always reproduces itself.
 
 ## The runtime, written in Zephyr
 
-Zephyr's runtime exists in two forms. The default is C (`bootstrap/runtime.c`,
-`zephyr_rt.dll`) — it has the tracing collector and full float support. The second is
-**written in Zephyr itself** (`runtime.zeph`): allocation, strings, lists,
-struct/list formatting, interpolation, panics, and command-line args, all
-implemented with Zephyr's low-level primitives — bitwise ops, raw memory access
+The runtime exists in two forms. The default is C (`bootstrap/runtime.c`,
+`zephyr_rt.dll`), which has the tracing collector and full float support. The
+second is written in Zephyr (`runtime.zeph`): allocation, strings, lists,
+struct/list formatting, interpolation, panics, command-line args — all built
+from Zephyr's low-level primitives, namely bitwise ops, raw memory access
 (`load64`/`store8`/`addr`), and Win64 FFI to kernel32 (`win("WriteFile", …)`).
 
 ```powershell
 .\zc.exe --rt app.zeph app.exe   # link the Zephyr runtime
-.\app.exe                            # depends on kernel32.dll ONLY — no zephyr_rt.dll, no C
+.\app.exe                        # imports kernel32.dll only
 ```
 
-An executable built with `--rt` imports nothing but `kernel32.dll`. The Zephyr
-runtime is now feature-complete: every type (including maps, enums, optionals
-and function values), string/int/float parsing **and float formatting**
-(matching C's `%.15g`), file I/O, command-line args, and **reference counting**.
+The Zephyr runtime is feature-complete: every type including maps, enums,
+optionals and function values; string/int/float parsing and float formatting
+matching C's `%.15g`; file I/O; command-line args; and reference counting.
+`examples/basics/ffi_runtime.zeph` is a smaller standalone demonstration —
+stdout I/O and integer formatting in pure Zephyr, calling only kernel32.
 
 ### Reference counting
 
 Every object carries a 24-byte header: a count, a pointer to a static shape
 descriptor the compiler emits, and its size. The compiler holds an ownership
-contract — an expression leaves an *owned* value in `rax`, every slot that
-stores one owns a count, and a function releases its locals on the way out —
-so `retain`/`release` never appear in source. Nothing is deferred, so freeing
-is spread evenly through the program instead of pooling into a pause:
+contract — an expression leaves an owned value in `rax`, every slot storing one
+owns a count, and a function releases its locals on the way out — so retain and
+release never appear in source. Nothing is deferred, so freeing spreads through
+the program instead of pooling into a pause.
 
-- **29 µs worst-case frame** over 3,000 frames with a 50 MB live set and
-  585 MB churned (`spikes/gc_pause.zeph`), zero frames over 1 ms. The tracing
-  collector spiked to ~4 ms on the same workload, which drops frames.
-- **Counting does all the reclaiming.** A 300k-iteration churn loop with a
-  four-object live set peaks at 4 MB, and at exactly 4 MB again with the
-  collector stubbed out entirely.
-- Compiling `zc.zeph` — about four million objects — leaves **one**
-  unreachable object unfreed. The collector-era build left 3,996,212.
+- 29 µs worst-case frame over 3,000 frames, 50 MB live, 585 MB churned
+  (`spikes/gc_pause.zeph`), no frame over 1 ms. The tracing collector spiked to
+  ~4 ms on the same workload, which drops frames.
+- A 300k-iteration churn loop with a four-object live set peaks at 4 MB, and at
+  4 MB again with the collector stubbed out. Counting does all the reclaiming.
+- Compiling `zc.zeph`, about four million objects, leaves one unreachable object
+  unfreed. The collector-era build left 3,996,212.
 
-Counting alone cannot reclaim a **cycle**, so the conservative mark-sweep
-collector stays linked underneath it — a contiguous reserved heap with an
-object-start bitmap for O(1) pointer identification, free lists for O(1)
-allocation, and roots scanned from the machine stack and the globals array.
-It now fires only when the free lists come up empty past a growth target,
-which counting makes rare, so it collects the cycles and otherwise stays out
-of the way. Declaring a back-edge weak, so cycles never form, is planned and
-not implemented.
-
-`examples/ffi_runtime.zeph` is a smaller standalone demonstration — stdout I/O
-and integer formatting in pure Zephyr, calling only kernel32.
-
-### A self-sustaining toolchain with no gcc and no C
-
-The self-hosted compiler `zc` can be built *with* the Zephyr runtime, and it
-can *emit* `--rt` output — so the whole toolchain closes on itself with no C
-anywhere in the loop. `bootstrap\nocc.ps1` proves it:
-
-1. **One-time C seed**: the C `zephyr.exe` builds a kernel32-only `zc` (this
-   is the unavoidable bootstrap seed every self-hosted language has).
-2. That kernel32-only `zc` compiles `zc.zeph` (with `--rt`) into another
-   kernel32-only `zc` — **no gcc, no C runtime** — and does it again to a
-   **byte-identical fixpoint**.
-3. The C-free-built compiler then compiles and runs ordinary programs, all
-   depending on nothing but `kernel32.dll`.
-
-After the seed, gcc and the C runtime can be discarded: a Zephyr compiler,
-assembler, and linker — all written in Zephyr, all in one standalone
-executable — reproduce themselves and compile standalone programs.
+Counting cannot reclaim a cycle, so the conservative mark-sweep collector stays
+linked underneath: a contiguous reserved heap with an object-start bitmap for
+O(1) pointer identification, free lists for O(1) allocation, and roots scanned
+from the machine stack and the globals array. It fires only when the free lists
+come up empty past a growth target, which counting makes rare. Declaring a
+back-edge weak, so cycles never form, is planned and not implemented.
 
 ## How it works
 
-Both compilers share the same pipeline: lexer → recursive-descent parser →
-type checker → inliner → optimizer passes → x86-64 code generator (Intel-syntax
-assembly) → peephole → **built-in assembler and PE linker**. The assembler
-encodes exactly the instruction vocabulary the code generator emits, and the
-linker writes a Windows PE64 executable directly — imports, sections, entry
-stub and all — with no external tools. Every Zephyr value is 64 bits; composite
-values live on a reference-counted heap.
+Both compilers share a pipeline: lexer → recursive-descent parser → type checker
+→ inliner → optimizer passes → x86-64 code generator (Intel syntax) → peephole →
+built-in assembler and PE linker. The assembler encodes exactly the instruction
+vocabulary the code generator emits, and the linker writes a PE64 executable
+directly, imports and sections and entry stub included. Every Zephyr value is 64
+bits; composites live on a reference-counted heap.
 
-The self-hosted `zc.exe` links the Zephyr-written runtime (`--rt`) and imports
-only `kernel32.dll`. The historical C seed instead links `zephyr_rt.dll`, a
-small C runtime with the same semantics. The optimizer — inliner, register
-promotion, runtime-reciprocal division, compare-and-branch fusion, the AVX2
-vectorizers — lives in `compiler/zc.zeph`; the C seed carries an older subset
-and exists only to reconstruct the first `zc.exe` from source.
+The self-hosted `zc.exe` links the Zephyr runtime (`--rt`) and imports only
+`kernel32.dll`. The C seed instead links `zephyr_rt.dll`, a small C runtime with
+the same semantics, and carries an older subset of the optimizer. It exists only
+to reconstruct the first `zc.exe` from source; the numbers above come from
+`zc.exe`.
 
 ## Tests
 
 ```powershell
 powershell -File tests\run_tests.ps1
+powershell -File scripts\crosscheck-linux.ps1
+powershell -File scripts\crosscheck-wasm.ps1
 ```
 
-Covers the examples, language features, allocation stress (200k objects),
-compile-time errors, and runtime panics.
+`run_tests.ps1` covers the examples, language features, allocation stress (200k
+objects), compile-time errors, and runtime panics. The crosscheck scripts are
+the only cover the non-Windows backends get, and the Linux one includes a
+self-build fixpoint.
 
 ## Roadmap
 
-Maps, enums, modules, optionals, closures, generics, interfaces, float
-formatting, reference counting, the inliner, register promotion (integer
-*and* float), runtime-reciprocal division, a **register-based calling
-convention** for user functions, and two further backends — **Linux/ELF**
-(`--linux`) and **WebAssembly** (`--wasm`) — have all landed. Still open,
-roughly in the order that would move the benchmarks:
+Landed: maps, enums, modules, optionals, closures, generics, interfaces, float
+formatting, reference counting, the inliner, register promotion (integer and
+float), runtime-reciprocal division, a register-based calling convention for
+user functions, and the Linux/ELF and WebAssembly backends.
 
-- **Reference-counting overhead** — counting costs a median ~1.1× across the
-  benchmarks and 1.36× on the compiler itself. The remaining cost is the sheer
-  number of retains executed, not the price of each one, so the levers are
-  fewer owned reads: escape analysis to stack-allocate non-escaping
-  temporaries, reuse analysis to write in place when a count is known to be
-  one, and weak back-edges so the collector is no longer needed for cycles.
-  Counts are also non-atomic, so sharing an object across threads is unsound
-  until they become interlocked.
-- **Counting on WebAssembly** — the `--wasm` backend emits no counting and
-  still relies on the tracing collector.
-- **Feature parity across targets** — WebAssembly still lacks files, closures,
+Open, roughly in the order that would move the benchmarks:
+
+- **Reference-counting overhead.** The cost is the number of retains executed,
+  not the price of each, so the levers are all fewer owned reads: escape
+  analysis to stack-allocate non-escaping temporaries, reuse analysis to write
+  in place when a count is known to be one, and weak back-edges so cycles stop
+  needing the collector. Counts are also non-atomic, so sharing an object across
+  threads is unsound until they become interlocked.
+- **Counting on WebAssembly.** That backend emits none and relies on the
+  collector.
+- **Feature parity across targets.** WebAssembly lacks files, closures,
   interfaces and threads; native interop (`extern fn … from`) is Windows-only.
-- **Overloading** — one name, one function. Generics covered the cases that
-  actually mattered; overloading is a convenience, not a gap.
-- **More vectorizer idioms** — the AVX2 wins cover the AXPY, fill and reduction
-  shapes. A real cost model would generalise it.
+- **Overloading.** One name, one function. Generics covered the cases that
+  mattered; overloading is a convenience.
+- **More vectorizer idioms.** The AVX2 wins cover AXPY, fill and reduction
+  shapes. Generalizing needs a real cost model.
