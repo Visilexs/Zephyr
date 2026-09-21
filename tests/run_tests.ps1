@@ -345,6 +345,10 @@ $adSuites = [ordered]@{
     "ml-fusion"   = @("tests\ml\fusion_test.zeph", "fusion: 40 checks passed")
     "ml-gru"      = @("tests\ml\gru_test.zeph", "gru: 275 checks passed")
     "ml-dataset"  = @("tests\ml\dataset_test.zeph", "dataset: 98 checks passed")
+    "ml-transformer" = @("tests\ml\transformer_test.zeph", "transformer: 18 checks passed")
+    "ml-ablation"  = @("tests\ml\ablation_test.zeph", "ablation: 19 checks passed")
+    "ml-causal"    = @("tests\ml\causal_test.zeph", "causal: 20 checks passed")
+    "ml-lifecycle" = @("tests\ml\lifecycle_test.zeph", "lifecycle: 11 checks passed")
 }
 foreach ($nm in $adSuites.Keys) {
     $src = $adSuites[$nm][0]
@@ -396,7 +400,7 @@ if (-not ((Test-Path $spvF64) -and (Test-Path $spvC64))) {
         if ($gout -match "vkCreateInstance" -or $gout -match "no Vulkan") {
             Write-Host "SKIP ml-gpu -- no Vulkan device available"
         } else {
-            Check "ml-gpu" ($gout -match "gpu: 277 checks passed") "got tail: $($gout.Trim() -split "`n" | Select-Object -Last 1)"
+            Check "ml-gpu" ($gout -match "gpu: 279 checks passed") "got tail: $($gout.Trim() -split "`n" | Select-Object -Last 1)"
         }
     }
 }

@@ -22,6 +22,8 @@ let VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 let VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 let VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2
 let VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3
+let VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000
+let VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES = 1000180000
 let VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
 let VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12
 let VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
@@ -125,6 +127,7 @@ let VK_TRUE = 1
 let VK_FALSE = 0
 let VK_API_VERSION_1_0 = 4194304
 let VK_API_VERSION_1_1 = 4198400
+let VK_API_VERSION_1_2 = 4202496
 let VK_API_VERSION_1_3 = 4206592
 
 // ---- struct layouts ----
@@ -163,6 +166,18 @@ let VkDeviceCreateInfo_ppEnabledLayerNames = 40
 let VkDeviceCreateInfo_enabledExtensionCount = 48
 let VkDeviceCreateInfo_ppEnabledExtensionNames = 56
 let VkDeviceCreateInfo_pEnabledFeatures = 64
+// 55 VkBool32 fields in spec order; shaderFloat64 is field 39 (0-based).
+let VkPhysicalDeviceFeatures_sizeof = 220
+let VkPhysicalDeviceFeatures_shaderFloat64 = 156
+let VkPhysicalDeviceFeatures2_sizeof = 240
+let VkPhysicalDeviceFeatures2_sType = 0
+let VkPhysicalDeviceFeatures2_pNext = 8
+let VkPhysicalDeviceFeatures2_features = 16
+let VkPhysicalDeviceShaderAtomicInt64Features_sizeof = 24
+let VkPhysicalDeviceShaderAtomicInt64Features_sType = 0
+let VkPhysicalDeviceShaderAtomicInt64Features_pNext = 8
+let VkPhysicalDeviceShaderAtomicInt64Features_shaderBufferInt64Atomics = 16
+let VkPhysicalDeviceShaderAtomicInt64Features_shaderSharedInt64Atomics = 20
 let VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256
 let VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1
 let VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU = 2

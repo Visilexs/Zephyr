@@ -38,6 +38,14 @@ chk(gpu_unavailable() == "", "backend is available here")
 let m = gpu_init()
 print("device: {gpu_device_name(m)}")
 
+// ---- the optional device features the kernels rely on --------------------
+// Every f64 kernel needs shaderFloat64 and scatter_add_f64 needs 64-bit
+// buffer atomics. Both are optional in Vulkan and using one unenabled is
+// undefined behaviour, so assert they really were enabled: a regression that
+// silently stops requesting them would otherwise keep passing here by luck.
+chk(m.g.has_f64, "shaderFloat64 is enabled on this device")
+chk(m.g.has_int64_atomics, "shaderBufferInt64Atomics is enabled on this device")
+
 var SEED = 20260921
 fn rnd() -> float {
     SEED = (SEED * 1103515245 + 12345) % 2147483648
