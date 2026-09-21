@@ -308,6 +308,59 @@ far slower than on the CPU. That is a fact about per-op dispatch, not about
 the device, and it is what tensor residency is for. A23 gates correctness;
 the performance work is M6's.
 
+## Tensor IR: capture, verification, guards and cache (A24)
+
+`lib/ml/ir.zeph` and `tests/ml/ir_test.zeph`, 58 checks. The suite implements
+the acceptance list at the end of the specification's tensor-IR section one
+item at a time: text dump golden tests, invalid IR rejection, eager versus
+captured output and gradient equivalence, shape guard miss, effect ordering,
+cache invalidation, and a source-located backend error.
+
+Capture is a translation of the autograd tape, not a second tracer. The tape
+is already an eagerly recorded operation graph with one value per node and
+handles allocated in forward order; the IR adds what a compiler needs and a
+tape does not -- dtype, shape, stride and device on every value, effects on
+every node, and a form that can be verified, hashed, printed deterministically
+and cached. The eager path stays the oracle, as M6 requires.
+
+The verifier returns a list of diagnostics rather than panicking on the first,
+because one that stops at a single problem is useless for what it is for.
+Every diagnostic names its tape node. Eight corruption cases are tested, each
+built by mutating a real capture: broken dominance, an out-of-range operand, a
+matmul with disagreeing inner dimensions, an abs2 declared complex, an
+elementwise dtype mismatch, a transfer boundary with no transfer, a sum_dim
+over a missing axis, and a result outside the graph. A ninth check requires a
+clean graph to still pass, so the verifier is not rejecting unconditionally.
+
+The cache key carries all eight components the specification lists, and the
+test changes each in turn and requires a miss: graph hash, guard hash, ABI,
+backend, device, driver version, numeric flags, layout.
+
+### A test that passed for the wrong reason
+
+"A different shape gives a different hash" passed even with the shape term
+deleted from `ir_hash`. `av_sum_all` records its input shape in the node
+attributes, which the hash also covers, so the two graphs differed through
+`ia` and the shape term was never exercised. The suite now also compares two
+captures with no reduction in them, where nothing but the value shape can tell
+them apart, and the same for dtype. Both mutations are caught now.
+
+Mutations caught: dominance check removed, shape dropped from the hash, dtype
+dropped from the hash, driver version dropped from the cache key, shape
+dropped from the guard.
+
+### A real bug this suite found
+
+`t_cast` accepts the same dtype on both sides, and the `OP_CAST` VJP took
+`t_real` of the upstream gradient unconditionally. That is right for the
+real-to-complex cast the phase model uses, and a panic for a degenerate
+same-dtype cast, where the gradient is already real. Nothing in the library
+writes such a cast, so nothing else had caught it. Fixed in `autograd.zeph`
+with a named regression check; autograd 674, phase ad 180 and overfit 132 are
+unchanged by the fix.
+
+The real phase model captures and verifies clean.
+
 ## Streams, events and allocator lifetime (A22)
 
 `lib/ml/gpu_stream.zeph` and `tests/ml/gpu_stream_test.zeph`, 23 checks. The

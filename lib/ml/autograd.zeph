@@ -581,7 +581,17 @@ fn backward_node(nd: ANode, g: Tensor) {
     }
     if nd.op == OP_CAST {
         if nd.ia[0] == 1 { panic("autograd: no gradient path out of a complex-to-real cast") }
-        accumulate(a, t_real(g))
+        // The forward was real-to-something. If that something was complex the
+        // upstream gradient is complex and its real part is what flows back;
+        // if the cast was degenerate -- the same dtype on both sides, which is
+        // legal and which t_cast happily performs -- the gradient is already
+        // real and taking its real part panics. An earlier version did that
+        // unconditionally, and a same-dtype cast crashed the backward pass.
+        if dtype_is_complex(g.dt) {
+            accumulate(a, t_real(g))
+        } else {
+            accumulate(a, g)
+        }
         return
     }
     if nd.op == OP_EXPAND {
