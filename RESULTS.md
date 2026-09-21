@@ -111,6 +111,30 @@ numpy's `complex128` has the same memory layout as `torch.complex128`. The
 byte-level check confirms that layout directly -- Zephyr's `C32` buffer for
 1.5-2.25j is `0000c03f000010c0`, which is what numpy writes for `complex64`.
 
+### The ML library on all three targets
+
+The tensor and operator suites were compiled for each backend from the same
+sources and run. Not a milestone requirement -- recorded because portability
+is cheap to lose silently and M5/M8 depend on it.
+
+| Target | tensor | ops |
+|---|---|---|
+| Windows x86-64 PE (kernel32) | 73 passed | 107 passed |
+| Linux x86-64 static ELF (raw syscalls, no libc) | 73 passed | 107 passed |
+| WebAssembly (node) | 73 passed | 107 passed |
+
+Identical counts, and identical assertions, so the stride arithmetic, the
+complex component layout and the reference-counted buffers all behave the
+same on a target with no libc and on one with a collector instead of counting.
+
+### Self-host fixpoint is unaffected by the ML work
+
+Re-verified after `lib/ml` grew to two modules: `embed-gen`, then
+zc.exe -> stage-a -> stage-b -> stage-c, all four `691CB25F91B961F1...`,
+byte-identical to the hash recorded before any ML code existed. `lib/ml` sits
+outside the `lib\std\*.zeph` embed glob, so this is the measured form of
+DESIGN.md D1 rather than an argument for it.
+
 ### Reference model gradients against central differences
 
 Phase Reasoner v1 at D=4, all eight parameters, real and imaginary parts

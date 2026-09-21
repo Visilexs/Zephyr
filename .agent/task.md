@@ -63,6 +63,9 @@ Commands actually run, exit codes, log paths:
   python tools/ml_reference/check_ops.py      0, 33/33 agree with numpy
   python tools/ml_reference/test_phase.py     0, 12 groups, D=4/8/128
   python tools/ml_reference/verify_phase.py    0, 112 checks, 0 failed
+  zc --linux + wsl, both ml suites            0, 73 and 107, same as Windows
+  zc --wasm + node, both ml suites            0, 73 and 107, same as Windows
+  embed-gen + manual 3-stage fixpoint         0, 691CB25F91B961F1 unchanged
   tests/math_fns.zeph                         0, "math: 213 checks passed"
   scripts\selfbuild.ps1                       1, objdump missing AFTER the
                                               fixpoint passed; not a failure
