@@ -343,3 +343,153 @@ fn t_conj_transpose(t: Tensor) -> Tensor {
     if dtype_is_complex(t.dt) { return t_copy(t_conj(t_transpose(t, 0, 1))) }
     return t_copy(t_transpose(t, 0, 1))
 }
+
+// ---- real unary maps -------------------------------------------------------
+// One dispatcher rather than one loop per function: the traversal is the bulk
+// of the code and it is identical every time. Complex inputs are refused
+// because tanh of a complex number is not what any caller here means.
+
+let MAP_TANH = 0
+let MAP_COS = 1
+let MAP_SIN = 2
+let MAP_EXP = 3
+let MAP_LN = 4
+
+fn map1_real(x: float, op: int) -> float {
+    if op == MAP_TANH { return tanh(x) }
+    if op == MAP_COS { return fcos(x) }
+    if op == MAP_SIN { return fsin(x) }
+    if op == MAP_EXP { return fexp(x) }
+    if op == MAP_LN { return fln(x) }
+    panic("map1: unknown op")
+    return 0.0
+}
+
+fn t_map1(t: Tensor, op: int) -> Tensor {
+    if dtype_is_complex(t.dt) { panic("map1: real tensor required") }
+    if not dtype_is_float(t.dt) { panic("map1: float tensor required") }
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, map1_real(t_get(t, idx), op))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_tanh(t: Tensor) -> Tensor { return t_map1(t, MAP_TANH) }
+fn t_cos(t: Tensor) -> Tensor { return t_map1(t, MAP_COS) }
+fn t_sin(t: Tensor) -> Tensor { return t_map1(t, MAP_SIN) }
+fn t_exp(t: Tensor) -> Tensor { return t_map1(t, MAP_EXP) }
+fn t_ln(t: Tensor) -> Tensor { return t_map1(t, MAP_LN) }
+
+// ---- gather and scatter ----------------------------------------------------
+// t_index_select covers three things the phase forward pass needs that would
+// otherwise be three operators: embedding lookup (dim 0), picking out one
+// Givens stage's pair coordinates (dim 1), and cyclic roll (below).
+
+fn t_index_select(t: Tensor, dim: int, sel: [int]) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("index_select: dim out of range") }
+    let n = t.shape[dim]
+    for i in 0..sel.len() {
+        if sel[i] < 0 or sel[i] >= n { panic("index_select: index out of range") }
+    }
+    var osh: [int] = []
+    for i in 0..r { osh.push(t.shape[i]) }
+    osh[dim] = sel.len()
+    let out = t_zeros(t.dt, osh)
+    if shape_numel(osh) == 0 { return out }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var sid: [int] = []
+        for i in 0..r { sid.push(idx[i]) }
+        sid[dim] = sel[idx[dim]]
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, idx, t_get_re(t, sid), t_get_im(t, sid))
+        } else {
+            t_set(out, idx, t_get(t, sid))
+        }
+        more = idx_next(idx, osh)
+    }
+    return out
+}
+
+// The scatter counterpart, writing in place. Duplicate indices are refused
+// rather than silently letting the last write win: every use here is a
+// disjoint pairing, so a duplicate means a caller bug, not an accumulation.
+fn t_index_copy(dst: Tensor, dim: int, sel: [int], src: Tensor) {
+    if dst.ro { panic("index_copy: write into a read-only (broadcast) view") }
+    same_dtype(dst, src, "index_copy")
+    let r = dst.shape.len()
+    if src.shape.len() != r { panic("index_copy: rank mismatch") }
+    if dim < 0 or dim >= r { panic("index_copy: dim out of range") }
+    if src.shape[dim] != sel.len() { panic("index_copy: source extent does not match the index count") }
+    for i in 0..r {
+        if i != dim and src.shape[i] != dst.shape[i] { panic("index_copy: shape mismatch off the indexed dimension") }
+    }
+    let n = dst.shape[dim]
+    var seen: [int] = []
+    for i in 0..n { seen.push(0) }
+    for i in 0..sel.len() {
+        if sel[i] < 0 or sel[i] >= n { panic("index_copy: index out of range") }
+        if seen[sel[i]] == 1 { panic("index_copy: duplicate index") }
+        seen[sel[i]] = 1
+    }
+    if t_numel(src) == 0 { return }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var did: [int] = []
+        for i in 0..r { did.push(idx[i]) }
+        did[dim] = sel[idx[dim]]
+        if dtype_is_complex(src.dt) {
+            t_set_c(dst, did, t_get_re(src, idx), t_get_im(src, idx))
+        } else {
+            t_set(dst, did, t_get(src, idx))
+        }
+        more = idx_next(idx, src.shape)
+    }
+}
+
+// out[i] = t[(i - shift) mod n], matching numpy's roll, so roll(x, -1) is the
+// forward cyclic neighbour the invariant feature map is defined in terms of.
+fn t_roll(t: Tensor, dim: int, shift: int) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("roll: dim out of range") }
+    let n = t.shape[dim]
+    if n == 0 { return t_copy(t) }
+    var sel: [int] = []
+    for i in 0..n {
+        var j = (i - shift) % n
+        if j < 0 { j += n }
+        sel.push(j)
+    }
+    return t_index_select(t, dim, sel)
+}
+
+// ---- concatenation ---------------------------------------------------------
+
+fn t_concat(a: Tensor, b: Tensor, dim: int) -> Tensor {
+    same_dtype(a, b, "concat")
+    let r = a.shape.len()
+    if b.shape.len() != r { panic("concat: rank mismatch") }
+    if dim < 0 or dim >= r { panic("concat: dim out of range") }
+    for i in 0..r {
+        if i != dim and a.shape[i] != b.shape[i] { panic("concat: shape mismatch off the joined dimension") }
+    }
+    var osh: [int] = []
+    for i in 0..r { osh.push(a.shape[i]) }
+    osh[dim] = a.shape[dim] + b.shape[dim]
+    let out = t_zeros(a.dt, osh)
+    var left: [int] = []
+    for i in 0..a.shape[dim] { left.push(i) }
+    var right: [int] = []
+    for i in 0..b.shape[dim] { right.push(a.shape[dim] + i) }
+    t_index_copy(out, dim, left, a)
+    t_index_copy(out, dim, right, b)
+    return out
+}

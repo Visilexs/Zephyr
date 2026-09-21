@@ -130,3 +130,24 @@ and the one thing numpy could differ on — complex memory layout — is checked
 directly at the byte level with `t_hex` rather than assumed. Where accumulation
 order is unspecified (matmul, sums) the agreement is 1–4 ulp, not bit-exact,
 and that is recorded as such rather than hidden behind a loose tolerance.
+
+## D14 — one gather covers three needs, and refuses duplicate scatter indices
+
+`t_index_select` serves the embedding lookup (dim 0), the Givens pair
+extraction (dim 1) and `t_roll`, which is a permutation of the same call.
+Writing three operators would have triplicated the stride traversal, which is
+where the bugs live. Its counterpart `t_index_copy` **panics on a duplicate
+index** rather than letting the last write win. Every use in this model is a
+disjoint pairing, so a duplicate is a caller bug; when the backward pass later
+needs genuine accumulation that will be a separate, named scatter-add.
+
+## D15 — the reference model came from a delegated agent and was verified twice
+
+`tools/ml_reference/phase_model.py` and `test_phase.py` were written by Codex
+against a written brief. Its own suite passing is not evidence, so
+`verify_phase.py` was written separately, from `MATHEMATICS.md`,
+`INTERFERENCE.md` and `READOUT.md` rather than from the module: it rebuilds
+the Givens matrix from the document, checks the module against that, and
+checks every gradient against central differences. 112 checks, independent of
+the 12 Codex wrote. Both are kept — agreement between two suites written from
+the same spec by different authors is the point.

@@ -26,13 +26,16 @@ Implemented files / interfaces:
   lib/ml/ops.zeph               elementwise add/sub/mul/div with broadcasting,
                                 neg, conj, abs2, real, imag, expi, complex
                                 construction, sum/mean, sum_dim, matmul,
-                                conjugate transpose -- real and complex
+                                conjugate transpose -- real and complex;
+                                plus the M3 prerequisites: real unary maps
+                                (tanh/cos/sin/exp/ln), index_select,
+                                index_copy, roll and concat
   tests/ml/tensor_test.zeph     73 positive checks (A02, A03)
-  tests/ml/ops_test.zeph        74 positive checks (A04, A05)
+  tests/ml/ops_test.zeph        107 positive checks (A04, A05)
   tools/ml_reference/check_ops.py + ops_dump.zeph
                                 numpy cross-check, 21 operators (A04, A05)
   tests/run_tests.ps1           + ml-tensor/ml-ops blocks, 15 ml-reject and
-                                13 ops-reject cases
+                                26 ops-reject cases
   tools/ml_reference/tasks.py   Task A and B generators, independent solvers,
                                 seeded splits (written by Codex, verified here)
   tools/ml_reference/test_tasks.py  13 check groups (A30, A31)
@@ -57,14 +60,17 @@ Commands actually run, exit codes, log paths:
   python tools/ml_reference/test_tasks.py     0, 13 groups
   tests/ml/tensor_test.zeph                   0, "tensor: 73 checks passed"
   tests/ml/ops_test.zeph                      0, "ops: 74 checks passed"
-  python tools/ml_reference/check_ops.py      0, 21/21 agree with numpy
+  python tools/ml_reference/check_ops.py      0, 33/33 agree with numpy
+  python tools/ml_reference/test_phase.py     0, 12 groups, D=4/8/128
+  python tools/ml_reference/verify_phase.py    0, 112 checks, 0 failed
   tests/math_fns.zeph                         0, "math: 213 checks passed"
   scripts\selfbuild.ps1                       1, objdump missing AFTER the
                                               fixpoint passed; not a failure
   tests\run_tests.ps1                         1, gcc missing, BLOCKED
 
 Acceptance IDs: pass / fail / blocked / not_run:
-  A00 pass, A02 pass, A03 pass, A04 pass, A05 pass, A30 pass, A31 pass
+  A00 pass, A02 pass, A03 pass, A04 pass, A05 pass, A10 pass, A11 pass,
+  A12 pass, A30 pass, A31 pass
   A01 partial: fixpoint and crosschecks pass, the bootstrap suite is blocked
   everything else not_run. See RESULTS.md for the evidence behind each.
 

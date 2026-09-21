@@ -108,3 +108,17 @@ while u < 2 {
 }
 dumpC("CM", CM)
 dumpC("cmatmul", t_matmul(CA, CM))
+
+// M3 prerequisite operators
+dumpR("tanh", t_tanh(A))
+dumpR("exp", t_exp(A))
+dumpR("cosr", t_cos(A))
+dumpR("sinr", t_sin(A))
+dumpR("sel0", t_index_select(A, 0, [3, 0, 2, 0]))
+dumpR("sel1", t_index_select(A, 1, [4, 1]))
+dumpR("rollm1", t_roll(A, 1, 0 - 1))
+dumpR("rollp2", t_roll(A, 0, 2))
+dumpR("cat0", t_concat(A, B, 0))
+dumpR("cat1", t_concat(A, B, 1))
+dumpC("csel", t_index_select(CA, 0, [2, 1]))
+dumpC("croll", t_roll(CA, 1, 0 - 1))

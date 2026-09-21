@@ -332,7 +332,7 @@ Remove-Item "$tmp\ops_test.exe" -ErrorAction SilentlyContinue
 & .\zc.exe --rt tests\ml\ops_test.zeph "$tmp\ops_test.exe" 2>&1 | Out-Null
 $opsBuilt = Test-Path "$tmp\ops_test.exe"
 $opsOut = if ($opsBuilt) { (cmd /c "`"$tmp\ops_test.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 74 checks passed") "got: $opsOut"
+Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 107 checks passed") "got: $opsOut"
 
 $opNeg = [ordered]@{
     "dtype-mix"  = 'let x = t_add(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]))'
@@ -348,6 +348,19 @@ $opNeg = [ordered]@{
     "expi-cplx"  = 'let x = t_expi(t_zeros(DType.C64, [2]), DType.C64)'
     "expand-bad" = 'let x = t_expand(t_zeros(DType.F64, [3]), [4])'
     "int-arith"  = 'let x = t_add(t_zeros(DType.I64, [2]), t_zeros(DType.I64, [2]))'
+    "sel-dim"     = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 5, [0])'
+    "sel-range"   = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 0, [2])'
+    "sel-neg"     = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 0, [0 - 1])'
+    "copy-dup"    = 't_index_copy(t_zeros(DType.F64, [3]), 0, [1, 1], t_zeros(DType.F64, [2]))'
+    "copy-shape"  = 't_index_copy(t_zeros(DType.F64, [3, 2]), 0, [0], t_zeros(DType.F64, [1, 5]))'
+    "copy-count"  = 't_index_copy(t_zeros(DType.F64, [3]), 0, [0, 1], t_zeros(DType.F64, [3]))'
+    "copy-ro"     = "let r = t_zeros(DType.F64, [1, 3])`nlet e = t_expand(r, [4, 3])`nt_index_copy(e, 0, [0], t_zeros(DType.F64, [1, 3]))"
+    "cat-dim"     = 'let x = t_concat(t_zeros(DType.F64, [2, 2]), t_zeros(DType.F64, [2, 2]), 9)'
+    "cat-shape"   = 'let x = t_concat(t_zeros(DType.F64, [2, 2]), t_zeros(DType.F64, [3, 2]), 1)'
+    "cat-dtype"   = 'let x = t_concat(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]), 0)'
+    "map-cplx"    = 'let x = t_tanh(t_zeros(DType.C64, [2]))'
+    "map-int"     = 'let x = t_tanh(t_zeros(DType.I64, [2]))'
+    "roll-dim"    = 'let x = t_roll(t_zeros(DType.F64, [2]), 3, 1)'
 }
 foreach ($nm in $opNeg.Keys) {
     $src = "import `"ml/ops.zeph`"`n" + $opNeg[$nm]

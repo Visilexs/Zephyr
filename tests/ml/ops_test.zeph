@@ -211,4 +211,89 @@ let fq = t_div(f, t_full(DType.F32, [2], 3.0))
 n += ck(near(t_get(fq, [0]), 1.0 / 3.0, 0.0000001), "f32 divide is close")
 n += ck(t_get(fq, [0]) != 1.0 / 3.0, "f32 divide is not the f64 value, by construction")
 
+// ---- real unary maps, gather/scatter, roll, concat (M3 prerequisites) ------
+
+let x_um = t_zeros(DType.F64, [2, 3])
+for umi in 0..2 {
+    for umj in 0..3 {
+        t_set(x_um, [umi, umj], (umi * 3 + umj) as float * 0.25 - 0.5)
+    }
+}
+let x_umt = t_tanh(x_um)
+n += ck(near(t_get(x_umt, [0, 0]), tanh(0.0 - 0.5), TOL), "tanh maps elementwise")
+n += ck(near(t_get(x_umt, [1, 2]), tanh(0.75), TOL), "tanh reaches the last element")
+n += ck(shapes_equal(x_umt.shape, x_um.shape), "tanh preserves shape")
+n += ck(near(t_get(t_cos(x_um), [0, 1]), fcos(0.0 - 0.25), TOL), "cos maps elementwise")
+n += ck(near(t_get(t_sin(x_um), [0, 1]), fsin(0.0 - 0.25), TOL), "sin maps elementwise")
+n += ck(near(t_get(t_exp(x_um), [1, 1]), fexp(0.5), TOL), "exp maps elementwise")
+n += ck(near(t_get(t_ln(t_exp(x_um)), [1, 2]), 0.75, TOL), "ln undoes exp")
+
+// the maps must also work through a non-contiguous view
+let x_umv = t_transpose(x_um, 0, 1)
+n += ck(near(t_get(t_tanh(x_umv), [2, 1]), tanh(0.75), TOL), "tanh through a transposed view")
+
+let x_e4 = t_zeros(DType.F64, [2, 2])
+t_set(x_e4, [0, 0], 1.0)
+t_set(x_e4, [0, 1], 2.0)
+t_set(x_e4, [1, 0], 3.0)
+t_set(x_e4, [1, 1], 4.0)
+
+let x_gsel = t_index_select(x_e4, 0, [1, 0, 1])
+n += ck(x_gsel.shape[0] == 3 and x_gsel.shape[1] == 2, "index_select resizes only the indexed dim")
+n += ck(t_get(x_gsel, [0, 0]) == 3.0 and t_get(x_gsel, [0, 1]) == 4.0, "index_select takes the right row")
+n += ck(t_get(x_gsel, [1, 0]) == 1.0, "index_select reorders")
+n += ck(t_get(x_gsel, [2, 1]) == 4.0, "index_select repeats a row")
+let x_gcol = t_index_select(x_e4, 1, [1])
+n += ck(x_gcol.shape[1] == 1 and t_get(x_gcol, [1, 0]) == 4.0, "index_select on dim 1")
+let x_gempty = t_index_select(x_e4, 0, [])
+n += ck(t_numel(x_gempty) == 0 and x_gempty.shape[0] == 0, "index_select with no indices is empty")
+
+// select must read through strides, not assume a packed buffer
+let x_e4t = t_transpose(x_e4, 0, 1)
+n += ck(t_get(t_index_select(x_e4t, 0, [1]), [0, 0]) == 2.0, "index_select through a transposed view")
+
+// gather then scatter back by the same indices is the identity
+let rtrip = t_zeros(DType.F64, [2, 2])
+t_index_copy(rtrip, 0, [1, 0], t_index_select(x_e4, 0, [1, 0]))
+n += ck(t_get(rtrip, [0, 0]) == 1.0 and t_get(rtrip, [1, 1]) == 4.0, "index_copy inverts index_select")
+
+let x_cdst = t_zeros(DType.C64, [3, 1])
+let x_csrc = t_zeros(DType.C64, [2, 1])
+t_set_c(x_csrc, [0, 0], 1.5, 0.0 - 2.5)
+t_set_c(x_csrc, [1, 0], 3.0, 4.0)
+t_index_copy(x_cdst, 0, [2, 0], x_csrc)
+n += ck(t_get_re(x_cdst, [2, 0]) == 1.5 and t_get_im(x_cdst, [2, 0]) == 0.0 - 2.5, "index_copy carries both complex components")
+n += ck(t_get_re(x_cdst, [0, 0]) == 3.0, "index_copy scatters out of order")
+n += ck(t_get_re(x_cdst, [1, 0]) == 0.0, "index_copy leaves untouched rows alone")
+
+// roll matches numpy: roll(x, -1)[i] == x[i+1] cyclically
+let x_rv = t_zeros(DType.F64, [1, 4])
+for rvi in 0..4 { t_set(x_rv, [0, rvi], rvi as float) }
+let x_rfwd = t_roll(x_rv, 1, 0 - 1)
+n += ck(t_get(x_rfwd, [0, 0]) == 1.0, "roll -1 brings the next element back")
+n += ck(t_get(x_rfwd, [0, 3]) == 0.0, "roll -1 wraps the last element round")
+let x_rback = t_roll(x_rv, 1, 1)
+n += ck(t_get(x_rback, [0, 0]) == 3.0 and t_get(x_rback, [0, 1]) == 0.0, "roll +1 shifts the other way")
+n += ck(t_get(t_roll(x_rv, 1, 4), [0, 2]) == 2.0, "roll by the full extent is the identity")
+n += ck(t_get(t_roll(x_rv, 1, 0 - 5), [0, 0]) == 1.0, "roll normalises a shift beyond one period")
+n += ck(t_get(t_roll(t_roll(x_rv, 1, 0 - 1), 1, 1), [0, 2]) == 2.0, "roll then unroll is the identity")
+
+let x_ca = t_concat(x_e4, x_e4, 1)
+n += ck(x_ca.shape[0] == 2 and x_ca.shape[1] == 4, "concat adds along the joined dim")
+n += ck(t_get(x_ca, [1, 1]) == 4.0 and t_get(x_ca, [1, 3]) == 4.0, "concat copies both operands")
+let x_cb = t_concat(x_e4, x_e4, 0)
+n += ck(x_cb.shape[0] == 4 and t_get(x_cb, [3, 0]) == 3.0, "concat on dim 0")
+let x_cmix = t_concat(t_full(DType.F64, [2, 1], 9.0), x_e4, 1)
+n += ck(t_get(x_cmix, [0, 0]) == 9.0 and t_get(x_cmix, [0, 1]) == 1.0, "concat joins unequal extents")
+n += ck(t_numel(t_concat(t_zeros(DType.F64, [2, 0]), x_e4, 1)) == 4, "concat with an empty operand")
+let x_cvw = t_concat(x_e4t, x_e4, 1)
+n += ck(t_get(x_cvw, [0, 1]) == 3.0, "concat reads a non-contiguous operand")
+
+// this is the exact feature-map shape the phase controller needs
+let x_fz = t_zeros(DType.F64, [1, 4])
+for fzi in 0..4 { t_set(x_fz, [0, fzi], (fzi + 1) as float) }
+let x_fcat = t_concat(t_concat(x_fz, t_roll(x_fz, 1, 0 - 1), 1), x_fz, 1)
+n += ck(x_fcat.shape[1] == 12, "three-way feature concat has width 3D")
+n += ck(t_get(x_fcat, [0, 4]) == 2.0 and t_get(x_fcat, [0, 7]) == 1.0, "feature concat holds the cyclic neighbour")
+
 print("ops: {n} checks passed")

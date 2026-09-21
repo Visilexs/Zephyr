@@ -84,28 +84,51 @@ sweep.
 | `tests/math_fns.zeph` | 213 | 0.49s |
 | `tests/ml/tensor_test.zeph` | 73 | instant |
 | tensor rejection cases | 15 processes | ~5s |
-| `tests/ml/ops_test.zeph` | 74 | instant |
-| ops rejection cases | 13 processes | ~4s |
+| `tests/ml/ops_test.zeph` | 107 | instant |
+| ops rejection cases | 26 processes | ~8s |
+| `tools/ml_reference/test_phase.py` | 12 groups, D=4/8/128 | ~6s |
+| `tools/ml_reference/verify_phase.py` | 112 | ~5s |
 | `tools/ml_reference/test_tasks.py` | 13 groups, 10,240 examples per task | ~8s |
 
 ### CPU operators against numpy
 
-21 operators, values crossing as IEEE-754 bit patterns rather than decimal
+33 operators, values crossing as IEEE-754 bit patterns rather than decimal
 text so nothing is lost to formatting.
 
 | Result | Operators |
 |---|---|
-| bit-exact, 0.0 error | add, sub, mul, div, broadcast add, neg, sum_dim 0 and 1, sum_all, mean_all, mul through transposed operands, complex add, conj, real, imag |
-| 1-4 ulp | matmul 3.3e-16, complex matmul 4.4e-16, abs2 3.1e-16, complex mul 4.3e-17, complex div 2.1e-17, expi 8.3e-17 |
+| bit-exact, 0.0 error | add, sub, mul, div, broadcast add, neg, sum_dim 0 and 1, sum_all, mean_all, mul through transposed operands, complex add, conj, real, imag, index_select (both dims, real and complex), roll (both directions, real and complex), concat (both dims) |
+| 1-4 ulp | tanh 1.1e-16, cos 1.7e-16, exp 3.3e-16, sin 3.5e-16, matmul 3.3e-16, complex matmul 4.4e-16, abs2 3.1e-16, complex mul 4.3e-17, complex div 2.1e-17, expi 8.3e-17 |
 
 The non-zero cases differ only in accumulation order, and `expi` additionally
-goes through this repository's own `fsin`/`fcos` rather than libm.
+goes through this repository's own `fsin`/`fcos` rather than libm. The same
+is true of tanh/cos/sin/exp: every pure data-movement operator is bit-exact,
+and only the ones routed through `lib/std/math.zeph` differ at all.
 
 numpy stands in for PyTorch here, which is not installed. For these operators
 the two agree by construction: both are IEEE-754 double arithmetic, and
 numpy's `complex128` has the same memory layout as `torch.complex128`. The
 byte-level check confirms that layout directly -- Zephyr's `C32` buffer for
 1.5-2.25j is `0000c03f000010c0`, which is what numpy writes for `complex64`.
+
+### Reference model gradients against central differences
+
+Phase Reasoner v1 at D=4, all eight parameters, real and imaginary parts
+perturbed separately, step 1e-6, two-sided.
+
+| Parameter | worst relative error |
+|---|---|
+| M | 8.6e-11 |
+| b2 | 1.2e-10 |
+| think | 1.6e-10 |
+| b1 | 1.7e-10 |
+| z_init | 2.2e-10 |
+| embedding, W2 | 2.5e-10 |
+| W1 | 3.7e-10 |
+
+The floor here is the finite difference, not the analytic gradient: the
+complex and paired-real models agree with each other to 1e-12, an order of
+magnitude tighter than either agrees with the stencil.
 
 ## Interpretation, kept separate
 

@@ -86,6 +86,19 @@ def main():
     cmp('expi', d['cexpi'], np.exp(1j * CA.real), res)
     cmp('complex matmul', d['cmatmul'], CA @ CM, res)
 
+    cmp('tanh', d['tanh'], np.tanh(A), res)
+    cmp('exp', d['exp'], np.exp(A), res)
+    cmp('cos', d['cosr'], np.cos(A), res)
+    cmp('sin', d['sinr'], np.sin(A), res)
+    cmp('index_select dim 0', d['sel0'], A[[3, 0, 2, 0], :], res)
+    cmp('index_select dim 1', d['sel1'], A[:, [4, 1]], res)
+    cmp('roll -1 dim 1', d['rollm1'], np.roll(A, -1, axis=1), res)
+    cmp('roll +2 dim 0', d['rollp2'], np.roll(A, 2, axis=0), res)
+    cmp('concat dim 0', d['cat0'], np.concatenate([A, B], axis=0), res)
+    cmp('concat dim 1', d['cat1'], np.concatenate([A, B], axis=1), res)
+    cmp('complex index_select', d['csel'], CA[[2, 1], :], res)
+    cmp('complex roll', d['croll'], np.roll(CA, -1, axis=1), res)
+
     width = max(len(n) for n, _, _ in res)
     bad = 0
     for name, ok, detail in res:
