@@ -693,3 +693,285 @@ fn t_concat(a: Tensor, b: Tensor, dim: int) -> Tensor {
     t_index_copy(out, dim, right, b)
     return out
 }
+
+// ---------------------------------------------------------------------------
+// The fused Givens stage.
+//
+// "A disjoint Givens stage can load a pair, rotate and write once." Unfused,
+// one stage is seventeen tape nodes and fourteen [B,D/2] temporaries: two
+// index_selects, cos, sin, two casts, expi, five muls, a neg, two adds, a
+// concat and a final index_select for the inverse permutation. Fused it is
+// one node, one pass, one write per element.
+//
+// The pairs of a stage are disjoint by construction -- stage 0 pairs (0,1),
+// (2,3), ... and stage 1 pairs (1,2), (3,4), ..., (D-1,0) -- so every output
+// coordinate is written exactly once and the loop needs no barrier between
+// pairs. Two *overlapping* stages do not have that property, which is why the
+// even stage still runs to completion before the odd one starts: they are two
+// launches, not one. Fusing across them would need the barrier the
+// optimization section warns about, and would buy nothing here.
+//
+// theta and phi arrive as one tensor because they always were one: the caller
+// slices them out of adjacent columns of the same angle block. Columns 0..H
+// are theta, columns H..2H are phi. That fuses the two slices away as well.
+//
+// The arithmetic below is not the short form of the rotation. It is the
+// composed graph's expression tree written out term for term, including the
+// multiplications by the zero imaginary part that a real-to-complex cast
+// introduces. The short form differs from it in the sign of zero and in the
+// last ulp, and the point of the fusion gate is to compare the two
+// bit-for-bit rather than within a tolerance.
+fn givens_check(z: Tensor, tp: Tensor, stage: int) -> int {
+    if not dtype_is_complex(z.dt) { panic("givens: state must be complex") }
+    if not dtype_is_float(tp.dt) { panic("givens: angles must be a real float tensor") }
+    if z.shape.len() != 2 or tp.shape.len() != 2 { panic("givens: state and angles must both be 2-D") }
+    if stage != 0 and stage != 1 { panic("givens: stage must be 0 or 1") }
+    let d = z.shape[1]
+    if d < 2 or d % 2 != 0 { panic("givens: state width {d} must be even and at least 2") }
+    if tp.shape[0] != z.shape[0] { panic("givens: angle batch {tp.shape[0]} does not match state batch {z.shape[0]}") }
+    if tp.shape[1] != d { panic("givens: angle width {tp.shape[1]} must be the state width {d}, theta then phi") }
+    return d
+}
+
+fn t_givens(z: Tensor, tp: Tensor, stage: int) -> Tensor {
+    let d = givens_check(z, tp, stage)
+    let h = d / 2
+    let b = z.shape[0]
+    let out = t_zeros(z.dt, [b, d])
+    let zb = z.st.buf
+    let tb = tp.st.buf
+    let ob = out.st.buf
+    let zs1 = z.stride[1] * 16
+    let ts1 = tp.stride[1] * 8
+    let os1 = out.stride[1] * 16
+    var r = 0
+    while r < b {
+        let zrow = (z.off + r * z.stride[0]) * 16
+        let trow = (tp.off + r * tp.stride[0]) * 8
+        let orow = (out.off + r * out.stride[0]) * 16
+        var k = 0
+        while k < h {
+            let ja = 2 * k + stage
+            let jb = (2 * k + stage + 1) % d
+            let pa = zrow + ja * zs1
+            let pb = zrow + jb * zs1
+            let ar = zb.getf64(pa)
+            let ai = zb.getf64(pa + 8)
+            let br = zb.getf64(pb)
+            let bi = zb.getf64(pb + 8)
+            let th = tb.getf64(trow + k * ts1)
+            let ph = tb.getf64(trow + (h + k) * ts1)
+            let c = fcos(th)
+            let s = fsin(th)
+            let qr = fcos(ph)
+            let qi = fsin(ph)
+            // new_a = (c+0i)*a + (s+0i)*(q*b)
+            let t1r = c * ar - 0.0 * ai
+            let t1i = c * ai + 0.0 * ar
+            let qbr = qr * br - qi * bi
+            let qbi = qr * bi + qi * br
+            let t3r = s * qbr - 0.0 * qbi
+            let t3i = s * qbi + 0.0 * qbr
+            // new_b = -((s+0i)*(conj(q)*a)) + (c+0i)*b
+            let nqi = 0.0 - qi
+            let u1r = qr * ar - nqi * ai
+            let u1i = qr * ai + nqi * ar
+            let u2r = s * u1r - 0.0 * u1i
+            let u2i = s * u1i + 0.0 * u1r
+            let u4r = c * br - 0.0 * bi
+            let u4i = c * bi + 0.0 * br
+            ob.putf64(orow + ja * os1, t1r + t3r)
+            ob.putf64(orow + ja * os1 + 8, t1i + t3i)
+            ob.putf64(orow + jb * os1, (0.0 - u2r) + u4r)
+            ob.putf64(orow + jb * os1 + 8, (0.0 - u2i) + u4i)
+            k += 1
+        }
+        r += 1
+    }
+    return out
+}
+
+// The adjoint of the same stage. In (a,b) the rotation is the holomorphic
+// linear map [[c, s q], [-s conj(q), c]], so the state gradient is that
+// matrix's conjugate transpose applied to the incoming gradient:
+//
+//     g_a = c gA - s q gB          g_b = s conj(q) gA + c gB
+//
+// theta and phi are real, so their gradients follow the library's convention
+// dL = Re(sum(conj(g) dz)) directly:
+//
+//     dA/dtheta = -s a + c q b     dB/dtheta = -c conj(q) a - s b
+//     dA/dphi   = i s q b          dB/dphi   = i s conj(q) a
+//
+// and Re(conj(u) i v) = -Im(conj(u) v), which is what the phi lines compute.
+//
+// Returned as [gz, gtp] because Zephyr has no tuples. Unlike the forward,
+// this is the short form rather than a transcription of the composed
+// backward pass, so nothing here guarantees agreement to the bit -- only to
+// rounding. tests/ml/fusion_test.zeph gates on 1e-14 relative and prints
+// what the difference actually is, which at the tested configuration is
+// zero. That is a measurement, not a promise.
+fn t_givens_backward(z: Tensor, tp: Tensor, g: Tensor, stage: int) -> [Tensor] {
+    let d = givens_check(z, tp, stage)
+    let h = d / 2
+    let b = z.shape[0]
+    let gz = t_zeros(z.dt, [b, d])
+    let gtp = t_zeros(tp.dt, [b, d])
+    let zb = z.st.buf
+    let tb = tp.st.buf
+    let gb = g.st.buf
+    let zob = gz.st.buf
+    let tob = gtp.st.buf
+    let zs1 = z.stride[1] * 16
+    let ts1 = tp.stride[1] * 8
+    let gs1 = g.stride[1] * 16
+    let os1 = gz.stride[1] * 16
+    let ps1 = gtp.stride[1] * 8
+    var r = 0
+    while r < b {
+        let zrow = (z.off + r * z.stride[0]) * 16
+        let trow = (tp.off + r * tp.stride[0]) * 8
+        let grow = (g.off + r * g.stride[0]) * 16
+        let zorow = (gz.off + r * gz.stride[0]) * 16
+        let torow = (gtp.off + r * gtp.stride[0]) * 8
+        var k = 0
+        while k < h {
+            let ja = 2 * k + stage
+            let jb = (2 * k + stage + 1) % d
+            let ar = zb.getf64(zrow + ja * zs1)
+            let ai = zb.getf64(zrow + ja * zs1 + 8)
+            let br = zb.getf64(zrow + jb * zs1)
+            let bi = zb.getf64(zrow + jb * zs1 + 8)
+            let gar = gb.getf64(grow + ja * gs1)
+            let gai = gb.getf64(grow + ja * gs1 + 8)
+            let gbr = gb.getf64(grow + jb * gs1)
+            let gbi = gb.getf64(grow + jb * gs1 + 8)
+            let th = tb.getf64(trow + k * ts1)
+            let ph = tb.getf64(trow + (h + k) * ts1)
+            let c = fcos(th)
+            let s = fsin(th)
+            let qr = fcos(ph)
+            let qi = fsin(ph)
+            let sqr = s * qr
+            let sqi = s * qi
+            // g_a = c gA - (s q) gB
+            let mr = sqr * gbr - sqi * gbi
+            let mi = sqr * gbi + sqi * gbr
+            zob.putf64(zorow + ja * os1, c * gar - mr)
+            zob.putf64(zorow + ja * os1 + 8, c * gai - mi)
+            // g_b = (s conj(q)) gA + c gB
+            let nr = sqr * gar + sqi * gai
+            let ni = sqr * gai - sqi * gar
+            zob.putf64(zorow + jb * os1, nr + c * gbr)
+            zob.putf64(zorow + jb * os1 + 8, ni + c * gbi)
+            // dA/dtheta = -s a + c q b, dB/dtheta = -c conj(q) a - s b
+            let qbr = qr * br - qi * bi
+            let qbi = qr * bi + qi * br
+            let dAr = 0.0 - s * ar + c * qbr
+            let dAi = 0.0 - s * ai + c * qbi
+            let car = qr * ar + qi * ai
+            let cai = qr * ai - qi * ar
+            let dBr = 0.0 - c * car - s * br
+            let dBi = 0.0 - c * cai - s * bi
+            tob.putf64(torow + k * ps1, gar * dAr + gai * dAi + gbr * dBr + gbi * dBi)
+            // dA/dphi = i s q b, dB/dphi = i s conj(q) a; Re(conj(g) i v) = -Im(conj(g) v)
+            let vAr = sqr * br - sqi * bi
+            let vAi = sqr * bi + sqi * br
+            let vBr = sqr * ar + sqi * ai
+            let vBi = sqr * ai - sqi * ar
+            tob.putf64(torow + (h + k) * ps1,
+                       0.0 - (gar * vAi - gai * vAr) - (gbr * vBi - gbi * vBr))
+            k += 1
+        }
+        r += 1
+    }
+    return [gz, gtp]
+}
+
+// ---------------------------------------------------------------------------
+// The fused controller nonlinearity: tanh(x + b), bias broadcast along rows.
+//
+// The controller is two of these back to back, and unfused each one is a
+// broadcast add that materialises a [B,H] temporary and then a tanh that
+// reads it back. Both passes walk the tensor through the generic elementwise
+// loop, which allocates an index list per element. Fused it is one pass, one
+// temporary, and the bias row read once per row rather than once per element.
+//
+// out = ftanh(x + b) is the same expression in the same order as the
+// composed t_tanh(t_add(x, b)), so this is bit-exact against it and the gate
+// compares t_hex rather than a tolerance.
+fn bias_tanh_check(x: Tensor, b: Tensor) {
+    if x.dt != DType.F64 or b.dt != DType.F64 { panic("bias_tanh: both operands must be f64") }
+    if x.shape.len() != 2 { panic("bias_tanh: input must be 2-D, got rank {x.shape.len()}") }
+    if b.shape.len() != 1 { panic("bias_tanh: bias must be 1-D, got rank {b.shape.len()}") }
+    if b.shape[0] != x.shape[1] { panic("bias_tanh: bias length {b.shape[0]} does not match the row width {x.shape[1]}") }
+}
+
+fn t_bias_tanh(x: Tensor, b: Tensor) -> Tensor {
+    bias_tanh_check(x, b)
+    let rows = x.shape[0]
+    let cols = x.shape[1]
+    let out = t_zeros(DType.F64, [rows, cols])
+    let xb = x.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let xs1 = x.stride[1] * 8
+    let bs0 = b.stride[0] * 8
+    let os1 = out.stride[1] * 8
+    let boff = b.off * 8
+    var r = 0
+    while r < rows {
+        var px = (x.off + r * x.stride[0]) * 8
+        var po = (out.off + r * out.stride[0]) * 8
+        var pb = boff
+        var j = 0
+        while j < cols {
+            ob.putf64(po, tanh(xb.getf64(px) + bb.getf64(pb)))
+            px += xs1
+            pb += bs0
+            po += os1
+            j += 1
+        }
+        r += 1
+    }
+    return out
+}
+
+// d/dx tanh(u) = 1 - tanh(u)^2, and the bias gradient is that summed down the
+// rows, which is what the broadcast add's VJP does unfused. Returned as
+// [gx, gb].
+//
+// The bias column sums accumulate in row order, the same order reduce_to
+// walks, so this one is bit-exact with the composed backward as well.
+fn t_bias_tanh_backward(out: Tensor, g: Tensor) -> [Tensor] {
+    let rows = out.shape[0]
+    let cols = out.shape[1]
+    let gx = t_zeros(DType.F64, [rows, cols])
+    let gb = t_zeros(DType.F64, [cols])
+    let ob = out.st.buf
+    let gbuf = g.st.buf
+    let xb = gx.st.buf
+    let bb = gb.st.buf
+    let os1 = out.stride[1] * 8
+    let gs1 = g.stride[1] * 8
+    let xs1 = gx.stride[1] * 8
+    var r = 0
+    while r < rows {
+        var po = (out.off + r * out.stride[0]) * 8
+        var pg = (g.off + r * g.stride[0]) * 8
+        var px = (gx.off + r * gx.stride[0]) * 8
+        var j = 0
+        while j < cols {
+            let o = ob.getf64(po)
+            let d = gbuf.getf64(pg) * (1.0 - o * o)
+            xb.putf64(px, d)
+            bb.putf64(j * 8, bb.getf64(j * 8) + d)
+            po += os1
+            pg += gs1
+            px += xs1
+            j += 1
+        }
+        r += 1
+    }
+    return [gx, gb]
+}

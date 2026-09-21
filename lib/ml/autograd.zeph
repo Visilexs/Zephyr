@@ -46,6 +46,12 @@ let OP_SIN = 26
 let OP_LN = 27
 let OP_EXP = 28
 
+// The fused Givens stage (A25). A fusion is a new opcode, not a rewrite of
+// the old ones: the composed form stays reachable so the two can be compared,
+// which is the whole content of the acceptance check.
+let OP_GIVENS = 29
+let OP_BIAS_TANH = 30
+
 // A node's inputs are variable handles, never tensors: a handle cannot go
 // stale and cannot alias, and the graph stays a plain integer DAG.
 struct ANode {
@@ -303,6 +309,20 @@ fn av_index_select(x: int, dim: int, sel: [int]) -> int {
     return record(out, OP_INDEX_SELECT, x, 0 - 1, [], ia, [])
 }
 
+// The controller nonlinearity as a single node: tanh(x + b).
+fn av_bias_tanh(x: int, b: int) -> int {
+    let out = t_bias_tanh(av_value(x), av_value(b))
+    return record(out, OP_BIAS_TANH, x, b, [t_save(out)], [], [])
+}
+
+// One Givens stage as a single node. theta and phi travel as one tensor, tp,
+// theta in columns 0..D/2 and phi in D/2..D -- the two halves the caller used
+// to slice apart.
+fn av_givens(z: int, tp: int, stage: int) -> int {
+    let out = t_givens(av_value(z), av_value(tp), stage)
+    return record(out, OP_GIVENS, z, tp, [t_save(av_value(z)), t_save(av_value(tp))], [stage], [])
+}
+
 fn av_roll(x: int, dim: int, shift: int) -> int {
     let out = t_roll(av_value(x), dim, shift)
     return record(out, OP_ROLL, x, 0 - 1, [], [dim, shift], [])
@@ -461,6 +481,20 @@ fn backward_node(nd: ANode, g: Tensor) {
             if dtype_is_complex(x.dt) { xt = t_conj_transpose(x) }
             accumulate(b, t_matmul(xt, g))
         }
+        return
+    }
+    if nd.op == OP_BIAS_TANH {
+        let gs = t_bias_tanh_backward(saved_get(nd.saved[0]), g)
+        accumulate(a, gs[0])
+        accumulate(b, gs[1])
+        return
+    }
+    if nd.op == OP_GIVENS {
+        let zv = saved_get(nd.saved[0])
+        let tv = saved_get(nd.saved[1])
+        let gs = t_givens_backward(zv, tv, g, nd.ia[0])
+        accumulate(a, gs[0])
+        accumulate(b, gs[1])
         return
     }
     if nd.op == OP_TANH {

@@ -136,7 +136,7 @@ if errs.len() > 0 {
     }
 }
 
-let NOPS = 29
+let NOPS = 31
 var t_by_op: [float] = []
 var n_by_op: [int] = []
 var el_by_op: [int] = []
@@ -175,6 +175,8 @@ for i in 0..g.nodes.len() {
     if nd.op == OP_SIN { r = t_sin(x) }
     if nd.op == OP_LN { r = t_ln(x) }
     if nd.op == OP_EXP { r = t_exp(x) }
+    if nd.op == OP_GIVENS { r = t_givens(x, y, nd.ia[0]) }
+    if nd.op == OP_BIAS_TANH { r = t_bias_tanh(x, y) }
     if nd.op == OP_ABS2 { r = t_abs2(x) }
     if nd.op == OP_CONJ { r = t_conj(x) }
     if nd.op == OP_REAL { r = t_real(x) }

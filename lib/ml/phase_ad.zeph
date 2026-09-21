@@ -61,6 +61,13 @@ fn pad_features(z: int) -> int {
     return av_concat(first, av_imag(neighbor), 1)
 }
 
+// The fusion switch. Off restores the composed stage below, which is what the
+// fusion is checked against; a fused-only library could not be checked at all.
+var GIVENS_FUSE = true
+
+// The controller's two bias-then-tanh stages, likewise switchable.
+var CTRL_FUSE = true
+
 // One stage, built functionally. combined holds [new_a | new_b] and perm maps
 // each output coordinate back to its place in that concatenation.
 fn pad_givens(z: int, theta: int, phi: int, stage: int, d: int) -> int {
@@ -91,10 +98,24 @@ fn pad_givens(z: int, theta: int, phi: int, stage: int, d: int) -> int {
 fn pad_update(m: PhaseAD, z: int, embedding: int) -> int {
     let d = m.cfg.D
     let inputs = av_concat(embedding, pad_features(z), 1)
-    let hidden = av_tanh(av_add(av_matmul(inputs, av_transpose(m.W1, 0, 1)), m.b1))
-    let bounded = av_tanh(av_add(av_matmul(hidden, av_transpose(m.W2, 0, 1)), m.b2))
+    var hidden = 0
+    var bounded = 0
+    if CTRL_FUSE {
+        hidden = av_bias_tanh(av_matmul(inputs, av_transpose(m.W1, 0, 1)), m.b1)
+        bounded = av_bias_tanh(av_matmul(hidden, av_transpose(m.W2, 0, 1)), m.b2)
+    } else {
+        hidden = av_tanh(av_add(av_matmul(inputs, av_transpose(m.W1, 0, 1)), m.b1))
+        bounded = av_tanh(av_add(av_matmul(hidden, av_transpose(m.W2, 0, 1)), m.b2))
+    }
     let angles = av_mul(bounded, pad_scalar(PI))
     let phased = av_mul(z, av_expi(av_slice(angles, 1, 0, d), DType.C64))
+    if GIVENS_FUSE {
+        // theta and phi for a stage are adjacent halves of one angle block,
+        // so the fused stage takes the block whole and the two slices go away
+        // with the seventeen nodes the composed stage cost.
+        let even_f = av_givens(phased, av_slice(angles, 1, d, 2 * d), 0)
+        return av_givens(even_f, av_slice(angles, 1, 2 * d, 3 * d), 1)
+    }
     let th0 = av_slice(angles, 1, d, d + d / 2)
     let ph0 = av_slice(angles, 1, d + d / 2, 2 * d)
     let even = pad_givens(phased, th0, ph0, 0, d)

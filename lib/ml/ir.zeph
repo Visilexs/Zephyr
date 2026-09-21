@@ -63,7 +63,7 @@ fn ir_op_name(op: int) -> str {
                  "sum_dim", "sum_all", "mean_all", "abs2", "conj", "real",
                  "imag", "expi", "complex", "concat", "index_select", "roll",
                  "transpose", "reshape", "slice", "cast", "expand", "cos",
-                 "sin", "ln", "exp"]
+                 "sin", "ln", "exp", "givens", "bias_tanh"]
     if op < 0 or op >= names.len() { return "op{op}" }
     return names[op]
 }
@@ -291,6 +291,29 @@ fn ir_verify(g: IrGraph) -> [str] {
                 }
                 if out.dt != a.dt {
                     errs.push("{where}: result dtype {ir_dtype_name(out.dt)} should be {ir_dtype_name(a.dt)}")
+                }
+            }
+
+            if nd.op == OP_GIVENS {
+                if nd.b < 0 {
+                    errs.push("{where}: the fused Givens stage has no angle operand")
+                } else {
+                    let ang = g.values[nd.b]
+                    if not dtype_is_complex(a.dt) {
+                        errs.push("{where}: state operand is {ir_dtype_name(a.dt)}, must be complex")
+                    }
+                    if dtype_is_complex(ang.dt) {
+                        errs.push("{where}: angle operand is {ir_dtype_name(ang.dt)}, must be real")
+                    }
+                    if not ir_same_shape(out.shape, a.shape) {
+                        errs.push("{where}: result shape {ir_shape_str(out.shape)} should equal the state's {ir_shape_str(a.shape)}")
+                    }
+                    if not ir_same_shape(ang.shape, a.shape) {
+                        errs.push("{where}: angle shape {ir_shape_str(ang.shape)} should equal the state's {ir_shape_str(a.shape)}, theta then phi")
+                    }
+                    if nd.ia.len() < 1 or nd.ia[0] < 0 or nd.ia[0] > 1 {
+                        errs.push("{where}: stage must be 0 or 1")
+                    }
                 }
             }
 
@@ -535,8 +558,10 @@ fn ir_replay(g: IrGraph, inputs: [Tensor]) -> Tensor {
             for k in 2..nd.ia.len() { sel.push(nd.ia[k]) }
             r = t_index_select(x, nd.ia[0], sel)
         }
+        if nd.op == OP_GIVENS { r = t_givens(x, y, nd.ia[0]) }
+        if nd.op == OP_BIAS_TANH { r = t_bias_tanh(x, y) }
         if nd.op == OP_LEAF { done = false }
-        if nd.op > OP_EXP { done = false }
+        if nd.op > OP_BIAS_TANH { done = false }
         if nd.op < 0 { done = false }
 
         if not done {

@@ -26,7 +26,8 @@ passed on the strength of an exit code alone.
 | A22 | **passed** | `tests/ml/gpu_stream_test.zeph`, 23 checks, implementing the reference-test list in the specification's memory-runtime document one for one: owner deleted while view lives, view deleted before owner, producer on stream A consumed on B, release immediately after launch, host source mutated during flight, allocation failure (in a child process, since it panics), repeated loop returning to a stable live-byte baseline, and a 40-iteration delayed-completion stress that checks the no-in-flight-reuse invariant at every acquisition rather than once at the end. Completion is polled per fence via `vkGetFenceStatus`; `vkDeviceWaitIdle` is not used. Three host-side use-after-frees were found and fixed by giving the pool ownership of any event passed to `pool_touch`. Mutation-tested: immediate recycling of in-flight storage, refcount-ignoring release, and cross-stream wait removal are all caught -- the last only after the producer was enlarged from 64x64 to 1024x1024, because at the smaller size the test was vacuous and passed with the wait deleted. It now asserts the producer is still running when the consumer is submitted. |
 | A23 | **passed** | Output gates: `tests/ml/gpu_ops_test.zeph`, 95 checks over 47 comparisons at 1e-12, covering four binary ops, thirteen unary ops, `sum_dim` on every axis, gather (with `roll` and `concat` expressed through it) and scatter-add with repeated indices, in both dtypes at ranks 1 to 3; transpose, slice, reshape and expand are metadata under the stride contract and are tested by feeding non-contiguous views into the other kernels. Gradient and update gates: `tests/ml/gpu_grad_test.zeph`, 15 checks, running one phase training step entirely on the CPU and again with every supported op on the device -- loss, 964 gradient components and 964 parameter components after an AdamW step with weight decay all agree to 1e-12, and a fourth gate confirms 54 matmuls actually reached the device so the agreement is not the two paths being the same code. No VJP is reimplemented for the device: the VJPs are compositions of the hooked primitives, which is what makes this "supported with VJP" rather than "the forward agrees". Mutation-tested at both levels. Complex transcendentals are device-only (`t_map1` panics on complex), are not reached by the model, and are not claimed. |
 | A24 | **passed** | `lib/ml/ir.zeph` and `tests/ml/ir_test.zeph`, 58 checks, implementing the acceptance list at the end of the specification's tensor-IR section one item at a time. Eight invalid-IR cases, each built by mutating a real capture, every diagnostic naming its tape node; a clean graph must still verify, so rejection is not unconditional. Eager versus captured output and gradient equivalence through a replay interpreter that panics on an unknown opcode rather than skipping it. Guard misses on shape, dtype and arity, each reporting what it got against what was specialised, with the eager fallback exercised afterwards. Cache invalidation across all eight key components the specification lists, one changed at a time. A rank-5 graph produces a source-located diagnostic that also says it must stay eager. The real phase model captures and verifies clean. Mutation-tested; one hash test was found to be passing for the wrong reason and replaced. Found and fixed a real bug: the `OP_CAST` VJP panicked on a same-dtype cast. |
-| A25, A32, A33, A40, A41 | **not_run** | Not started. The specification defines no A15–A19, A26–A29 or A34–A39; the 27 defined IDs are A00–A14, A20–A25, A30–A33, A40 and A41. |
+| A25 | **passed** | `tests/ml/opt_test.zeph` (23 checks) and `tests/ml/fusion_test.zeph` (40 checks), implementing the optimization section's gate list for three optimizations: a hoisted-stride matmul, the fused Givens stage, and the fused controller nonlinearity. **The profile came first**, as that section demands, and contradicted the candidate order it suggests: at the specification's dimensions matmul was 94.85% of the forward pass and the elementwise work the fusion targets was about 1.9%, so matmul was fixed first and the fusions were written only once re-profiling made them worth writing. End to end the step went 8093 ms to 564 ms, 14.3x, with the loss bit-identical at every stage. Forward parity is **bit-exact via `t_hex`**, not a tolerance: each kernel evaluates the composed expression in the same order, including the multiplications by the zero imaginary part that a real-to-complex cast introduces, so equality is the correct gate and a reassociation would be caught. Gradients are bit-exact for the matmul and the controller fusion; for the Givens fusion the adjoint is a short closed form rather than a transcription of the composed backward, so they are gated at 1e-14 relative and the measured worst is 3.6e-16, printed scaled by 1e18 because Zephyr's `print` is fixed-point and would show it as a flat 0. **Pairing:** each stage is checked to write all D output coordinates exactly once and to preserve every row's norm, and the two overlapping stages are shown to be genuinely sequenced -- reversing them gives a different answer, and running both against the same input gives a third -- so the ordering is a fact about the code rather than an intention. There is no in-kernel barrier because there is no fused GPU stage: on the host the sequencing is two calls, and the specification's block-barrier case does not arise. **Memory report:** the tape falls from 426 to 186 nodes at specification size, 292 to 132 in the gate, with identical output storage; peak allocator bytes are not reported because this library does not expose that counter. Both latencies are reported separately and the suite asserts the optimized path is faster cold and warm, which is what enforces "a slower optimization remains disabled". Seven mutations caught: reversed matmul accumulation (5 failures), matmul validation bypassed (2), wrong sign on the Givens second row (10), overlapping instead of disjoint pairs (13), conjugate dropped from the Givens adjoint (2), bias added after the nonlinearity instead of before (7), and the 1-tanh^2 factor dropped from the controller adjoint (3). Two bugs in the suite itself were found and fixed on the way: a comparison that reused already-updated checkpoints, and an invalid-input case whose mutation was applied after the parameters were built, so it was testing nothing. |
+| A32, A33, A40, A41 | **not_run** | Not started. The specification defines no A15–A19, A26–A29 or A34–A39; the 27 defined IDs are A00–A14, A20–A25, A30–A33, A40 and A41. |
 | A10 | **passed** | `tools/ml_reference/test_phase.py` (12 groups, D=4/8/128 and the spec defaults) *and* an independently written `tools/ml_reference/verify_phase.py`, 121 checks, coded from MATHEMATICS.md rather than from the module. Pair bijection and bounds at D=4/8/128, G^H G=I built from the doc's own matrix, inverse by G^H, norm preservation, simultaneity, and 10,000 fixed-angle gates drifting 1.1e-16. No renormalization exists anywhere in the update path. The native port is covered separately by `tests/ml/phase_gates_test.zeph`, 1,981 checks and the only phase suite that runs on all three targets, which pins the pairing `phase_givens` builds in Zephyr at D=4, 8 **and 128** -- the per-step parity harness only reaches D=4 and D=8, and a pairing that was a bijection but paired the wrong coordinates would preserve the norm perfectly and go unnoticed. It also checks inverse by G^H, per-stage norm preservation, the stage-B wrap from the last coordinate to the first, and that the two stages are genuinely different permutations. Its assertions were confirmed load-bearing by mutation: perturbing the expected pairing makes it panic on the first check. |
 | A11 | **passed** | Same two suites. Probabilities invariant and state equivariant under global phase at three angles, controller angles unchanged, features invariant under global phase but sensitive to relative phase and matching the doc formula bit-for-bit. The constructed interference example is internally inconsistent in the specification -- with the normalized row it states, the squared amplitude is (1+cos(delta))/2, not the 1+cos(delta) the prose claims -- so both forms are asserted explicitly and the discrepancy is recorded as DESIGN.md D16 rather than absorbed into a tolerance. The claim the paragraph actually makes, that two orthonormal rows sweep [1,0] to [0,1] while global phase moves neither, holds exactly. |
 | A12 | **passed** | Same two suites. The paired-real port agrees with the complex model on loss, probabilities, state and every one of the eight parameter gradients to 1e-12, and holds no complex array at all. Both are checked against central differences: worst relative error 3.7e-10, real and imaginary parts separately. The mapped optimizer step is the SGD check in test_phase.py; AdamW waits for M4. |
@@ -36,6 +37,57 @@ passed on the strength of an exit code alone.
 | A31 | **passed** | Same suite. Seeded split hashes reproducible and pairwise disjoint, no duplicates within a split, frozen vocabulary covering all test tokens, composition and length bins non-empty, exact class balance, and class mean lengths equal to 1e-12 so length does not leak the target. |
 
 ## Measurements
+
+### End-to-end profile and what it changed (A25)
+
+`tools/ml_profile.zeph`, at the specification's dimensions (D=128, E=32,
+H=128, K=2, batch 32, T=4). The per-op column comes from replaying the
+captured IR node by node with a timer around each, which covers all opcodes
+the model reaches rather than only the six op families a hook-based profiler
+would see.
+
+| Stage | Step | Forward | Backward | Optimizer | Tape nodes |
+|---|---|---|---|---|---|
+| before any optimization | 8093 ms | 2646 | 5416 | 32 | 426 |
+| hoisted-stride matmul | 778 ms | 218 | — | 32 | 426 |
+| plus the fused Givens stage | 597 ms | 170 | 395 | 32 | 198 |
+| plus the fused controller | 564 ms | 160 | 372 | 32 | 186 |
+
+14.3x end to end. The loss is bit-identical across all four rows at
+1.31231441239229.
+
+Forward share by op, before and after:
+
+| op | before | after |
+|---|---|---|
+| matmul | 94.85% (2480 ms) | 46.70% (69.3 ms) |
+| concat | 1.00% | 13.35% |
+| mul | 0.93% | 7.59% |
+| givens (was 17 nodes of elementwise) | — | 2.62% |
+| bias_tanh (was tanh + broadcast add) | — | 3.09% |
+
+Two cautions about that table rather than one. The `transpose` row, 16% after
+optimization, is **replay overhead and not real work**: `av_transpose` is
+metadata on the tape, and the replay interpreter materialises it with
+`t_copy` so that a node has a value to hand on. It does not exist in the
+eager forward pass. And replay timing carries a roughly constant per-node
+cost, so a cheap op with a large node count is partly reporting dispatch, not
+arithmetic -- which is why the node count is printed next to every time.
+
+Isolated kernel speedups, warm, from the two gate suites:
+
+| Kernel | Shape | Composed | Fused | Speedup |
+|---|---|---|---|---|
+| matmul | [64,256]x[256,128] | 264 ms | 7.3 ms | 36.3x |
+| givens stage 0 | [64,128] | 9.7 ms | 0.65 ms | 14.2x |
+| bias_tanh | [64,256] | 2.8 ms | 0.86 ms | 3.2x |
+
+The matmul figure is not an arithmetic improvement. The reference reads every
+element through `t_get`, which allocates a two-element index list per access;
+for that shape it is 1.7 million list allocations to do 1.7 million
+multiply-adds. The kernel computes the same sums in the same order with the
+byte strides hoisted out of the inner loop, which is why the result is
+bit-identical rather than merely close.
 
 ### Self-host fixpoint
 

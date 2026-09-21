@@ -503,3 +503,36 @@ is, rather than written in Zephyr through `zspv`.
 The fixpoint was verified by hand rather than by trusting `selfbuild.ps1`'s
 exit code, using the staged procedure in `zephyr-ml/15_BOOTSTRAP_PLAN.md`:
 `embed-gen`, then `zc.exe` → stage-a → stage-b → stage-c, comparing SHA-256.
+
+## Optimization measurements (M6b, A25)
+
+Same machine and toolchain as the rest of this ledger. All timings from
+`QueryPerformanceCounter`, phase model at the specification's dimensions
+(D=128, E=32, H=128, K=2, batch 32, T=4), CPU path only -- the device backend
+is not involved in any figure here.
+
+| Stage | Step | Tape nodes | Loss |
+|---|---|---|---|
+| baseline | 8093 ms | 426 | 1.31231441239308 |
+| hoisted-stride matmul | 778 ms | 426 | 1.31231441239308 |
+| plus fused Givens | 597 ms | 198 | 1.31231441239229 |
+| plus fused controller | 564 ms | 186 | 1.31231441239229 |
+
+The loss shifts in the last two digits between rows two and three. That is
+not the fusion changing the forward pass -- the forward is bit-identical, and
+the gate asserts it with `t_hex` -- it is the profiler's own run recording a
+different last step after the tape shortened. The eager and replayed losses
+agree to the printed digit within each row.
+
+Isolated warm kernel timings: matmul [64,256]x[256,128] 264 -> 7.3 ms
+(36.3x), Givens stage [64,128] 9.7 -> 0.65 ms (14.2x), bias_tanh [64,256]
+2.8 -> 0.86 ms (3.2x). Full forward plus backward at the gate's smaller
+D=16 configuration: 14.6 -> 9.1 ms, 1.6x.
+
+Two notes worth keeping for anyone reading the profiler output later.
+`print` is fixed-point, so a relative difference of 3.6e-16 prints as a flat
+`0` and reads as "identical" when it is not; the fusion gate multiplies by
+1e18 before printing for that reason. And the profiler's `transpose` row is
+replay overhead -- the replay interpreter materialises a transpose with
+`t_copy` because a node must have a value, while the eager tape keeps it as
+metadata -- so it should not be read as a fourth optimization target.
