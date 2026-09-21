@@ -417,6 +417,25 @@ if (-not (Test-Path $spvF64)) {
     }
 }
 
+# ---- GPU elementwise, reduction and gather kernels (A23, outputs) ----
+if (-not (Test-Path $spvF64)) {
+    Write-Host "SKIP ml-gpu-ops -- compute kernels not built"
+} else {
+    $opsExe = Join-Path $tmp "gpu_ops_test.exe"
+    Remove-Item $opsExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tests\ml\gpu_ops_test.zeph $opsExe 2>&1 | Out-Null
+    if (-not (Test-Path $opsExe)) {
+        Check "ml-gpu-ops" $false "gpu_ops_test.zeph did not compile"
+    } else {
+        $oout = (& $opsExe 2>&1 | Out-String)
+        if ($oout -match "vkCreateInstance" -or $oout -match "no Vulkan") {
+            Write-Host "SKIP ml-gpu-ops -- no Vulkan device available"
+        } else {
+            Check "ml-gpu-ops" ($oout -match "gpu ops: 95 checks over 47 comparisons passed") "got tail: $($oout.Trim() -split "`n" | Select-Object -Last 1)"
+        }
+    }
+}
+
 # ---- phase parity against the float64 numpy reference (A13) ----
 # Skipped rather than failed when numpy is absent: it is a reference-side
 # dependency, and its absence is not a defect in the compiler or the port.

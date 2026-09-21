@@ -194,6 +194,75 @@ The benchmark is a tool rather than a suite entry: two minutes at the
 specification size is too slow for `run_tests.ps1`, and the correctness it
 depends on is already covered there by `ml-gpu`.
 
+## Device kernels: output tolerance gates (A23, first half)
+
+`lib/ml/gpu_ops.zeph` dispatches the five kernels; `tests/ml/gpu_ops_test.zeph`
+checks them against the CPU. **95 checks over 47 comparisons, all passing**,
+at 1e-12 relative -- not bit-equality, because the driver contracts
+multiply-adds into FMA and the measured host/device disagreement is about
+1e-15.
+
+Coverage is the census list: all four binary ops and all thirteen unary ops
+in both dtypes where the CPU has a counterpart, `sum_dim` over every axis,
+gather (including `roll` and `concat` expressed through it), and scatter-add
+with repeated indices. Ranks 1, 2 and 3.
+
+**transpose, slice, reshape and expand have no kernels and never will.** The
+push-constant contract carries strides, so those four are metadata: the
+view's own strides are the kernel's strides and a zero stride broadcasts.
+They are tested by feeding non-contiguous views into the other kernels, which
+is stronger than a dedicated kernel would be -- mishandled strides would fail
+every one of those cases at once.
+
+### Mutation testing, and a way mutation testing can lie
+
+| mutation | result |
+|---|---|
+| tanh returns its input unchanged | caught, 2 failures |
+| scatter-add stores instead of accumulating | caught, 3 failures |
+
+The second row was first recorded as NOT caught, and that was wrong. The
+mutated shader had failed to compile, the build script left the previous
+`.spv` in place, and the suite happily re-ran the unmutated kernel. Any
+mutation test that edits a shader must confirm the `.spv` actually changed;
+comparing its hash before and after is enough, and that is how the row above
+was finally established.
+
+### Two agents, one file
+
+Both kernel agents wrote `elem_binary_f64.comp` and `elem_unary_f64.comp`
+despite disjoint assignments. The second agent's versions are kept, because
+they are the ones that were verified, and the first agent's are preserved
+under the session scratchpad. The second agent's own verification was an
+emulation of the shader arithmetic in Python against libm, not a GPU run --
+the 95 checks above are the first time either version executed on silicon.
+
+### Three errors in my brief, found by the agent that implemented it
+
+1. The stated `ln2` split has all 53 mantissa bits in the high part, so
+   `k * ln2_hi` rounds and the reduced argument loses about ten bits.
+   Measured 5.69e-14, or 256 ulp, at x = -542.6. The correct split clears the
+   low 24 bits of the high part, which is what `lib/std/math.zeph` already
+   does.
+2. `sinh` via `expm1` divides by zero for x < -37, where `expm1` returns
+   exactly -1.
+3. The stated complex `tanh` denominator `cosh(2re) + cos(2im)` cancels near
+   the poles, measured at 72 ulp. The algebraically identical
+   `sinh(re)^2 + cos(im)^2` has nothing to cancel.
+
+### Known divergence, inside the gate
+
+`t_tanh` on the CPU saturates to 1 at |x| = 15; the kernel saturates at 20.
+In that band the two differ by up to 2.5e-13. That is inside the 1e-12 gate
+and the kernel is the more accurate of the two, but a tighter gate would
+need the CPU changed, not the kernel.
+
+### Complex transcendentals have no CPU reference
+
+`t_map1` panics on complex tensors, so complex `tanh`, `cos`, `sin`, `exp`
+and `ln` exist only on the device. They are therefore **not** covered by the
+95 checks and nothing here claims them. The phase model does not reach them.
+
 ## Streams, events and allocator lifetime (A22)
 
 `lib/ml/gpu_stream.zeph` and `tests/ml/gpu_stream_test.zeph`, 23 checks. The
