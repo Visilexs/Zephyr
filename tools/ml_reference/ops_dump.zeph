@@ -1,0 +1,124 @@
+// Dump operator results bit-exactly for the numpy cross-check.
+import "ml/ops.zeph"
+
+var SEED = 12345
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 20001) as float) / 1000.0 - 10.0
+}
+
+fn dumpR(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+fn dumpC(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get_re(t, idx))} {bits(t_get_im(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// real operands [4,5] and [4,5], plus a [1,5] row and a [4,1] column
+let A = t_zeros(DType.F64, [4, 5])
+let B = t_zeros(DType.F64, [4, 5])
+var i = 0
+while i < 4 {
+    var j = 0
+    while j < 5 {
+        t_set(A, [i, j], rnd())
+        t_set(B, [i, j], rnd())
+        j += 1
+    }
+    i += 1
+}
+let R = t_zeros(DType.F64, [1, 5])
+var j2 = 0
+while j2 < 5 {
+    t_set(R, [0, j2], rnd())
+    j2 += 1
+}
+dumpR("A", A)
+dumpR("B", B)
+dumpR("R", R)
+dumpR("add", t_add(A, B))
+dumpR("sub", t_sub(A, B))
+dumpR("mul", t_mul(A, B))
+dumpR("div", t_div(A, B))
+dumpR("bcast", t_add(A, R))
+dumpR("neg", t_neg(A))
+dumpR("sumdim0", t_sum_dim(A, 0))
+dumpR("sumdim1", t_sum_dim(A, 1))
+print("sumall {bits(t_sum_all(A))}")
+print("meanall {bits(t_mean_all(A))}")
+// transposed operand, to exercise the strided path
+dumpR("trmul", t_mul(t_transpose(A, 0, 1), t_transpose(B, 0, 1)))
+// matmul [4,5] @ [5,3]
+let M = t_zeros(DType.F64, [5, 3])
+var p = 0
+while p < 5 {
+    var q = 0
+    while q < 3 {
+        t_set(M, [p, q], rnd())
+        q += 1
+    }
+    p += 1
+}
+dumpR("M", M)
+dumpR("matmul", t_matmul(A, M))
+
+// complex operands [3,2]
+let CA = t_zeros(DType.C64, [3, 2])
+let CB = t_zeros(DType.C64, [3, 2])
+var r = 0
+while r < 3 {
+    var s = 0
+    while s < 2 {
+        t_set_c(CA, [r, s], rnd(), rnd())
+        t_set_c(CB, [r, s], rnd(), rnd())
+        s += 1
+    }
+    r += 1
+}
+dumpC("CA", CA)
+dumpC("CB", CB)
+dumpC("cadd", t_add(CA, CB))
+dumpC("cmul", t_mul(CA, CB))
+dumpC("cdiv", t_div(CA, CB))
+dumpC("cconj", t_conj(CA))
+dumpR("cabs2", t_abs2(CA))
+dumpR("creal", t_real(CA))
+dumpR("cimag", t_imag(CA))
+dumpC("cexpi", t_expi(t_real(CA), DType.C64))
+// complex matmul [3,2] @ [2,4]
+let CM = t_zeros(DType.C64, [2, 4])
+var u = 0
+while u < 2 {
+    var w = 0
+    while w < 4 {
+        t_set_c(CM, [u, w], rnd(), rnd())
+        w += 1
+    }
+    u += 1
+}
+dumpC("CM", CM)
+dumpC("cmatmul", t_matmul(CA, CM))
+
+// M3 prerequisite operators
+dumpR("tanh", t_tanh(A))
+dumpR("exp", t_exp(A))
+dumpR("cosr", t_cos(A))
+dumpR("sinr", t_sin(A))
+dumpR("sel0", t_index_select(A, 0, [3, 0, 2, 0]))
+dumpR("sel1", t_index_select(A, 1, [4, 1]))
+dumpR("rollm1", t_roll(A, 1, 0 - 1))
+dumpR("rollp2", t_roll(A, 0, 2))
+dumpR("cat0", t_concat(A, B, 0))
+dumpR("cat1", t_concat(A, B, 1))
+dumpC("csel", t_index_select(CA, 0, [2, 1]))
+dumpC("croll", t_roll(CA, 1, 0 - 1))

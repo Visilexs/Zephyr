@@ -1,0 +1,977 @@
+// CPU operators over the descriptors in ml/tensor.zeph -- milestone M2b.
+// Acceptance A04 (operator fixtures against the reference, including
+// non-contiguous layouts and invalid inputs) and A05 (complex arithmetic).
+//
+// Everything here is out-of-place and same-dtype. There is no promotion: the
+// specification wants a mixed-dtype call to be an error the caller resolves
+// with an explicit cast, not a silent widening. Nothing here records a tape;
+// autograd is M4 and will wrap these.
+//
+// The accumulation order is the reference order -- plain row-major traversal,
+// no reassociation, no fused paths. A faster kernel must reproduce these
+// numbers under the strict numeric policy, so this file is what it is
+// measured against.
+import "ml/tensor.zeph"
+import "std/math.zeph"
+
+fn same_dtype(a: Tensor, b: Tensor, who: str) {
+    if a.dt != b.dt {
+        panic("{who}: dtype mismatch, {dtype_name(a.dt)} against {dtype_name(b.dt)}; cast explicitly")
+    }
+}
+
+// Both operands are expanded to the broadcast shape, then read through
+// zero-stride views. No data is copied to do it.
+fn bcast_pair(a: Tensor, b: Tensor, who: str) -> [int] {
+    same_dtype(a, b, who)
+    return broadcast_shape(a.shape, b.shape)
+}
+
+// ---- elementwise binary ----------------------------------------------------
+
+// op: 0 add, 1 sub, 2 mul, 3 div
+fn ew_real(x: float, y: float, op: int) -> float {
+    if op == 0 { return x + y }
+    if op == 1 { return x - y }
+    if op == 2 { return x * y }
+    return x / y
+}
+
+// Smith's algorithm for the division, so an intermediate does not overflow
+// merely because the components are large. Scaling by the larger component
+// keeps the ratio at or below one.
+fn cdiv_re(a: float, b: float, c: float, d: float) -> float {
+    if fabs(c) >= fabs(d) {
+        let r = d / c
+        return (a + b * r) / (c + d * r)
+    }
+    let r = c / d
+    return (a * r + b) / (c * r + d)
+}
+
+fn cdiv_im(a: float, b: float, c: float, d: float) -> float {
+    if fabs(c) >= fabs(d) {
+        let r = d / c
+        return (b - a * r) / (c + d * r)
+    }
+    let r = c / d
+    return (b * r - a) / (c * r + d)
+}
+
+// ---------------------------------------------------------------------------
+// Backend hooks.
+//
+// A backend takes over an op family by pushing one function here; empty means
+// the CPU body below, which is what every existing bit-exact comparison in
+// this repository runs against. The unary hook is keyed by the device opcode
+// so that t_map1 and the five complex-specific ops share one slot instead of
+// needing five, and the output dtype is passed because abs2, real, imag and
+// expi all change it.
+//
+// The cost is one length check per call against bodies that are O(n) or
+// worse, so the CPU path is unaffected.
+var BINARY_HOOK: [fn(Tensor, Tensor, int) -> Tensor] = []
+var UNARY_HOOK: [fn(Tensor, int, DType) -> Tensor] = []
+var SUMDIM_HOOK: [fn(Tensor, int) -> Tensor] = []
+var GATHER_HOOK: [fn(Tensor, int, [int]) -> Tensor] = []
+
+fn hook_unary(t: Tensor, op: int, odt: DType) -> Tensor {
+    let f = UNARY_HOOK[0]
+    return f(t, op, odt)
+}
+
+fn t_binary(a: Tensor, b: Tensor, op: int, who: str) -> Tensor {
+    if BINARY_HOOK.len() > 0 {
+        let f = BINARY_HOOK[0]
+        return f(a, b, op)
+    }
+    return t_binary_cpu(a, b, op, who)
+}
+
+fn t_binary_cpu(a: Tensor, b: Tensor, op: int, who: str) -> Tensor {
+    let shape = bcast_pair(a, b, who)
+    let ea = t_expand(a, shape)
+    let eb = t_expand(b, shape)
+    let out = t_zeros(a.dt, shape)
+    if t_numel(out) == 0 { return out }
+    var idx = idx_zeros(shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(a.dt) {
+            let ar = t_get_re(ea, idx)
+            let ai = t_get_im(ea, idx)
+            let br = t_get_re(eb, idx)
+            let bi = t_get_im(eb, idx)
+            if op == 0 {
+                t_set_c(out, idx, ar + br, ai + bi)
+            } else {
+                if op == 1 {
+                    t_set_c(out, idx, ar - br, ai - bi)
+                } else {
+                    if op == 2 {
+                        t_set_c(out, idx, ar * br - ai * bi, ar * bi + ai * br)
+                    } else {
+                        t_set_c(out, idx, cdiv_re(ar, ai, br, bi), cdiv_im(ar, ai, br, bi))
+                    }
+                }
+            }
+        } else {
+            if dtype_is_float(a.dt) {
+                t_set(out, idx, ew_real(t_get(ea, idx), t_get(eb, idx), op))
+            } else {
+                panic("{who}: integer and bool arithmetic is not supported yet")
+            }
+        }
+        more = idx_next(idx, shape)
+    }
+    return out
+}
+
+fn t_add(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 0, "add") }
+fn t_sub(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 1, "sub") }
+fn t_mul(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 2, "mul") }
+fn t_div(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 3, "div") }
+
+// ---- elementwise unary -----------------------------------------------------
+
+fn t_neg(t: Tensor) -> Tensor {
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, idx, 0.0 - t_get_re(t, idx), 0.0 - t_get_im(t, idx))
+        } else {
+            t_set(out, idx, 0.0 - t_get(t, idx))
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_conj(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 7, t.dt) }
+    return t_conj_cpu(t)
+}
+
+fn t_conj_cpu(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("conj: not a complex tensor") }
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set_c(out, idx, t_get_re(t, idx), 0.0 - t_get_im(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// abs2 leaves the complex domain, so the output dtype is the component dtype.
+// This is the only real-from-complex path that is not an error, and its VJP
+// is 2z under the real inner product.
+fn t_abs2(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 6, dtype_component(t.dt)) }
+    return t_abs2_cpu(t)
+}
+
+fn t_abs2_cpu(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("abs2: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        let re = t_get_re(t, idx)
+        let im = t_get_im(t, idx)
+        t_set(out, idx, re * re + im * im)
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_real(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 8, dtype_component(t.dt)) }
+    return t_real_cpu(t)
+}
+
+fn t_real_cpu(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("real: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, t_get_re(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_imag(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 9, dtype_component(t.dt)) }
+    return t_imag_cpu(t)
+}
+
+fn t_imag_cpu(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("imag: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, t_get_im(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// expi(theta) = cos(theta) + i sin(theta), real in, complex out. The phase
+// gate is built on this.
+fn t_expi(t: Tensor, d: DType) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 10, d) }
+    return t_expi_cpu(t, d)
+}
+
+fn t_expi_cpu(t: Tensor, d: DType) -> Tensor {
+    if not dtype_is_float(t.dt) { panic("expi: argument must be a real float tensor") }
+    if not dtype_is_complex(d) { panic("expi: output dtype must be complex") }
+    let out = t_zeros(d, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        let th = t_get(t, idx)
+        t_set_c(out, idx, fcos(th), fsin(th))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// build a complex tensor from two real ones
+fn t_complex(re: Tensor, im: Tensor, d: DType) -> Tensor {
+    if not dtype_is_complex(d) { panic("complex: output dtype must be complex") }
+    same_dtype(re, im, "complex")
+    let shape = broadcast_shape(re.shape, im.shape)
+    let er = t_expand(re, shape)
+    let ei = t_expand(im, shape)
+    let out = t_zeros(d, shape)
+    if t_numel(out) == 0 { return out }
+    var idx = idx_zeros(shape.len())
+    var more = true
+    while more {
+        t_set_c(out, idx, t_get(er, idx), t_get(ei, idx))
+        more = idx_next(idx, shape)
+    }
+    return out
+}
+
+// ---- reductions ------------------------------------------------------------
+// sum over an empty tensor is 0, per the specification. mean over an empty
+// tensor is an error rather than a NaN, because it is always a caller bug.
+
+fn t_sum_all(t: Tensor) -> float {
+    if dtype_is_complex(t.dt) { panic("sum_all: use t_sum_all_re / t_sum_all_im") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+fn t_mean_all(t: Tensor) -> float {
+    let n = t_numel(t)
+    if n == 0 { panic("mean_all: mean over no elements is undefined") }
+    return t_sum_all(t) / (n as float)
+}
+
+fn t_sum_all_re(t: Tensor) -> float {
+    if not dtype_is_complex(t.dt) { panic("sum_all_re: not a complex tensor") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get_re(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+fn t_sum_all_im(t: Tensor) -> float {
+    if not dtype_is_complex(t.dt) { panic("sum_all_im: not a complex tensor") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get_im(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+// Reduce one axis, keeping the rank so the result broadcasts back over the
+// input without the caller having to reason about which axis vanished.
+fn t_sum_dim(t: Tensor, dim: int) -> Tensor {
+    if SUMDIM_HOOK.len() > 0 {
+        let f = SUMDIM_HOOK[0]
+        return f(t, dim)
+    }
+    return t_sum_dim_cpu(t, dim)
+}
+
+fn t_sum_dim_cpu(t: Tensor, dim: int) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("sum_dim: dim out of range") }
+    var osh: [int] = []
+    for i in 0..r { osh.push(t.shape[i]) }
+    osh[dim] = 1
+    let out = t_zeros(t.dt, osh)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var oid: [int] = []
+        for i in 0..r { oid.push(idx[i]) }
+        oid[dim] = 0
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, oid, t_get_re(out, oid) + t_get_re(t, idx),
+                              t_get_im(out, oid) + t_get_im(t, idx))
+        } else {
+            t_set(out, oid, t_get(out, oid) + t_get(t, idx))
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// ---- matmul ----------------------------------------------------------------
+// [M,K] @ [K,N] -> [M,N] only. Batch dimensions are deliberately not here: the
+// specification wants the two-dimensional case correct and the vector cases
+// specified separately rather than inherited by accident.
+// A backend may take over matmul by pushing one function here; empty means the
+// CPU path below. A list rather than an optional because it needs no default
+// value and no new type. The cost is one length check per call, against an
+// O(n^3) body, so the CPU path is unaffected and stays the default -- every
+// existing bit-exact comparison in this repository runs with this empty.
+var MATMUL_HOOK: [fn(Tensor, Tensor) -> Tensor] = []
+var MATMUL_CALLS = 0
+
+fn t_matmul(a: Tensor, b: Tensor) -> Tensor {
+    MATMUL_CALLS = MATMUL_CALLS + 1
+    if MATMUL_HOOK.len() > 0 {
+        let f = MATMUL_HOOK[0]
+        return f(a, b)
+    }
+    return t_matmul_cpu(a, b)
+}
+
+// ---- the matmul fast path --------------------------------------------------
+//
+// An end-to-end profile of a real training step at the specification's model
+// dimension (tools/ml_profile.zeph) puts matmul at 94.85% of the forward: 13
+// nodes out of 426, 2480 ms out of 2614. Everything the optimization section
+// lists for fusion -- the elementwise chain in the Givens stages -- is about
+// 1.9% put together. So this is where the time is, and the reference loop
+// below is why it is here rather than in the arithmetic.
+//
+// The reference reads every element through t_get, which allocates a list
+// literal for the index on every call, walks the shape to compute an offset,
+// and bounds-checks twice. For a [32,416]x[416,128] product that is 1.7
+// million list allocations to perform 1.7 million multiply-adds.
+//
+// This kernel computes the same sums in the same order with the index
+// arithmetic hoisted: byte strides are constant per operand, so the inner
+// loop advances two pointers and does nothing else. It is not blocked, not
+// vectorised and not reassociated -- the accumulation order is identical to
+// the reference, which is what keeps it inside the strict numeric policy and
+// lets the two be compared bit-for-bit rather than within a tolerance.
+//
+// Strided and offset views are handled by construction, since the strides are
+// read from the tensors. There is no contiguity requirement and so no hidden
+// copy.
+fn mm_f64(a: Tensor, b: Tensor, out: Tensor, m: int, k: int, n: int) {
+    let ab = a.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let as1 = a.stride[1] * 8
+    let bs0 = b.stride[0] * 8
+    var i = 0
+    while i < m {
+        let arow = (a.off + i * a.stride[0]) * 8
+        let orow = (out.off + i * out.stride[0]) * 8
+        var j = 0
+        while j < n {
+            var acc = 0.0
+            var pa = arow
+            var pb = (b.off + j * b.stride[1]) * 8
+            var q = 0
+            while q < k {
+                acc += ab.getf64(pa) * bb.getf64(pb)
+                pa += as1
+                pb += bs0
+                q += 1
+            }
+            ob.putf64(orow + j * out.stride[1] * 8, acc)
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// Complex elements are 16 bytes, real part first, which is the C64 layout in
+// tensor.zeph and the same one the device kernels use.
+fn mm_c64(a: Tensor, b: Tensor, out: Tensor, m: int, k: int, n: int) {
+    let ab = a.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let as1 = a.stride[1] * 16
+    let bs0 = b.stride[0] * 16
+    var i = 0
+    while i < m {
+        let arow = (a.off + i * a.stride[0]) * 16
+        let orow = (out.off + i * out.stride[0]) * 16
+        var j = 0
+        while j < n {
+            var sr = 0.0
+            var si = 0.0
+            var pa = arow
+            var pb = (b.off + j * b.stride[1]) * 16
+            var q = 0
+            while q < k {
+                let ar = ab.getf64(pa)
+                let ai = ab.getf64(pa + 8)
+                let br = bb.getf64(pb)
+                let bi = bb.getf64(pb + 8)
+                sr += ar * br - ai * bi
+                si += ar * bi + ai * br
+                pa += as1
+                pb += bs0
+                q += 1
+            }
+            let o = orow + j * out.stride[1] * 16
+            ob.putf64(o, sr)
+            ob.putf64(o + 8, si)
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// Off by default until measured; tools/ml_profile.zeph and the A25 suite turn
+// it on. "A slower optimization remains disabled" is the specification's rule
+// and a default-on optimization cannot honour it.
+var MM_FAST = true
+
+fn t_matmul_cpu(a: Tensor, b: Tensor) -> Tensor {
+    same_dtype(a, b, "matmul")
+    if a.shape.len() != 2 or b.shape.len() != 2 { panic("matmul: both operands must be rank 2") }
+    let m = a.shape[0]
+    let k = a.shape[1]
+    let n = b.shape[1]
+    if b.shape[0] != k {
+        panic("matmul: inner dimensions differ, {k} against {b.shape[0]}")
+    }
+    let out = t_zeros(a.dt, [m, n])
+    if m == 0 or n == 0 { return out }
+    if MM_FAST {
+        if a.dt == DType.F64 {
+            mm_f64(a, b, out, m, k, n)
+            return out
+        }
+        if a.dt == DType.C64 {
+            mm_c64(a, b, out, m, k, n)
+            return out
+        }
+    }
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            if dtype_is_complex(a.dt) {
+                var sr = 0.0
+                var si = 0.0
+                var p = 0
+                while p < k {
+                    let ar = t_get_re(a, [i, p])
+                    let ai = t_get_im(a, [i, p])
+                    let br = t_get_re(b, [p, j])
+                    let bi = t_get_im(b, [p, j])
+                    sr += ar * br - ai * bi
+                    si += ar * bi + ai * br
+                    p += 1
+                }
+                t_set_c(out, [i, j], sr, si)
+            } else {
+                var s = 0.0
+                var p = 0
+                while p < k {
+                    s += t_get(a, [i, p]) * t_get(b, [p, j])
+                    p += 1
+                }
+                t_set(out, [i, j], s)
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return out
+}
+
+// conjugate transpose, which is what the complex VJPs are written in terms of
+fn t_conj_transpose(t: Tensor) -> Tensor {
+    if t.shape.len() != 2 { panic("conj_transpose: rank 2 only") }
+    if dtype_is_complex(t.dt) { return t_copy(t_conj(t_transpose(t, 0, 1))) }
+    return t_copy(t_transpose(t, 0, 1))
+}
+
+// ---- real unary maps -------------------------------------------------------
+// One dispatcher rather than one loop per function: the traversal is the bulk
+// of the code and it is identical every time. Complex inputs are refused
+// because tanh of a complex number is not what any caller here means.
+
+let MAP_TANH = 0
+let MAP_COS = 1
+let MAP_SIN = 2
+let MAP_EXP = 3
+let MAP_LN = 4
+
+fn map1_real(x: float, op: int) -> float {
+    if op == MAP_TANH { return tanh(x) }
+    if op == MAP_COS { return fcos(x) }
+    if op == MAP_SIN { return fsin(x) }
+    if op == MAP_EXP { return fexp(x) }
+    if op == MAP_LN { return fln(x) }
+    panic("map1: unknown op")
+    return 0.0
+}
+
+fn t_map1(t: Tensor, op: int) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, op, t.dt) }
+    return t_map1_cpu(t, op)
+}
+
+fn t_map1_cpu(t: Tensor, op: int) -> Tensor {
+    if dtype_is_complex(t.dt) { panic("map1: real tensor required") }
+    if not dtype_is_float(t.dt) { panic("map1: float tensor required") }
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, map1_real(t_get(t, idx), op))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_tanh(t: Tensor) -> Tensor { return t_map1(t, MAP_TANH) }
+fn t_cos(t: Tensor) -> Tensor { return t_map1(t, MAP_COS) }
+fn t_sin(t: Tensor) -> Tensor { return t_map1(t, MAP_SIN) }
+fn t_exp(t: Tensor) -> Tensor { return t_map1(t, MAP_EXP) }
+fn t_ln(t: Tensor) -> Tensor { return t_map1(t, MAP_LN) }
+
+// ---- gather and scatter ----------------------------------------------------
+// t_index_select covers three things the phase forward pass needs that would
+// otherwise be three operators: embedding lookup (dim 0), picking out one
+// Givens stage's pair coordinates (dim 1), and cyclic roll (below).
+
+fn t_index_select(t: Tensor, dim: int, sel: [int]) -> Tensor {
+    if GATHER_HOOK.len() > 0 {
+        let f = GATHER_HOOK[0]
+        return f(t, dim, sel)
+    }
+    return t_index_select_cpu(t, dim, sel)
+}
+
+fn t_index_select_cpu(t: Tensor, dim: int, sel: [int]) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("index_select: dim out of range") }
+    let n = t.shape[dim]
+    for i in 0..sel.len() {
+        if sel[i] < 0 or sel[i] >= n { panic("index_select: index out of range") }
+    }
+    var osh: [int] = []
+    for i in 0..r { osh.push(t.shape[i]) }
+    osh[dim] = sel.len()
+    let out = t_zeros(t.dt, osh)
+    if shape_numel(osh) == 0 { return out }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var sid: [int] = []
+        for i in 0..r { sid.push(idx[i]) }
+        sid[dim] = sel[idx[dim]]
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, idx, t_get_re(t, sid), t_get_im(t, sid))
+        } else {
+            t_set(out, idx, t_get(t, sid))
+        }
+        more = idx_next(idx, osh)
+    }
+    return out
+}
+
+// The scatter counterpart, writing in place. Duplicate indices are refused
+// rather than silently letting the last write win: every use here is a
+// disjoint pairing, so a duplicate means a caller bug, not an accumulation.
+fn t_index_copy(dst: Tensor, dim: int, sel: [int], src: Tensor) {
+    if dst.ro { panic("index_copy: write into a read-only (broadcast) view") }
+    same_dtype(dst, src, "index_copy")
+    let r = dst.shape.len()
+    if src.shape.len() != r { panic("index_copy: rank mismatch") }
+    if dim < 0 or dim >= r { panic("index_copy: dim out of range") }
+    if src.shape[dim] != sel.len() { panic("index_copy: source extent does not match the index count") }
+    for i in 0..r {
+        if i != dim and src.shape[i] != dst.shape[i] { panic("index_copy: shape mismatch off the indexed dimension") }
+    }
+    let n = dst.shape[dim]
+    var seen: [int] = []
+    for i in 0..n { seen.push(0) }
+    for i in 0..sel.len() {
+        if sel[i] < 0 or sel[i] >= n { panic("index_copy: index out of range") }
+        if seen[sel[i]] == 1 { panic("index_copy: duplicate index") }
+        seen[sel[i]] = 1
+    }
+    if t_numel(src) == 0 { return }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var did: [int] = []
+        for i in 0..r { did.push(idx[i]) }
+        did[dim] = sel[idx[dim]]
+        if dtype_is_complex(src.dt) {
+            t_set_c(dst, did, t_get_re(src, idx), t_get_im(src, idx))
+        } else {
+            t_set(dst, did, t_get(src, idx))
+        }
+        more = idx_next(idx, src.shape)
+    }
+}
+
+// out[i] = t[(i - shift) mod n], matching numpy's roll, so roll(x, -1) is the
+// forward cyclic neighbour the invariant feature map is defined in terms of.
+fn t_roll(t: Tensor, dim: int, shift: int) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("roll: dim out of range") }
+    let n = t.shape[dim]
+    if n == 0 { return t_copy(t) }
+    var sel: [int] = []
+    for i in 0..n {
+        var j = (i - shift) % n
+        if j < 0 { j += n }
+        sel.push(j)
+    }
+    return t_index_select(t, dim, sel)
+}
+
+// ---- concatenation ---------------------------------------------------------
+
+fn t_concat(a: Tensor, b: Tensor, dim: int) -> Tensor {
+    same_dtype(a, b, "concat")
+    let r = a.shape.len()
+    if b.shape.len() != r { panic("concat: rank mismatch") }
+    if dim < 0 or dim >= r { panic("concat: dim out of range") }
+    for i in 0..r {
+        if i != dim and a.shape[i] != b.shape[i] { panic("concat: shape mismatch off the joined dimension") }
+    }
+    var osh: [int] = []
+    for i in 0..r { osh.push(a.shape[i]) }
+    osh[dim] = a.shape[dim] + b.shape[dim]
+    let out = t_zeros(a.dt, osh)
+    var left: [int] = []
+    for i in 0..a.shape[dim] { left.push(i) }
+    var right: [int] = []
+    for i in 0..b.shape[dim] { right.push(a.shape[dim] + i) }
+    t_index_copy(out, dim, left, a)
+    t_index_copy(out, dim, right, b)
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// The fused Givens stage.
+//
+// "A disjoint Givens stage can load a pair, rotate and write once." Unfused,
+// one stage is seventeen tape nodes and fourteen [B,D/2] temporaries: two
+// index_selects, cos, sin, two casts, expi, five muls, a neg, two adds, a
+// concat and a final index_select for the inverse permutation. Fused it is
+// one node, one pass, one write per element.
+//
+// The pairs of a stage are disjoint by construction -- stage 0 pairs (0,1),
+// (2,3), ... and stage 1 pairs (1,2), (3,4), ..., (D-1,0) -- so every output
+// coordinate is written exactly once and the loop needs no barrier between
+// pairs. Two *overlapping* stages do not have that property, which is why the
+// even stage still runs to completion before the odd one starts: they are two
+// launches, not one. Fusing across them would need the barrier the
+// optimization section warns about, and would buy nothing here.
+//
+// theta and phi arrive as one tensor because they always were one: the caller
+// slices them out of adjacent columns of the same angle block. Columns 0..H
+// are theta, columns H..2H are phi. That fuses the two slices away as well.
+//
+// The arithmetic below is not the short form of the rotation. It is the
+// composed graph's expression tree written out term for term, including the
+// multiplications by the zero imaginary part that a real-to-complex cast
+// introduces. The short form differs from it in the sign of zero and in the
+// last ulp, and the point of the fusion gate is to compare the two
+// bit-for-bit rather than within a tolerance.
+fn givens_check(z: Tensor, tp: Tensor, stage: int) -> int {
+    if not dtype_is_complex(z.dt) { panic("givens: state must be complex") }
+    if not dtype_is_float(tp.dt) { panic("givens: angles must be a real float tensor") }
+    if z.shape.len() != 2 or tp.shape.len() != 2 { panic("givens: state and angles must both be 2-D") }
+    if stage != 0 and stage != 1 { panic("givens: stage must be 0 or 1") }
+    let d = z.shape[1]
+    if d < 2 or d % 2 != 0 { panic("givens: state width {d} must be even and at least 2") }
+    if tp.shape[0] != z.shape[0] { panic("givens: angle batch {tp.shape[0]} does not match state batch {z.shape[0]}") }
+    if tp.shape[1] != d { panic("givens: angle width {tp.shape[1]} must be the state width {d}, theta then phi") }
+    return d
+}
+
+fn t_givens(z: Tensor, tp: Tensor, stage: int) -> Tensor {
+    let d = givens_check(z, tp, stage)
+    let h = d / 2
+    let b = z.shape[0]
+    let out = t_zeros(z.dt, [b, d])
+    let zb = z.st.buf
+    let tb = tp.st.buf
+    let ob = out.st.buf
+    let zs1 = z.stride[1] * 16
+    let ts1 = tp.stride[1] * 8
+    let os1 = out.stride[1] * 16
+    var r = 0
+    while r < b {
+        let zrow = (z.off + r * z.stride[0]) * 16
+        let trow = (tp.off + r * tp.stride[0]) * 8
+        let orow = (out.off + r * out.stride[0]) * 16
+        var k = 0
+        while k < h {
+            let ja = 2 * k + stage
+            let jb = (2 * k + stage + 1) % d
+            let pa = zrow + ja * zs1
+            let pb = zrow + jb * zs1
+            let ar = zb.getf64(pa)
+            let ai = zb.getf64(pa + 8)
+            let br = zb.getf64(pb)
+            let bi = zb.getf64(pb + 8)
+            let th = tb.getf64(trow + k * ts1)
+            let ph = tb.getf64(trow + (h + k) * ts1)
+            let c = fcos(th)
+            let s = fsin(th)
+            let qr = fcos(ph)
+            let qi = fsin(ph)
+            // new_a = (c+0i)*a + (s+0i)*(q*b)
+            let t1r = c * ar - 0.0 * ai
+            let t1i = c * ai + 0.0 * ar
+            let qbr = qr * br - qi * bi
+            let qbi = qr * bi + qi * br
+            let t3r = s * qbr - 0.0 * qbi
+            let t3i = s * qbi + 0.0 * qbr
+            // new_b = -((s+0i)*(conj(q)*a)) + (c+0i)*b
+            let nqi = 0.0 - qi
+            let u1r = qr * ar - nqi * ai
+            let u1i = qr * ai + nqi * ar
+            let u2r = s * u1r - 0.0 * u1i
+            let u2i = s * u1i + 0.0 * u1r
+            let u4r = c * br - 0.0 * bi
+            let u4i = c * bi + 0.0 * br
+            ob.putf64(orow + ja * os1, t1r + t3r)
+            ob.putf64(orow + ja * os1 + 8, t1i + t3i)
+            ob.putf64(orow + jb * os1, (0.0 - u2r) + u4r)
+            ob.putf64(orow + jb * os1 + 8, (0.0 - u2i) + u4i)
+            k += 1
+        }
+        r += 1
+    }
+    return out
+}
+
+// The adjoint of the same stage. In (a,b) the rotation is the holomorphic
+// linear map [[c, s q], [-s conj(q), c]], so the state gradient is that
+// matrix's conjugate transpose applied to the incoming gradient:
+//
+//     g_a = c gA - s q gB          g_b = s conj(q) gA + c gB
+//
+// theta and phi are real, so their gradients follow the library's convention
+// dL = Re(sum(conj(g) dz)) directly:
+//
+//     dA/dtheta = -s a + c q b     dB/dtheta = -c conj(q) a - s b
+//     dA/dphi   = i s q b          dB/dphi   = i s conj(q) a
+//
+// and Re(conj(u) i v) = -Im(conj(u) v), which is what the phi lines compute.
+//
+// Returned as [gz, gtp] because Zephyr has no tuples. Unlike the forward,
+// this is the short form rather than a transcription of the composed
+// backward pass, so nothing here guarantees agreement to the bit -- only to
+// rounding. tests/ml/fusion_test.zeph gates on 1e-14 relative and prints
+// what the difference actually is, which at the tested configuration is
+// zero. That is a measurement, not a promise.
+fn t_givens_backward(z: Tensor, tp: Tensor, g: Tensor, stage: int) -> [Tensor] {
+    let d = givens_check(z, tp, stage)
+    let h = d / 2
+    let b = z.shape[0]
+    let gz = t_zeros(z.dt, [b, d])
+    let gtp = t_zeros(tp.dt, [b, d])
+    let zb = z.st.buf
+    let tb = tp.st.buf
+    let gb = g.st.buf
+    let zob = gz.st.buf
+    let tob = gtp.st.buf
+    let zs1 = z.stride[1] * 16
+    let ts1 = tp.stride[1] * 8
+    let gs1 = g.stride[1] * 16
+    let os1 = gz.stride[1] * 16
+    let ps1 = gtp.stride[1] * 8
+    var r = 0
+    while r < b {
+        let zrow = (z.off + r * z.stride[0]) * 16
+        let trow = (tp.off + r * tp.stride[0]) * 8
+        let grow = (g.off + r * g.stride[0]) * 16
+        let zorow = (gz.off + r * gz.stride[0]) * 16
+        let torow = (gtp.off + r * gtp.stride[0]) * 8
+        var k = 0
+        while k < h {
+            let ja = 2 * k + stage
+            let jb = (2 * k + stage + 1) % d
+            let ar = zb.getf64(zrow + ja * zs1)
+            let ai = zb.getf64(zrow + ja * zs1 + 8)
+            let br = zb.getf64(zrow + jb * zs1)
+            let bi = zb.getf64(zrow + jb * zs1 + 8)
+            let gar = gb.getf64(grow + ja * gs1)
+            let gai = gb.getf64(grow + ja * gs1 + 8)
+            let gbr = gb.getf64(grow + jb * gs1)
+            let gbi = gb.getf64(grow + jb * gs1 + 8)
+            let th = tb.getf64(trow + k * ts1)
+            let ph = tb.getf64(trow + (h + k) * ts1)
+            let c = fcos(th)
+            let s = fsin(th)
+            let qr = fcos(ph)
+            let qi = fsin(ph)
+            let sqr = s * qr
+            let sqi = s * qi
+            // g_a = c gA - (s q) gB
+            let mr = sqr * gbr - sqi * gbi
+            let mi = sqr * gbi + sqi * gbr
+            zob.putf64(zorow + ja * os1, c * gar - mr)
+            zob.putf64(zorow + ja * os1 + 8, c * gai - mi)
+            // g_b = (s conj(q)) gA + c gB
+            let nr = sqr * gar + sqi * gai
+            let ni = sqr * gai - sqi * gar
+            zob.putf64(zorow + jb * os1, nr + c * gbr)
+            zob.putf64(zorow + jb * os1 + 8, ni + c * gbi)
+            // dA/dtheta = -s a + c q b, dB/dtheta = -c conj(q) a - s b
+            let qbr = qr * br - qi * bi
+            let qbi = qr * bi + qi * br
+            let dAr = 0.0 - s * ar + c * qbr
+            let dAi = 0.0 - s * ai + c * qbi
+            let car = qr * ar + qi * ai
+            let cai = qr * ai - qi * ar
+            let dBr = 0.0 - c * car - s * br
+            let dBi = 0.0 - c * cai - s * bi
+            tob.putf64(torow + k * ps1, gar * dAr + gai * dAi + gbr * dBr + gbi * dBi)
+            // dA/dphi = i s q b, dB/dphi = i s conj(q) a; Re(conj(g) i v) = -Im(conj(g) v)
+            let vAr = sqr * br - sqi * bi
+            let vAi = sqr * bi + sqi * br
+            let vBr = sqr * ar + sqi * ai
+            let vBi = sqr * ai - sqi * ar
+            tob.putf64(torow + (h + k) * ps1,
+                       0.0 - (gar * vAi - gai * vAr) - (gbr * vBi - gbi * vBr))
+            k += 1
+        }
+        r += 1
+    }
+    return [gz, gtp]
+}
+
+// ---------------------------------------------------------------------------
+// The fused controller nonlinearity: tanh(x + b), bias broadcast along rows.
+//
+// The controller is two of these back to back, and unfused each one is a
+// broadcast add that materialises a [B,H] temporary and then a tanh that
+// reads it back. Both passes walk the tensor through the generic elementwise
+// loop, which allocates an index list per element. Fused it is one pass, one
+// temporary, and the bias row read once per row rather than once per element.
+//
+// out = ftanh(x + b) is the same expression in the same order as the
+// composed t_tanh(t_add(x, b)), so this is bit-exact against it and the gate
+// compares t_hex rather than a tolerance.
+fn bias_tanh_check(x: Tensor, b: Tensor) {
+    if x.dt != DType.F64 or b.dt != DType.F64 { panic("bias_tanh: both operands must be f64") }
+    if x.shape.len() != 2 { panic("bias_tanh: input must be 2-D, got rank {x.shape.len()}") }
+    if b.shape.len() != 1 { panic("bias_tanh: bias must be 1-D, got rank {b.shape.len()}") }
+    if b.shape[0] != x.shape[1] { panic("bias_tanh: bias length {b.shape[0]} does not match the row width {x.shape[1]}") }
+}
+
+fn t_bias_tanh(x: Tensor, b: Tensor) -> Tensor {
+    bias_tanh_check(x, b)
+    let rows = x.shape[0]
+    let cols = x.shape[1]
+    let out = t_zeros(DType.F64, [rows, cols])
+    let xb = x.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let xs1 = x.stride[1] * 8
+    let bs0 = b.stride[0] * 8
+    let os1 = out.stride[1] * 8
+    let boff = b.off * 8
+    var r = 0
+    while r < rows {
+        var px = (x.off + r * x.stride[0]) * 8
+        var po = (out.off + r * out.stride[0]) * 8
+        var pb = boff
+        var j = 0
+        while j < cols {
+            ob.putf64(po, tanh(xb.getf64(px) + bb.getf64(pb)))
+            px += xs1
+            pb += bs0
+            po += os1
+            j += 1
+        }
+        r += 1
+    }
+    return out
+}
+
+// d/dx tanh(u) = 1 - tanh(u)^2, and the bias gradient is that summed down the
+// rows, which is what the broadcast add's VJP does unfused. Returned as
+// [gx, gb].
+//
+// The bias column sums accumulate in row order, the same order reduce_to
+// walks, so this one is bit-exact with the composed backward as well.
+fn t_bias_tanh_backward(out: Tensor, g: Tensor) -> [Tensor] {
+    let rows = out.shape[0]
+    let cols = out.shape[1]
+    let gx = t_zeros(DType.F64, [rows, cols])
+    let gb = t_zeros(DType.F64, [cols])
+    let ob = out.st.buf
+    let gbuf = g.st.buf
+    let xb = gx.st.buf
+    let bb = gb.st.buf
+    let os1 = out.stride[1] * 8
+    let gs1 = g.stride[1] * 8
+    let xs1 = gx.stride[1] * 8
+    var r = 0
+    while r < rows {
+        var po = (out.off + r * out.stride[0]) * 8
+        var pg = (g.off + r * g.stride[0]) * 8
+        var px = (gx.off + r * gx.stride[0]) * 8
+        var j = 0
+        while j < cols {
+            let o = ob.getf64(po)
+            let d = gbuf.getf64(pg) * (1.0 - o * o)
+            xb.putf64(px, d)
+            bb.putf64(j * 8, bb.getf64(j * 8) + d)
+            po += os1
+            pg += gs1
+            px += xs1
+            j += 1
+        }
+        r += 1
+    }
+    return [gx, gb]
+}

@@ -22,3 +22,10 @@ dist/*.zip
 
 # copied next to test outputs by bootstrap/build.ps1
 zephyr_rt.dll
+__pycache__/
+*.pyc
+
+# checkpoint artifacts from tests/ml/optim_test.zeph
+*.ckpt
+*.ckpt.tmp.*
+optim-child.log

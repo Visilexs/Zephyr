@@ -1,0 +1,162 @@
+// A20: a tiny real and complex forward and backward on the device, checked
+// against the CPU implementations that are themselves checked against numpy
+// and PyTorch, plus the unavailable-backend message.
+//
+// The backward check is deliberately not "GPU formula against CPU formula" --
+// that would compare gpu_matmul_backward to a copy of itself. It runs the
+// autograd tape, whose matmul VJP is verified against finite differences in
+// autograd_test.zeph, and compares the tape's gradients to the device's.
+import "ml/gpu.zeph"
+import "ml/autograd.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+fn near(a: float, b: float, tol: float, what: str) {
+    let d = fabs(a - b) / (1.0 + fabs(b))
+    if d <= tol { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}: got {a} want {b} rel {d}")
+    }
+}
+
+// ---- the unavailable-backend message -------------------------------------
+// Checked on a path that really is absent, so the branch is exercised rather
+// than assumed. An unavailable backend that has a fixable cause must say so.
+let msg = gpu_kernel_missing("examples/shaders/no_such_kernel.comp.spv")
+chk(msg != "", "missing kernel is reported")
+chk(msg.contains("no_such_kernel.comp.spv"), "message names the missing file")
+chk(msg.contains("build-compute-shaders.ps1"), "message names the fix")
+chk(msg.contains("glslc"), "message names the tool the fix needs")
+chk(gpu_unavailable() == "", "backend is available here")
+
+let m = gpu_init()
+print("device: {gpu_device_name(m)}")
+
+// ---- the optional device features the kernels rely on --------------------
+// Every f64 kernel needs shaderFloat64 and scatter_add_f64 needs 64-bit
+// buffer atomics. Both are optional in Vulkan and using one unenabled is
+// undefined behaviour, so assert they really were enabled: a regression that
+// silently stops requesting them would otherwise keep passing here by luck.
+chk(m.g.has_f64, "shaderFloat64 is enabled on this device")
+chk(m.g.has_int64_atomics, "shaderBufferInt64Atomics is enabled on this device")
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+
+let M = 5
+let K = 7
+let N = 4
+// Deliberately not square and not multiples of the 16x16 workgroup, so the
+// bounds guard in the shader is load-bearing. A kernel that ignored it would
+// write outside the logical matrix and the comparison below would catch it.
+chk(M % 16 != 0 and N % 16 != 0, "shapes are not workgroup multiples")
+
+// ---- real float64 forward -------------------------------------------------
+let A = t_zeros(DType.F64, [M, K])
+let B = t_zeros(DType.F64, [K, N])
+for i in 0..M {
+    for j in 0..K { t_set(A, [i, j], rnd()) }
+}
+for i in 0..K {
+    for j in 0..N { t_set(B, [i, j], rnd()) }
+}
+let C_cpu = t_matmul(A, B)
+let C_gpu = gpu_matmul(m, A, B)
+chk(t_rank(C_gpu) == 2 and C_gpu.shape[0] == M and C_gpu.shape[1] == N, "real result shape")
+for i in 0..M {
+    for j in 0..N { near(t_get(C_gpu, [i, j]), t_get(C_cpu, [i, j]), 0.000000000001, "real forward [{i},{j}]") }
+}
+
+// ---- real backward, against the tape --------------------------------------
+// loss = sum(A @ B), so dL/dC is all ones and the tape's gradients are the
+// two matmuls gpu_matmul_backward should reproduce.
+av_reset()
+let ia = av_leaf(A, true)
+let ib = av_leaf(B, true)
+av_backward(av_sum_all(av_matmul(ia, ib)))
+let gA_cpu = av_grad(ia)
+let gB_cpu = av_grad(ib)
+let gr = gpu_matmul_backward(m, A, B, t_ones(DType.F64, [M, N]))
+for i in 0..M {
+    for j in 0..K { near(t_get(gr[0], [i, j]), t_get(gA_cpu, [i, j]), 0.000000000001, "real dA [{i},{j}]") }
+}
+for i in 0..K {
+    for j in 0..N { near(t_get(gr[1], [i, j]), t_get(gB_cpu, [i, j]), 0.000000000001, "real dB [{i},{j}]") }
+}
+
+// ---- complex float64 forward ----------------------------------------------
+let cA = t_zeros(DType.C64, [M, K])
+let cB = t_zeros(DType.C64, [K, N])
+for i in 0..M {
+    for j in 0..K { t_set_c(cA, [i, j], rnd(), rnd()) }
+}
+for i in 0..K {
+    for j in 0..N { t_set_c(cB, [i, j], rnd(), rnd()) }
+}
+let cC_cpu = t_matmul(cA, cB)
+let cC_gpu = gpu_matmul(m, cA, cB)
+var any_im = false
+for i in 0..M {
+    for j in 0..N {
+        near(t_get_re(cC_gpu, [i, j]), t_get_re(cC_cpu, [i, j]), 0.000000000001, "complex forward re [{i},{j}]")
+        near(t_get_im(cC_gpu, [i, j]), t_get_im(cC_cpu, [i, j]), 0.000000000001, "complex forward im [{i},{j}]")
+        if fabs(t_get_im(cC_cpu, [i, j])) > 0.01 { any_im = true }
+    }
+}
+// Without this the imaginary comparisons above could all be passing on zeros,
+// which a kernel that dropped the cross terms would also produce.
+chk(any_im, "complex result has a non-trivial imaginary part")
+
+// ---- complex backward, against the tape ------------------------------------
+// loss = sum(abs2(A @ B)) is real, and under the dL = Re(sum(conj(g) dz))
+// convention its gradient with respect to C is exactly 2C -- so the conjugate
+// transposes in gpu_matmul_backward are exercised, not bypassed.
+av_reset()
+let ica = av_leaf(cA, true)
+let icb = av_leaf(cB, true)
+av_backward(av_sum_all(av_abs2(av_matmul(ica, icb))))
+let cgA_cpu = av_grad(ica)
+let cgB_cpu = av_grad(icb)
+let gc = t_add(cC_cpu, cC_cpu)
+let cgr = gpu_matmul_backward(m, cA, cB, gc)
+for i in 0..M {
+    for j in 0..K {
+        near(t_get_re(cgr[0], [i, j]), t_get_re(cgA_cpu, [i, j]), 0.000000000001, "complex dA re [{i},{j}]")
+        near(t_get_im(cgr[0], [i, j]), t_get_im(cgA_cpu, [i, j]), 0.000000000001, "complex dA im [{i},{j}]")
+    }
+}
+for i in 0..K {
+    for j in 0..N {
+        near(t_get_re(cgr[1], [i, j]), t_get_re(cgB_cpu, [i, j]), 0.000000000001, "complex dB re [{i},{j}]")
+        near(t_get_im(cgr[1], [i, j]), t_get_im(cgB_cpu, [i, j]), 0.000000000001, "complex dB im [{i},{j}]")
+    }
+}
+
+// ---- non-contiguous operands ----------------------------------------------
+// gpu_upload reads through t_get, so a transposed view must upload correctly
+// without being made contiguous first. This is exactly the shape the backward
+// pass feeds it, so a repack bug here would corrupt every gradient.
+let Bt = t_transpose(B, 0, 1)
+let D_cpu = t_matmul(Bt, t_transpose(A, 0, 1))
+let D_gpu = gpu_matmul(m, Bt, t_transpose(A, 0, 1))
+for i in 0..N {
+    for j in 0..M { near(t_get(D_gpu, [i, j]), t_get(D_cpu, [i, j]), 0.000000000001, "transposed view [{i},{j}]") }
+}
+
+gpu_done(m)
+
+if failed == 0 {
+    print("gpu: {passed} checks passed")
+} else {
+    print("gpu: {failed} FAILED, {passed} passed")
+    panic("gpu tests failed")
+}

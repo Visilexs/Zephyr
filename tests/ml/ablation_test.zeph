@@ -1,0 +1,298 @@
+// The two mechanism ablations.
+//
+// An ablation is only evidence if it removes the mechanism it names and
+// nothing else. Three things therefore have to hold and each one is a way
+// the ablation could be worthless rather than merely weak:
+//
+//   * It must actually remove the mechanism. The incoherent readout must be
+//     unable to interfere, and the real-rotation model must be unable to
+//     turn a real state complex. Checked as invariances, not by reading the
+//     code.
+//   * It must remove nothing else. Same parameter tensors, same shapes, same
+//     count -- otherwise a capacity difference is being reported as a
+//     mechanism difference.
+//   * It must still be trainable. Both ablations are differentiated by the
+//     same tape, and their gradients are checked against central
+//     differences, because an ablation that trains badly for a gradient bug
+//     would read as evidence for the mechanism.
+//
+// And the default path must be untouched with both switches off, which is
+// the first thing checked.
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = 0.4 * rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, 0.4 * rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+let D = 8
+let E = 4
+let H = 12
+let IV = 6
+let OV = 3
+let NB = 4
+let T = 3
+let CFG = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: 1, pad: 0, eps: 0.00000001}
+
+fn build() -> PhaseParams {
+    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
+              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    let zi = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [OV, D])
+    fill_random(zi)
+    fill_random(Mo)
+    return PhaseParams{config: CFG, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+}
+fn params_of(p: PhaseParams) -> [Tensor] {
+    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+}
+
+let save = SEED
+let P = build()
+let tokens = t_zeros(DType.I64, [NB, T])
+var targets: [int] = []
+for row in 0..NB {
+    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+
+fn loss_now() -> float {
+    av_reset()
+    let m = pad_params(P, false)
+    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+}
+fn probs_now() -> Tensor {
+    av_reset()
+    let m = pad_params(P, false)
+    return t_copy(av_value(pad_readout(m, pad_forward(m, tokens))))
+}
+
+fn grad_check(label: str, minnz: int) {
+    av_reset()
+    let m = pad_params(P, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+    let hs = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..hs.len() { grads.push(t_copy(av_grad(hs[i]))) }
+    let ts = params_of(P)
+    let h = 0.000001
+    var worst = 0.0
+    var nonzero = 0
+    for i in 0..ts.len() {
+        var idx = idx_zeros(ts[i].shape.len())
+        let n = t_numel(ts[i])
+        var rem = (i * 5 + 1) % n
+        var k = ts[i].shape.len() - 1
+        while k >= 0 {
+            idx[k] = rem % ts[i].shape[k]
+            rem = rem / ts[i].shape[k]
+            k = k - 1
+        }
+        if dtype_is_complex(ts[i].dt) {
+            let orr = t_get_re(ts[i], idx)
+            let oii = t_get_im(ts[i], idx)
+            t_set_c(ts[i], idx, orr + h, oii)
+            let up = loss_now()
+            t_set_c(ts[i], idx, orr - h, oii)
+            let dn = loss_now()
+            t_set_c(ts[i], idx, orr, oii)
+            let fd = (up - dn) / (2.0 * h)
+            let an = t_get_re(grads[i], idx)
+            let rel = fabs(fd - an) / (1.0 + fabs(an))
+            if rel > worst { worst = rel }
+            if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
+        } else {
+            let orig = t_get(ts[i], idx)
+            t_set(ts[i], idx, orig + h)
+            let up = loss_now()
+            t_set(ts[i], idx, orig - h)
+            let dn = loss_now()
+            t_set(ts[i], idx, orig)
+            let fd = (up - dn) / (2.0 * h)
+            let an = t_get(grads[i], idx)
+            let rel = fabs(fd - an) / (1.0 + fabs(an))
+            if rel > worst { worst = rel }
+            if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
+        }
+    }
+    print("{label}: worst gradient error against central differences {worst}, {nonzero} of 8 nonzero")
+    chk(worst < 0.0000001, "{label}: gradients agree with central differences ({worst})")
+    chk(nonzero >= minnz, "{label}: the probed gradients are mostly nonzero ({nonzero} of 8, expected at least {minnz})")
+}
+
+// ---- the default path is untouched -----------------------------------------
+READOUT_INCOHERENT = false
+PHASE_REAL_ROTATIONS = false
+let base_loss = loss_now()
+let base_probs = probs_now()
+chk(base_loss == base_loss and base_loss > 0.0, "the unablated loss is finite and positive ({base_loss})")
+grad_check("baseline", 6)
+
+// ---- incoherent readout ------------------------------------------------------
+// The defining property: the coherent readout's probabilities change when a
+// per-coordinate phase is applied to the state, because the contributions
+// interfere. The incoherent one cannot see that rotation at all.
+fn probs_with_twist(twist: bool) -> Tensor {
+    av_reset()
+    let m = pad_params(P, false)
+    var z = pad_forward(m, tokens)
+    if twist {
+        let ph = t_zeros(DType.F64, [1, D])
+        for j in 0..D { t_set(ph, [0, j], 0.3 + 0.21 * (j as float)) }
+        z = av_mul(z, av_expi(av_leaf(ph, false), DType.C64))
+    }
+    return t_copy(av_value(pad_readout(m, z)))
+}
+
+READOUT_INCOHERENT = false
+let coh_plain = probs_with_twist(false)
+let coh_twist = probs_with_twist(true)
+READOUT_INCOHERENT = true
+let inc_plain = probs_with_twist(false)
+let inc_twist = probs_with_twist(true)
+
+fn max_abs_diff(a: Tensor, b: Tensor) -> float {
+    var w = 0.0
+    for r in 0..a.shape[0] {
+        for c in 0..a.shape[1] {
+            let d2 = fabs(t_get(a, [r, c]) - t_get(b, [r, c]))
+            if d2 > w { w = d2 }
+        }
+    }
+    return w
+}
+let coh_moved = max_abs_diff(coh_plain, coh_twist)
+let inc_moved = max_abs_diff(inc_plain, inc_twist)
+print("per-coordinate phase twist moves the coherent readout by {coh_moved}, the incoherent one by {inc_moved}")
+chk(coh_moved > 0.001, "the coherent readout interferes: a relative phase twist changes it ({coh_moved})")
+chk(inc_moved < 0.000000000001, "the incoherent readout cannot interfere: the same twist changes nothing ({inc_moved})")
+chk(max_abs_diff(coh_plain, inc_plain) > 0.001, "the two readouts are different functions on the same state")
+
+// Still a distribution, and still trainable.
+var wsum = 0.0
+for r in 0..NB {
+    var s = 0.0
+    for c in 0..OV { s = s + t_get(inc_plain, [r, c]) }
+    if fabs(s - 1.0) > wsum { wsum = fabs(s - 1.0) }
+}
+chk(wsum < 0.000000000001, "the incoherent readout is still a probability distribution ({wsum})")
+grad_check("incoherent readout", 6)
+READOUT_INCOHERENT = false
+
+// ---- real rotations -----------------------------------------------------------
+// The defining property: with the phase modulation removed and every phi
+// forced to zero, the update is a real rotation, so a state that starts
+// entirely real stays entirely real for ever. The unablated model does not
+// have that property -- that is the mechanism.
+fn imag_mass_after(steps: int) -> float {
+    let zr = t_zeros(DType.C64, [D])
+    for j in 0..D { t_set_c(zr, [j], 0.3 + 0.1 * (j as float), 0.0) }
+    let p2 = PhaseParams{config: CFG, embedding: P.embedding, think: P.think, W1: P.W1, b1: P.b1,
+                         W2: P.W2, b2: P.b2, z_init: zr, M: P.M}
+    av_reset()
+    let m = pad_params(p2, false)
+    let z = pad_forward(m, tokens)
+    let v = av_value(z)
+    var mass = 0.0
+    for r in 0..NB {
+        for j in 0..D { mass = mass + fabs(t_get_im(v, [r, j])) }
+    }
+    return mass
+}
+PHASE_REAL_ROTATIONS = false
+let coh_imag = imag_mass_after(T)
+PHASE_REAL_ROTATIONS = true
+let real_imag = imag_mass_after(T)
+print("imaginary mass from a real initial state: unablated {coh_imag}, real-rotation ablation {real_imag}")
+chk(coh_imag > 0.01, "the unablated model turns a real state complex, which is the mechanism ({coh_imag})")
+chk(real_imag < 0.000000000001, "the real-rotation ablation leaves a real state real ({real_imag})")
+
+let abl_loss = loss_now()
+chk(fabs(abl_loss - base_loss) > 0.000001, "the ablation changes the loss, so it is doing something ({base_loss} against {abl_loss})")
+// Five of eight rather than six, and the two that drop out are the point.
+// The ablation multiplies every phi angle by zero and removes the phase
+// modulation entirely, so the controller weights that feed those outputs
+// have exactly zero gradient. That is the mechanism being absent, not a
+// gradient bug -- so it is asserted precisely rather than tolerated by a
+// loosened bound.
+grad_check("real rotations", 5)
+
+av_reset()
+let mr = pad_params(P, true)
+av_backward(pad_loss(mr, tokens, targets))
+let gW2 = av_grad(mr.W2)
+let gb2 = av_grad(mr.b2)
+var dead_ok = true
+var live_any = false
+for row in 0..(3 * D) {
+    // rows 0..D drive the phase modulation, D+D/2..2D and 2D+D/2..3D the
+    // two phi halves; everything else is a theta and must still move.
+    var should_be_dead = row < D
+    if row >= D + D / 2 and row < 2 * D { should_be_dead = true }
+    if row >= 2 * D + D / 2 { should_be_dead = true }
+    var rowsum = fabs(t_get(gb2, [row]))
+    for c in 0..H { rowsum = rowsum + fabs(t_get(gW2, [row, c])) }
+    if should_be_dead and rowsum != 0.0 { dead_ok = false }
+    if not should_be_dead and rowsum > 0.0000001 { live_any = true }
+}
+chk(dead_ok, "under the real-rotation ablation every phase and phi controller output has exactly zero gradient")
+chk(live_any, "and the theta outputs still have gradient, so the model is not simply dead")
+
+// Neither ablation changes the parameters.
+let ts = params_of(P)
+var shapes_ok = true
+if ts.len() != 8 { shapes_ok = false }
+var nparam = 0
+for i in 0..ts.len() {
+    var n = t_numel(ts[i])
+    if dtype_is_complex(ts[i].dt) { n = n * 2 }
+    nparam = nparam + n
+}
+chk(shapes_ok, "both ablations keep the same eight parameter tensors")
+print("parameter count under every setting: {nparam} real numbers")
+
+// Both at once, since the protocol runs them independently but nothing
+// should break if they are combined.
+READOUT_INCOHERENT = true
+let both = loss_now()
+chk(both == both, "both ablations together still give a finite loss ({both})")
+READOUT_INCOHERENT = false
+PHASE_REAL_ROTATIONS = false
+
+// And the default is restored, bit for bit.
+chk(t_hex(t_full(DType.F64, [1], loss_now())) == t_hex(t_full(DType.F64, [1], base_loss)),
+    "switching both ablations off restores the original loss bit-for-bit")
+
+if failed == 0 {
+    print("ablation: {passed} checks passed")
+} else {
+    print("ablation: {failed} FAILED, {passed} passed")
+    panic("ablation tests failed")
+}

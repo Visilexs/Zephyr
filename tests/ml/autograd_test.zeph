@@ -1,0 +1,259 @@
+// Reverse-mode AD checks for lib/ml/autograd.zeph -- acceptance A06 and A07.
+//
+// Every VJP is checked against central differences on the same graph, with
+// real and imaginary parts perturbed separately. Zephyr has no closures, so a
+// case is an integer and build() is the dispatch: the same function builds the
+// graph for the analytic pass and for each finite-difference probe, which
+// means the two cannot silently drift apart.
+import "ml/autograd.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+let H = 0.000001
+let FD_TOL = 0.0000002
+
+fn rel_close(a: float, b: float, tol: float) -> bool {
+    return fabs(a - b) <= tol * (1.0 + fabs(b))
+}
+
+// ---- case definitions ------------------------------------------------------
+// 0..15 real, 16..27 complex in x.
+
+fn case_complex(c: int) -> bool { return c >= 16 and c <= 27 }
+
+fn shape_x(c: int) -> [int] {
+    if c == 12 { return [2, 3] }
+    return [3, 4]
+}
+
+fn shape_y(c: int) -> [int] {
+    if c == 6 { return [4, 2] }
+    if c == 15 { return [1, 4] }
+    if c == 12 { return [2, 3] }
+    return [3, 4]
+}
+
+// Deterministic, nonzero, and away from the poles of the operations used.
+fn fill(t: Tensor, seed: int) -> Tensor {
+    var s = seed
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let a = ((s % 1201) as float) / 1000.0 + 0.35
+        s = (s * 1103515245 + 12345) % 2147483648
+        let b = ((s % 1201) as float) / 1000.0 + 0.35
+        if dtype_is_complex(t.dt) {
+            t_set_c(t, idx, a, b)
+        } else {
+            t_set(t, idx, a)
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return t
+}
+
+fn make_x(c: int) -> Tensor {
+    if case_complex(c) { return fill(t_zeros(DType.C64, shape_x(c)), 7 + c) }
+    return fill(t_zeros(DType.F64, shape_x(c)), 7 + c)
+}
+
+fn make_y(c: int) -> Tensor {
+    if case_complex(c) { return fill(t_zeros(DType.C64, shape_y(c)), 991 + c) }
+    return fill(t_zeros(DType.F64, shape_y(c)), 991 + c)
+}
+
+// Builds the graph for one case and returns the scalar loss handle. Complex
+// cases end in abs2 so the loss is real, which is what a loss has to be.
+fn build(c: int, x: int, y: int) -> int {
+    if c == 0 { return av_sum_all(av_add(x, y)) }
+    if c == 1 { return av_sum_all(av_sub(x, y)) }
+    if c == 2 { return av_sum_all(av_mul(x, y)) }
+    if c == 3 { return av_sum_all(av_div(x, y)) }
+    if c == 4 { return av_sum_all(av_neg(x)) }
+    if c == 5 { return av_sum_all(av_tanh(x)) }
+    if c == 6 { return av_sum_all(av_matmul(x, y)) }
+    if c == 7 { return av_mean_all(av_mul(x, x)) }
+    if c == 8 { return av_sum_all(av_sum_dim(x, 0)) }
+    if c == 9 { return av_sum_all(av_concat(x, y, 1)) }
+    if c == 10 { return av_sum_all(av_index_select(x, 0, [1, 0, 1])) }
+    if c == 11 { return av_sum_all(av_mul(av_roll(x, 1, 0 - 1), y)) }
+    if c == 12 { return av_sum_all(av_mul(av_transpose(x, 0, 1), av_transpose(y, 0, 1))) }
+    if c == 13 { return av_sum_all(av_mul(av_reshape(x, [4, 3]), av_reshape(y, [4, 3]))) }
+    if c == 14 { return av_sum_all(av_slice(x, 1, 1, 3)) }
+    // broadcasting: y is a single row reused across every row of x
+    if c == 15 { return av_sum_all(av_mul(x, y)) }
+    if c == 28 { return av_sum_all(av_cos(x)) }
+    if c == 29 { return av_sum_all(av_sin(x)) }
+    if c == 30 { return av_sum_all(av_mul(av_cos(x), av_sin(x))) }
+    if c == 31 { return av_sum_all(av_ln(x)) }
+    if c == 32 { return av_sum_all(av_mul(av_ln(x), av_ln(y))) }
+    if c == 33 { return av_sum_all(av_neg(av_ln(av_div(x, av_sum_dim(x, 1))))) }
+    if c == 34 { return av_sum_all(av_exp(x)) }
+    if c == 35 { return av_sum_all(av_exp(av_mul(av_ln(x), y))) }
+
+    if c == 16 { return av_sum_all(av_abs2(x)) }
+    if c == 17 { return av_sum_all(av_abs2(av_conj(x))) }
+    if c == 18 { return av_sum_all(av_abs2(av_add(x, y))) }
+    if c == 19 { return av_sum_all(av_abs2(av_mul(x, y))) }
+    if c == 20 { return av_sum_all(av_abs2(av_div(x, y))) }
+    if c == 21 { return av_sum_all(av_real(x)) }
+    if c == 22 { return av_sum_all(av_imag(x)) }
+    if c == 23 { return av_sum_all(av_mul(av_real(x), av_imag(x))) }
+    if c == 24 { return av_sum_all(av_abs2(av_expi(av_real(x), DType.C64))) }
+    if c == 25 { return av_sum_all(av_mul(av_real(av_expi(av_imag(x), DType.C64)), av_real(x))) }
+    if c == 26 { return av_sum_all(av_abs2(av_complex(av_real(x), av_imag(x), DType.C64))) }
+    if c == 27 { return av_sum_all(av_abs2(av_neg(av_conj(av_mul(x, y))))) }
+    panic("unknown case")
+    return 0
+}
+
+// The loss alone, with nothing recorded, for a finite-difference probe.
+fn loss_of(c: int, xt: Tensor, yt: Tensor) -> float {
+    av_reset()
+    let x = av_leaf(xt, false)
+    let y = av_leaf(yt, false)
+    let l = build(c, x, y)
+    return t_get(av_value(l), [0])
+}
+
+var n = 0
+
+// ---- every VJP against central differences --------------------------------
+for c in 0..36 {
+    let xt = make_x(c)
+    let yt = make_y(c)
+
+    av_reset()
+    let x = av_leaf(xt, true)
+    let y = av_leaf(yt, true)
+    let loss = build(c, x, y)
+    av_backward(loss)
+    let gx = av_grad(x)
+
+    n += ck(shapes_equal(gx.shape, xt.shape), "gradient has the shape of its input")
+    n += ck(gx.dt == xt.dt, "gradient has the dtype of its input")
+
+    var idx = idx_zeros(xt.shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(xt.dt) {
+            let re0 = t_get_re(xt, idx)
+            let im0 = t_get_im(xt, idx)
+            t_set_c(xt, idx, re0 + H, im0)
+            let up_re = loss_of(c, xt, yt)
+            t_set_c(xt, idx, re0 - H, im0)
+            let dn_re = loss_of(c, xt, yt)
+            t_set_c(xt, idx, re0, im0 + H)
+            let up_im = loss_of(c, xt, yt)
+            t_set_c(xt, idx, re0, im0 - H)
+            let dn_im = loss_of(c, xt, yt)
+            t_set_c(xt, idx, re0, im0)
+            n += ck(rel_close((up_re - dn_re) / (2.0 * H), t_get_re(gx, idx), FD_TOL), "real part matches central differences")
+            n += ck(rel_close((up_im - dn_im) / (2.0 * H), t_get_im(gx, idx), FD_TOL), "imaginary part matches central differences")
+        } else {
+            let v0 = t_get(xt, idx)
+            t_set(xt, idx, v0 + H)
+            let up = loss_of(c, xt, yt)
+            t_set(xt, idx, v0 - H)
+            let dn = loss_of(c, xt, yt)
+            t_set(xt, idx, v0)
+            n += ck(rel_close((up - dn) / (2.0 * H), t_get(gx, idx), FD_TOL), "gradient matches central differences")
+        }
+        more = idx_next(idx, xt.shape)
+    }
+}
+
+// ---- the convention's defining case: grad(abs2(z)) is exactly 2z -----------
+av_reset()
+let z2 = fill(t_zeros(DType.C64, [2, 3]), 31)
+let zh = av_leaf(z2, true)
+av_backward(av_sum_all(av_abs2(zh)))
+let g2 = av_grad(zh)
+var i2 = idx_zeros(2)
+var more2 = true
+while more2 {
+    n += ck(t_get_re(g2, i2) == 2.0 * t_get_re(z2, i2), "abs2 gradient is exactly 2z, real part")
+    n += ck(t_get_im(g2, i2) == 2.0 * t_get_im(z2, i2), "abs2 gradient is exactly 2z, imaginary part")
+    more2 = idx_next(i2, [2, 3])
+}
+
+// ---- broadcast and shared-parameter contributions --------------------------
+// A row reused across four rows must receive four contributions, not one.
+av_reset()
+let base = t_full(DType.F64, [4, 3], 2.0)
+let row = t_full(DType.F64, [1, 3], 5.0)
+let bh = av_leaf(base, true)
+let rh = av_leaf(row, true)
+av_backward(av_sum_all(av_mul(bh, rh)))
+let grow = av_grad(rh)
+n += ck(shapes_equal(grow.shape, [1, 3]), "broadcast gradient is reduced back to the input shape")
+for j in 0..3 { n += ck(t_get(grow, [0, j]) == 8.0, "every broadcast contribution is summed") }
+let gbase = av_grad(bh)
+for j in 0..3 { n += ck(t_get(gbase, [0, j]) == 5.0, "the broadcast operand's own gradient is unreduced") }
+
+// the same handle used twice must accumulate both paths
+av_reset()
+let s1 = av_leaf(t_full(DType.F64, [2], 3.0), true)
+av_backward(av_sum_all(av_add(s1, s1)))
+n += ck(t_get(av_grad(s1), [0]) == 2.0, "a variable used twice accumulates both contributions")
+
+av_reset()
+let s2 = av_leaf(t_full(DType.F64, [2], 3.0), true)
+av_backward(av_sum_all(av_mul(s2, s2)))
+n += ck(t_get(av_grad(s2), [0]) == 6.0, "x*x differentiates to 2x through accumulation")
+
+// ---- A07: tape semantics ---------------------------------------------------
+
+// consumed tape
+av_reset()
+let c1 = av_leaf(t_full(DType.F64, [2], 1.5), true)
+let l1 = av_sum_all(av_mul(c1, c1))
+av_backward(l1)
+n += ck(av_consumed(), "backward marks the tape consumed")
+
+// detach cuts the history
+av_reset()
+let d1 = av_leaf(t_full(DType.F64, [2], 1.5), true)
+let d2 = av_mul(d1, d1)
+let d3 = av_detach(d2)
+n += ck(not av_requires(d3), "a detached variable requires no gradient")
+n += ck(t_get(av_value(d3), [0]) == t_get(av_value(d2), [0]), "detach preserves the value")
+
+// no_grad records nothing
+av_reset()
+let ng = av_leaf(t_full(DType.F64, [2], 1.5), true)
+let before_nodes = av_nodes()
+av_no_grad(true)
+let ng2 = av_mul(ng, ng)
+n += ck(av_nodes() == before_nodes, "no_grad records no node")
+n += ck(not av_requires(ng2), "a no_grad result requires no gradient")
+av_no_grad(false)
+let ng3 = av_mul(ng, ng)
+n += ck(av_nodes() == before_nodes + 1, "recording resumes after no_grad")
+n += ck(av_requires(ng3), "a recorded result requires a gradient")
+
+// a constant leaf contributes no node and no gradient
+av_reset()
+let k1 = av_leaf(t_full(DType.F64, [2], 2.0), false)
+let k2 = av_leaf(t_full(DType.F64, [2], 3.0), false)
+let k3 = av_mul(k1, k2)
+n += ck(av_nodes() == 0, "an operation on constants records nothing")
+n += ck(not av_has_grad(k1), "a constant never receives a gradient")
+
+// the tape does not grow across repeated steps
+av_reset()
+var peak = 0
+for step in 0..25 {
+    av_reset()
+    let p = av_leaf(t_full(DType.F64, [4], 1.25), true)
+    av_backward(av_sum_all(av_tanh(av_mul(p, p))))
+    if av_nodes() > peak { peak = av_nodes() }
+}
+n += ck(peak == 3, "one step records exactly three nodes")
+n += ck(av_nodes() == 3, "25 steps leave the tape the size of one step")
+
+print("autograd: {n} checks passed")

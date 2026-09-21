@@ -1,0 +1,248 @@
+// A23, output half: every device kernel against the CPU implementation that
+// is already verified against numpy and PyTorch.
+//
+// The coverage target is the op census in tools/op_census.zeph, which counts
+// what one real full step actually reaches rather than what the library
+// happens to export. Ops that are metadata on the device -- transpose,
+// reshape, slice, expand -- have no kernel of their own and are instead fed
+// INTO the kernels as non-contiguous views, which is a stronger test than a
+// kernel would be: if stride handling were wrong, every one of those cases
+// would disagree.
+//
+// Tolerance is 1e-12 relative throughout. The device is not bit-identical to
+// the host even in float64 -- the driver contracts multiply-adds into FMA,
+// measured at about 1e-15 in tests/ml/gpu_test.zeph -- so bit-equality is the
+// wrong gate and 1e-12 leaves three orders of headroom over the observed
+// disagreement while still catching any real defect.
+import "ml/gpu_ops.zeph"
+import "ml/autograd.zeph"
+
+var passed = 0
+var failed = 0
+var groups = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+// Compare two tensors of the same shape elementwise, real or complex.
+fn same(got: Tensor, want: Tensor, what: str) {
+    groups = groups + 1
+    if got.shape.len() != want.shape.len() {
+        chk(false, "{what}: rank {got.shape.len()} against {want.shape.len()}")
+        return
+    }
+    for i in 0..want.shape.len() {
+        if got.shape[i] != want.shape[i] {
+            chk(false, "{what}: shape differs at {i}, {got.shape[i]} against {want.shape[i]}")
+            return
+        }
+    }
+    if got.dt != want.dt {
+        chk(false, "{what}: dtype differs")
+        return
+    }
+    var idx = idx_zeros(want.shape.len())
+    var more = t_numel(want) > 0
+    var worst = 0.0
+    var nontrivial = 0
+    while more {
+        if dtype_is_complex(want.dt) {
+            let wr = t_get_re(want, idx)
+            let wi = t_get_im(want, idx)
+            let dr = fabs(t_get_re(got, idx) - wr) / (1.0 + fabs(wr))
+            let di = fabs(t_get_im(got, idx) - wi) / (1.0 + fabs(wi))
+            if dr > worst { worst = dr }
+            if di > worst { worst = di }
+            if fabs(wr) > 0.001 or fabs(wi) > 0.001 { nontrivial = nontrivial + 1 }
+        } else {
+            let w = t_get(want, idx)
+            let d = fabs(t_get(got, idx) - w) / (1.0 + fabs(w))
+            if d > worst { worst = d }
+            if fabs(w) > 0.001 { nontrivial = nontrivial + 1 }
+        }
+        more = idx_next(idx, want.shape)
+    }
+    chk(worst <= 0.000000000001, "{what}: worst relative disagreement {worst}")
+    // A comparison whose expected values are all zero would pass against a
+    // kernel that wrote nothing at all.
+    chk(nontrivial > 0, "{what}: expected values are non-trivial, so the comparison is not vacuous")
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn filled(d: DType, shape: [int]) -> Tensor {
+    let t = t_zeros(d, shape)
+    var idx = idx_zeros(shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        if dtype_is_complex(d) { t_set_c(t, idx, rnd(), rnd()) } else { t_set(t, idx, rnd()) }
+        more = idx_next(idx, shape)
+    }
+    return t
+}
+// Strictly positive, for ln.
+fn filled_pos(d: DType, shape: [int]) -> Tensor {
+    let t = t_zeros(d, shape)
+    var idx = idx_zeros(shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        if dtype_is_complex(d) { t_set_c(t, idx, rnd() + 1.5, rnd()) } else { t_set(t, idx, rnd() + 1.5) }
+        more = idx_next(idx, shape)
+    }
+    return t
+}
+
+var m = gpu_init()
+print("device: {gpu_device_name(m)}")
+
+// ===========================================================================
+// Elementwise binary, real and complex, contiguous
+// ===========================================================================
+let OPS = [GOP_ADD, GOP_SUB, GOP_MUL, GOP_DIV]
+let OPNAME = ["add", "sub", "mul", "div"]
+for k in 0..OPS.len() {
+    let a = filled(DType.F64, [3, 5])
+    let b = filled_pos(DType.F64, [3, 5])      // positive, so div has no zero divisor
+    var want = t_add(a, b)
+    if OPS[k] == GOP_SUB { want = t_sub(a, b) }
+    if OPS[k] == GOP_MUL { want = t_mul(a, b) }
+    if OPS[k] == GOP_DIV { want = t_div(a, b) }
+    same(gop_binary(m, a, b, OPS[k]), want, "binary {OPNAME[k]} f64")
+
+    let ca = filled(DType.C64, [3, 5])
+    let cb = filled_pos(DType.C64, [3, 5])
+    var cwant = t_add(ca, cb)
+    if OPS[k] == GOP_SUB { cwant = t_sub(ca, cb) }
+    if OPS[k] == GOP_MUL { cwant = t_mul(ca, cb) }
+    if OPS[k] == GOP_DIV { cwant = t_div(ca, cb) }
+    same(gop_binary(m, ca, cb, OPS[k]), cwant, "binary {OPNAME[k]} c64")
+}
+
+// ===========================================================================
+// Non-contiguous and broadcast operands
+// ===========================================================================
+// This is where transpose, slice and expand are actually tested. None of them
+// has a kernel; they are strides, and if the kernels mishandled strides these
+// would be the cases that show it.
+let base = filled(DType.F64, [4, 6])
+let tr = t_transpose(base, 0, 1)                    // [6,4], swapped strides
+let tr2 = t_transpose(filled(DType.F64, [4, 6]), 0, 1)
+same(gop_binary(m, tr, tr2, GOP_MUL), t_mul(tr, tr2), "binary mul over transposed views")
+
+let sl = t_slice(base, 1, 1, 5)                     // [4,4], offset and gaps
+let sl2 = t_slice(filled(DType.F64, [4, 6]), 1, 1, 5)
+same(gop_binary(m, sl, sl2, GOP_ADD), t_add(sl, sl2), "binary add over sliced views")
+
+let row = filled(DType.F64, [1, 6])
+let bc = t_expand(row, [4, 6])                      // stride 0 on axis 0
+same(gop_binary(m, base, bc, GOP_ADD), t_add(base, bc), "binary add with a broadcast operand")
+chk(bc.stride[0] == 0, "the broadcast operand really has a zero stride")
+
+let crow = filled(DType.C64, [1, 5])
+let cbc = t_expand(crow, [3, 5])
+let cbase = filled(DType.C64, [3, 5])
+same(gop_binary(m, cbase, cbc, GOP_MUL), t_mul(cbase, cbc), "complex mul with a broadcast operand")
+
+// rank 1 and rank 3, so rank handling is not only ever exercised at 2
+let v1 = filled(DType.F64, [7])
+let v2 = filled(DType.F64, [7])
+same(gop_binary(m, v1, v2, GOP_ADD), t_add(v1, v2), "binary add rank 1")
+let w1 = filled(DType.C64, [2, 3, 4])
+let w2 = filled(DType.C64, [2, 3, 4])
+same(gop_binary(m, w1, w2, GOP_MUL), t_mul(w1, w2), "complex mul rank 3")
+
+// ===========================================================================
+// Elementwise unary
+// ===========================================================================
+// The transcendentals are the substance here: GLSL has no float64 tanh, cos,
+// sin, exp or log, so the kernel implements them by range reduction and
+// polynomial. Agreement with the CPU to 1e-12 is what says that worked.
+let ur = filled(DType.F64, [4, 5])
+same(gop_unary(m, ur, GOP_NEG, DType.F64), t_neg(ur), "unary neg f64")
+same(gop_unary(m, ur, GOP_TANH, DType.F64), t_tanh(ur), "unary tanh f64")
+same(gop_unary(m, ur, GOP_COS, DType.F64), t_cos(ur), "unary cos f64")
+same(gop_unary(m, ur, GOP_SIN, DType.F64), t_sin(ur), "unary sin f64")
+same(gop_unary(m, ur, GOP_EXP, DType.F64), t_exp(ur), "unary exp f64")
+let up = filled_pos(DType.F64, [4, 5])
+same(gop_unary(m, up, GOP_LN, DType.F64), t_ln(up), "unary ln f64")
+same(gop_unary(m, ur, GOP_COPY, DType.F64), t_copy(ur), "unary copy f64")
+
+// dtype-changing ops, where the three complex flag bits have to be right
+let uc = filled(DType.C64, [4, 5])
+same(gop_unary(m, uc, GOP_ABS2, DType.F64), t_abs2(uc), "abs2 c64 to f64")
+same(gop_unary(m, uc, GOP_CONJ, DType.C64), t_conj(uc), "conj c64")
+same(gop_unary(m, uc, GOP_REAL, DType.F64), t_real(uc), "real c64 to f64")
+same(gop_unary(m, uc, GOP_IMAG, DType.F64), t_imag(uc), "imag c64 to f64")
+same(gop_unary(m, ur, GOP_EXPI, DType.C64), t_expi(ur, DType.C64), "expi f64 to c64")
+same(gop_unary(m, ur, GOP_CAST, DType.C64), t_cast(ur, DType.C64), "cast f64 to c64")
+// GOP_CAST complex-to-real is intentionally NOT tested against t_cast: the
+// CPU refuses that direction outright ("cast: complex to real needs an
+// explicit t_real or t_imag"), because silently discarding an imaginary part
+// is the kind of thing that should be written down at the call site. The
+// device kernel implements it, but nothing in the library should reach it,
+// and t_real above covers the operation that is actually wanted.
+
+// unary over a non-contiguous input
+same(gop_unary(m, tr, GOP_TANH, DType.F64), t_tanh(tr), "unary tanh over a transposed view")
+same(gop_unary(m, sl, GOP_NEG, DType.F64), t_neg(sl), "unary neg over a sliced view")
+
+// ===========================================================================
+// Reduction
+// ===========================================================================
+let rr = filled(DType.F64, [3, 4, 2])
+for d in 0..3 { same(gop_sum_dim(m, rr, d), t_sum_dim(rr, d), "sum_dim f64 axis {d}") }
+let rc = filled(DType.C64, [3, 4])
+for d in 0..2 { same(gop_sum_dim(m, rc, d), t_sum_dim(rc, d), "sum_dim c64 axis {d}") }
+same(gop_sum_dim(m, tr, 0), t_sum_dim(tr, 0), "sum_dim over a transposed view")
+same(gop_sum_dim(m, sl, 1), t_sum_dim(sl, 1), "sum_dim over a sliced view")
+
+// ===========================================================================
+// Gather: index_select, and roll and concat expressed through it
+// ===========================================================================
+let gr = filled(DType.F64, [5, 3])
+same(gop_gather(m, gr, 0, [3, 0, 3, 1]), t_index_select(gr, 0, [3, 0, 3, 1]), "gather axis 0 with a repeated index")
+same(gop_gather(m, gr, 1, [2, 0]), t_index_select(gr, 1, [2, 0]), "gather axis 1")
+let gc = filled(DType.C64, [4, 3])
+same(gop_gather(m, gc, 0, [2, 2, 0]), t_index_select(gc, 0, [2, 2, 0]), "gather c64")
+same(gop_gather(m, tr, 0, [5, 1, 0]), t_index_select(tr, 0, [5, 1, 0]), "gather over a transposed view")
+
+// roll is a gather whose index list is the rotation
+let RN = 5
+let SHIFT = 2
+var rollsel: [int] = []
+for i in 0..RN { rollsel.push(((i - SHIFT) % RN + RN) % RN) }
+same(gop_gather(m, gr, 0, rollsel), t_roll(gr, 0, SHIFT), "roll expressed as a gather")
+
+// concat along an axis is a gather from a stacked source; here the simpler
+// equivalent check is that gathering the two halves back reproduces them
+let cc = t_concat(gr, gr, 0)
+same(gop_gather(m, cc, 0, [0, 1, 2, 3, 4]), gr, "first half of a concat recovered by gather")
+same(gop_gather(m, cc, 0, [5, 6, 7, 8, 9]), gr, "second half of a concat recovered by gather")
+
+// ===========================================================================
+// Scatter-add, the gather VJP
+// ===========================================================================
+// Duplicate indices must accumulate, which on the device means a float64
+// atomic compare-and-swap loop. A non-atomic version would lose writes and
+// the repeated-index cases below are what catch it.
+let sg = filled(DType.F64, [4, 3])
+same(gop_scatter_add(m, sg, 0, 6, [1, 1, 4, 1]), scatter_add(sg, 0, 6, [1, 1, 4, 1]), "scatter_add with three writes to one row")
+same(gop_scatter_add(m, sg, 0, 5, [0, 1, 2, 3]), scatter_add(sg, 0, 5, [0, 1, 2, 3]), "scatter_add with distinct indices")
+let sc2 = filled(DType.C64, [3, 2])
+same(gop_scatter_add(m, sc2, 0, 4, [2, 2, 2]), scatter_add(sc2, 0, 4, [2, 2, 2]), "scatter_add c64, all three into one row")
+same(gop_scatter_add(m, sg, 1, 4, [2, 0, 2]), scatter_add(sg, 1, 4, [2, 0, 2]), "scatter_add along axis 1")
+
+gpu_done(m)
+
+if failed == 0 {
+    print("gpu ops: {passed} checks over {groups} comparisons passed")
+} else {
+    print("gpu ops: {failed} FAILED, {passed} passed")
+    panic("gpu ops tests failed")
+}

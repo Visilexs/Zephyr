@@ -1,0 +1,382 @@
+// GPU feasibility probe for M5a -- acceptance A20 and A21, in part.
+//
+// The question this exists to answer is narrow and decides the milestone:
+// everything in lib/ml is float64, and both reference cross-check harnesses
+// compare bit-identical float64 fixtures, so an fp32 backend would cost the
+// parity evidence built across M2 to M4. shaderFloat64 is true on this
+// device, so an fp64 path is possible. Whether it is affordable is a
+// measurement, and this program makes it.
+//
+// It times the same matmul as an fp32 and an fp64 compute shader and against
+// lib/ml/ops on the CPU, at the shapes the phase controller and readout
+// actually use, and checks every result against the CPU implementation
+// before reporting any timing. A fast wrong kernel is not a result.
+//
+// NOT COVERED HERE, and not claimed: the CUDA arm of A21 (no toolkit on this
+// machine, recorded as blocked), peak memory, cold compile time, and the
+// tiny real+complex forward/backward A20 asks for. This is the first slice.
+import "vk/gfx.zeph"
+import "ml/ops.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+fn median_of(xs: [float]) -> float {
+    var s: [float] = []
+    for x in xs { s.push(x) }
+    for i in 0..s.len() {
+        for j in 0..(s.len() - 1 - i) {
+            if s[j] > s[j + 1] {
+                let t = s[j]
+                s[j] = s[j + 1]
+                s[j + 1] = t
+            }
+        }
+    }
+    return s[s.len() / 2]
+}
+
+fn p95_of(xs: [float]) -> float {
+    var s: [float] = []
+    for x in xs { s.push(x) }
+    for i in 0..s.len() {
+        for j in 0..(s.len() - 1 - i) {
+            if s[j] > s[j + 1] {
+                let t = s[j]
+                s[j] = s[j + 1]
+                s[j + 1] = t
+            }
+        }
+    }
+    var k = (s.len() * 95) / 100
+    if k >= s.len() { k = s.len() - 1 }
+    return s[k]
+}
+
+var g = Gfx.init("zephyr-gpu-probe", [])
+print("device: {g.gpu_name()}")
+
+// Deterministic operands, small enough in magnitude that fp32 accumulation
+// error stays interpretable rather than catastrophic.
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+
+// Shapes the phase model actually uses at the specification's dimensions
+// (D=128, E=32, H=128, batch 32), plus one larger square to show scaling.
+let SHAPES = [[32, 416, 128], [32, 128, 384], [32, 128, 3], [256, 256, 256]]
+let NAMES = ["controller W1 [32,416]x[416,128]", "controller W2 [32,128]x[128,384]", "readout [32,128]x[128,3]", "square [256,256]x[256,256]"]
+let REPS = 30
+
+print("")
+print("shape                                 cpu_ms    f32_ms    f64_ms   f64/f32   max_rel_err_f32  max_rel_err_f64")
+
+for si in 0..SHAPES.len() {
+    let M = SHAPES[si][0]
+    let K = SHAPES[si][1]
+    let N = SHAPES[si][2]
+
+    // ---- CPU reference, and the operands both GPU paths will see ----
+    let A = t_zeros(DType.F64, [M, K])
+    let B = t_zeros(DType.F64, [K, N])
+    for i in 0..M {
+        for j in 0..K { t_set(A, [i, j], rnd()) }
+    }
+    for i in 0..K {
+        for j in 0..N { t_set(B, [i, j], rnd()) }
+    }
+    let t_cpu0 = now_ms()
+    let C_cpu = t_matmul(A, B)
+    let t_cpu1 = now_ms()
+    let cpu_ms = t_cpu1 - t_cpu0
+
+    var gpu_ms: [float] = []
+    var errs: [float] = []
+
+    for prec in 0..2 {
+        var esz = 4
+        if prec == 1 { esz = 8 }
+        let bufA = g.buffer(M * K * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let bufB = g.buffer(K * N * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let bufC = g.buffer(M * N * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+
+        // upload A and B
+        var pp = Bytes.new(8)
+        var cell = Bytes.new(8)
+        vkcheck(vkMapMemory(g.dev, bufA.mem, 0, bufA.size, 0, pp.addr()), "map A")
+        var basep = pp.get64(0)
+        for i in 0..M {
+            for j in 0..K {
+                let v = t_get(A, [i, j])
+                if prec == 1 { cell.putf64(0, v) } else { cell.putf32(0, v) }
+                let off = basep + (i * K + j) * esz
+                for b in 0..esz { store8(off + b, cell.get8(b)) }
+            }
+        }
+        vkUnmapMemory(g.dev, bufA.mem)
+        vkcheck(vkMapMemory(g.dev, bufB.mem, 0, bufB.size, 0, pp.addr()), "map B")
+        basep = pp.get64(0)
+        for i in 0..K {
+            for j in 0..N {
+                let v = t_get(B, [i, j])
+                if prec == 1 { cell.putf64(0, v) } else { cell.putf32(0, v) }
+                let off = basep + (i * N + j) * esz
+                for b in 0..esz { store8(off + b, cell.get8(b)) }
+            }
+        }
+        vkUnmapMemory(g.dev, bufB.mem)
+
+        var bufs: [GpuBuffer] = []
+        bufs.push(bufA)
+        bufs.push(bufB)
+        bufs.push(bufC)
+        let ds = g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT)
+        var entry = cbytes("main")
+        var path = "examples/shaders/matmul_f32.comp.spv"
+        if prec == 1 { path = "examples/shaders/matmul_f64.comp.spv" }
+        let shader = g.shader(path)
+        var setlayouts: [int] = []
+        setlayouts.push(ds.layout)
+        let layout = g.pipeline_layout(setlayouts, 12, VK_SHADER_STAGE_COMPUTE_BIT)
+        let pipeline = g.compute_pipeline(shader, layout, entry)
+
+        var pc = Bytes.new(12)
+        pc.put32(0, M)
+        pc.put32(4, K)
+        pc.put32(8, N)
+        var sets = u64s([ds.set])
+        let gx = (N + 15) / 16
+        let gy = (M + 15) / 16
+        let pl = layout
+        let pipe = pipeline
+        let seta = sets.addr()
+        let pca = pc.addr()
+
+        // one warm-up submission, then REPS timed ones
+        g.immediate(fn(cb: int) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe)
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, seta, 0, 0)
+            vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pca)
+            vkCmdDispatch(cb, gx, gy, 1)
+        })
+
+        var times: [float] = []
+        for r in 0..REPS {
+            let a0 = now_ms()
+            g.immediate(fn(cb: int) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe)
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, seta, 0, 0)
+                vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pca)
+                vkCmdDispatch(cb, gx, gy, 1)
+            })
+            times.push(now_ms() - a0)
+        }
+        gpu_ms.push(median_of(times))
+
+        // ---- correctness, before any timing is believed ----
+        vkcheck(vkMapMemory(g.dev, bufC.mem, 0, bufC.size, 0, pp.addr()), "map C")
+        let rb = pp.get64(0)
+        var worst = 0.0
+        var got = Bytes.new(8)
+        for i in 0..M {
+            for j in 0..N {
+                let off = rb + (i * N + j) * esz
+                for b in 0..esz { got.put8(b, load8(off + b)) }
+                var gv = 0.0
+                if prec == 1 { gv = got.getf64(0) } else { gv = (got.getf32(0)) as float }
+                let want = t_get(C_cpu, [i, j])
+                let rel = fabs(gv - want) / (1.0 + fabs(want))
+                if rel > worst { worst = rel }
+            }
+        }
+        vkUnmapMemory(g.dev, bufC.mem)
+        errs.push(worst)
+
+        vkDestroyPipeline(g.dev, pipeline, 0)
+        vkDestroyPipelineLayout(g.dev, layout, 0)
+        vkDestroyShaderModule(g.dev, shader, 0)
+        g.destroy_desc_set(ds)
+        g.destroy_buffer(bufA)
+        g.destroy_buffer(bufB)
+        g.destroy_buffer(bufC)
+    }
+
+    let ratio = gpu_ms[1] / gpu_ms[0]
+    print("{NAMES[si]}  {cpu_ms}  {gpu_ms[0]}  {gpu_ms[1]}  {ratio}  {errs[0]}  {errs[1]}")
+
+    // fp64 must be essentially exact against the float64 CPU path; fp32 is
+    // allowed to be loose, and how loose is itself part of the finding.
+    assert(errs[1] < 0.000000000001, "fp64 kernel disagrees with the CPU")
+    assert(errs[0] < 0.001, "fp32 kernel is wildly wrong, not merely imprecise")
+}
+
+// ---------------------------------------------------------------------------
+// Compute-bound shapes.
+//
+// The table above is not a throughput measurement and must not be read as one.
+// Every shape there finishes in well under a tenth of a millisecond, which is
+// the cost of building and submitting a command buffer and waiting on its
+// fence; the arithmetic is lost inside the submission. An fp64/fp32 ratio near
+// 1.0 at those sizes means only that neither kernel was the bottleneck.
+//
+// To get the arithmetic ratio the dispatch has to be large enough that the
+// multiply-accumulates dominate. These shapes are too large for a full CPU
+// reference -- the naive t_matmul above already takes two seconds at 256 --
+// so operands are a pure function of their index and correctness is checked on
+// a sample of output cells recomputed directly.
+fn val_at(idx: int) -> float {
+    let h = (idx * 2654435761 + 12345) % 2147483648
+    return ((h % 2001) as float) / 1000.0 - 1.0
+}
+
+let BIG = [512, 1024]
+let BIG_REPS = 10
+let SAMPLES = 64
+
+print("")
+print("compute-bound (operands by index, 64 sampled cells checked per run)")
+print("n        f32_med_ms  f32_p95_ms  f64_med_ms  f64_p95_ms   f64/f32   err_f32   err_f64")
+
+for bi in 0..BIG.len() {
+    let n = BIG[bi]
+    var med: [float] = []
+    var p95: [float] = []
+    var berr: [float] = []
+
+    for prec in 0..2 {
+        var esz = 4
+        if prec == 1 { esz = 8 }
+        let bufA = g.buffer(n * n * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let bufB = g.buffer(n * n * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let bufC = g.buffer(n * n * esz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+
+        var pp2 = Bytes.new(8)
+        var cell2 = Bytes.new(8)
+        // A is indexed 0..n*n, B is offset so the two operands differ
+        let t_up0 = now_ms()
+        vkcheck(vkMapMemory(g.dev, bufA.mem, 0, bufA.size, 0, pp2.addr()), "map bigA")
+        var bp = pp2.get64(0)
+        for i in 0..(n * n) {
+            let v = val_at(i)
+            if prec == 1 { cell2.putf64(0, v) } else { cell2.putf32(0, v) }
+            let off = bp + i * esz
+            for b in 0..esz { store8(off + b, cell2.get8(b)) }
+        }
+        vkUnmapMemory(g.dev, bufA.mem)
+        vkcheck(vkMapMemory(g.dev, bufB.mem, 0, bufB.size, 0, pp2.addr()), "map bigB")
+        bp = pp2.get64(0)
+        for i in 0..(n * n) {
+            let v = val_at(i + 777777)
+            if prec == 1 { cell2.putf64(0, v) } else { cell2.putf32(0, v) }
+            let off = bp + i * esz
+            for b in 0..esz { store8(off + b, cell2.get8(b)) }
+        }
+        vkUnmapMemory(g.dev, bufB.mem)
+        let up_ms = now_ms() - t_up0
+
+        var bufs2: [GpuBuffer] = []
+        bufs2.push(bufA)
+        bufs2.push(bufB)
+        bufs2.push(bufC)
+        let ds2 = g.storage_set(bufs2, VK_SHADER_STAGE_COMPUTE_BIT)
+        var entry2 = cbytes("main")
+        var path2 = "examples/shaders/matmul_f32.comp.spv"
+        if prec == 1 { path2 = "examples/shaders/matmul_f64.comp.spv" }
+        // cold pipeline build, timed: the driver compiles SPIR-V to machine code here
+        let t_c0 = now_ms()
+        let sh2 = g.shader(path2)
+        var sl2: [int] = []
+        sl2.push(ds2.layout)
+        let lay2 = g.pipeline_layout(sl2, 12, VK_SHADER_STAGE_COMPUTE_BIT)
+        let pipe2 = g.compute_pipeline(sh2, lay2, entry2)
+        let cold_ms = now_ms() - t_c0
+
+        var pc2 = Bytes.new(12)
+        pc2.put32(0, n)
+        pc2.put32(4, n)
+        pc2.put32(8, n)
+        var sets2 = u64s([ds2.set])
+        let gxy = (n + 15) / 16
+        let pl2 = lay2
+        let pi2 = pipe2
+        let sa2 = sets2.addr()
+        let pa2 = pc2.addr()
+
+        g.immediate(fn(cb: int) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pi2)
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl2, 0, 1, sa2, 0, 0)
+            vkCmdPushConstants(cb, pl2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pa2)
+            vkCmdDispatch(cb, gxy, gxy, 1)
+        })
+
+        var ts: [float] = []
+        for r in 0..BIG_REPS {
+            let a0 = now_ms()
+            g.immediate(fn(cb: int) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pi2)
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl2, 0, 1, sa2, 0, 0)
+                vkCmdPushConstants(cb, pl2, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pa2)
+                vkCmdDispatch(cb, gxy, gxy, 1)
+            })
+            ts.push(now_ms() - a0)
+        }
+        med.push(median_of(ts))
+        p95.push(p95_of(ts))
+
+        // sampled readback, recomputing each cell from val_at
+        let t_dn0 = now_ms()
+        vkcheck(vkMapMemory(g.dev, bufC.mem, 0, bufC.size, 0, pp2.addr()), "map bigC")
+        let rb2 = pp2.get64(0)
+        var worst2 = 0.0
+        var got2 = Bytes.new(8)
+        for k in 0..SAMPLES {
+            let i = (k * 7919) % n
+            let j = (k * 104729) % n
+            var want = 0.0
+            for q in 0..n { want = want + val_at(i * n + q) * val_at(q * n + j + 777777) }
+            let off = rb2 + (i * n + j) * esz
+            for b in 0..esz { got2.put8(b, load8(off + b)) }
+            var gv = 0.0
+            if prec == 1 { gv = got2.getf64(0) } else { gv = (got2.getf32(0)) as float }
+            let rel = fabs(gv - want) / (1.0 + fabs(want))
+            if rel > worst2 { worst2 = rel }
+        }
+        vkUnmapMemory(g.dev, bufC.mem)
+        let dn_ms = now_ms() - t_dn0
+        berr.push(worst2)
+
+        var pname = "f32"
+        if prec == 1 { pname = "f64" }
+        let mb = ((n * n * esz * 2) as float) / 1048576.0
+        print("  n={n} {pname}: host upload {mb} MiB in {up_ms} ms, cold pipeline build {cold_ms} ms, mapped readback+check {dn_ms} ms")
+
+        vkDestroyPipeline(g.dev, pipe2, 0)
+        vkDestroyPipelineLayout(g.dev, lay2, 0)
+        vkDestroyShaderModule(g.dev, sh2, 0)
+        g.destroy_desc_set(ds2)
+        g.destroy_buffer(bufA)
+        g.destroy_buffer(bufB)
+        g.destroy_buffer(bufC)
+    }
+
+    let r2 = med[1] / med[0]
+    print("{n}  {med[0]}  {p95[0]}  {med[1]}  {p95[1]}  {r2}  {berr[0]}  {berr[1]}")
+    assert(berr[1] < 0.000000001, "fp64 kernel wrong at compute-bound size")
+    assert(berr[0] < 0.01, "fp32 kernel wrong at compute-bound size")
+}
+
+g.shutdown()
+print("")
+print("probe complete")

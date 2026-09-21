@@ -1,0 +1,541 @@
+// A25 for the fused Givens stage.
+//
+// Same gate list as tests/ml/opt_test.zeph -- "same input/checkpoint; forward
+// and all parameter gradients within registered tolerance; identical
+// invalid-input behavior; no peak-memory regression beyond a recorded
+// tradeoff; cold and warm latency separately; benchmark artifacts. A slower
+// optimization remains disabled." -- plus the two things the optimization
+// section says specifically about this fusion: that a disjoint stage loads a
+// pair, rotates and writes once, and that overlapping pairing stages cannot
+// simply run concurrently.
+//
+// The two tolerances here are deliberately different and the difference is
+// the point.
+//
+//   * The FORWARD is bit-exact. t_givens is the composed expression tree
+//     written out term for term, including the multiplications by the zero
+//     imaginary part that the real-to-complex casts introduce, so there is no
+//     reassociation and equality is the correct gate.
+//   * The GRADIENTS are gated on 1e-14 relative instead. The fused adjoint
+//     is a short closed form, not the composed backward pass evaluated in
+//     the same order, so there is no argument that says they must agree to
+//     the bit. At the configuration tested here they do -- the suite prints
+//     the measured worst difference and how many of the eight are
+//     bit-identical -- but that is an observation, not a guarantee, and
+//     gating on it would be asserting something nobody proved.
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// The composed stage, kept here rather than imported, because phase_ad's copy
+// is the one being replaced and a gate that compares an optimization against
+// itself proves nothing. This is the expression the fused kernel claims to
+// reproduce, written without the tape.
+fn givens_composed(z: Tensor, tp: Tensor, stage: int) -> Tensor {
+    let d = z.shape[1]
+    let h = d / 2
+    var left: [int] = []
+    var right: [int] = []
+    for j in 0..h {
+        left.push(2 * j + stage)
+        right.push((2 * j + stage + 1) % d)
+    }
+    var perm: [int] = []
+    for j in 0..d { perm.push(0) }
+    for k in 0..h {
+        perm[left[k]] = k
+        perm[right[k]] = h + k
+    }
+    let a = t_index_select(z, 1, left)
+    let b = t_index_select(z, 1, right)
+    let theta = t_slice(tp, 1, 0, h)
+    let phi = t_slice(tp, 1, h, d)
+    let c = t_cast(t_cos(theta), DType.C64)
+    let s = t_cast(t_sin(theta), DType.C64)
+    let q = t_expi(phi, DType.C64)
+    let new_a = t_add(t_mul(c, a), t_mul(s, t_mul(q, b)))
+    let new_b = t_add(t_neg(t_mul(s, t_mul(t_conj(q), a))), t_mul(c, b))
+    return t_index_select(t_concat(new_a, new_b, 1), 1, perm)
+}
+
+fn max_rel(x: Tensor, y: Tensor) -> float {
+    var worst = 0.0
+    var idx = idx_zeros(x.shape.len())
+    var more = t_numel(x) > 0
+    while more {
+        var dv = 0.0
+        var sc = 0.0
+        if dtype_is_complex(x.dt) {
+            dv = fabs(t_get_re(x, idx) - t_get_re(y, idx)) + fabs(t_get_im(x, idx) - t_get_im(y, idx))
+            sc = fabs(t_get_re(x, idx)) + fabs(t_get_im(x, idx))
+        } else {
+            dv = fabs(t_get(x, idx) - t_get(y, idx))
+            sc = fabs(t_get(x, idx))
+        }
+        let r = dv / (1.0 + sc)
+        if r > worst { worst = r }
+        more = idx_next(idx, x.shape)
+    }
+    return worst
+}
+
+// ---- identical invalid-input behaviour, in children ------------------------
+// Run through the model rather than through t_givens directly: the composed
+// path never calls t_givens, so comparing the kernel with itself would be the
+// only thing a direct call could do. What has to match is what the caller
+// sees, with the fusion on and off, on input that must be refused.
+if args().len() > 2 {
+    GIVENS_FUSE = args()[2] == "fused"
+    CTRL_FUSE = args()[2] == "fused"
+    let case = args()[1]
+    let d = 8
+    let cfg = PhaseConfig{input_vocab: 5, output_vocab: 3, D: d, E: 4, H: 6, K: 1, pad: 0, eps: 0.00000001}
+    var dd = d
+    if case == "odd" { dd = 7 }
+    let ps = [t_zeros(DType.F64, [5, 4]), t_zeros(DType.F64, [4]),
+              t_zeros(DType.F64, [6, 4 + 3 * dd]), t_zeros(DType.F64, [6]),
+              t_zeros(DType.F64, [3 * dd, 6]), t_zeros(DType.F64, [3 * dd])]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    let zi = t_zeros(DType.C64, [dd])
+    let Mo = t_zeros(DType.C64, [3, dd])
+    fill_random(zi)
+    fill_random(Mo)
+    if case == "bias" { ps[3] = t_zeros(DType.F64, [7]) }
+    var c2 = cfg
+    if case == "odd" { c2 = PhaseConfig{input_vocab: 5, output_vocab: 3, D: dd, E: 4, H: 6, K: 1, pad: 0, eps: 0.00000001} }
+    let p = PhaseParams{config: c2, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                        W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+    let tok = t_zeros(DType.I64, [2, 2])
+    if case == "vocab" { t_set_int(tok, [0, 0], 99) }
+    if case == "negative" { t_set_int(tok, [1, 1], 0 - 1) }
+    av_reset()
+    let m = pad_params(p, true)
+    pad_loss(m, tok, [0, 1])
+    print("UNREACHABLE: {case} was accepted")
+}
+let IS_CHILD = args().len() > 2
+
+fn child(case: str, mode: str) -> int {
+    var cmd = cbytes("\"{args()[0]}\" {case} {mode}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, cmd.addr(), 0, 0, 1, 134217728, 0, 0, startup.addr(), process.addr())
+    if started == 0 { return 0 - 1 }
+    win("WaitForSingleObject", process.get64(0), 30000)
+    let status = Bytes.new(8)
+    win("GetExitCodeProcess", process.get64(0), status.addr())
+    let code = status.get32(0)
+    win("CloseHandle", process.get64(0))
+    win("CloseHandle", process.get64(8))
+    return code
+}
+
+// ===========================================================================
+let D = 16
+let E = 8
+let H = 32
+let K = 1
+let IV = 6
+let OV = 3
+let NB = 8
+let T = 3
+
+fn build() -> PhaseParams {
+    let cfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
+              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    let zi = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [OV, D])
+    fill_random(zi)
+    fill_random(Mo)
+    return PhaseParams{config: cfg, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+}
+fn params_of(p: PhaseParams) -> [Tensor] {
+    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+}
+
+let save = SEED
+let p_ref = build()
+SEED = save
+let p_opt = build()
+
+let tokens = t_zeros(DType.I64, [NB, T])
+var targets: [int] = []
+for row in 0..NB {
+    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+
+var LAST_NODES = 0
+fn step(p: PhaseParams, opt: Optim, out: [Tensor]) -> float {
+    av_reset()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+    LAST_NODES = av_nodes()
+    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
+    clip_grad_norm(grads, 5.0)
+    optim_step(opt, params_of(p), grads)
+    for i in 0..grads.len() { out.push(grads[i]) }
+    return t_get(av_value(loss), [0])
+}
+
+if not IS_CHILD {
+    GIVENS_FUSE = false
+    CTRL_FUSE = false
+    var g_ref: [Tensor] = []
+    let loss_ref = step(p_ref, adamw_new(params_of(p_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_ref)
+    let nodes_unfused = LAST_NODES
+
+    GIVENS_FUSE = true
+    CTRL_FUSE = true
+    var g_opt: [Tensor] = []
+    let loss_opt = step(p_opt, adamw_new(params_of(p_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_opt)
+    let nodes_fused = LAST_NODES
+
+    chk(t_hex(t_full(DType.F64, [1], loss_ref)) == t_hex(t_full(DType.F64, [1], loss_opt)),
+        "fused and unfused forward loss are bit-identical: {loss_ref} against {loss_opt}")
+    chk(loss_ref == loss_ref and loss_ref > 0.0, "the loss is finite and positive, so this is not a comparison of NaN")
+
+    chk(g_ref.len() == 8 and g_opt.len() == 8, "both paths produced eight gradients")
+    var worst = 0.0
+    for i in 0..g_ref.len() {
+        let r = max_rel(g_ref[i], g_opt[i])
+        if r > worst { worst = r }
+    }
+    var gbit = 0
+    for i in 0..g_ref.len() {
+        if t_hex(g_ref[i]) == t_hex(g_opt[i]) { gbit = gbit + 1 }
+    }
+    // Reported scaled by 1e18, because print is fixed-point and a difference
+    // of a few times 1e-17 prints as a flat 0 -- which reads as "identical"
+    // and is not. The component count is printed next to it so the scale and
+    // the spread are both visible.
+    var nzdiff = 0
+    for i in 0..g_ref.len() {
+        var idx = idx_zeros(g_ref[i].shape.len())
+        var more = t_numel(g_ref[i]) > 0
+        while more {
+            if dtype_is_complex(g_ref[i].dt) {
+                let dr = t_get_re(g_ref[i], idx) - t_get_re(g_opt[i], idx)
+                let di = t_get_im(g_ref[i], idx) - t_get_im(g_opt[i], idx)
+                if dr != 0.0 or di != 0.0 { nzdiff = nzdiff + 1 }
+            } else {
+                if t_get(g_ref[i], idx) != t_get(g_opt[i], idx) { nzdiff = nzdiff + 1 }
+            }
+            more = idx_next(idx, g_ref[i].shape)
+        }
+    }
+    print("gradients: worst relative difference {worst * 1000000000000000000.0} times 1e-18, whole tensors bit-identical {gbit} of 8, components differing at all {nzdiff}")
+    chk(worst < 0.00000000000001, "all eight gradients agree to 1e-14 relative ({worst * 1000000000000000000.0} times 1e-18)")
+
+    var pworst = 0.0
+    let pr = params_of(p_ref)
+    let po = params_of(p_opt)
+    for i in 0..pr.len() {
+        let r = max_rel(pr[i], po[i])
+        if r > pworst { pworst = r }
+    }
+    print("parameters after one AdamW step: worst relative difference {pworst * 1000000000000000000.0} times 1e-18")
+    chk(pworst < 0.00000000000001, "all eight parameters after an AdamW step agree to 1e-14 relative ({pworst * 1000000000000000000.0} times 1e-18)")
+
+    var moved = 0
+    for i in 0..g_ref.len() {
+        var idx = idx_zeros(g_ref[i].shape.len())
+        var more = t_numel(g_ref[i]) > 0
+        while more {
+            if dtype_is_complex(g_ref[i].dt) {
+                if fabs(t_get_re(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
+            } else {
+                if fabs(t_get(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
+            }
+            more = idx_next(idx, g_ref[i].shape)
+        }
+    }
+    chk(moved > 100, "the gradients are non-trivial ({moved} components above 1e-4)")
+
+    // ---- the stage itself, against the composed expression ----------------
+    let zs = t_zeros(DType.C64, [7, 12])
+    let tps = t_zeros(DType.F64, [7, 12])
+    fill_random(zs)
+    fill_random(tps)
+    for st in 0..2 {
+        chk(t_hex(t_givens(zs, tps, st)) == t_hex(givens_composed(zs, tps, st)),
+            "stage {st} is bit-identical to the composed expression")
+    }
+
+    // Views. The kernel reads strides, so a non-contiguous operand must give
+    // the same answer as the same operand through the composed path.
+    let zw = t_zeros(DType.C64, [12, 7])
+    fill_random(zw)
+    let zt = t_transpose(zw, 0, 1)                  // [7,12], swapped strides
+    let tpw = t_zeros(DType.F64, [7, 20])
+    fill_random(tpw)
+    let tsl = t_slice(tpw, 1, 4, 16)                // [7,12], offset
+    chk(t_hex(t_givens(zt, tps, 0)) == t_hex(givens_composed(zt, tps, 0)),
+        "a transposed state operand gives a bit-identical result")
+    chk(t_hex(t_givens(zs, tsl, 1)) == t_hex(givens_composed(zs, tsl, 1)),
+        "a sliced and offset angle operand gives a bit-identical result")
+
+    // ---- pairing: disjoint within a stage, ordered across stages ----------
+    // "A disjoint Givens stage can load a pair, rotate and write once."
+    // Written once means every output coordinate is covered exactly once, so
+    // no coordinate is left at its zero-initialised value and none is written
+    // twice. Setting one input coordinate to a marker and checking how many
+    // outputs it can reach is the direct way to see the pairing.
+    for st in 0..2 {
+        var covered = 0
+        let zc = t_zeros(DType.C64, [1, 12])
+        let tc = t_zeros(DType.F64, [1, 12])
+        for j in 0..12 { t_set_c(zc, [0, j], 1.0, 0.0) }
+        for j in 0..6 { t_set(tc, [0, j], 0.3) }
+        for j in 6..12 { t_set(tc, [0, j], 0.7) }
+        let oc = t_givens(zc, tc, st)
+        for j in 0..12 {
+            if fabs(t_get_re(oc, [0, j])) + fabs(t_get_im(oc, [0, j])) > 0.000001 { covered = covered + 1 }
+        }
+        chk(covered == 12, "stage {st} writes every one of the 12 output coordinates ({covered})")
+    }
+
+    // A rotation is unitary, so a stage preserves the norm of every row. A
+    // pairing bug that dropped or duplicated a coordinate would not.
+    let zu = t_zeros(DType.C64, [4, 12])
+    let tu = t_zeros(DType.F64, [4, 12])
+    fill_random(zu)
+    fill_random(tu)
+    for st in 0..2 {
+        let ou = t_givens(zu, tu, st)
+        var wn = 0.0
+        for r in 0..4 {
+            var n0 = 0.0
+            var n1 = 0.0
+            for j in 0..12 {
+                n0 = n0 + t_get_re(zu, [r, j]) * t_get_re(zu, [r, j]) + t_get_im(zu, [r, j]) * t_get_im(zu, [r, j])
+                n1 = n1 + t_get_re(ou, [r, j]) * t_get_re(ou, [r, j]) + t_get_im(ou, [r, j]) * t_get_im(ou, [r, j])
+            }
+            let rel = fabs(n1 - n0) / n0
+            if rel > wn { wn = rel }
+        }
+        chk(wn < 0.0000000000001, "stage {st} preserves the norm of every row, so the pairing is a rotation ({wn})")
+    }
+
+    // "Different overlapping pairing stages cannot simply run concurrently."
+    // The even and odd stages share coordinates, so they are two launches and
+    // the second reads the first's output. These two checks are what makes
+    // that a fact about the code rather than an intention: sequencing them
+    // the other way round gives a different answer, and feeding the odd stage
+    // the original state instead of the even stage's output gives a third.
+    let z2 = t_zeros(DType.C64, [3, 12])
+    let ta0 = t_zeros(DType.F64, [3, 12])
+    let ta1 = t_zeros(DType.F64, [3, 12])
+    fill_random(z2)
+    fill_random(ta0)
+    fill_random(ta1)
+    let seq = t_givens(t_givens(z2, ta0, 0), ta1, 1)
+    let rev = t_givens(t_givens(z2, ta1, 1), ta0, 0)
+    let conc = t_add(t_givens(z2, ta1, 1), t_sub(t_givens(z2, ta0, 0), z2))
+    chk(t_hex(seq) != t_hex(rev), "the two stages do not commute, so their order is load-bearing")
+    chk(t_hex(seq) != t_hex(conc), "running the overlapping stages against the same input is a different function, so they are not fused")
+    chk(t_hex(seq) == t_hex(givens_composed(givens_composed(z2, ta0, 0), ta1, 1)),
+        "the sequenced pair matches the composed sequenced pair")
+
+    // ---- the controller nonlinearity ---------------------------------------
+    // tanh(x + b) against the composed pair. Same argument as the Givens
+    // stage: the fused kernel evaluates the same expression in the same
+    // order, so equality is the gate.
+    let cx = t_zeros(DType.F64, [9, 13])
+    let cbv = t_zeros(DType.F64, [13])
+    fill_random(cx)
+    fill_random(cbv)
+    chk(t_hex(t_bias_tanh(cx, cbv)) == t_hex(t_tanh(t_add(cx, cbv))),
+        "the fused controller nonlinearity is bit-identical to tanh(x + b)")
+    let cxt = t_transpose(t_zeros(DType.F64, [13, 9]), 0, 1)
+    fill_random(cxt)
+    chk(t_hex(t_bias_tanh(cxt, cbv)) == t_hex(t_tanh(t_add(cxt, cbv))),
+        "and on a transposed input, so the kernel reads strides rather than assuming contiguity")
+
+    // Isolated: the controller fusion alone, with the Givens fusion off on
+    // both sides, so the two optimizations are gated separately rather than
+    // as a bundle where one could be hiding the other's regression.
+    // Fresh checkpoints: the headline step above already applied an AdamW
+    // update to p_ref and p_opt, and those two updates were not identical
+    // -- they are what the gradient tolerance above measures. Reusing them
+    // here would compare two different models and blame the fusion.
+    let seed_c = SEED
+    let c_ref = build()
+    SEED = seed_c
+    let c_opt = build()
+    GIVENS_FUSE = false
+    CTRL_FUSE = false
+    var gc_ref: [Tensor] = []
+    let lc_ref = step(c_ref, adamw_new(params_of(c_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_ref)
+    CTRL_FUSE = true
+    var gc_opt: [Tensor] = []
+    let lc_opt = step(c_opt, adamw_new(params_of(c_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_opt)
+    chk(t_hex(t_full(DType.F64, [1], lc_ref)) == t_hex(t_full(DType.F64, [1], lc_opt)),
+        "the controller fusion alone leaves the forward loss bit-identical: {lc_ref} against {lc_opt}")
+    var cbit = 0
+    for i in 0..gc_ref.len() {
+        if t_hex(gc_ref[i]) == t_hex(gc_opt[i]) { cbit = cbit + 1 }
+    }
+    chk(cbit == 8, "and all eight gradients bit-identical ({cbit} of 8)")
+    GIVENS_FUSE = true
+    CTRL_FUSE = true
+
+    let bx = t_zeros(DType.F64, [64, 256])
+    let bv = t_zeros(DType.F64, [256])
+    fill_random(bx)
+    fill_random(bv)
+    let bc0 = now_ms()
+    t_tanh(t_add(bx, bv))
+    let bt_comp_cold = now_ms() - bc0
+    var bt_comp_warm = 0.0
+    for r in 0..3 {
+        let a0 = now_ms()
+        t_tanh(t_add(bx, bv))
+        bt_comp_warm = bt_comp_warm + (now_ms() - a0)
+    }
+    bt_comp_warm = bt_comp_warm / 3.0
+    let bf0 = now_ms()
+    t_bias_tanh(bx, bv)
+    let bt_fuse_cold = now_ms() - bf0
+    var bt_fuse_warm = 0.0
+    for r in 0..3 {
+        let a0 = now_ms()
+        t_bias_tanh(bx, bv)
+        bt_fuse_warm = bt_fuse_warm + (now_ms() - a0)
+    }
+    bt_fuse_warm = bt_fuse_warm / 3.0
+    print("bias_tanh [64,256]  cold: composed {bt_comp_cold} ms, fused {bt_fuse_cold} ms")
+    print("                    warm: composed {bt_comp_warm} ms, fused {bt_fuse_warm} ms, speedup {bt_comp_warm / bt_fuse_warm}x")
+    chk(bt_fuse_warm < bt_comp_warm, "the controller fusion is faster warm ({bt_comp_warm} against {bt_fuse_warm})")
+    chk(bt_fuse_cold < bt_comp_cold, "and faster cold")
+
+    // ---- memory ------------------------------------------------------------
+    // The fusion's memory effect is the intermediates it does not allocate.
+    // One composed stage is seventeen nodes holding fourteen [B,D/2]
+    // temporaries; the fused stage is one node holding its output. The tape
+    // node count is the measurement this library exposes.
+    print("tape nodes: unfused {nodes_unfused}, fused {nodes_fused}")
+    chk(nodes_fused < nodes_unfused, "the fused tape is smaller ({nodes_fused} against {nodes_unfused} nodes)")
+    let fz = t_givens(zs, tps, 0)
+    let cz = givens_composed(zs, tps, 0)
+    chk(fz.st.nbytes == cz.st.nbytes, "the fused stage allocates the same output storage, {fz.st.nbytes} bytes")
+
+    // ---- identical invalid-input behaviour ---------------------------------
+    let cases = ["odd", "vocab", "negative", "bias"]
+    for i in 0..cases.len() {
+        let slow = child(cases[i], "composed")
+        let fast = child(cases[i], "fused")
+        chk(slow != 0, "{cases[i]}: the composed path rejects it (exit {slow})")
+        chk(fast != 0, "{cases[i]}: the fused path rejects it too (exit {fast})")
+        chk(slow == fast, "{cases[i]}: both paths fail identically ({slow} against {fast})")
+    }
+
+    // ---- cold and warm latency, separately ---------------------------------
+    let zb = t_zeros(DType.C64, [64, 128])
+    let tb = t_zeros(DType.F64, [64, 128])
+    fill_random(zb)
+    fill_random(tb)
+
+    let cc0 = now_ms()
+    givens_composed(zb, tb, 0)
+    let comp_cold = now_ms() - cc0
+    var comp_warm = 0.0
+    for r in 0..3 {
+        let a0 = now_ms()
+        givens_composed(zb, tb, 0)
+        comp_warm = comp_warm + (now_ms() - a0)
+    }
+    comp_warm = comp_warm / 3.0
+
+    let fc0 = now_ms()
+    t_givens(zb, tb, 0)
+    let fuse_cold = now_ms() - fc0
+    var fuse_warm = 0.0
+    for r in 0..3 {
+        let a0 = now_ms()
+        t_givens(zb, tb, 0)
+        fuse_warm = fuse_warm + (now_ms() - a0)
+    }
+    fuse_warm = fuse_warm / 3.0
+
+    print("givens [64,128] stage 0  cold: composed {comp_cold} ms, fused {fuse_cold} ms")
+    print("                         warm: composed {comp_warm} ms, fused {fuse_warm} ms, speedup {comp_warm / fuse_warm}x")
+    chk(fuse_warm < comp_warm, "the fusion is faster warm, so it is allowed to be on ({comp_warm} against {fuse_warm})")
+    chk(fuse_cold < comp_cold, "and faster cold")
+
+    // ---- end to end ---------------------------------------------------------
+    // A kernel that is faster in isolation and slower in the model would still
+    // have to be disabled, so the step is timed both ways too.
+    var e_un = 0.0
+    var e_fu = 0.0
+    for r in 0..2 {
+        GIVENS_FUSE = false
+        CTRL_FUSE = false
+        av_reset()
+        let u0 = now_ms()
+        let mu = pad_params(p_ref, true)
+        av_backward(pad_loss(mu, tokens, targets))
+        e_un = e_un + (now_ms() - u0)
+        GIVENS_FUSE = true
+        CTRL_FUSE = true
+        av_reset()
+        let f0 = now_ms()
+        let mf = pad_params(p_ref, true)
+        av_backward(pad_loss(mf, tokens, targets))
+        e_fu = e_fu + (now_ms() - f0)
+    }
+    print("forward plus backward: unfused {e_un / 2.0} ms, fused {e_fu / 2.0} ms, speedup {e_un / e_fu}x")
+    chk(e_fu < e_un, "the fusion is faster end to end ({e_un / 2.0} against {e_fu / 2.0} ms)")
+
+    if failed == 0 {
+        print("fusion: {passed} checks passed")
+    } else {
+        print("fusion: {failed} FAILED, {passed} passed")
+        panic("fusion tests failed")
+    }
+}

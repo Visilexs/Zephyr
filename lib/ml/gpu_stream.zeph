@@ -1,0 +1,360 @@
+// Streams, events and an allocator that recycles only completed storage.
+//
+// This is the machinery A22 stresses. The specification's memory-runtime
+// document is precise about what it wants, and the three sentences that
+// shape everything here are:
+//
+//   "Stream is an ordered execution lane, not guaranteed independent
+//    hardware"
+//   "Cross-stream consumers must wait on producer events"
+//   "Associate each allocation's last use with completion information;
+//    releasing a tensor handle cannot immediately recycle in-flight storage"
+//
+// The first sentence is why this needs no change to device creation. The
+// repository creates one queue with queueCount hardcoded to 1, and a second
+// queue would mean rewriting vkCreateDevice and risking every graphics
+// example. A stream is defined as an ordered lane, explicitly not as
+// independent hardware, so two lanes sharing one queue satisfy it: each lane
+// keeps its own chain of submissions and its own fences, and ordering
+// between lanes goes through semaphores rather than through the queue.
+//
+// The second sentence is why events carry a binary semaphore as well as a
+// fence. A fence answers the host's question, "is this finished yet"; a
+// semaphore answers the device's, "do not start until that finished". Both
+// are needed and they are not interchangeable.
+//
+// The specification also says: "Do not emulate every event with device-wide
+// idle." vkDeviceWaitIdle appears nowhere in this file. Completion is asked
+// per fence, and asked without blocking via vkGetFenceStatus.
+//
+// Timeline semaphores would be a better fit than binary ones, but there are
+// no bindings, structs or constants for them anywhere in lib/vk, and the
+// specification permits "timeline semaphores or fences according to
+// available support".
+import "vk/gfx.zeph"
+
+// An event is a recorded completion point. `fence` is the host's view and
+// `sem` is the device's; `pending` distinguishes a submitted event from a
+// fresh one, because an unsubmitted fence never signals and treating it as
+// merely "not done yet" would deadlock a waiter.
+struct GpuEvent {
+    fence: int,
+    sem: int,
+    pending: bool,
+    cb: int,        // the command buffer this submission recorded into, owned here
+}
+
+// An ordered execution lane. `waits` holds semaphores the next submission on
+// this lane must wait for -- consumed by that submission and then cleared,
+// because a wait is a one-shot on a binary semaphore and re-waiting on an
+// already-consumed one would hang.
+struct GpuStream {
+    queue: int,
+    waits: [int],
+}
+
+// Lane 0 is the default queue; lane 1 is the second queue when the device
+// has one. Two lanes on genuinely separate queues can overlap, which is what
+// makes a missing cross-lane wait observable instead of hidden by the
+// in-order behaviour of a single queue.
+fn stream_new_lane(g: Gfx, lane: int) -> GpuStream {
+    var w: [int] = []
+    var q = g.queue
+    if lane != 0 { q = g.queue2 }
+    return GpuStream{ queue: q, waits: w }
+}
+
+fn stream_new(g: Gfx) -> GpuStream { return stream_new_lane(g, 0) }
+
+fn event_new(g: Gfx) -> GpuEvent {
+    var fci = Bytes.new(VkFenceCreateInfo_sizeof)
+    fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+    var pf = Bytes.new(8)
+    vkcheck(vkCreateFence(g.dev, fci.addr(), 0, pf.addr()), "event_new: vkCreateFence")
+    var sci = Bytes.new(VkSemaphoreCreateInfo_sizeof)
+    sci.put32(VkSemaphoreCreateInfo_sType, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+    var ps = Bytes.new(8)
+    vkcheck(vkCreateSemaphore(g.dev, sci.addr(), 0, ps.addr()), "event_new: vkCreateSemaphore")
+    return GpuEvent{ fence: pf.get64(0), sem: ps.get64(0), pending: false, cb: 0 }
+}
+
+// Has the work this event records finished? Asked without blocking, which is
+// the point: an allocator that can only answer by stalling the device cannot
+// recycle anything during a training step.
+//
+// An event that was never submitted is reported finished. That is the honest
+// answer -- there is no work outstanding -- and it keeps a freshly created
+// allocation from being pinned forever by a fence nobody ever signals.
+fn event_done(g: Gfx, e: GpuEvent) -> bool {
+    if not e.pending { return true }
+    return vkGetFenceStatus(g.dev, e.fence) == VK_SUCCESS
+}
+
+fn event_wait(g: Gfx, e: GpuEvent) {
+    if not e.pending { return }
+    var pf = Bytes.new(8)
+    pf.put64(0, e.fence)
+    vkcheck(vkWaitForFences(g.dev, 1, pf.addr(), VK_TRUE, 5000000000), "event_wait: vkWaitForFences")
+}
+
+fn event_destroy(g: Gfx, e: GpuEvent) {
+    // Destroying a fence or semaphore that a pending submission still
+    // references is undefined behaviour, so wait first. This is the same
+    // early-release rule the allocator enforces for buffers, applied to the
+    // synchronisation objects themselves.
+    event_wait(g, e)
+    // The command buffer cannot be freed while its submission is pending, which
+    // is why this happens after the wait and not at submit time. Freeing it at
+    // submit -- or never, as the first draft did -- is how a stress loop with
+    // dozens of outstanding submissions runs the pool out from under itself.
+    if e.cb != 0 {
+        var pcb = Bytes.new(8)
+        pcb.put64(0, e.cb)
+        vkFreeCommandBuffers(g.dev, g.cmdpool, 1, pcb.addr())
+    }
+    vkDestroyFence(g.dev, e.fence, 0)
+    vkDestroySemaphore(g.dev, e.sem, 0)
+}
+
+// Record and submit without waiting. Returns the event that marks completion.
+//
+// This is the piece gfx.zeph does not provide: `immediate` submits and then
+// blocks on its own fence, so nothing can ever be in flight and the phrase
+// "delayed completion" has no meaning. Everything below depends on being able
+// to leave work outstanding.
+fn stream_submit(g: Gfx, s: GpuStream, e: GpuEvent, rec: fn(int)) -> GpuEvent {
+    var cbai = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
+    cbai.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+    cbai.put64(VkCommandBufferAllocateInfo_commandPool, g.cmdpool)
+    cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+    cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
+    var pcb = Bytes.new(8)
+    vkcheck(vkAllocateCommandBuffers(g.dev, cbai.addr(), pcb.addr()), "stream_submit: vkAllocateCommandBuffers")
+    let cb = pcb.get64(0)
+
+    var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
+    bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    bi.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+    vkcheck(vkBeginCommandBuffer(cb, bi.addr()), "stream_submit: vkBeginCommandBuffer")
+    rec(cb)
+    vkcheck(vkEndCommandBuffer(cb), "stream_submit: vkEndCommandBuffer")
+
+    var si = Bytes.new(VkSubmitInfo_sizeof)
+    si.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
+    si.put32(VkSubmitInfo_commandBufferCount, 1)
+    si.put64(VkSubmitInfo_pCommandBuffers, pcb.addr())
+
+    // Cross-stream ordering: whatever this lane was told to wait for is
+    // consumed here, at COMPUTE_SHADER stage, and then cleared.
+    var waitsem = u64s(s.waits)
+    var stages = Bytes.new(4 * 16)
+    if s.waits.len() > 0 {
+        for i in 0..s.waits.len() { stages.put32(i * 4, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) }
+        si.put32(VkSubmitInfo_waitSemaphoreCount, s.waits.len())
+        si.put64(VkSubmitInfo_pWaitSemaphores, waitsem.addr())
+        si.put64(VkSubmitInfo_pWaitDstStageMask, stages.addr())
+    }
+    var sigsem = Bytes.new(8)
+    sigsem.put64(0, e.sem)
+    si.put32(VkSubmitInfo_signalSemaphoreCount, 1)
+    si.put64(VkSubmitInfo_pSignalSemaphores, sigsem.addr())
+
+    vkcheck(vkQueueSubmit(s.queue, 1, si.addr(), e.fence), "stream_submit: vkQueueSubmit")
+    let cleared: [int] = []
+    s.waits = cleared
+    return GpuEvent{ fence: e.fence, sem: e.sem, pending: true, cb: cb }
+}
+
+// Make the next submission on `s` wait for `e`. This is the cross-stream
+// ordering primitive: a consumer on one lane waits on the producer's event
+// rather than on device idle.
+fn stream_wait_event(s: GpuStream, e: GpuEvent) {
+    if not e.pending { return }
+    s.waits.push(e.sem)
+}
+
+// ---------------------------------------------------------------------------
+// The allocator.
+//
+// Every allocation remembers the event of the last submission that used it.
+// Releasing a handle does not return storage to the free list; it moves the
+// allocation to `retired`, where it stays until its event reports done. That
+// is the whole of "releasing a tensor handle cannot immediately recycle
+// in-flight storage", and it is the property the delayed-completion stress
+// test is designed to break.
+
+struct GpuAlloc {
+    buf: GpuBuffer,
+    last: GpuEvent,     // the submission that last touched this storage
+    live: bool,         // handed out to an owner right now
+    refs: int,          // owners plus views; storage retires at zero, not before
+}
+
+struct GpuPool {
+    g: Gfx,
+    allocs: [GpuAlloc],
+    free: [int],        // indices into allocs, known complete, reusable
+    retired: [int],     // indices released by their owner but possibly in flight
+    live_bytes: int,
+    peak_bytes: int,
+    total_allocated: int,   // how many vkCreateBuffer calls we have made
+    reuses: int,            // how many acquisitions were served from the free list
+    limit_bytes: int,       // 0 means no limit; a limit makes allocation failure testable
+    owned: [GpuEvent],      // events the pool holds references to, destroyed with it
+}
+
+fn pool_new(g: Gfx) -> GpuPool {
+    var a: [GpuAlloc] = []
+    var f: [int] = []
+    var r: [int] = []
+    var o: [GpuEvent] = []
+    return GpuPool{ g: g, allocs: a, free: f, retired: r, live_bytes: 0, peak_bytes: 0, total_allocated: 0, reuses: 0, limit_bytes: 0, owned: o }
+}
+
+// Move every retired allocation whose last use has completed onto the free
+// list. Non-blocking: an allocation still in flight simply stays retired.
+fn pool_collect(p: GpuPool) -> int {
+    var still: [int] = []
+    var moved = 0
+    for i in 0..p.retired.len() {
+        let idx = p.retired[i]
+        if event_done(p.g, p.allocs[idx].last) {
+            p.free.push(idx)
+            moved = moved + 1
+        } else {
+            still.push(idx)
+        }
+    }
+    p.retired = still
+    return moved
+}
+
+fn pool_acquire(p: GpuPool, bytes: int) -> int {
+    if bytes <= 0 { panic("pool_acquire: size must be positive, got {bytes}") }
+    pool_collect(p)
+    // Exact-size reuse only. Size-class reuse would return a larger buffer and
+    // then every kernel would need to know its logical length separately from
+    // its allocated length; exact matching keeps that impossible to get wrong.
+    // ponytail: exact-fit free list, add size classes if fragmentation shows up.
+    for i in 0..p.free.len() {
+        let idx = p.free[i]
+        if p.allocs[idx].buf.size == bytes {
+            var rest: [int] = []
+            for j in 0..p.free.len() {
+                if j != i { rest.push(p.free[j]) }
+            }
+            p.free = rest
+            p.allocs[idx].live = true
+            p.allocs[idx].refs = 1
+            p.live_bytes = p.live_bytes + bytes
+            if p.live_bytes > p.peak_bytes { p.peak_bytes = p.live_bytes }
+            p.reuses = p.reuses + 1
+            return idx
+        }
+    }
+    if p.limit_bytes > 0 and p.live_bytes + bytes > p.limit_bytes {
+        // Before giving up, wait out everything in flight and collect again --
+        // an allocation failure that could have been satisfied by finished
+        // work is a bug in the allocator, not a real exhaustion.
+        for i in 0..p.retired.len() { event_wait(p.g, p.allocs[p.retired[i]].last) }
+        pool_collect(p)
+        for i in 0..p.free.len() {
+            let idx = p.free[i]
+            if p.allocs[idx].buf.size == bytes {
+                var rest: [int] = []
+                for j in 0..p.free.len() {
+                    if j != i { rest.push(p.free[j]) }
+                }
+                p.free = rest
+                p.allocs[idx].live = true
+                p.allocs[idx].refs = 1
+                p.live_bytes = p.live_bytes + bytes
+                if p.live_bytes > p.peak_bytes { p.peak_bytes = p.live_bytes }
+                p.reuses = p.reuses + 1
+                return idx
+            }
+        }
+        if p.live_bytes + bytes > p.limit_bytes {
+            panic("gpu allocation failed: requested {bytes} bytes with {p.live_bytes} live against a limit of {p.limit_bytes}. Reduce batch size or model dimension, or raise the pool limit.")
+        }
+    }
+    let b = p.g.buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    // A fresh allocation has no outstanding use. The pool deliberately does
+    // NOT create an event here: pool_touch will store one the caller owns,
+    // and an event created here would be both leaked and double-destroyed.
+    // Events belong to whoever submitted the work, never to the allocator.
+    p.allocs.push(GpuAlloc{ buf: b, last: GpuEvent{ fence: 0, sem: 0, pending: false, cb: 0 }, live: true, refs: 1 })
+    p.total_allocated = p.total_allocated + 1
+    p.live_bytes = p.live_bytes + bytes
+    if p.live_bytes > p.peak_bytes { p.peak_bytes = p.live_bytes }
+    return p.allocs.len() - 1
+}
+
+// Record that a submission touched this allocation. Called for every buffer a
+// dispatch reads or writes, before the submission goes in. Without this the
+// allocator has no completion information to associate and recycling becomes
+// a guess.
+// The pool TAKES OWNERSHIP of the event. It must: the allocator goes on
+// asking this fence whether the work finished, long after the caller has
+// forgotten about the submission, and a caller that destroyed its own event
+// would leave the allocator polling a freed handle. That is a host-side
+// use-after-free, it crashes rather than misbehaves quietly, and it is
+// exactly the early-release failure this criterion is about -- so callers
+// must not call event_destroy on anything they pass here.
+//
+// One submission touches several buffers in a row with the same event, so
+// deduplication only has to look at the most recent entry.
+fn pool_touch(p: GpuPool, idx: int, e: GpuEvent) {
+    p.allocs[idx].last = e
+    if e.pending {
+        var fresh = true
+        if p.owned.len() > 0 {
+            if p.owned[p.owned.len() - 1].fence == e.fence { fresh = false }
+        }
+        if fresh { p.owned.push(e) }
+    }
+}
+
+// A view shares storage with its owner. The order in which the two are
+// released must not matter, which is what a count buys and a bool cannot.
+fn pool_retain(p: GpuPool, idx: int) {
+    if p.allocs[idx].refs <= 0 { panic("pool_retain: allocation {idx} has no live reference to retain") }
+    p.allocs[idx].refs = p.allocs[idx].refs + 1
+}
+
+// Drop one reference. Note what does NOT happen at the last one: the storage
+// does not go on the free list, and nothing is destroyed. It goes to
+// `retired` and waits there for its last use to complete.
+fn pool_release(p: GpuPool, idx: int) {
+    if p.allocs[idx].refs <= 0 { panic("pool_release: allocation {idx} released more times than it was retained") }
+    p.allocs[idx].refs = p.allocs[idx].refs - 1
+    if p.allocs[idx].refs > 0 { return }
+    p.allocs[idx].live = false
+    p.live_bytes = p.live_bytes - p.allocs[idx].buf.size
+    p.retired.push(idx)
+}
+
+fn pool_buffer(p: GpuPool, idx: int) -> GpuBuffer { return p.allocs[idx].buf }
+
+// Tear the pool down. Waits for every outstanding use before destroying
+// anything: freeing memory the device is still reading is exactly the
+// host-owner early release this is meant to make impossible.
+fn pool_destroy(p: GpuPool) {
+    // Order matters and getting it wrong is the same use-after-free in a
+    // different costume. Wait for everything first, then release the buffers,
+    // and only destroy the events last -- an allocation's `last` points at an
+    // event in `owned`, so destroying events up front leaves every following
+    // wait reading a freed fence.
+    for i in 0..p.allocs.len() { event_wait(p.g, p.allocs[i].last) }
+    for i in 0..p.allocs.len() { p.g.destroy_buffer(p.allocs[i].buf) }
+    for i in 0..p.owned.len() { event_destroy(p.g, p.owned[i]) }
+    var noev: [GpuEvent] = []
+    p.owned = noev
+    var a: [GpuAlloc] = []
+    var f: [int] = []
+    var r: [int] = []
+    p.allocs = a
+    p.free = f
+    p.retired = r
+    p.live_bytes = 0
+}

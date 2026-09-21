@@ -1,0 +1,158 @@
+{
+  "difficulty": {
+    "length_split": {
+      "delay": [
+        64,
+        128
+      ],
+      "task_A_keys": [
+        9,
+        16
+      ]
+    },
+    "task_A": {
+      "distractors": [
+        0,
+        8
+      ],
+      "keys": [
+        2,
+        4
+      ],
+      "spec_suggestion": {
+        "distractors": [
+          0,
+          32
+        ],
+        "keys": [
+          2,
+          8
+        ]
+      }
+    },
+    "task_B": {
+      "informative_clues": [
+        2,
+        4
+      ],
+      "neutral_delay": [
+        0,
+        8
+      ]
+    }
+  },
+  "files": [
+    {
+      "bytes": 409636,
+      "file": "a_train.bin",
+      "n_class": 8,
+      "n_rows": 4096,
+      "pad_id": 2,
+      "seq_len": 24,
+      "sha256": "064235bdd887a3b35a44078816041100cd525a16517d9b7e44c999e832b86963",
+      "split": "train",
+      "task": "A",
+      "vocab": 46
+    },
+    {
+      "bytes": 204836,
+      "file": "a_validation.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 24,
+      "sha256": "bb8130ade4724c63ff3c1ac25fd7d0c162d0761d9064276c3609b2beeeb3b3a7",
+      "split": "validation",
+      "task": "A",
+      "vocab": 46
+    },
+    {
+      "bytes": 204836,
+      "file": "a_composition.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 24,
+      "sha256": "032d52866bc3359e5716a181b3570b9cf28c5aa7eefc64ff62e8f8ebb0f940c0",
+      "split": "composition",
+      "task": "A",
+      "vocab": 46
+    },
+    {
+      "bytes": 1458212,
+      "file": "a_length.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 177,
+      "sha256": "e62919444731b4a1c030e4f0e3d59801df8e3a4d8a6fc3aaca75a62801e66bc5",
+      "split": "length",
+      "task": "A",
+      "vocab": 46
+    },
+    {
+      "bytes": 360484,
+      "file": "b_train.bin",
+      "n_class": 8,
+      "n_rows": 4096,
+      "pad_id": 2,
+      "seq_len": 21,
+      "sha256": "b9d3b7bc5ea6ce4e0d1f8b0b6ab3294197cd93bc897704a7ba4b8c4705bbce92",
+      "split": "train",
+      "task": "B",
+      "vocab": 261
+    },
+    {
+      "bytes": 180260,
+      "file": "b_validation.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 21,
+      "sha256": "7b156784fd47e83bd098fce64f7086ba77552f59c362893ca68ad3de9b2dbf9e",
+      "split": "validation",
+      "task": "B",
+      "vocab": 261
+    },
+    {
+      "bytes": 180260,
+      "file": "b_composition.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 21,
+      "sha256": "8fd4dc080f57c473a709a1a7c19bd6c25268521c354bf483764b349cd239bade",
+      "split": "composition",
+      "task": "B",
+      "vocab": 261
+    },
+    {
+      "bytes": 1163300,
+      "file": "b_length.bin",
+      "n_class": 8,
+      "n_rows": 2048,
+      "pad_id": 2,
+      "seq_len": 141,
+      "sha256": "faa6c07210326f762dcc6230480de9d2ed5e4a4842deed4cd489259875faf022",
+      "split": "length",
+      "task": "B",
+      "vocab": 261
+    }
+  ],
+  "format": {
+    "element": "i32",
+    "endianness": "little",
+    "magic": "ZML7DATA",
+    "version": 1
+  },
+  "generator_version": 1,
+  "note": "Difficulty is below the specification's suggestion by declaration: task A uses n=2..4 keys and d=0..8 distractors where the spec suggests n=2..8 and d=0..32. Task B uses 2..4 informative clues with neutral delays drawn from the same reduced distractor range. The length split keeps tasks.py's unreduced extension ranges, since its purpose is to test beyond training.",
+  "preset": "m7-reduced",
+  "seed": 20260921,
+  "sizes": {
+    "composition": 2048,
+    "length": 2048,
+    "train": 4096,
+    "validation": 2048
+  }
+}

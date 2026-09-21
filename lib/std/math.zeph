@@ -1,35 +1,67 @@
 // Transcendental maths for a runtime with no libm (kernel32-only exes).
-// exp/ln by range reduction + short series (good to ~1e-9), tanh on top.
-// First written for gale (the GPT project); promoted here once a third
-// project needed them. Import as "std/math.zeph".
+// exp/ln by range reduction + short series, tanh on top, then the inverse
+// trig / hyperbolic / special-function family built on a single new
+// primitive: fatan. First written for gale (the GPT project); promoted here
+// once a third project needed them. Import as "std/math.zeph".
+//
+// Domain errors return NAN, matching the sqrt builtin, which already does.
+// Poles return INF where the limit is +inf, NAN where it is undefined.
+//
+//   fn              domain             outside it
+//   fln             x > 0              NAN below zero, -INF at zero
+//   fasin facos     -1 <= x <= 1       NAN
+//   fasec facsc     |x| >= 1           NAN
+//   gd_inv          |y| < pi/2         NAN
+//   gamma digamma   x not 0,-1,-2,...  NAN at the poles, gamma INF above 171.62
+//   lgamma          x not 0,-1,-2,...  INF at the poles
 
 let LN2 = 0.6931471805599453
+// Cody-Waite split of ln2: HI holds the top bits exactly, so n*LN2_HI is
+// exact and the reduced argument keeps full precision for large |n|.
+let LN2_HI = 0.6931471803691238
+let LN2_LO = 0.00000000019082149292705877
+let NAN = frombits((2047 << 52) | (1 << 51))
+let INF = frombits(2047 << 52)
 
 fn round_i(v: float) -> int {
     if v >= 0.0 { return (v + 0.5) as int }
     return 0 - ((0.5 - v) as int)
 }
 
+fn is_nan(x: float) -> bool { return x != x }
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
 // e^x: e^x = 2^n * e^r with r in [-ln2/2, ln2/2], Taylor for e^r, 2^n from bits
-fn fexp(x0: float) -> float {
-    var x = x0
-    if x < -87.3 { return 0.0 }
-    if x > 88.7 { x = 88.7 }
-    let n = round_i(x / LN2)
-    let r = x - (n as float) * LN2
+fn fexp(x: float) -> float {
+    if x < -745.2 { return 0.0 }
+    if x > 709.782712893384 { return INF }
+    var n = round_i(x / LN2)
+    if n > 1023 { n = 1023 }
+    let nf = n as float
+    let r = (x - nf * LN2_HI) - nf * LN2_LO
     var term = 1.0
     var sum = 1.0
-    for i in 1..12 {
+    for i in 1..15 {
         term = term * r / (i as float)
         sum += term
     }
-    let p2 = frombits((1023 + n) << 52)
-    return sum * p2
+    if n < -1022 {
+        // subnormal result: split the scale so both factors stay representable
+        return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52)
+    }
+    return sum * frombits((1023 + n) << 52)
 }
 
 // ln(x) = e*ln2 + 2*atanh((m-1)/(m+1)), where x = m * 2^e, m in [1,2)
 fn fln(x: float) -> float {
-    if x <= 0.0 { return 0.0 - 1000000000000000000000000000000.0 }
+    // was a -1e30 sentinel; NAN/-INF is what the rest of the file and the
+    // sqrt builtin do, and -INF is the actual limit at zero
+    if x < 0.0 { return NAN }
+    if x == 0.0 { return 0.0 - INF }
     let b = bits(x)
     let e = ((b >> 52) & 2047) - 1023
     let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
@@ -37,16 +69,42 @@ fn fln(x: float) -> float {
     let t2 = t * t
     var term = t
     var sum = t
-    for i in 1..12 {
+    // 19 terms, not 11: t reaches 1/3, where the old count left ~1e-13 of
+    // absolute error. gamma multiplies that by (z+0.5), so it showed up there.
+    for i in 1..20 {
         term = term * t2
         sum += term / ((2 * i + 1) as float)
     }
     return (e as float) * LN2 + 2.0 * sum
 }
 
+// (e^x - e^-x)/2 cancels badly for small x, so use the series there instead
+fn sinh(x: float) -> float {
+    if x < 1.0 and x > -1.0 {
+        let x2 = x * x
+        var term = x
+        var sum = x
+        for i in 1..10 {
+            term = term * x2 / (((2 * i) * (2 * i + 1)) as float)
+            sum += term
+        }
+        return sum
+    }
+    let e = fexp(x)
+    return (e - 1.0 / e) / 2.0
+}
+
+// no cancellation here: both terms are positive
+fn cosh(x: float) -> float {
+    let e = fexp(x)
+    return (e + 1.0 / e) / 2.0
+}
+
 fn tanh(x: float) -> float {
     if x > 15.0 { return 1.0 }
     if x < -15.0 { return -1.0 }
+    // (e^2x - 1) loses ~8 digits near zero; sinh/cosh stay exact there
+    if x < 1.0 and x > -1.0 { return sinh(x) / cosh(x) }
     let e = fexp(2.0 * x)
     return (e - 1.0) / (e + 1.0)
 }
@@ -54,15 +112,26 @@ fn tanh(x: float) -> float {
 let PI = 3.141592653589793
 let TWO_PI = 6.283185307179586
 let HALF_PI = 1.5707963267948966
+let PI_6 = 0.5235987755982988
+let SQRT3 = 1.7320508075688772
+let TAN_PI_12 = 0.2679491924311227
+// Cody-Waite split of 2pi, as for ln2 above. HI has its low 20 mantissa bits
+// clear, so k*HI is exact out to k = 2^20 and the reduced argument does not
+// inherit k ulps of error from a single rounded TWO_PI.
+let TWO_PI_HI = 6.2831853069365025
+let TWO_PI_LO = 0.0000000002430840202602477
 
-// sin via range reduction to [-pi,pi] then Taylor (10 terms -> ~1e-6 at +-pi)
+// sin via range reduction to [-pi,pi] then Taylor. 13 terms reaches double
+// precision at +-pi; the old 9 stopped at ~5e-10, which capped every
+// reciprocal and inverse built on it (tan, csc, cot, gd_inv, digamma).
 fn fsin(x0: float) -> float {
     let k = round_i(x0 / TWO_PI)
-    let x = x0 - (k as float) * TWO_PI
+    let kf = k as float
+    let x = (x0 - kf * TWO_PI_HI) - kf * TWO_PI_LO
     let x2 = x * x
     var term = x
     var sum = x
-    for i in 1..10 {
+    for i in 1..14 {
         let d = ((2 * i) * (2 * i + 1)) as float
         term = term * (0.0 - x2) / d
         sum += term
@@ -70,4 +139,267 @@ fn fsin(x0: float) -> float {
     return sum
 }
 
-fn fcos(x: float) -> float { return fsin(x + HALF_PI) }
+// Its own reduction and series rather than fsin(x + HALF_PI): that shift
+// rounds away the low bits of a large argument before the reduction sees it.
+fn fcos(x0: float) -> float {
+    let k = round_i(x0 / TWO_PI)
+    let kf = k as float
+    let x = (x0 - kf * TWO_PI_HI) - kf * TWO_PI_LO
+    let x2 = x * x
+    var term = 1.0
+    var sum = 1.0
+    for i in 1..15 {
+        let d = ((2 * i - 1) * (2 * i)) as float
+        term = term * (0.0 - x2) / d
+        sum += term
+    }
+    return sum
+}
+fn ftan(x: float) -> float { return fsin(x) / fcos(x) }
+
+fn fcsc(x: float) -> float { return 1.0 / fsin(x) }
+fn fsec(x: float) -> float { return 1.0 / fcos(x) }
+fn fcot(x: float) -> float { return fcos(x) / fsin(x) }
+
+// The one new primitive everything below needs. Fold to [0,1] by sign and
+// reciprocal, then a pi/6 shift puts |t| under tan(pi/12) = 0.268, where the
+// alternating series reaches full double precision in 13 terms.
+fn fatan(x0: float) -> float {
+    var x = x0
+    var neg = false
+    if x < 0.0 {
+        x = 0.0 - x
+        neg = true
+    }
+    var inv = false
+    if x > 1.0 {
+        x = 1.0 / x
+        inv = true
+    }
+    var add = 0.0
+    var t = x
+    if x > TAN_PI_12 {
+        t = (x * SQRT3 - 1.0) / (x + SQRT3)
+        add = PI_6
+    }
+    let mt2 = 0.0 - t * t
+    var term = t
+    var sum = t
+    for i in 1..14 {
+        term = term * mt2
+        sum += term / ((2 * i + 1) as float)
+    }
+    var r = add + sum
+    if inv { r = HALF_PI - r }
+    if neg { r = 0.0 - r }
+    return r
+}
+
+// (1-x)*(1+x) rather than 1-x*x: the latter cancels as |x| approaches 1
+fn fasin(x: float) -> float {
+    if x > 1.0 or x < -1.0 { return NAN }
+    if x == 1.0 { return HALF_PI }
+    if x == -1.0 { return 0.0 - HALF_PI }
+    return fatan(x / sqrt((1.0 - x) * (1.0 + x)))
+}
+
+// 2*atan(sqrt((1-x)/(1+x))) holds its digits near x=1, where HALF_PI - fasin
+// would cancel away the answer
+fn facos(x: float) -> float {
+    if x > 1.0 or x < -1.0 { return NAN }
+    if x == -1.0 { return PI }
+    return 2.0 * fatan(sqrt((1.0 - x) / (1.0 + x)))
+}
+
+// Continuous branch, range (0,pi) -- the calculus convention, not the
+// arctan(1/x) one that jumps at zero. Built from atan(1/x) rather than
+// HALF_PI - atan(x), which cancels for large |x|.
+fn facot(x: float) -> float {
+    if x == 0.0 { return HALF_PI }
+    if x > 0.0 { return fatan(1.0 / x) }
+    return PI + fatan(1.0 / x)
+}
+
+fn fasec(x: float) -> float {
+    if x < 1.0 and x > -1.0 { return NAN }
+    return facos(1.0 / x)
+}
+
+fn facsc(x: float) -> float {
+    if x < 1.0 and x > -1.0 { return NAN }
+    return fasin(1.0 / x)
+}
+
+// Gudermannian: links circular and hyperbolic angle without complex numbers.
+// 2*atan(tanh(x/2)) is the stable form; 2*atan(e^x) - pi/2 cancels at zero.
+fn gd(x: float) -> float { return 2.0 * fatan(tanh(x / 2.0)) }
+
+// inverse Gudermannian, which is also the antiderivative of sec
+fn gd_inv(y: float) -> float {
+    if y >= HALF_PI or y <= 0.0 - HALF_PI { return NAN }
+    return fln(fabs(fsec(y) + ftan(y)))
+}
+
+// Lanczos g=7, n=9. Evaluated in log space so the result survives the range
+// of fexp and stays finite up to the true overflow point.
+fn lanczos_a(z: float) -> float {
+    var a = 0.99999999999980993
+    a += 676.5203681218851 / (z + 1.0)
+    a += (0.0 - 1259.1392167224028) / (z + 2.0)
+    a += 771.32342877765313 / (z + 3.0)
+    a += (0.0 - 176.61502916214059) / (z + 4.0)
+    a += 12.507343278686905 / (z + 5.0)
+    a += (0.0 - 0.13857109526572012) / (z + 6.0)
+    a += 0.0000099843695780195716 / (z + 7.0)
+    a += 0.00000015056327351493116 / (z + 8.0)
+    return a
+}
+
+fn is_nonpos_int(x: float) -> bool {
+    if x > 0.0 { return false }
+    return x == (round_i(x) as float)
+}
+
+// log of the absolute value of gamma
+fn lgamma(x: float) -> float {
+    if is_nonpos_int(x) { return INF }
+    if x < 0.5 {
+        // reflection: gamma(x)*gamma(1-x) = pi/sin(pi*x)
+        return fln(PI / fabs(fsin(PI * x))) - lgamma(1.0 - x)
+    }
+    let z = x - 1.0
+    let t = z + 7.5
+    return 0.5 * fln(TWO_PI) + (z + 0.5) * fln(t) - t + fln(lanczos_a(z))
+}
+
+fn gamma(x: float) -> float {
+    if is_nonpos_int(x) { return NAN }
+    if x > 171.62 { return INF }
+    if x < 0.5 { return PI / (fsin(PI * x) * gamma(1.0 - x)) }
+    return fexp(lgamma(x))
+}
+
+// digamma is the logarithmic derivative of gamma. Recurrence up to x >= 6,
+// then the asymptotic series.
+fn digamma(x0: float) -> float {
+    if is_nonpos_int(x0) { return NAN }
+    if x0 < 0.0 { return digamma(1.0 - x0) - PI * fcot(PI * x0) }
+    var x = x0
+    var r = 0.0
+    // shift to 12, not 6: the series truncates after the 1/(132 x^10) term,
+    // and at 6 that leaves ~5e-12, which is ruinous near the root at 1.4616
+    while x < 12.0 {
+        r -= 1.0 / x
+        x += 1.0
+    }
+    let f = 1.0 / (x * x)
+    let s = f * (1.0 / 12.0 - f * (1.0 / 120.0 - f * (1.0 / 252.0 - f * (1.0 / 240.0 - f * (1.0 / 132.0)))))
+    return r + fln(x) - 0.5 / x - s
+}
+
+// ---- derivatives -----------------------------------------------------------
+// One per function above. These are the VJP bodies for a future lib/ml tape;
+// today they are ordinary functions, checkable by finite differences.
+
+fn d_fsin(x: float) -> float { return fcos(x) }
+fn d_fcos(x: float) -> float { return 0.0 - fsin(x) }
+fn d_ftan(x: float) -> float { return fsec(x) * fsec(x) }
+fn d_fcsc(x: float) -> float { return 0.0 - fcsc(x) * fcot(x) }
+fn d_fsec(x: float) -> float { return fsec(x) * ftan(x) }
+fn d_fcot(x: float) -> float { return 0.0 - fcsc(x) * fcsc(x) }
+
+fn d_fasin(x: float) -> float {
+    if x >= 1.0 or x <= -1.0 { return NAN }
+    return 1.0 / sqrt((1.0 - x) * (1.0 + x))
+}
+
+fn d_facos(x: float) -> float {
+    if x >= 1.0 or x <= -1.0 { return NAN }
+    return 0.0 - 1.0 / sqrt((1.0 - x) * (1.0 + x))
+}
+
+fn d_fatan(x: float) -> float { return 1.0 / (1.0 + x * x) }
+fn d_facot(x: float) -> float { return 0.0 - 1.0 / (1.0 + x * x) }
+
+// the fabs here is not decoration: without it the sign is wrong for x < -1
+fn d_fasec(x: float) -> float {
+    if x <= 1.0 and x >= -1.0 { return NAN }
+    return 1.0 / (fabs(x) * sqrt(x * x - 1.0))
+}
+
+fn d_facsc(x: float) -> float {
+    if x <= 1.0 and x >= -1.0 { return NAN }
+    return 0.0 - 1.0 / (fabs(x) * sqrt(x * x - 1.0))
+}
+
+fn d_fln(x: float) -> float { return 1.0 / x }
+fn d_fexp(x: float) -> float { return fexp(x) }
+fn d_sinh(x: float) -> float { return cosh(x) }
+fn d_cosh(x: float) -> float { return sinh(x) }
+
+fn d_tanh(x: float) -> float {
+    let t = tanh(x)
+    return 1.0 - t * t
+}
+
+fn d_gd(x: float) -> float { return 1.0 / cosh(x) }
+fn d_gd_inv(y: float) -> float { return fsec(y) }
+fn d_lgamma(x: float) -> float { return digamma(x) }
+fn d_gamma(x: float) -> float { return gamma(x) * digamma(x) }
+
+// ---- quadrature ------------------------------------------------------------
+// Adaptive Simpson with Richardson extrapolation. For the two functions above
+// with no elementary antiderivative -- gamma and gd -- this is the only route.
+
+fn simpson(f: fn(float) -> float, a: float, b: float) -> float {
+    let c = (a + b) / 2.0
+    return (b - a) / 6.0 * (f(a) + 4.0 * f(c) + f(b))
+}
+
+fn adapt(f: fn(float) -> float, a: float, b: float, eps: float, whole: float, depth: int) -> float {
+    let c = (a + b) / 2.0
+    let left = simpson(f, a, c)
+    let right = simpson(f, c, b)
+    let delta = left + right - whole
+    if depth <= 0 or fabs(delta) <= 15.0 * eps {
+        return left + right + delta / 15.0
+    }
+    let lo = adapt(f, a, c, eps / 2.0, left, depth - 1)
+    let hi = adapt(f, c, b, eps / 2.0, right, depth - 1)
+    return lo + hi
+}
+
+// definite integral of f over [a,b]; eps is the absolute error target
+fn integrate(f: fn(float) -> float, a: float, b: float, eps: float) -> float {
+    if a == b { return 0.0 }
+    if a > b { return 0.0 - integrate(f, b, a, eps) }
+    return adapt(f, a, b, eps, simpson(f, a, b), 50)
+}
+
+// Same again for a one-parameter family f(t; p). Worth the duplication: the
+// alternative is capturing p in a closure, which does not exist on wasm, or a
+// module-level var, which would make the quadrature non-reentrant.
+
+fn simpson_p(f: fn(float, float) -> float, p: float, a: float, b: float) -> float {
+    let c = (a + b) / 2.0
+    return (b - a) / 6.0 * (f(a, p) + 4.0 * f(c, p) + f(b, p))
+}
+
+fn adapt_p(f: fn(float, float) -> float, p: float, a: float, b: float, eps: float, whole: float, depth: int) -> float {
+    let c = (a + b) / 2.0
+    let left = simpson_p(f, p, a, c)
+    let right = simpson_p(f, p, c, b)
+    let delta = left + right - whole
+    if depth <= 0 or fabs(delta) <= 15.0 * eps {
+        return left + right + delta / 15.0
+    }
+    let lo = adapt_p(f, p, a, c, eps / 2.0, left, depth - 1)
+    let hi = adapt_p(f, p, c, b, eps / 2.0, right, depth - 1)
+    return lo + hi
+}
+
+fn integrate_p(f: fn(float, float) -> float, p: float, a: float, b: float, eps: float) -> float {
+    if a == b { return 0.0 }
+    if a > b { return 0.0 - integrate_p(f, p, b, a, eps) }
+    return adapt_p(f, p, a, b, eps, simpson_p(f, p, a, b), 50)
+}

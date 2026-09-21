@@ -21,7 +21,18 @@ struct Gfx {
     qfam: int,
     cmdpool: int,
     memprops: Bytes,       // cached VkPhysicalDeviceMemoryProperties
-    surface: int           // 0 when headless
+    surface: int,          // 0 when headless
+    has_f64: bool,         // shaderFloat64 was supported and is enabled
+    has_int64_atomics: bool, // shaderBufferInt64Atomics likewise. The f64
+                           // compute kernels need both; a device without them
+                           // still gets a working Gfx for the graphics paths,
+                           // so callers must check before dispatching them.
+    queue2: int            // a second queue from the same family, or `queue`
+                           // again when the family only exposes one. Nothing
+                           // in the graphics path uses it; it exists so a
+                           // compute backend can run two lanes that really
+                           // can overlap, which is the only way a test can
+                           // tell a cross-lane wait from luck.
 }
 
 // One frame's worth of reusable per-frame state. Keeping several of these in
@@ -88,7 +99,15 @@ impl Gfx {
         app.put32(VkApplicationInfo_sType, VK_STRUCTURE_TYPE_APPLICATION_INFO)
         app.put64(VkApplicationInfo_pApplicationName, nameb.addr())
         app.put64(VkApplicationInfo_pEngineName, nameb.addr())
-        app.put32(VkApplicationInfo_apiVersion, VK_API_VERSION_1_0)
+        // Ask for 1.2 when the loader has it: the shader-atomic-int64 feature
+        // struct chained into vkCreateDevice below is core only from 1.2.
+        // Older loaders keep the 1.0 behaviour and simply lose that feature.
+        var pver = Bytes.new(8)
+        var apiver = VK_API_VERSION_1_0
+        if vkEnumerateInstanceVersion(pver.addr()) == VK_SUCCESS {
+            if pver.get32(0) >= VK_API_VERSION_1_2 { apiver = VK_API_VERSION_1_2 }
+        }
+        app.put32(VkApplicationInfo_apiVersion, apiver)
 
         // layer names: an array of char* that must outlive vkCreateInstance
         var lnames = Bytes.new(8 * (layers.len() + 1))
@@ -177,12 +196,19 @@ impl Gfx {
         }
         if qfam < 0 { panic("no graphics queue family that can present") }
 
-        var prio = Bytes.new(4)
-        prio.putf32(0, 1.0)
+        // Ask for two queues when the family has them. Queue 0 is what every
+        // existing caller uses and its behaviour is unchanged; queue 1 is
+        // spare capacity for concurrent compute lanes. Families that expose
+        // only one queue still work -- nq_avail clamps the request.
+        var nq_avail = qprops.get32(qfam * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueCount)
+        var nq_want = 2
+        if nq_avail < 2 { nq_want = 1 }
+        var prio = Bytes.new(4 * nq_want)
+        for i in 0..nq_want { prio.putf32(i * 4, 1.0) }
         var qci = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
         qci.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
         qci.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, qfam)
-        qci.put32(VkDeviceQueueCreateInfo_queueCount, 1)
+        qci.put32(VkDeviceQueueCreateInfo_queueCount, nq_want)
         qci.put64(VkDeviceQueueCreateInfo_pQueuePriorities, prio.addr())
 
         var dexts: [str] = []
@@ -195,18 +221,58 @@ impl Gfx {
             dnames.put64(i * 8, db.addr())
         }
 
+        // Features the compute kernels need, enabled only where supported --
+        // using one without enabling it is undefined behaviour, and failing
+        // device creation over it would break the graphics examples on a GPU
+        // without fp64. shaderFloat64 rides in pEnabledFeatures and the int64
+        // atomics struct rides in pNext: the two are independent, so this is
+        // shorter than building a VkPhysicalDeviceFeatures2 chain for both
+        // (which would then require pEnabledFeatures to be NULL).
+        var feat = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
+        vkGetPhysicalDeviceFeatures(phys, feat.addr())
+        let want_f64 = feat.get32(VkPhysicalDeviceFeatures_shaderFloat64) != 0
+        var enabled = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
+        if want_f64 { enabled.put32(VkPhysicalDeviceFeatures_shaderFloat64, VK_TRUE) }
+
+        // vkGetPhysicalDeviceFeatures2 is core 1.1, but the struct it reports
+        // into is only usable in VkDeviceCreateInfo.pNext from 1.2, so gate on
+        // the version we actually asked the instance for and on the device's.
+        vkGetPhysicalDeviceProperties(phys, props.addr())
+        var atomics = Bytes.new(VkPhysicalDeviceShaderAtomicInt64Features_sizeof)
+        atomics.put32(VkPhysicalDeviceShaderAtomicInt64Features_sType,
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES)
+        var want_atomics = false
+        if apiver >= VK_API_VERSION_1_2 and props.get32(VkPhysicalDeviceProperties_apiVersion) >= VK_API_VERSION_1_2 {
+            var f2 = Bytes.new(VkPhysicalDeviceFeatures2_sizeof)
+            f2.put32(VkPhysicalDeviceFeatures2_sType, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            f2.put64(VkPhysicalDeviceFeatures2_pNext, atomics.addr())
+            vkGetPhysicalDeviceFeatures2(phys, f2.addr())
+            want_atomics = atomics.get32(VkPhysicalDeviceShaderAtomicInt64Features_shaderBufferInt64Atomics) != 0
+        }
+        // hand the same struct back as a request, with only what we want set
+        atomics.put64(VkPhysicalDeviceShaderAtomicInt64Features_pNext, 0)
+        atomics.put32(VkPhysicalDeviceShaderAtomicInt64Features_shaderSharedInt64Atomics, VK_FALSE)
+
         var dci = Bytes.new(VkDeviceCreateInfo_sizeof)
         dci.put32(VkDeviceCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
         dci.put32(VkDeviceCreateInfo_queueCreateInfoCount, 1)
         dci.put64(VkDeviceCreateInfo_pQueueCreateInfos, qci.addr())
         dci.put32(VkDeviceCreateInfo_enabledExtensionCount, dexts.len())
         if dexts.len() > 0 { dci.put64(VkDeviceCreateInfo_ppEnabledExtensionNames, dnames.addr()) }
+        dci.put64(VkDeviceCreateInfo_pEnabledFeatures, enabled.addr())
+        if want_atomics { dci.put64(VkDeviceCreateInfo_pNext, atomics.addr()) }
         var pdev = Bytes.new(8)
         vkcheck(vkCreateDevice(phys, dci.addr(), 0, pdev.addr()), "vkCreateDevice")
         let dev = pdev.get64(0)
 
         var pq = Bytes.new(8)
         vkGetDeviceQueue(dev, qfam, 0, pq.addr())
+        var pq2 = Bytes.new(8)
+        if nq_want > 1 {
+            vkGetDeviceQueue(dev, qfam, 1, pq2.addr())
+        } else {
+            pq2.put64(0, pq.get64(0))
+        }
 
         var cpci = Bytes.new(VkCommandPoolCreateInfo_sizeof)
         cpci.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
@@ -219,7 +285,9 @@ impl Gfx {
         vkGetPhysicalDeviceMemoryProperties(phys, mp.addr())
 
         return Gfx{instance: instance, phys: phys, dev: dev, queue: pq.get64(0),
-                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface}
+                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface,
+                   has_f64: want_f64, has_int64_atomics: want_atomics,
+                   queue2: pq2.get64(0)}
     }
 
     fn shutdown(self) {

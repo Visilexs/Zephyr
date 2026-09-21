@@ -1,0 +1,96 @@
+// Independent deterministic forward fixture; no reference values or file input.
+import "ml/phase.zeph"
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 20001) as float) / 100000.0 - 0.1
+}
+
+// Emit row-major float64 bit patterns, matching the operator dump protocol.
+fn dumpR(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// Complex entries contain separate real and imaginary float64 bit patterns.
+fn dumpC(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get_re(t, idx))} {bits(t_get_im(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// Fill one tensor row-major; complex components consume real then imaginary.
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) {
+            let im = rnd()
+            t_set_c(t, idx, re, im)
+        } else {
+            t_set(t, idx, re)
+        }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// Reset the seed for EACH D. Fill order is embedding, think, W1, b1, W2,
+// b2, z_init, M; row-major, with real/imag interleaved per complex element.
+fn dump_phase(d: int, tag: str) {
+    SEED = 20260921
+    let config = PhaseConfig{input_vocab: 7, output_vocab: 3, D: d, E: 3, H: 5, K: 4, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [7, 3])
+    let think = t_zeros(DType.F64, [3])
+    let W1 = t_zeros(DType.F64, [5, 3 + 3 * d])
+    let b1 = t_zeros(DType.F64, [5])
+    let W2 = t_zeros(DType.F64, [3 * d, 5])
+    let b2 = t_zeros(DType.F64, [3 * d])
+    let z_init = t_zeros(DType.C64, [d])
+    let M = t_zeros(DType.C64, [3, d])
+    let tensors = [embedding, think, W1, b1, W2, b2, z_init, M]
+    for i in 0..tensors.len() { fill_random(tensors[i]) }
+    let params = PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: M}
+    let names = ["embedding", "think", "W1", "b1", "W2", "b2", "z_init", "M"]
+    for i in 0..tensors.len() {
+        let name = names[i]
+        if i < 6 {
+            dumpR("{tag}.param.{name}", tensors[i])
+        } else {
+            dumpC("{tag}.param.{name}", tensors[i])
+        }
+    }
+    let rows = [[1, 2, 3, 4], [5, 6, 0, 0], [0, 0, 0, 0]]
+    let tokens = t_zeros(DType.I64, [3, 4])
+    for row in 0..3 {
+        for step in 0..4 { t_set_int(tokens, [row, step], rows[row][step]) }
+    }
+    let result = phase_forward(params, tokens, true)
+    dumpC("{tag}.initial", result.initial)
+    for i in 0..result.steps.len() {
+        let step = result.steps[i]
+        for j in 0..step.active.len() {
+            let active = step.active[j] as float
+            print("{tag}.step{i}.active {bits(active)}")
+        }
+        dumpR("{tag}.step{i}.features", step.features)
+        dumpR("{tag}.step{i}.hidden", step.hidden)
+        dumpR("{tag}.step{i}.angles", step.angles)
+        dumpC("{tag}.step{i}.phase", step.phased)
+        dumpC("{tag}.step{i}.stage0", step.even)
+        dumpC("{tag}.step{i}.stage1", step.odd)
+        dumpC("{tag}.step{i}.state", result.trajectory[i + 1])
+    }
+    dumpR("{tag}.probabilities", result.probabilities)
+}
+
+dump_phase(4, "D4")
+dump_phase(8, "D8")

@@ -33,6 +33,9 @@ extern fn vkDestroyInstance(instance: int, pAllocator: int) from "vulkan-1.dll"
 // ---- physical device ----
 extern fn vkEnumeratePhysicalDevices(instance: int, pCount: int, pDevices: int) -> i32 from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceProperties(physicalDevice: int, pProperties: int) from "vulkan-1.dll"
+extern fn vkGetPhysicalDeviceFeatures(physicalDevice: int, pFeatures: int) from "vulkan-1.dll"
+// core since 1.1; only called when the loader reports >= 1.2 (see gfx.zeph)
+extern fn vkGetPhysicalDeviceFeatures2(physicalDevice: int, pFeatures: int) from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice: int, pCount: int, pProps: int) from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceMemoryProperties(physicalDevice: int, pMemoryProperties: int) from "vulkan-1.dll"
 
@@ -93,6 +96,7 @@ extern fn vkCreateFence(device: int, pCreateInfo: int, pAllocator: int, pFence: 
 extern fn vkDestroyFence(device: int, fence: int, pAllocator: int) from "vulkan-1.dll"
 extern fn vkWaitForFences(device: int, fenceCount: int, pFences: int, waitAll: int, timeout: int) -> i32 from "vulkan-1.dll"
 extern fn vkResetFences(device: int, fenceCount: int, pFences: int) -> i32 from "vulkan-1.dll"
+extern fn vkGetFenceStatus(device: int, fence: int) -> i32 from "vulkan-1.dll"
 extern fn vkCreateSemaphore(device: int, pCreateInfo: int, pAllocator: int, pSemaphore: int) -> i32 from "vulkan-1.dll"
 extern fn vkDestroySemaphore(device: int, semaphore: int, pAllocator: int) from "vulkan-1.dll"
 

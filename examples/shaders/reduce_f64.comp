@@ -1,0 +1,54 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 256) in;
+// Match t_sum_dim: retain rank and set oshape[meta.z] = 1.
+// astr retains input axes; bstr.x is the reduced stride, offs.w its length.
+layout(std430, binding = 0) readonly buffer BufA { double data[]; } A;
+layout(std430, binding = 1) writeonly buffer BufO { double data[]; } O;
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = output numel, z = op/axis, w = dtype flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // operand A strides, in elements
+    uvec4 bstr;    // operand B strides, in elements
+    uvec4 ostr;    // output strides, in elements
+    uvec4 offs;    // A offset, B offset, output offset, auxiliary value
+} pc;
+
+// Decode only the active dimensions, in row-major logical order.
+uvec4 output_index(uint linear) {
+    uvec4 index = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        index[d - 1u] = linear % pc.oshape[d - 1u];
+        linear /= pc.oshape[d - 1u];
+    }
+    return index;
+}
+
+// Strides and offsets are in elements; complex elements occupy two doubles.
+uint double_index(uvec4 index, uvec4 strides, uint offset, bool is_complex) {
+    uint position = offset;
+    for (uint d = 0u; d < pc.meta.x; ++d) {
+        position += index[d] * strides[d];
+    }
+    return is_complex ? 2u * position : position;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+    uvec4 index = output_index(gid);
+    bool ac = (pc.meta.w & 1u) != 0u;
+    bool oc = (pc.meta.w & 4u) != 0u;
+    uint io = double_index(index, pc.ostr, pc.offs.z, oc);
+    index[pc.meta.z] = 0u;
+    precise double re = 0.0lf;
+    precise double im = 0.0lf;
+    // Each sum follows the CPU's ascending traversal without reassociation.
+    for (uint k = 0u; k < pc.offs.w; ++k) {
+        uint ia = double_index(index, pc.astr, pc.offs.x + k * pc.bstr.x, ac);
+        re += A.data[ia];
+        if (ac) { im += A.data[ia + 1u]; }
+    }
+    O.data[io] = re;
+    if (oc) { O.data[io + 1u] = im; }
+}

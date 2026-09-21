@@ -1,0 +1,224 @@
+// Standalone M3 invariants, including isolated child-process panic checks.
+import "ml/phase.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+fn near(a: float, b: float) -> bool { return fabs(a - b) <= 0.000000000001 * (1.0 + fabs(b)) }
+
+// Nonzero, nonuniform fixtures keep phase and both mixing stages observable.
+fn test_params(d: int, k: int) -> PhaseParams {
+    let c = PhaseConfig{input_vocab: 7, output_vocab: 3, D: d, E: 3, H: 5, K: k, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [7, 3])
+    let think = t_zeros(DType.F64, [3])
+    let w1 = t_zeros(DType.F64, [5, 3 + 3 * d])
+    let b1 = t_full(DType.F64, [5], 0.02)
+    let w2 = t_zeros(DType.F64, [3 * d, 5])
+    let b2 = t_zeros(DType.F64, [3 * d])
+    let init = t_zeros(DType.C64, [d])
+    let matrix = t_zeros(DType.C64, [3, d])
+    let real = [embedding, think, w1, w2, b2]
+    var serial = 1
+    for t in real {
+        var idx = idx_zeros(t.shape.len())
+        var more = true
+        while more {
+            t_set(t, idx, ((serial % 17) as float) / 100.0 - 0.08)
+            serial += 1
+            more = idx_next(idx, t.shape)
+        }
+    }
+    for j in 0..d {
+        t_set_c(init, [j], 0.1 + (j as float) / (d as float), 0.2 - (j as float) / (2 * d) as float)
+        for row in 0..3 { t_set_c(matrix, [row, j], ((j + row + 1) as float) / (d as float), ((j * row + 2) as float) / (2 * d) as float) }
+    }
+    return PhaseParams{config: c, embedding: embedding, think: think, W1: w1, b1: b1, W2: w2, b2: b2, z_init: init, M: matrix}
+}
+
+fn test_tokens() -> Tensor {
+    let tokens = t_zeros(DType.I64, [3, 4])
+    let values = [[1, 2, 3, 4], [5, 6, 0, 0], [0, 0, 0, 0]]
+    for row in 0..3 {
+        for step in 0..4 { t_set_int(tokens, [row, step], values[row][step]) }
+    }
+    return tokens
+}
+
+// Compare tensors over logical indices, including non-contiguous row slices.
+fn tensor_near(a: Tensor, b: Tensor) -> bool {
+    if a.dt != b.dt or not shapes_equal(a.shape, b.shape) { return false }
+    var idx = idx_zeros(a.shape.len())
+    var more = t_numel(a) > 0
+    while more {
+        if dtype_is_complex(a.dt) {
+            if not near(t_get_re(a, idx), t_get_re(b, idx)) or not near(t_get_im(a, idx), t_get_im(b, idx)) { return false }
+        } else {
+            if not near(t_get(a, idx), t_get(b, idx)) { return false }
+        }
+        more = idx_next(idx, a.shape)
+    }
+    return true
+}
+
+// Panics are uncatchable: launch this executable in a single rejection mode.
+fn rejects(mode: str) -> bool {
+    let command = cbytes("\"{args()[0]}\" {mode}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, command.p, 0, 0, 0, 134217728, 0, 0, startup.p, process.p)
+    assert(started != 0, "start rejection child")
+    let waited = win("WaitForSingleObject", process.get64(0), 30000)
+    assert(waited == 0, "wait rejection child")
+    let status = Bytes.new(4)
+    let got = win("GetExitCodeProcess", process.get64(0), status.p)
+    assert(got != 0, "read rejection status")
+    let closed_process = win("CloseHandle", process.get64(0))
+    let closed_thread = win("CloseHandle", process.get64(8))
+    return status.get32(0) == 1
+}
+
+// A mistakenly accepted invalid call exits zero, so the parent fails its check.
+if args().len() > 1 {
+    let mode = args()[1]
+    let bad = test_params(4, 0)
+    let bad_tokens = test_tokens()
+    if mode == "zero" { bad.z_init = t_zeros(DType.C64, [4]) }
+    if mode == "nonfinite" { t_set_c(bad.z_init, [0], INF, 0.0) }
+    if mode == "overflow_norm" { t_set_c(bad.z_init, [0], frombits(2046 << 52), 0.0) }
+    if mode == "token" { t_set_int(bad_tokens, [0, 0], 7) }
+    if mode == "negative_token" { t_set_int(bad_tokens, [0, 0], 0 - 1) }
+    if mode == "odd" { bad.config.D = 3 }
+    if mode == "amplitude" {
+        let state = phase_initial(bad, 1)
+        t_set_c(state, [0, 0], INF, 0.0)
+        let ignored_readout = phase_readout(bad, state)
+    } else {
+        let ignored_forward = phase_forward(bad, bad_tokens, false)
+    }
+    let accepted = win("ExitProcess", 0)
+}
+
+var n = 0
+let tokens = test_tokens()
+for dimension in [4, 8, 128] {
+    let p = test_params(dimension, 4)
+    let result = phase_forward(p, tokens, true)
+    for state in result.trajectory {
+        let norms = t_sum_dim(t_abs2(state), 1)
+        for row in 0..3 { n += ck(near(t_get(norms, [row, 0]), 1.0), "norm after full update, no renormalization") }
+    }
+    let rotated = t_mul(result.state, t_expi(t_full(DType.F64, [], 0.73), DType.C64))
+    n += ck(tensor_near(phase_features(result.state), phase_features(rotated)), "global phase invariant features")
+    n += ck(tensor_near(result.probabilities, phase_readout(p, rotated)), "global phase invariant probabilities")
+    let embedding = t_expand(p.think, [3, 3])
+    let updated_rotated = phase_update(p, rotated, embedding)
+    let rotated_updated = t_mul(phase_update(p, result.state, embedding), t_expi(t_full(DType.F64, [], 0.73), DType.C64))
+    n += ck(tensor_near(updated_rotated, rotated_updated), "global phase equivariant update")
+    let changed = t_copy(result.initial)
+    t_set_c(changed, [0, 0], 0.0 - t_get_im(changed, [0, 0]), t_get_re(changed, [0, 0]))
+    n += ck(not tensor_near(phase_features(changed), phase_features(result.initial)), "relative phase changes features")
+    for step in 0..4 {
+        let before = t_copy(t_slice(result.trajectory[step], 0, 2, 3))
+        let after = t_copy(t_slice(result.trajectory[step + 1], 0, 2, 3))
+        n += ck(t_hex(before) == t_hex(after), "all-PAD row bit-identical")
+        if step >= 2 {
+            let padded_before = t_copy(t_slice(result.trajectory[step], 0, 1, 2))
+            let padded_after = t_copy(t_slice(result.trajectory[step + 1], 0, 1, 2))
+            n += ck(t_hex(padded_before) == t_hex(padded_after), "PAD suffix bit-identical")
+        }
+    }
+    for row in 0..3 {
+        let alone = phase_forward(p, t_slice(tokens, 0, row, row + 1), false)
+        n += ck(tensor_near(alone.state, t_slice(result.state, 0, row, row + 1)), "batch-independent state")
+        n += ck(tensor_near(alone.probabilities, t_slice(result.probabilities, 0, row, row + 1)), "batch-independent probabilities")
+    }
+    // Count active updates and independently compose exactly K THINK updates.
+    for k in [0, 1, 4] {
+        p.config.K = k
+        let counted = phase_forward(p, tokens, true)
+        n += ck(counted.steps.len() == 4 + k, "exact sequence plus THINK step count")
+        for row in 0..3 {
+            var count = 0
+            for step in counted.steps {
+                for active_row in step.active {
+                    if active_row == row { count += 1 }
+                }
+            }
+            let valid = [4, 2, 0]
+            n += ck(count == valid[row] + k, "exact per-row non-PAD plus THINK update count")
+        }
+        var expected = counted.trajectory[4]
+        for repeat in 0..k { expected = phase_update(p, expected, t_expand(p.think, [3, 3])) }
+        n += ck(tensor_near(expected, counted.state), "exactly K THINK applications")
+    }
+}
+
+// INTERFERENCE.md's constructed example, per DESIGN.md D16. The document
+// specifies the normalized row (1,1)/sqrt(2) and then states the squared
+// amplitude is 1+cos(delta) ranging 0 to 2. Both cannot hold: with that row
+// the value is (1+cos(delta))/2. Assert what each row actually produces
+// rather than carrying a bare factor of two that hides the discrepancy.
+let unit = 1.0 / sqrt(2.0)
+let norm_row = t_zeros(DType.C64, [1, 2])
+t_set_c(norm_row, [0, 0], unit, 0.0)
+t_set_c(norm_row, [0, 1], unit, 0.0)
+let raw_row = t_zeros(DType.C64, [1, 2])
+t_set_c(raw_row, [0, 0], 1.0, 0.0)
+t_set_c(raw_row, [0, 1], 1.0, 0.0)
+// the second orthonormal row, which is what makes the paragraph's real claim
+let other_row = t_zeros(DType.C64, [1, 2])
+t_set_c(other_row, [0, 0], unit, 0.0)
+t_set_c(other_row, [0, 1], 0.0 - unit, 0.0)
+let want_first = [1.0, 0.5, 0.0]
+var di = 0
+for delta in [0.0, HALF_PI, PI] {
+    let state = t_zeros(DType.C64, [1, 2])
+    t_set_c(state, [0, 0], unit, 0.0)
+    t_set_c(state, [0, 1], unit * fcos(delta), unit * fsin(delta))
+    let normalized = t_abs2(t_matmul(state, t_transpose(norm_row, 0, 1)))
+    n += ck(near(t_get(normalized, [0, 0]), (1.0 + fcos(delta)) / 2.0), "normalized row gives (1+cos(delta))/2")
+    let unnormalized = t_abs2(t_matmul(state, t_transpose(raw_row, 0, 1)))
+    n += ck(near(t_get(unnormalized, [0, 0]), 1.0 + fcos(delta)), "unnormalized row gives 1+cos(delta)")
+    // two orthonormal rows sweep constructive to destructive and sum to one
+    let w0 = t_get(normalized, [0, 0])
+    let w1 = t_get(t_abs2(t_matmul(state, t_transpose(other_row, 0, 1))), [0, 0])
+    n += ck(near(w0 + w1, 1.0), "orthonormal rows conserve the total weight")
+    n += ck(near(w0, want_first[di]), "interference sweeps constructive to destructive")
+    // global phase moves neither weight
+    let turned = t_mul(state, t_expi(t_full(DType.F64, [], 0.9), DType.C64))
+    let g0 = t_get(t_abs2(t_matmul(turned, t_transpose(norm_row, 0, 1))), [0, 0])
+    let g1 = t_get(t_abs2(t_matmul(turned, t_transpose(other_row, 0, 1))), [0, 0])
+    n += ck(near(g0, w0) and near(g1, w1), "global phase leaves both weights unchanged")
+    di += 1
+}
+
+// Readout includes one epsilon per class; zero amplitudes must be uniform.
+let readout_params = test_params(4, 0)
+let readout_state = phase_initial(readout_params, 1)
+readout_params.M = t_zeros(DType.C64, [3, 4])
+let uniform = phase_readout(readout_params, readout_state)
+for j in 0..3 { n += ck(near(t_get(uniform, [0, j]), 1.0 / 3.0), "zero amplitudes uniform") }
+let basis = t_zeros(DType.C64, [1, 4])
+t_set_c(basis, [0, 0], 1.0, 0.0)
+t_set_c(readout_params.M, [0, 0], sqrt(readout_params.config.eps), 0.0)
+let smoothed = phase_readout(readout_params, basis)
+n += ck(near(t_get(smoothed, [0, 0]), 0.5), "denominator sum(w) + V*eps")
+n += ck(near(t_get(smoothed, [0, 1]), 0.25), "epsilon included for zero class")
+t_set_c(readout_params.M, [0, 0], frombits(1800 << 52), frombits(1800 << 52))
+let saturated = phase_readout(readout_params, basis)
+n += ck(near(t_sum_all(saturated), 1.0) and near(t_get(saturated, [0, 0]), 1.0), "large finite amplitudes do not overflow abs2")
+t_set_c(readout_params.M, [0, 0], frombits(1), frombits(1))
+let tiny = phase_readout(readout_params, basis)
+n += ck(near(t_get(tiny, [0, 0]), 1.0 / 3.0), "subnormal amplitude stability")
+let empty_sequence = phase_forward(readout_params, t_zeros(DType.I64, [1, 0]), true)
+n += ck(empty_sequence.steps.len() == 0 and tensor_near(empty_sequence.initial, empty_sequence.state), "empty sequence K=0")
+let all_pad = phase_forward(readout_params, t_zeros(DType.I64, [1, 2]), true)
+n += ck(all_pad.steps[0].active.len() == 0 and t_hex(all_pad.initial) == t_hex(all_pad.state), "empty active batch leaves state identical")
+
+for mode in ["zero", "nonfinite", "overflow_norm", "token", "negative_token", "odd", "amplitude"] {
+    n += ck(rejects(mode), "reject {mode}")
+}
+print("phase: {n} checks passed")

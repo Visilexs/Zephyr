@@ -1,0 +1,248 @@
+// A small causal Transformer, as a control for the phase reasoner.
+//
+// The baselines document lists this as "Small causal Transformer -- later,
+// same vocabulary/data and tuning budget". It is included here rather than
+// deferred, so what "small" means is declared up front rather than tuned
+// until it flatters or embarrasses the comparison: one attention head, a
+// configurable number of blocks (two by default), pre-norm, a tanh MLP, and
+// learned positional embeddings. Those are choices, not findings, and they
+// are recorded in the run record with everything else.
+//
+// Everything is built from existing av_* operators. No opcode and no VJP is
+// added, which is deliberate: a control whose gradients came from new,
+// separately-verified-at-best code would confound "this architecture does
+// worse" with "this architecture's backward pass is wrong". The verified
+// tape differentiates all three families.
+//
+// Three things here are worth reading before trusting the numbers.
+//
+//   * Attention is computed per batch row. The tape's matmul is 2-D, so the
+//     linear layers run on a flattened [B*T, d] matrix -- one large matmul
+//     each, which is where the time goes -- while the [T,T] score matrix is
+//     built one row at a time and concatenated back. That is a layout
+//     decision, not an approximation: the arithmetic is the usual one.
+//   * The softmax subtracts a row maximum that is DETACHED. Subtracting a
+//     constant does not change softmax's value, and the maximum is not
+//     differentiated, so no gradient is lost and nothing overflows. If the
+//     maximum were on the tape it would contribute a spurious gradient path
+//     through whichever element happened to be largest.
+//   * Padding is masked in two places and both are necessary. Keys at PAD
+//     positions are masked out of attention, and the readout is taken at
+//     each row's last REAL token rather than at the padded end. Masking only
+//     one of the two produces a model that looks trained and is reading
+//     padding.
+import "ml/autograd.zeph"
+
+let TF_PER_LAYER = 12
+let TF_NEG = 0.0 - 1000000000000000000000000000000.0
+
+struct TfConfig {
+    input_vocab: int,
+    output_vocab: int,
+    d: int,           // model width
+    ff: int,          // MLP inner width
+    layers: int,
+    max_len: int,
+    pad: int,
+    eps: float,
+}
+
+struct TfParams {
+    config: TfConfig,
+    // embedding, pos, then TF_PER_LAYER per layer, then lnf_g, lnf_b, Wout, bout
+    ts: [Tensor],
+}
+
+struct TfAD {
+    cfg: TfConfig,
+    hs: [int],
+}
+
+// The parameter order is fixed and is the only thing that relates a
+// TfParams to a TfAD, so it is written once, here, and never duplicated.
+fn tf_new(cfg: TfConfig) -> TfParams {
+    var ts: [Tensor] = []
+    ts.push(t_zeros(DType.F64, [cfg.input_vocab, cfg.d]))   // token embedding
+    ts.push(t_zeros(DType.F64, [cfg.max_len, cfg.d]))       // positional
+    for l in 0..cfg.layers {
+        ts.push(t_ones(DType.F64, [cfg.d]))                 // ln1 gain
+        ts.push(t_zeros(DType.F64, [cfg.d]))                // ln1 bias
+        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wq
+        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wk
+        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wv
+        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wo
+        ts.push(t_ones(DType.F64, [cfg.d]))                 // ln2 gain
+        ts.push(t_zeros(DType.F64, [cfg.d]))                // ln2 bias
+        ts.push(t_zeros(DType.F64, [cfg.ff, cfg.d]))        // W1
+        ts.push(t_zeros(DType.F64, [cfg.ff]))               // b1
+        ts.push(t_zeros(DType.F64, [cfg.d, cfg.ff]))        // W2
+        ts.push(t_zeros(DType.F64, [cfg.d]))                // b2
+    }
+    ts.push(t_ones(DType.F64, [cfg.d]))                     // final ln gain
+    ts.push(t_zeros(DType.F64, [cfg.d]))                    // final ln bias
+    ts.push(t_zeros(DType.F64, [cfg.output_vocab, cfg.d]))  // readout
+    ts.push(t_zeros(DType.F64, [cfg.output_vocab]))
+    return TfParams{config: cfg, ts: ts}
+}
+
+fn tf_param_list(p: TfParams) -> [Tensor] { return p.ts }
+
+fn tf_params(p: TfParams, req: bool) -> TfAD {
+    var hs: [int] = []
+    for i in 0..p.ts.len() { hs.push(av_leaf(p.ts[i], req)) }
+    return TfAD{cfg: p.config, hs: hs}
+}
+
+fn tf_layer_base(cfg: TfConfig, l: int) -> int { return 2 + l * TF_PER_LAYER }
+fn tf_tail_base(cfg: TfConfig) -> int { return 2 + cfg.layers * TF_PER_LAYER }
+
+fn tf_scalar(v: float) -> int { return av_leaf(t_full(DType.F64, [], v), false) }
+
+// Softmax along rows with a detached maximum. See the header note: the
+// maximum is a constant leaf, so it shifts the exponent without creating a
+// gradient path.
+fn tf_softmax(s: int) -> int {
+    let v = av_value(s)
+    let n = v.shape[0]
+    let m = v.shape[1]
+    let mx = t_zeros(DType.F64, [n, 1])
+    for r in 0..n {
+        var best = t_get(v, [r, 0])
+        for c in 1..m {
+            let x = t_get(v, [r, c])
+            if x > best { best = x }
+        }
+        t_set(mx, [r, 0], best)
+    }
+    let e = av_exp(av_sub(s, av_leaf(mx, false)))
+    return av_div(e, av_sum_dim(e, 1))
+}
+
+// Layer norm over the feature dimension. The reciprocal square root is
+// reached through exp(-0.5 ln(v)) for the same reason phase_ad does it: ln
+// and exp already carry VJPs and a sqrt primitive would buy nothing.
+fn tf_layernorm(x: int, gain: int, bias: int, d: int, eps: float) -> int {
+    let dn = tf_scalar(d as float)
+    let mean = av_div(av_sum_dim(x, 1), dn)
+    let c = av_sub(x, mean)
+    let vr = av_div(av_sum_dim(av_mul(c, c), 1), dn)
+    let inv = av_exp(av_mul(av_ln(av_add(vr, tf_scalar(eps))), tf_scalar(0.0 - 0.5)))
+    return av_add(av_mul(av_mul(c, inv), gain), bias)
+}
+
+// The additive attention mask for one row: -inf above the diagonal, and
+// -inf on any key at a PAD position. Built as a constant because it depends
+// only on the input, never on the parameters.
+fn tf_mask_row(tokens: Tensor, row: int, length: int, pad: int) -> Tensor {
+    let m = t_zeros(DType.F64, [length, length])
+    for q in 0..length {
+        for k in 0..length {
+            var blocked = k > q
+            if t_get_int(tokens, [row, k]) == pad { blocked = true }
+            // A row's first position must keep at least one visible key, or
+            // the softmax is 0/0. The diagonal is always visible.
+            if k == q { blocked = false }
+            if blocked { t_set(m, [q, k], TF_NEG) }
+        }
+    }
+    return m
+}
+
+// The last non-PAD position of each row, which is where the readout is
+// taken. A model read at the padded end is reading padding.
+fn tf_last_real(tokens: Tensor, row: int, length: int, pad: int) -> int {
+    var last = 0
+    for k in 0..length {
+        if t_get_int(tokens, [row, k]) != pad { last = k }
+    }
+    return last
+}
+
+// The full hidden state, [B*T, d], before any position is selected.
+// Separated from tf_forward so causality can be tested directly: two inputs
+// that agree up to position p must give the same hidden state AT p, and
+// there is no way to check that if only the selected row is reachable.
+fn tf_encode(m: TfAD, tokens: Tensor) -> int {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    let cfg = m.cfg
+    let d = cfg.d
+    if length > cfg.max_len { panic("transformer: sequence of {length} exceeds max_len {cfg.max_len}") }
+
+    // Token and position embeddings, flattened to [B*T, d] so every linear
+    // layer below is one matmul rather than B of them.
+    var tok_ids: [int] = []
+    var pos_ids: [int] = []
+    for r in 0..batch {
+        for s in 0..length {
+            let tid = t_get_int(tokens, [r, s])
+            if tid < 0 or tid >= cfg.input_vocab { panic("transformer: token id {tid} outside the vocabulary of {cfg.input_vocab}") }
+            tok_ids.push(tid)
+            pos_ids.push(s)
+        }
+    }
+    var x = av_add(av_index_select(m.hs[0], 0, tok_ids), av_index_select(m.hs[1], 0, pos_ids))
+
+    // The per-row attention masks, constant for the whole forward pass.
+    var masks: [int] = []
+    for r in 0..batch { masks.push(av_leaf(tf_mask_row(tokens, r, length, cfg.pad), false)) }
+    let scale = tf_scalar(1.0 / fexp(0.5 * fln(d as float)))
+
+    for l in 0..cfg.layers {
+        let b = tf_layer_base(cfg, l)
+        let h = tf_layernorm(x, m.hs[b], m.hs[b + 1], d, cfg.eps)
+        let q = av_matmul(h, av_transpose(m.hs[b + 2], 0, 1))
+        let k = av_matmul(h, av_transpose(m.hs[b + 3], 0, 1))
+        let v = av_matmul(h, av_transpose(m.hs[b + 4], 0, 1))
+
+        var ctx = 0 - 1
+        for r in 0..batch {
+            let lo = r * length
+            let hi = lo + length
+            let qr = av_slice(q, 0, lo, hi)
+            let kr = av_slice(k, 0, lo, hi)
+            let vr = av_slice(v, 0, lo, hi)
+            let sc = av_add(av_mul(av_matmul(qr, av_transpose(kr, 0, 1)), scale), masks[r])
+            let at = tf_softmax(sc)
+            let cr = av_matmul(at, vr)
+            if r == 0 { ctx = cr } else { ctx = av_concat(ctx, cr, 0) }
+        }
+        x = av_add(x, av_matmul(ctx, av_transpose(m.hs[b + 5], 0, 1)))
+
+        let h2 = tf_layernorm(x, m.hs[b + 6], m.hs[b + 7], d, cfg.eps)
+        let inner = av_tanh(av_add(av_matmul(h2, av_transpose(m.hs[b + 8], 0, 1)), m.hs[b + 9]))
+        x = av_add(x, av_add(av_matmul(inner, av_transpose(m.hs[b + 10], 0, 1)), m.hs[b + 11]))
+    }
+
+    let tb = tf_tail_base(cfg)
+    return tf_layernorm(x, m.hs[tb], m.hs[tb + 1], d, cfg.eps)
+}
+
+fn tf_forward(m: TfAD, tokens: Tensor) -> int {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    let hf = tf_encode(m, tokens)
+    var pick: [int] = []
+    for r in 0..batch { pick.push(r * length + tf_last_real(tokens, r, length, m.cfg.pad)) }
+    return av_index_select(hf, 0, pick)
+}
+
+fn tf_readout(m: TfAD, h: int) -> int {
+    let tb = tf_tail_base(m.cfg)
+    return tf_softmax(av_add(av_matmul(h, av_transpose(m.hs[tb + 2], 0, 1)), m.hs[tb + 3]))
+}
+
+// Mean negative log likelihood, selected by a one-hot mask and a sum so the
+// selection stays on the tape -- the same construction pad_loss uses, for
+// the same reason, and so the two families' losses are the same quantity.
+fn tf_loss(m: TfAD, tokens: Tensor, targets: [int]) -> int {
+    let batch = tokens.shape[0]
+    let probs = tf_readout(m, tf_forward(m, tokens))
+    let hot = t_zeros(DType.F64, [batch, m.cfg.output_vocab])
+    for row in 0..batch {
+        if targets[row] < 0 or targets[row] >= m.cfg.output_vocab { panic("transformer: target out of range") }
+        t_set(hot, [row, targets[row]], 1.0)
+    }
+    let picked = av_sum_dim(av_mul(probs, av_leaf(hot, false)), 1)
+    return av_mean_all(av_neg(av_ln(picked)))
+}

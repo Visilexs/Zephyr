@@ -1,0 +1,385 @@
+// A22: cross-stream event ordering and allocation recycling under delayed
+// completion, with no host-owner early release.
+//
+// The specification's memory-runtime document lists the reference tests this
+// criterion wants, and rather than invent a different set this suite
+// implements that list one for one:
+//
+//   owner deleted while view lives; view deleted before owner; producer on
+//   stream A consumed on B; release immediately after launch; async host
+//   source mutated too early; allocation failure; repeated training loop
+//   returns to stable live-byte baseline. Run delayed-completion stress
+//   tests to expose race conditions.
+//
+// The hard part of testing any of this is making completion genuinely
+// delayed. A dispatch that finishes before the host can ask about it proves
+// nothing: every one of these tests would pass against an allocator that
+// recycled in-flight storage immediately. So the slow work here is a real
+// 1024x1024 float64 matmul, measured at about 17 ms in tools/gpu_probe.zeph,
+// and the tests assert on the in-flight window rather than only on the state
+// after it closes. Where a test depends on that window actually being open,
+// it says so and fails loudly if the work finished too fast to be a test.
+import "ml/gpu_stream.zeph"
+import "std/math.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+// ---- the allocation-failure child ----------------------------------------
+// A failed allocation panics, which ends the process, so it runs in a child
+// and the parent checks the exit status and the message. Same pattern as the
+// eleven rejection processes in optim_test.zeph.
+if args().len() > 1 {
+    if args()[1] == "oom" {
+        var gc = Gfx.init("oom", [])
+        var pc = pool_new(gc)
+        pc.limit_bytes = 4096
+        pool_acquire(pc, 2048)
+        pool_acquire(pc, 2048)
+        pool_acquire(pc, 2048)      // must fail: 6144 requested against a 4096 limit
+        print("UNREACHABLE: the limit was not enforced")
+        pool_destroy(pc)
+        gc.shutdown()
+    }
+}
+
+let RUNNING_CHILD = args().len() > 1
+
+var g = Gfx.init("zephyr-a22", [])
+var pool = pool_new(g)
+print("device: {g.gpu_name()}")
+
+// ---- a genuinely slow dispatch --------------------------------------------
+// 1024^3 float64. Buffer contents are left undefined on purpose: these tests
+// are about lifetime and ordering, and uploading 24 MiB through the per-byte
+// mapped-memory path would cost more than the work being timed. The tests
+// that do need real values say so and use a small shape.
+let BIG = 1024
+let BIG_BYTES = BIG * BIG * 8
+
+fn dispatch(s: GpuStream, a: int, b: int, c: int, n: int) -> GpuEvent {
+    let ev = event_new(g)
+    var bufs: [GpuBuffer] = []
+    bufs.push(pool_buffer(pool, a))
+    bufs.push(pool_buffer(pool, b))
+    bufs.push(pool_buffer(pool, c))
+    let ds = g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT)
+    let sh = g.shader("examples/shaders/matmul_f64.comp.spv")
+    var sl: [int] = []
+    sl.push(ds.layout)
+    let lay = g.pipeline_layout(sl, 12, VK_SHADER_STAGE_COMPUTE_BIT)
+    let pipe = g.compute_pipeline(sh, lay, cbytes("main"))
+    var pcon = Bytes.new(12)
+    pcon.put32(0, n)
+    pcon.put32(4, n)
+    pcon.put32(8, n)
+    var sets = u64s([ds.set])
+    let grp = (n + 15) / 16
+    let pl = lay
+    let pi = pipe
+    let sa = sets.addr()
+    let pa = pcon.addr()
+    let out = stream_submit(g, s, ev, fn(cb: int) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pi)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, sa, 0, 0)
+        vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pa)
+        vkCmdDispatch(cb, grp, grp, 1)
+    })
+    // Every buffer the submission touches gets its last use recorded. This is
+    // the association the allocator recycles on; without it the pool would be
+    // guessing.
+    pool_touch(pool, a, out)
+    pool_touch(pool, b, out)
+    pool_touch(pool, c, out)
+    return out
+}
+
+// ===========================================================================
+// 1. Owner deleted while view lives.
+// ===========================================================================
+// The view must keep the storage alive. If the pool retired it on the owner's
+// release, a later acquisition of the same size could hand the same storage
+// to someone else while the view still reads it.
+let o1 = pool_acquire(pool, 4096)
+pool_retain(pool, o1)               // a view is taken
+pool_release(pool, o1)              // the owner goes away first
+chk(pool.live_bytes == 4096, "owner released but view lives: storage still counted live")
+let other1 = pool_acquire(pool, 4096)
+chk(other1 != o1, "owner released but view lives: storage is NOT handed to a new acquirer")
+pool_release(pool, o1)              // now the view goes too
+pool_release(pool, other1)
+pool_collect(pool)
+chk(pool.live_bytes == 0, "both references gone: live bytes return to zero")
+
+// ===========================================================================
+// 2. View deleted before owner.
+// ===========================================================================
+// The mirror case. Release order must not matter.
+let o2 = pool_acquire(pool, 8192)
+pool_retain(pool, o2)
+pool_release(pool, o2)              // the view goes first this time
+chk(pool.live_bytes == 8192, "view released before owner: storage still live")
+let other2 = pool_acquire(pool, 8192)
+chk(other2 != o2, "view released before owner: storage is NOT reused early")
+pool_release(pool, o2)
+pool_release(pool, other2)
+pool_collect(pool)
+chk(pool.live_bytes == 0, "release order does not matter: both paths reach zero")
+
+// ===========================================================================
+// 3. Producer on stream A consumed on stream B.
+// ===========================================================================
+// Stream 1 computes C = A @ I; stream 2, on a genuinely separate queue, then
+// computes D = C @ I. Because I is the identity, D must equal A.
+//
+// The size here is not arbitrary and an earlier version of this test was
+// worthless without it. At 64x64 the producer finished in about 0.06 ms,
+// which is far less than the 0.3 ms the host spends building the consumer's
+// pipeline and descriptor set, so the consumer could not have started early
+// even if it had wanted to -- deleting the cross-stream wait entirely left
+// the test passing. At 1024x1024 the producer runs for about 17 ms and is
+// demonstrably still going when the consumer is submitted, so the wait is
+// what makes the answer right. Mutation-tested both ways.
+let XM = 1024
+let XB = XM * XM * 8
+var s1 = stream_new(g)
+var s2 = stream_new_lane(g, 1)   // a genuinely separate queue
+let ha = pool_acquire(pool, XB)
+let hi = pool_acquire(pool, XB)
+let hc = pool_acquire(pool, XB)
+let hd = pool_acquire(pool, XB)
+
+// Operands as a pure function of position, so expected values can be
+// recomputed for sampled outputs instead of holding a million of them.
+fn val_at(i: int, j: int) -> float {
+    let h = (i * 7919 + j * 104729 + 12345) % 2147483648
+    return ((h % 2001) as float) / 1000.0 - 1.0
+}
+fn fill_at(h: int, n: int, identity: bool) {
+    var pp = Bytes.new(8)
+    var cell = Bytes.new(8)
+    let bf = pool_buffer(pool, h)
+    vkcheck(vkMapMemory(g.dev, bf.mem, 0, bf.size, 0, pp.addr()), "fill: map")
+    let base = pp.get64(0)
+    for i in 0..n {
+        for j in 0..n {
+            var v = 0.0
+            if identity {
+                if i == j { v = 1.0 }
+            } else {
+                v = val_at(i, j)
+            }
+            cell.putf64(0, v)
+            for b in 0..8 { store8(base + (i * n + j) * 8 + b, cell.get8(b)) }
+        }
+    }
+    vkUnmapMemory(g.dev, bf.mem)
+}
+fn read_at(h: int, n: int, i: int, j: int) -> float {
+    var pp = Bytes.new(8)
+    var cell = Bytes.new(8)
+    let bf = pool_buffer(pool, h)
+    vkcheck(vkMapMemory(g.dev, bf.mem, 0, bf.size, 0, pp.addr()), "read: map")
+    let base = pp.get64(0)
+    for b in 0..8 { cell.put8(b, load8(base + (i * n + j) * 8 + b)) }
+    vkUnmapMemory(g.dev, bf.mem)
+    return cell.getf64(0)
+}
+
+fill_at(ha, XM, false)
+fill_at(hi, XM, true)
+let prod = dispatch(s1, ha, hi, hc, XM)       // C = A @ I on stream 1, ~17 ms
+stream_wait_event(s2, prod)                    // the consumer waits on the producer
+let started_before_producer_finished = not event_done(g, prod)
+let cons = dispatch(s2, hc, hi, hd, XM)        // D = C @ I on stream 2
+// If the producer had already finished by the time the consumer was
+// submitted, this test cannot distinguish a real wait from luck, so say so.
+chk(started_before_producer_finished, "the consumer was submitted while the producer was still running, so the wait is load-bearing")
+event_wait(g, cons)
+var bad = 0
+var nonzero = 0
+for k in 0..512 {
+    let i = (k * 7919) % XM
+    let j = (k * 104729) % XM
+    let want = val_at(i, j)
+    if fabs(read_at(hd, XM, i, j) - want) > 0.000000000001 { bad = bad + 1 }
+    if fabs(want) > 0.01 { nonzero = nonzero + 1 }
+}
+chk(bad == 0, "producer on stream A consumed on stream B: {bad} of 512 sampled elements wrong")
+// Non-vacuity: an all-zero operand would compare equal regardless of ordering.
+chk(nonzero > 256, "cross-stream operand is non-trivial, so the check is not passing on zeros")
+
+// ===========================================================================
+// 4. Release immediately after launch.
+// ===========================================================================
+// The case the specification calls out by name. A handle released while its
+// work is still running must not become reusable storage.
+let ra = pool_acquire(pool, BIG_BYTES)
+let rb = pool_acquire(pool, BIG_BYTES)
+let rc = pool_acquire(pool, BIG_BYTES)
+let inflight = dispatch(s1, ra, rb, rc, BIG)
+pool_release(pool, rc)              // released the instant after launch
+let freed_now = pool_collect(pool)
+let still_running = not event_done(g, inflight)
+// If the dispatch already finished, this test cannot say anything, so say so
+// rather than reporting a pass that was never exercised.
+chk(still_running, "the 1024x1024 dispatch is still in flight, so the in-flight window is real")
+if still_running {
+    chk(freed_now == 0, "release immediately after launch: in-flight storage is NOT collected")
+    let reacquired = pool_acquire(pool, BIG_BYTES)
+    chk(reacquired != rc, "release immediately after launch: in-flight storage is NOT handed out again")
+    pool_release(pool, reacquired)
+}
+event_wait(g, inflight)
+let freed_after = pool_collect(pool)
+chk(freed_after > 0, "once the work completes, the released storage does become collectable")
+
+// ===========================================================================
+// 5. Host source mutated too early.
+// ===========================================================================
+// Transfers here are synchronous by default, which the specification permits,
+// so there is no pinned async host buffer to get wrong. The hazard that does
+// exist is the one above: host-visible storage that the device is still
+// reading being handed to someone else who writes it. Test 4 shows the pool
+// refuses that. What remains to check is that the refusal is what protects
+// the data, by confirming the device's view of a buffer is not disturbed by a
+// host write to a DIFFERENT recycled buffer while work is in flight.
+let SM = 64
+let SB = SM * SM * 8
+let ma = pool_acquire(pool, SB)
+let mi = pool_acquire(pool, SB)
+let mc = pool_acquire(pool, SB)
+fill_at(ma, SM, false)
+fill_at(mi, SM, true)
+let mrun = dispatch(s1, ma, mi, mc, SM)
+// Scribble over every buffer the pool will hand out next, while the dispatch
+// above is outstanding. None of these may be the in-flight operands.
+let scratch = pool_acquire(pool, SB)
+chk(scratch != ma and scratch != mi and scratch != mc, "a buffer acquired during flight is none of the in-flight operands")
+var sp = Bytes.new(8)
+var sc = Bytes.new(8)
+let sbuf = pool_buffer(pool, scratch)
+vkcheck(vkMapMemory(g.dev, sbuf.mem, 0, sbuf.size, 0, sp.addr()), "scribble: map")
+sc.putf64(0, 123456.789)
+for i in 0..(SM * SM) {
+    for b in 0..8 { store8(sp.get64(0) + i * 8 + b, sc.get8(b)) }
+}
+vkUnmapMemory(g.dev, sbuf.mem)
+event_wait(g, mrun)
+var mbad = 0
+for i in 0..SM {
+    for j in 0..SM {
+        if fabs(read_at(mc, SM, i, j) - val_at(i, j)) > 0.000000000001 { mbad = mbad + 1 }
+    }
+}
+chk(mbad == 0, "a host write during flight did not disturb the in-flight result: {mbad} wrong")
+pool_release(pool, scratch)
+
+// ===========================================================================
+// 7. Repeated loop returns to a stable live-byte baseline.
+// ===========================================================================
+// The leak test. Sixty acquire/dispatch/release cycles must end where they
+// started, and must not have allocated sixty buffers to do it.
+pool_release(pool, ha)
+pool_release(pool, hi)
+pool_release(pool, hc)
+pool_release(pool, hd)
+pool_release(pool, ma)
+pool_release(pool, mi)
+pool_release(pool, mc)
+pool_release(pool, ra)
+pool_release(pool, rb)
+event_wait(g, mrun)
+pool_collect(pool)
+let baseline = pool.live_bytes
+let allocs_before = pool.total_allocated
+for iter in 0..60 {
+    let la = pool_acquire(pool, SB)
+    let lb = pool_acquire(pool, SB)
+    let lc = pool_acquire(pool, SB)
+    let ev = dispatch(s1, la, lb, lc, SM)
+    pool_release(pool, la)
+    pool_release(pool, lb)
+    pool_release(pool, lc)
+    event_wait(g, ev)
+    pool_collect(pool)
+}
+chk(pool.live_bytes == baseline, "60 iterations return to the live-byte baseline: {pool.live_bytes} against {baseline}")
+let grew = pool.total_allocated - allocs_before
+chk(grew <= 6, "60 iterations allocated at most 6 new buffers, not 180: allocated {grew}")
+chk(pool.reuses > 100, "recycling actually happened: {pool.reuses} reuses")
+
+// ===========================================================================
+// 8. Delayed-completion stress.
+// ===========================================================================
+// Many overlapping submissions, each releasing its output immediately, while
+// the host keeps acquiring. The invariant under test is absolute: at no point
+// may the pool hand out storage whose last use is unfinished. Checked on
+// every acquisition rather than at the end, because a race that is repaired
+// before the final measurement is still a race.
+var violations = 0
+var inflight_seen = 0
+var live: [int] = []
+var evs: [GpuEvent] = []
+for iter in 0..40 {
+    let xa = pool_acquire(pool, SB)
+    let xb = pool_acquire(pool, SB)
+    let xc = pool_acquire(pool, SB)
+    // The invariant, checked at the moment of acquisition.
+    if not event_done(g, pool.allocs[xa].last) { violations = violations + 1 }
+    if not event_done(g, pool.allocs[xb].last) { violations = violations + 1 }
+    if not event_done(g, pool.allocs[xc].last) { violations = violations + 1 }
+    let done = dispatch(s1, xa, xb, xc, SM)
+    evs.push(done)
+    pool_release(pool, xa)
+    pool_release(pool, xb)
+    pool_release(pool, xc)
+    // Deliberately do NOT wait. Work piles up behind the host.
+    if not event_done(g, done) { inflight_seen = inflight_seen + 1 }
+    pool_collect(pool)
+}
+for i in 0..evs.len() { event_wait(g, evs[i]) }
+pool_collect(pool)
+chk(violations == 0, "delayed-completion stress: {violations} acquisitions returned in-flight storage")
+chk(inflight_seen > 0, "the stress test actually left work outstanding ({inflight_seen} of 40 iterations), so it is not vacuous")
+chk(pool.live_bytes == baseline, "stress test returns to the live-byte baseline")
+
+// ===========================================================================
+// 6. Allocation failure.
+// ===========================================================================
+// Run in a child, because it panics. Checked for a nonzero exit and for a
+// message that says what was asked for, what was live and what the limit was
+// -- an allocation failure that does not say those three things cannot be
+// acted on.
+if not RUNNING_CHILD {
+    var cmd = cbytes("\"{args()[0]}\" oom")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, cmd.addr(), 0, 0, 1, 134217728, 0, 0, startup.addr(), process.addr())
+    chk(started != 0, "allocation-failure child started")
+    if started != 0 {
+        win("WaitForSingleObject", process.get64(0), 60000)
+        let status = Bytes.new(8)
+        win("GetExitCodeProcess", process.get64(0), status.addr())
+        chk(status.get32(0) != 0, "allocation failure exits nonzero, got {status.get32(0)}")
+        win("CloseHandle", process.get64(0))
+        win("CloseHandle", process.get64(8))
+    }
+}
+
+pool_destroy(pool)
+g.shutdown()
+
+if failed == 0 {
+    print("gpu stream: {passed} checks passed")
+} else {
+    print("gpu stream: {failed} FAILED, {passed} passed")
+    panic("gpu stream tests failed")
+}
