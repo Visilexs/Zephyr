@@ -16,14 +16,17 @@ Actual HEAD / branch / dirty files:
 
 Approved milestone and remaining scope:
   M0 complete. M1a complete. M1b complete. M2a complete. M2b complete.
-  M3 complete.
+  M3 complete. M4 in progress: the tape, its VJPs and the differentiable
+  phase forward are done and verified; optimizers and checkpointing (A08,
+  A09) are delegated and not yet collected; the 32-example overfit (A14)
+  waits on them.
   M1 as a whole is complete except its tiny-overfit clause, which needs the
   optimizer from M4. A PyTorch oracle is still absent; numpy carries the
   reference, and the substitution is justified per-acceptance in RESULTS.md
   rather than waved through -- for the operators it covers, both are IEEE-754
   double arithmetic, and the one thing that could differ, complex memory
   layout, is checked at the byte level instead of assumed.
-  Not started: M4 onward.
+  Not started: M5 onward.
 
 Decisions made and reasons:
   See DESIGN.md, D1..D18. The load-bearing ones: lib/ml is library code and
@@ -58,6 +61,16 @@ Implemented files / interfaces:
   tests/ml/phase_gates_test.zeph  1,981 gate-level checks (A10), written here
                                 rather than by the agent, and the only phase
                                 suite that runs on all three targets
+  lib/ml/autograd.zeph          eager reverse-mode AD: opcode-and-handle tape,
+                                analytic VJPs for 28 primitives, version-checked
+                                saved tensors, detach / no_grad / explicit reset
+  lib/ml/phase_ad.zeph          the phase forward pass on the tape; a second
+                                expression of phase.zeph, held to it by test
+  tests/ml/autograd_test.zeph   674 checks, 36 finite-difference cases (A06, A07)
+  tests/ml/phase_ad_test.zeph   180 checks (A06, A14)
+  tools/ml_reference/phase_grad_dump.zeph + check_phase_grad.py
+                                native gradients vs the analytic reference,
+                                18 quantities (A06, A14)
   tests/run_tests.ps1           + ml-tensor/ml-ops/ml-phase/ml-phase-gates and
                                 ml-phase-parity blocks, 15 ml-reject and 26
                                 ops-reject cases
@@ -103,6 +116,11 @@ Commands actually run, exit codes, log paths:
   python tools/ml_reference/verify_phase.py   0, 121 checks, 0 failed
   python tools/ml_reference/check_ops.py      0, 33/33 agree with numpy
   python tools/ml_reference/check_phase.py    0, 148/148 quantities, 16 steps
+  tests/ml/autograd_test.zeph                 0, "autograd: 674 checks passed"
+  tests/ml/phase_ad_test.zeph                 0, "phase ad: 180 checks passed"
+  python tools/ml_reference/check_phase_grad.py  0, 18/18 vs analytic
+  extracted autograd block from run_tests     0, 2 passed, 0 failed
+  extracted parity+reject block               0, 28 passed, 0 failed
   zc --linux + wsl, tensor/ops/phase_gates    0, same counts as Windows
   zc --wasm + node, tensor/ops/phase_gates    0, same counts as Windows
   extracted ops-reject block                  0, 26 passed, 0 failed
@@ -113,7 +131,9 @@ Commands actually run, exit codes, log paths:
 
 Acceptance IDs: pass / fail / blocked / not_run:
   A00 pass, A02 pass, A03 pass, A04 pass, A05 pass, A10 pass, A11 pass,
-  A12 pass, A13 pass, A30 pass, A31 pass
+  A06 pass, A07 pass, A12 pass, A13 pass, A30 pass, A31 pass
+  A14 partial: native forward and backward verified against the analytic
+  reference; the bounded overfit needs the optimizer from A08
   A01 partial: fixpoint and both crosschecks pass, the bootstrap suite is
   blocked. The blocker is structural, not a missing package -- see below.
   everything else not_run. See RESULTS.md for the evidence behind each.
@@ -145,23 +165,24 @@ Known failure with exact reproduction:
       line, after the fixpoint has already passed.
 
 Next one concrete action:
-  M4. Eager reverse-mode AD over lib/ml/ops, then modules, AdamW and
-  checkpointing. Follow the approach already agreed: analytic VJPs for the
-  primitive operations, higher-level functions composed from those, and
-  specialized VJPs only where an operation is unsupported or a measurement
-  demands one.
+  Collect and verify the delegated A08/A09 work (optimizers and
+  checkpointing), the same way the earlier agent output was verified: re-run
+  it, read the AdamW update against the decoupled-weight-decay definition
+  rather than trusting the report, and confirm the complex moments really are
+  kept separately per component and not shared or taken of a magnitude. Both
+  wrong forms still appear to train, which is why they need an explicit test.
 
-  Start with the tape and its semantics -- A07 covers consumed tape, in-place
-  mutation, detach, and no unbounded growth across repeated steps -- because
-  those decide the shape of everything after them. The saved-tensor staleness
-  machinery already in tensor.zeph was built for exactly this and is still
-  unused.
+  Then finish A14: a bounded 32-example overfit run entirely in Zephyr. A14
+  requires no Python runtime dependency for that run, so the loss curve has
+  to come out of the native binary, not a harness. Assert the loss falls
+  monotonically enough to be evidence and that the model reaches a stated
+  accuracy on those 32 examples -- and record it as an implementation result,
+  not as evidence about the architecture, which it is not.
 
-  M4 has an oracle from day one: phase_model.py already carries analytic
-  reverse passes for every phase operation, verified against central
-  differences to 3.7e-10. Port the VJPs, then check native gradients against
-  it the same per-step way the forward pass was checked, rather than only
-  comparing a final loss.
+  M5 after that: the GPU feasibility comparison. Note the environment ledger
+  before planning it -- nvcuda.dll is present but NVRTC, cuBLAS and the CUDA
+  toolkit are ABSENT, while the Vulkan SDK and glslc are present. That likely
+  decides the backend for us.
 
 Rollback / preserved seed path:
   bootstrap/ untouched; no stage binary was ever promoted by hand. Every

@@ -17,11 +17,14 @@ passed on the strength of an exit code alone.
 | A03 | **passed** | Same suite. Owner/view sharing, writes visible in both directions, a view outliving the owner handle, version bumps through views, stale-save detection, and 50 allocate/release cycles returning to a zero baseline with peak at one buffer rather than fifty. |
 | A04 | **passed** | `tests/ml/ops_test.zeph`, 107 checks, plus 26 rejection cases in their own processes. Independently, `tools/ml_reference/check_ops.py` agrees with numpy on all 33 operators, most bit-exact. Non-contiguous inputs are covered by running the same operators through transposed and sliced views. |
 | A05 | **passed** | Same suites. Complex mul, div, conj, abs2, expi and matmul against analytic values; byte layout compared against numpy's `complex64`/`complex128`, which share PyTorch's memory format. |
+| A06 | **passed** | `tests/ml/autograd_test.zeph`, 674 checks. Thirty-six cases, each differentiated analytically and then probed with central differences on the same graph, real and imaginary parts perturbed separately. Because Zephyr has no closures a case is an integer and one `build()` is the dispatch, so the analytic path and every probe call identical code and cannot drift apart. `grad(abs2(z))` is asserted to be **exactly** 2z rather than close, since it is the case that pins the dL = Re(conj(g) dz) convention. Broadcast and shared-parameter contributions are covered: a row reused across four rows receives four summed contributions and its gradient is reduced back to its own shape, a handle used twice accumulates both paths, and x*x differentiates to 2x through that accumulation rather than a special rule. The whole-model gradients are covered separately by A14 below. |
+| A07 | **passed** | Same suite. `av_backward` consumes the tape and a second call panics; a tensor mutated in place between forward and reverse makes the reverse pass panic, through the version-checked `Saved` type from M2a, rather than returning a plausible wrong gradient; `detach` yields a leaf with the value and no history; `no_grad` records no node and resumes cleanly; an operation whose inputs all require no gradient records nothing at all, so inference costs no tape rather than a tape that is discarded. Tape growth is measured, not bounded loosely: one step records exactly three nodes and twenty-five steps leave exactly three. |
+| A08–A09, A15–A29, A32–A41 | **not_run** | Not started. A08 and A09 are in progress. |
 | A10 | **passed** | `tools/ml_reference/test_phase.py` (12 groups, D=4/8/128 and the spec defaults) *and* an independently written `tools/ml_reference/verify_phase.py`, 121 checks, coded from MATHEMATICS.md rather than from the module. Pair bijection and bounds at D=4/8/128, G^H G=I built from the doc's own matrix, inverse by G^H, norm preservation, simultaneity, and 10,000 fixed-angle gates drifting 1.1e-16. No renormalization exists anywhere in the update path. The native port is covered separately by `tests/ml/phase_gates_test.zeph`, 1,981 checks and the only phase suite that runs on all three targets, which pins the pairing `phase_givens` builds in Zephyr at D=4, 8 **and 128** -- the per-step parity harness only reaches D=4 and D=8, and a pairing that was a bijection but paired the wrong coordinates would preserve the norm perfectly and go unnoticed. It also checks inverse by G^H, per-stage norm preservation, the stage-B wrap from the last coordinate to the first, and that the two stages are genuinely different permutations. Its assertions were confirmed load-bearing by mutation: perturbing the expected pairing makes it panic on the first check. |
 | A11 | **passed** | Same two suites. Probabilities invariant and state equivariant under global phase at three angles, controller angles unchanged, features invariant under global phase but sensitive to relative phase and matching the doc formula bit-for-bit. The constructed interference example is internally inconsistent in the specification -- with the normalized row it states, the squared amplitude is (1+cos(delta))/2, not the 1+cos(delta) the prose claims -- so both forms are asserted explicitly and the discrepancy is recorded as DESIGN.md D16 rather than absorbed into a tolerance. The claim the paragraph actually makes, that two orthonormal rows sweep [1,0] to [0,1] while global phase moves neither, holds exactly. |
 | A12 | **passed** | Same two suites. The paired-real port agrees with the complex model on loss, probabilities, state and every one of the eight parameter gradients to 1e-12, and holds no complex array at all. Both are checked against central differences: worst relative error 3.7e-10, real and imaginary parts separately. The mapped optimizer step is the SGD check in test_phase.py; AdamW waits for M4. |
 | A13 | **passed** | `tools/ml_reference/check_phase.py` compares the Zephyr port against the verified float64 reference on **148 quantities and all 16 steps** at D=4 and D=8: not just the final probabilities but, for every step, the invariant features, the controller hidden layer, the angles, the post-phase state, both Givens stage outputs, the resulting state and the active-row mask. Worst disagreement 2.3e-16. The two sides build their weights independently from a mirrored LCG and all 16 parameter tensors are asserted **bit-identical**, so the agreement cannot be an artifact of a drifting fixture. Masks preserve state exactly (compared as hex, not within a tolerance); K=0/1/4 give exact update counts and are cross-checked by recomposing K THINK steps independently; zero, subnormal and near-overflow readouts all stay finite. |
-| A06–A09, A14–A29, A32–A41 | **not_run** | Not started. A06 is partly evidenced already by the finite-difference sweep above, but the native autograd it refers to does not exist yet. |
+| A14 | **partial** | Native forward and backward are finite and verified. `tools/ml_reference/check_phase_grad.py` agrees with the reference's **analytic** reverse pass on 18/18 quantities at D=4 and D=8 -- the loss and all eight parameter gradients, complex ones on both components -- to between 2.6e-17 and 1.9e-15. That is the sharp form of the test: finite differences inside Zephyr already pass, but the reference's own stencil error is 3.7e-10 while its two model implementations agree to 1e-12, so the analytic comparison removes slack the stencil cannot. `tests/ml/phase_ad_test.zeph` adds 180 checks including forward agreement with the M3-verified `phase.zeph`. **Not yet done:** the bounded 32-example overfit, which needs the optimizer from A08. |
 | A30 | **passed** | `tools/ml_reference/test_tasks.py`. Solver agrees with the label on 10,240 examples per task, recomputing from the token sequence alone. Task A query-only baseline sits within 0.125 ± 0.04 of chance on every split. Task B per-example: ≥2 feasible until the final clue, exactly 1 after, and the final clue combined with the original candidate list admits ≥2. |
 | A31 | **passed** | Same suite. Seeded split hashes reproducible and pairwise disjoint, no duplicates within a split, frozen vocabulary covering all test tokens, composition and length bins non-empty, exact class balance, and class mean lengths equal to 1e-12 so length does not leak the target. |
 
@@ -97,6 +100,9 @@ sweep.
 | `tests/ml/phase_test.zeph` | 205 | ~1s |
 | `tests/ml/phase_gates_test.zeph` | 1,981 | ~1s |
 | `tools/ml_reference/check_phase.py` | 148 quantities, 16 steps | ~2s |
+| `tests/ml/autograd_test.zeph` | 674 | ~3s |
+| `tests/ml/phase_ad_test.zeph` | 180 | ~4s |
+| `tools/ml_reference/check_phase_grad.py` | 18 quantities | ~2s |
 | `tools/ml_reference/test_tasks.py` | 13 groups, 10,240 examples per task | ~8s |
 
 ### CPU operators against numpy
@@ -192,6 +198,52 @@ repository's own `fsin`/`fcos` standing in for libm. Nothing here is a
 tolerance chosen to make a comparison pass: the weights are bit-identical, and
 a quantity missing from the dump or present but unexpected is a failure rather
 than a silent omission.
+
+### Native gradients against the reference's analytic reverse pass
+
+Whole model, mean NLL, batch of three including a fully padded row, four
+tokens and four THINK steps.
+
+| Quantity | D=4 | D=8 |
+|---|---|---|
+| loss | 2.1e-16 | 1.1e-16 |
+| embedding | 2.6e-17 | 3.7e-17 |
+| think | 1.6e-16 | 9.5e-17 |
+| W1 | 1.3e-15 | 4.3e-16 |
+| b1 | 5.3e-16 | 1.1e-15 |
+| W2 | 1.4e-15 | 1.1e-15 |
+| b2 | 1.2e-15 | 1.9e-15 |
+| z_init, complex | 5.8e-16 | 1.7e-15 |
+| M, complex | 1.5e-15 | 1.6e-15 |
+
+A few ulp, on gradients that pass through the controller, both Givens stages,
+the phase gate, the readout and z_init's normalization. The complex
+parameters agree on both components, so two independently written
+implementations carry the dL = Re(conj(g) dz) convention identically.
+
+These are sharper than the finite-difference numbers elsewhere in this file
+for a reason worth stating: the stencil is the loose party. The reference's
+analytic gradients agree with its own central differences only to 3.7e-10,
+while its complex and paired-real models agree with each other to 1e-12.
+Comparing native gradients against the analytic ones therefore tests
+something the stencil cannot resolve.
+
+### Mutation testing of the gradient suites
+
+A passing test that cannot fail is worth nothing, so the two AD suites were
+checked by deliberately breaking the code they cover.
+
+| Mutation | Caught by |
+|---|---|
+| drop the 1-t^2 factor from the tanh VJP | central differences |
+| drop the conjugate from the complex product rule | central differences |
+| flip a sign in the expi VJP | central differences |
+| drop the conjugate from the Givens b-branch | forward agreement with phase.zeph |
+| reverse the cyclic neighbour in the feature map | forward agreement with phase.zeph |
+
+The last two matter most: both are self-consistently differentiable, so
+finite differences alone would pass them. They are caught only because
+`phase_ad` is required to reproduce the independently verified `phase.zeph`.
 
 ## Interpretation, kept separate
 
