@@ -122,12 +122,16 @@ fn storage_bump(s: Storage) { s.version += 1 }
 // ---- tensor descriptor -----------------------------------------------------
 // strides and off are counted in ELEMENTS, never bytes; the byte conversion
 // happens once, at the access site.
+// ro marks a read-only view. A broadcast expansion carries stride 0 on the
+// expanded axes, so many output indices alias one input element; writing
+// through it would be a silent many-to-one corruption. Every setter refuses.
 struct Tensor {
     st: Storage,
     dt: DType,
     shape: [int],
     stride: [int],
     off: int,
+    ro: bool,
 }
 
 fn shape_numel(shape: [int]) -> int {
@@ -213,7 +217,7 @@ fn t_zeros(d: DType, shape: [int]) -> Tensor {
         panic("t_zeros: {n} elements of {esz} bytes exceeds the {MAX_BYTES} byte cap")
     }
     let st = storage_new(n * esz)
-    return Tensor{st: st, dt: d, shape: shape, stride: contiguous_strides(shape), off: 0}
+    return Tensor{st: st, dt: d, shape: shape, stride: contiguous_strides(shape), off: 0, ro: false}
 }
 
 fn t_is_contiguous(t: Tensor) -> bool {
@@ -261,6 +265,7 @@ fn t_get(t: Tensor, idx: [int]) -> float {
 }
 
 fn t_set(t: Tensor, idx: [int], v: float) {
+    if t.ro { panic("write into a read-only (broadcast) view") }
     let b = t_byte_offset(t, idx)
     if t.dt == DType.F64 {
         t.st.buf.putf64(b, v)
@@ -284,6 +289,7 @@ fn t_get_int(t: Tensor, idx: [int]) -> int {
 }
 
 fn t_set_int(t: Tensor, idx: [int], v: int) {
+    if t.ro { panic("write into a read-only (broadcast) view") }
     let b = t_byte_offset(t, idx)
     if t.dt == DType.I64 {
         t.st.buf.put64(b, v)
@@ -320,6 +326,7 @@ fn t_get_im(t: Tensor, idx: [int]) -> float {
 }
 
 fn t_set_c(t: Tensor, idx: [int], re: float, im: float) {
+    if t.ro { panic("write into a read-only (broadcast) view") }
     let b = t_byte_offset(t, idx)
     if t.dt == DType.C64 {
         t.st.buf.putf64(b, re)
@@ -352,7 +359,7 @@ fn t_transpose(t: Tensor, a: int, b: int) -> Tensor {
     sh[b] = t.shape[a]
     sd[a] = t.stride[b]
     sd[b] = t.stride[a]
-    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off}
+    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off, ro: t.ro}
 }
 
 // half-open [start, stop), matching the language's own range convention
@@ -367,7 +374,7 @@ fn t_slice(t: Tensor, dim: int, start: int, stop: int) -> Tensor {
         sd.push(t.stride[i])
     }
     sh[dim] = stop - start
-    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off + start * t.stride[dim]}
+    return Tensor{st: t.st, dt: t.dt, shape: sh, stride: sd, off: t.off + start * t.stride[dim], ro: t.ro}
 }
 
 // Aliases only when the layout permits. No hidden copy: a non-contiguous
@@ -376,7 +383,7 @@ fn t_slice(t: Tensor, dim: int, start: int, stop: int) -> Tensor {
 fn t_reshape(t: Tensor, shape: [int]) -> Tensor {
     if not t_is_contiguous(t) { panic("reshape: tensor is not contiguous") }
     if shape_numel(shape) != t_numel(t) { panic("reshape: element count differs") }
-    return Tensor{st: t.st, dt: t.dt, shape: shape, stride: contiguous_strides(shape), off: t.off}
+    return Tensor{st: t.st, dt: t.dt, shape: shape, stride: contiguous_strides(shape), off: t.off, ro: t.ro}
 }
 
 // ---- saved tensors ---------------------------------------------------------
@@ -399,4 +406,157 @@ fn saved_get(s: Saved) -> Tensor {
 
 fn saved_is_stale(s: Saved) -> bool {
     return s.t.st.version != s.ver
+}
+
+// ---- index iteration -------------------------------------------------------
+// Row-major odometer over an arbitrary shape. Returns false once it wraps, so
+// a rank-zero shape runs its body exactly once and an empty shape not at all.
+
+fn idx_zeros(rank: int) -> [int] {
+    var idx: [int] = []
+    for i in 0..rank { idx.push(0) }
+    return idx
+}
+
+fn idx_next(idx: [int], shape: [int]) -> bool {
+    var i = shape.len()
+    while i > 0 {
+        i -= 1
+        idx[i] += 1
+        if idx[i] < shape[i] { return true }
+        idx[i] = 0
+    }
+    return false
+}
+
+// ---- broadcast expansion ---------------------------------------------------
+// Zero stride on every expanded axis, so all the output indices along it read
+// the one source element. Read-only by construction: writing through it would
+// be many-to-one.
+fn t_expand(t: Tensor, shape: [int]) -> Tensor {
+    let r = shape.len()
+    let rt = t.shape.len()
+    if rt > r { panic("expand: cannot reduce rank") }
+    var sd: [int] = []
+    for i in 0..r { sd.push(0) }
+    var i = 0
+    while i < r {
+        let oi = r - 1 - i
+        if i < rt {
+            let ti = rt - 1 - i
+            let ds = t.shape[ti]
+            if ds == shape[oi] {
+                sd[oi] = t.stride[ti]
+            } else {
+                if ds == 1 {
+                    sd[oi] = 0
+                } else {
+                    panic("expand: source dimension is neither 1 nor equal to the target")
+                }
+            }
+        } else {
+            sd[oi] = 0
+        }
+        i += 1
+    }
+    return Tensor{st: t.st, dt: t.dt, shape: shape, stride: sd, off: t.off, ro: true}
+}
+
+// ---- fills, copy and cast --------------------------------------------------
+
+fn t_full(d: DType, shape: [int], v: float) -> Tensor {
+    let t = t_zeros(d, shape)
+    let n = t_numel(t)
+    if n == 0 { return t }
+    var idx = idx_zeros(shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(d) {
+            t_set_c(t, idx, v, 0.0)
+        } else {
+            t_set(t, idx, v)
+        }
+        more = idx_next(idx, shape)
+    }
+    return t
+}
+
+fn t_ones(d: DType, shape: [int]) -> Tensor { return t_full(d, shape, 1.0) }
+
+// Always materialises a fresh contiguous buffer, so the result never aliases
+// the source and is safe to write to even when the source was a broadcast.
+fn t_copy(t: Tensor) -> Tensor {
+    let out = t_zeros(t.dt, t.shape)
+    let n = t_numel(t)
+    if n == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, idx, t_get_re(t, idx), t_get_im(t, idx))
+        } else {
+            if dtype_is_float(t.dt) {
+                t_set(out, idx, t_get(t, idx))
+            } else {
+                t_set_int(out, idx, t_get_int(t, idx))
+            }
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// Explicit only. Real to complex fills the imaginary part with zero; complex
+// to real is refused outright, because dropping the imaginary part silently
+// is exactly the bug the specification wants made impossible.
+fn t_cast(t: Tensor, d: DType) -> Tensor {
+    if dtype_is_complex(t.dt) and not dtype_is_complex(d) {
+        panic("cast: complex to real needs an explicit t_real or t_imag")
+    }
+    let out = t_zeros(d, t.shape)
+    let n = t_numel(t)
+    if n == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(d) {
+            if dtype_is_complex(t.dt) {
+                t_set_c(out, idx, t_get_re(t, idx), t_get_im(t, idx))
+            } else {
+                if dtype_is_float(t.dt) {
+                    t_set_c(out, idx, t_get(t, idx), 0.0)
+                } else {
+                    t_set_c(out, idx, t_get_int(t, idx) as float, 0.0)
+                }
+            }
+        } else {
+            if dtype_is_float(d) {
+                if dtype_is_float(t.dt) { t_set(out, idx, t_get(t, idx)) }
+                else { t_set(out, idx, t_get_int(t, idx) as float) }
+            } else {
+                if dtype_is_float(t.dt) { t_set_int(out, idx, t_get(t, idx) as int) }
+                else { t_set_int(out, idx, t_get_int(t, idx)) }
+            }
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// ---- raw layout inspection (A05) -------------------------------------------
+// Lowercase hex of the whole backing buffer, so the byte order of a complex
+// tensor can be compared against numpy or torch without a binary channel.
+
+fn hexdig(d: int) -> str {
+    if d < 10 { return chr(48 + d) }
+    return chr(87 + d)
+}
+
+fn t_hex(t: Tensor) -> str {
+    var out = ""
+    for i in 0..t.st.nbytes {
+        let b = t.st.buf.get8(i)
+        out = "{out}{hexdig(b / 16)}{hexdig(b % 16)}"
+    }
+    return out
 }

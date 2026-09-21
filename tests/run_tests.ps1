@@ -327,6 +327,40 @@ foreach ($nm in $mlNeg.Keys) {
     Check "ml-reject:$nm" ($LASTEXITCODE -ne 0 -and $o -match "panic:") "expected panic, got($LASTEXITCODE): $o"
 }
 
+# ---- lib/ml CPU operators: acceptance A04 and A05 ----
+Remove-Item "$tmp\ops_test.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt tests\ml\ops_test.zeph "$tmp\ops_test.exe" 2>&1 | Out-Null
+$opsBuilt = Test-Path "$tmp\ops_test.exe"
+$opsOut = if ($opsBuilt) { (cmd /c "`"$tmp\ops_test.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 74 checks passed") "got: $opsOut"
+
+$opNeg = [ordered]@{
+    "dtype-mix"  = 'let x = t_add(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]))'
+    "bcast-bad"  = 'let x = t_add(t_zeros(DType.F64, [2, 3]), t_zeros(DType.F64, [4, 3]))'
+    "mm-inner"   = 'let x = t_matmul(t_zeros(DType.F64, [2, 3]), t_zeros(DType.F64, [4, 2]))'
+    "mm-rank"    = 'let x = t_matmul(t_zeros(DType.F64, [2, 3, 1]), t_zeros(DType.F64, [3, 2]))'
+    "ro-write"   = "let r = t_zeros(DType.F64, [1, 3])`nlet e = t_expand(r, [4, 3])`nt_set(e, [0, 0], 1.0)"
+    "cast-down"  = 'let x = t_cast(t_zeros(DType.C64, [2]), DType.F64)'
+    "abs2-real"  = 'let x = t_abs2(t_zeros(DType.F64, [2]))'
+    "conj-real"  = 'let x = t_conj(t_zeros(DType.F64, [2]))'
+    "sum-cplx"   = 'let x = t_sum_all(t_zeros(DType.C64, [2]))'
+    "mean-empty" = 'let x = t_mean_all(t_zeros(DType.F64, [0]))'
+    "expi-cplx"  = 'let x = t_expi(t_zeros(DType.C64, [2]), DType.C64)'
+    "expand-bad" = 'let x = t_expand(t_zeros(DType.F64, [3]), [4])'
+    "int-arith"  = 'let x = t_add(t_zeros(DType.I64, [2]), t_zeros(DType.I64, [2]))'
+}
+foreach ($nm in $opNeg.Keys) {
+    $src = "import `"ml/ops.zeph`"`n" + $opNeg[$nm]
+    $f = Join-Path $tmp "opneg_$nm.zeph"
+    $x = Join-Path $tmp "opneg_$nm.exe"
+    Set-Content -Path $f -Value $src -Encoding ascii
+    Remove-Item $x -ErrorAction SilentlyContinue
+    & .\zc.exe --rt $f $x 2>&1 | Out-Null
+    if (-not (Test-Path $x)) { Check "ops-reject:$nm" $false "did not compile"; continue }
+    $o = (cmd /c "`"$x`" 2>&1" | Out-String).Trim()
+    Check "ops-reject:$nm" ($LASTEXITCODE -ne 0 -and $o -match "panic:") "expected panic, got($LASTEXITCODE): $o"
+}
+
 # ---- modules: import splices declarations, once, resolved relative to the importer ----
 $moddir = Join-Path $tmp "mod"
 New-Item -ItemType Directory -Force "$moddir\sub" | Out-Null

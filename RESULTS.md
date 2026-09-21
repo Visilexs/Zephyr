@@ -84,7 +84,28 @@ sweep.
 | `tests/math_fns.zeph` | 213 | 0.49s |
 | `tests/ml/tensor_test.zeph` | 73 | instant |
 | tensor rejection cases | 15 processes | ~5s |
+| `tests/ml/ops_test.zeph` | 74 | instant |
+| ops rejection cases | 13 processes | ~4s |
 | `tools/ml_reference/test_tasks.py` | 13 groups, 10,240 examples per task | ~8s |
+
+### CPU operators against numpy
+
+21 operators, values crossing as IEEE-754 bit patterns rather than decimal
+text so nothing is lost to formatting.
+
+| Result | Operators |
+|---|---|
+| bit-exact, 0.0 error | add, sub, mul, div, broadcast add, neg, sum_dim 0 and 1, sum_all, mean_all, mul through transposed operands, complex add, conj, real, imag |
+| 1-4 ulp | matmul 3.3e-16, complex matmul 4.4e-16, abs2 3.1e-16, complex mul 4.3e-17, complex div 2.1e-17, expi 8.3e-17 |
+
+The non-zero cases differ only in accumulation order, and `expi` additionally
+goes through this repository's own `fsin`/`fcos` rather than libm.
+
+numpy stands in for PyTorch here, which is not installed. For these operators
+the two agree by construction: both are IEEE-754 double arithmetic, and
+numpy's `complex128` has the same memory layout as `torch.complex128`. The
+byte-level check confirms that layout directly -- Zephyr's `C32` buffer for
+1.5-2.25j is `0000c03f000010c0`, which is what numpy writes for `complex64`.
 
 ## Interpretation, kept separate
 

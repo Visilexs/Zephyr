@@ -1,0 +1,345 @@
+// CPU operators over the descriptors in ml/tensor.zeph -- milestone M2b.
+// Acceptance A04 (operator fixtures against the reference, including
+// non-contiguous layouts and invalid inputs) and A05 (complex arithmetic).
+//
+// Everything here is out-of-place and same-dtype. There is no promotion: the
+// specification wants a mixed-dtype call to be an error the caller resolves
+// with an explicit cast, not a silent widening. Nothing here records a tape;
+// autograd is M4 and will wrap these.
+//
+// The accumulation order is the reference order -- plain row-major traversal,
+// no reassociation, no fused paths. A faster kernel must reproduce these
+// numbers under the strict numeric policy, so this file is what it is
+// measured against.
+import "ml/tensor.zeph"
+import "std/math.zeph"
+
+fn same_dtype(a: Tensor, b: Tensor, who: str) {
+    if a.dt != b.dt {
+        panic("{who}: dtype mismatch, {dtype_name(a.dt)} against {dtype_name(b.dt)}; cast explicitly")
+    }
+}
+
+// Both operands are expanded to the broadcast shape, then read through
+// zero-stride views. No data is copied to do it.
+fn bcast_pair(a: Tensor, b: Tensor, who: str) -> [int] {
+    same_dtype(a, b, who)
+    return broadcast_shape(a.shape, b.shape)
+}
+
+// ---- elementwise binary ----------------------------------------------------
+
+// op: 0 add, 1 sub, 2 mul, 3 div
+fn ew_real(x: float, y: float, op: int) -> float {
+    if op == 0 { return x + y }
+    if op == 1 { return x - y }
+    if op == 2 { return x * y }
+    return x / y
+}
+
+// Smith's algorithm for the division, so an intermediate does not overflow
+// merely because the components are large. Scaling by the larger component
+// keeps the ratio at or below one.
+fn cdiv_re(a: float, b: float, c: float, d: float) -> float {
+    if fabs(c) >= fabs(d) {
+        let r = d / c
+        return (a + b * r) / (c + d * r)
+    }
+    let r = c / d
+    return (a * r + b) / (c * r + d)
+}
+
+fn cdiv_im(a: float, b: float, c: float, d: float) -> float {
+    if fabs(c) >= fabs(d) {
+        let r = d / c
+        return (b - a * r) / (c + d * r)
+    }
+    let r = c / d
+    return (b * r - a) / (c * r + d)
+}
+
+fn t_binary(a: Tensor, b: Tensor, op: int, who: str) -> Tensor {
+    let shape = bcast_pair(a, b, who)
+    let ea = t_expand(a, shape)
+    let eb = t_expand(b, shape)
+    let out = t_zeros(a.dt, shape)
+    if t_numel(out) == 0 { return out }
+    var idx = idx_zeros(shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(a.dt) {
+            let ar = t_get_re(ea, idx)
+            let ai = t_get_im(ea, idx)
+            let br = t_get_re(eb, idx)
+            let bi = t_get_im(eb, idx)
+            if op == 0 {
+                t_set_c(out, idx, ar + br, ai + bi)
+            } else {
+                if op == 1 {
+                    t_set_c(out, idx, ar - br, ai - bi)
+                } else {
+                    if op == 2 {
+                        t_set_c(out, idx, ar * br - ai * bi, ar * bi + ai * br)
+                    } else {
+                        t_set_c(out, idx, cdiv_re(ar, ai, br, bi), cdiv_im(ar, ai, br, bi))
+                    }
+                }
+            }
+        } else {
+            if dtype_is_float(a.dt) {
+                t_set(out, idx, ew_real(t_get(ea, idx), t_get(eb, idx), op))
+            } else {
+                panic("{who}: integer and bool arithmetic is not supported yet")
+            }
+        }
+        more = idx_next(idx, shape)
+    }
+    return out
+}
+
+fn t_add(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 0, "add") }
+fn t_sub(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 1, "sub") }
+fn t_mul(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 2, "mul") }
+fn t_div(a: Tensor, b: Tensor) -> Tensor { return t_binary(a, b, 3, "div") }
+
+// ---- elementwise unary -----------------------------------------------------
+
+fn t_neg(t: Tensor) -> Tensor {
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, idx, 0.0 - t_get_re(t, idx), 0.0 - t_get_im(t, idx))
+        } else {
+            t_set(out, idx, 0.0 - t_get(t, idx))
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_conj(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("conj: not a complex tensor") }
+    let out = t_zeros(t.dt, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set_c(out, idx, t_get_re(t, idx), 0.0 - t_get_im(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// abs2 leaves the complex domain, so the output dtype is the component dtype.
+// This is the only real-from-complex path that is not an error, and its VJP
+// is 2z under the real inner product.
+fn t_abs2(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("abs2: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        let re = t_get_re(t, idx)
+        let im = t_get_im(t, idx)
+        t_set(out, idx, re * re + im * im)
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_real(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("real: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, t_get_re(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+fn t_imag(t: Tensor) -> Tensor {
+    if not dtype_is_complex(t.dt) { panic("imag: not a complex tensor") }
+    let out = t_zeros(dtype_component(t.dt), t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        t_set(out, idx, t_get_im(t, idx))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// expi(theta) = cos(theta) + i sin(theta), real in, complex out. The phase
+// gate is built on this.
+fn t_expi(t: Tensor, d: DType) -> Tensor {
+    if not dtype_is_float(t.dt) { panic("expi: argument must be a real float tensor") }
+    if not dtype_is_complex(d) { panic("expi: output dtype must be complex") }
+    let out = t_zeros(d, t.shape)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        let th = t_get(t, idx)
+        t_set_c(out, idx, fcos(th), fsin(th))
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// build a complex tensor from two real ones
+fn t_complex(re: Tensor, im: Tensor, d: DType) -> Tensor {
+    if not dtype_is_complex(d) { panic("complex: output dtype must be complex") }
+    same_dtype(re, im, "complex")
+    let shape = broadcast_shape(re.shape, im.shape)
+    let er = t_expand(re, shape)
+    let ei = t_expand(im, shape)
+    let out = t_zeros(d, shape)
+    if t_numel(out) == 0 { return out }
+    var idx = idx_zeros(shape.len())
+    var more = true
+    while more {
+        t_set_c(out, idx, t_get(er, idx), t_get(ei, idx))
+        more = idx_next(idx, shape)
+    }
+    return out
+}
+
+// ---- reductions ------------------------------------------------------------
+// sum over an empty tensor is 0, per the specification. mean over an empty
+// tensor is an error rather than a NaN, because it is always a caller bug.
+
+fn t_sum_all(t: Tensor) -> float {
+    if dtype_is_complex(t.dt) { panic("sum_all: use t_sum_all_re / t_sum_all_im") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+fn t_mean_all(t: Tensor) -> float {
+    let n = t_numel(t)
+    if n == 0 { panic("mean_all: mean over no elements is undefined") }
+    return t_sum_all(t) / (n as float)
+}
+
+fn t_sum_all_re(t: Tensor) -> float {
+    if not dtype_is_complex(t.dt) { panic("sum_all_re: not a complex tensor") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get_re(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+fn t_sum_all_im(t: Tensor) -> float {
+    if not dtype_is_complex(t.dt) { panic("sum_all_im: not a complex tensor") }
+    var acc = 0.0
+    if t_numel(t) == 0 { return acc }
+    var idx = idx_zeros(t.shape.len())
+    var more = true
+    while more {
+        acc += t_get_im(t, idx)
+        more = idx_next(idx, t.shape)
+    }
+    return acc
+}
+
+// Reduce one axis, keeping the rank so the result broadcasts back over the
+// input without the caller having to reason about which axis vanished.
+fn t_sum_dim(t: Tensor, dim: int) -> Tensor {
+    let r = t.shape.len()
+    if dim < 0 or dim >= r { panic("sum_dim: dim out of range") }
+    var osh: [int] = []
+    for i in 0..r { osh.push(t.shape[i]) }
+    osh[dim] = 1
+    let out = t_zeros(t.dt, osh)
+    if t_numel(t) == 0 { return out }
+    var idx = idx_zeros(r)
+    var more = true
+    while more {
+        var oid: [int] = []
+        for i in 0..r { oid.push(idx[i]) }
+        oid[dim] = 0
+        if dtype_is_complex(t.dt) {
+            t_set_c(out, oid, t_get_re(out, oid) + t_get_re(t, idx),
+                              t_get_im(out, oid) + t_get_im(t, idx))
+        } else {
+            t_set(out, oid, t_get(out, oid) + t_get(t, idx))
+        }
+        more = idx_next(idx, t.shape)
+    }
+    return out
+}
+
+// ---- matmul ----------------------------------------------------------------
+// [M,K] @ [K,N] -> [M,N] only. Batch dimensions are deliberately not here: the
+// specification wants the two-dimensional case correct and the vector cases
+// specified separately rather than inherited by accident.
+fn t_matmul(a: Tensor, b: Tensor) -> Tensor {
+    same_dtype(a, b, "matmul")
+    if a.shape.len() != 2 or b.shape.len() != 2 { panic("matmul: both operands must be rank 2") }
+    let m = a.shape[0]
+    let k = a.shape[1]
+    let n = b.shape[1]
+    if b.shape[0] != k {
+        panic("matmul: inner dimensions differ, {k} against {b.shape[0]}")
+    }
+    let out = t_zeros(a.dt, [m, n])
+    if m == 0 or n == 0 { return out }
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            if dtype_is_complex(a.dt) {
+                var sr = 0.0
+                var si = 0.0
+                var p = 0
+                while p < k {
+                    let ar = t_get_re(a, [i, p])
+                    let ai = t_get_im(a, [i, p])
+                    let br = t_get_re(b, [p, j])
+                    let bi = t_get_im(b, [p, j])
+                    sr += ar * br - ai * bi
+                    si += ar * bi + ai * br
+                    p += 1
+                }
+                t_set_c(out, [i, j], sr, si)
+            } else {
+                var s = 0.0
+                var p = 0
+                while p < k {
+                    s += t_get(a, [i, p]) * t_get(b, [p, j])
+                    p += 1
+                }
+                t_set(out, [i, j], s)
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return out
+}
+
+// conjugate transpose, which is what the complex VJPs are written in terms of
+fn t_conj_transpose(t: Tensor) -> Tensor {
+    if t.shape.len() != 2 { panic("conj_transpose: rank 2 only") }
+    if dtype_is_complex(t.dt) { return t_copy(t_conj(t_transpose(t, 0, 1))) }
+    return t_copy(t_transpose(t, 0, 1))
+}

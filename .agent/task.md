@@ -7,8 +7,10 @@ Actual HEAD / branch / dirty files:
   Working tree clean at the end of this session
 
 Approved milestone and remaining scope:
-  M0 complete. M1b complete. M2a complete.
-  Not started: M1a (needs PyTorch, absent), M2b, M3 onward.
+  M0 complete. M1b complete. M2a complete. M2b complete.
+  M1a in progress: the numpy model reference is delegated to Codex and not
+  yet verified. A PyTorch oracle proper is still blocked on the install.
+  Not started: M3 onward.
 
 Decisions made and reasons:
   See DESIGN.md, D1..D10. The load-bearing ones: lib/ml is library code and
@@ -18,9 +20,19 @@ Decisions made and reasons:
 
 Implemented files / interfaces:
   lib/ml/tensor.zeph            DType, Storage, Tensor, views, saved tensors,
-                                broadcast_shape, allocation accounting
+                                broadcast_shape and t_expand, read-only views,
+                                fills/copy/cast, index odometer, allocation
+                                accounting, t_hex for layout inspection
+  lib/ml/ops.zeph               elementwise add/sub/mul/div with broadcasting,
+                                neg, conj, abs2, real, imag, expi, complex
+                                construction, sum/mean, sum_dim, matmul,
+                                conjugate transpose -- real and complex
   tests/ml/tensor_test.zeph     73 positive checks (A02, A03)
-  tests/run_tests.ps1           + ml-tensor block and 15 ml-reject cases
+  tests/ml/ops_test.zeph        74 positive checks (A04, A05)
+  tools/ml_reference/check_ops.py + ops_dump.zeph
+                                numpy cross-check, 21 operators (A04, A05)
+  tests/run_tests.ps1           + ml-tensor/ml-ops blocks, 15 ml-reject and
+                                13 ops-reject cases
   tools/ml_reference/tasks.py   Task A and B generators, independent solvers,
                                 seeded splits (written by Codex, verified here)
   tools/ml_reference/test_tasks.py  13 check groups (A30, A31)
@@ -44,13 +56,15 @@ Commands actually run, exit codes, log paths:
   scripts\crosscheck-wasm.ps1                 0, 7/7
   python tools/ml_reference/test_tasks.py     0, 13 groups
   tests/ml/tensor_test.zeph                   0, "tensor: 73 checks passed"
+  tests/ml/ops_test.zeph                      0, "ops: 74 checks passed"
+  python tools/ml_reference/check_ops.py      0, 21/21 agree with numpy
   tests/math_fns.zeph                         0, "math: 213 checks passed"
   scripts\selfbuild.ps1                       1, objdump missing AFTER the
                                               fixpoint passed; not a failure
   tests\run_tests.ps1                         1, gcc missing, BLOCKED
 
 Acceptance IDs: pass / fail / blocked / not_run:
-  A00 pass, A02 pass, A03 pass, A30 pass, A31 pass
+  A00 pass, A02 pass, A03 pass, A04 pass, A05 pass, A30 pass, A31 pass
   A01 partial: fixpoint and crosschecks pass, the bootstrap suite is blocked
   everything else not_run. See RESULTS.md for the evidence behind each.
 
@@ -70,14 +84,18 @@ Known failure with exact reproduction:
                                               line, after the fixpoint passed
 
 Next one concrete action:
-  M2b. Add CPU arithmetic over the descriptors in lib/ml/tensor.zeph --
-  elementwise add/sub/mul/div with broadcasting, sum, and a first matmul --
-  each with a float64 reference fixture, targeting A04 and A05. Keep
-  out-of-place and same-dtype; no promotion, no AD yet.
+  Verify the Codex-written tools/ml_reference/phase_model.py and test_phase.py
+  the same way tasks.py was verified: re-run it, read the Givens and readout
+  code against MATHEMATICS.md rather than trusting the report, and confirm the
+  paired-real port really is a separate expression of the function and not the
+  complex one in disguise. Then record A10, A11, A12 in RESULTS.md.
 
-  Do NOT start M1a until PyTorch is installed into a local environment and
-  its version recorded here. M3 needs M1a's fixtures, so the native phase
-  port is gated behind that, but M2b is not.
+  After that, M3: port the phase forward pass to Zephyr on top of lib/ml/ops,
+  and check it step by step against the numpy reference on shared fixtures.
+  The operators it needs all exist now except the Givens pairing itself.
+
+  A PyTorch oracle is still worth installing into a local environment when
+  convenient, but it is no longer what blocks M3.
 
 Rollback / preserved seed path:
   bootstrap/ untouched; no stage binary was ever promoted by hand. Every

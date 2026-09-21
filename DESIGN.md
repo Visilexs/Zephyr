@@ -105,3 +105,28 @@ first: `fexp` range, `tanh` cancellation near zero, `fsin` term count, `fln`
 term count, and later the 2pi reduction split. All are recorded in the git
 history with measurements. Nothing outside `lib/std/math.zeph` imported it, so
 no caller changed.
+
+## D11 — broadcast views are read-only, enforced by the descriptor
+
+`t_expand` produces a zero-stride view, which means many logical elements
+alias one stored element. A write through such a view would silently scatter,
+so `Tensor` carries `ro: bool` and all three setters panic on it. This is
+stricter than PyTorch, which permits the write and lets the aliasing surprise
+you. Rejecting it costs nothing here: nothing in the planned autograd needs to
+write through a broadcast.
+
+## D12 — no dtype promotion, ever
+
+`t_add(f32, f64)` panics rather than promoting. Promotion rules are the most
+common source of silent precision loss in a framework, and the phase model has
+exactly one dtype per tensor decided up front. A cast is available as `t_cast`
+and has to be written down.
+
+## D13 — numpy is the operator oracle, and says what it can
+
+PyTorch is not installed, so `check_ops.py` compares against numpy. That is
+sound for A04/A05 specifically because both are IEEE-754 double arithmetic,
+and the one thing numpy could differ on — complex memory layout — is checked
+directly at the byte level with `t_hex` rather than assumed. Where accumulation
+order is unspecified (matmul, sums) the agreement is 1–4 ulp, not bit-exact,
+and that is recorded as such rather than hidden behind a loose tolerance.
