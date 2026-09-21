@@ -117,15 +117,88 @@ float emissive(int m)
     return 0.0;
 }
 
+// Everything below is deliberately free of exp(), pow() and the trig
+// functions. The CPU mirror in voxel.zeph has to reproduce it exactly, and
+// Zephyr's transcendentals are polynomial approximations that will not match
+// GLSL bit for bit -- so the falloffs are rational and the blends are
+// polynomial. They look the same and they stay comparable.
+
+// Warm at a low sun, neutral overhead. Driving this off the sun vector rather
+// than a separate uniform means a caller gets a day cycle just by rotating the
+// sun, with nothing new in the push constant.
+vec3 sunColor(vec3 sun)
+{
+    float h = clamp(sun.y, 0.0, 1.0);
+    float k = h * h * (3.0 - 2.0 * h);
+    return mix(vec3(1.40, 0.68, 0.32), vec3(1.05, 1.00, 0.94), k);
+}
+
+// The vertical gradient only. Used for the sky itself, for fog, and as the
+// ambient term -- which is the change that makes shadows read as sky-lit
+// rather than as flat grey.
+vec3 skyGradient(vec3 rd, vec3 sun)
+{
+    float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+    float k = h * h * (3.0 - 2.0 * h);
+    float lo = clamp(sun.y, 0.0, 1.0);
+    float warm = 1.0 - lo * lo * (3.0 - 2.0 * lo);
+    vec3 horizon = mix(vec3(0.70, 0.79, 0.90), vec3(0.95, 0.70, 0.46), warm);
+    vec3 zenith  = mix(vec3(0.20, 0.41, 0.78), vec3(0.16, 0.26, 0.55), warm);
+    return mix(horizon, zenith, k);
+}
+
+// Gradient plus the sun itself: a tight disc and a broad halo, both rational
+// falloffs standing in for pow(dot, n).
+vec3 skyColor(vec3 rd, vec3 sun)
+{
+    float g = 1.0 - max(0.0, dot(rd, sun));
+    float disc = 1.0 / (1.0 + 900.0 * g * g);
+    float halo = 1.0 / (1.0 + 14.0 * g);
+    return skyGradient(rd, sun) + sunColor(sun) * (disc * 1.8 + halo * 0.20);
+}
+
+// Aerial perspective. Distant geometry washes toward the sky along the view
+// ray, which is what gives a voxel world depth instead of leaving it a flat
+// diorama. FOG_SCALE is in world units and is the knob worth tuning.
+const float FOG_SCALE = 170.0;
+float fogAmount(float d)
+{
+    float x = d * (1.0 / FOG_SCALE);
+    float x2 = x * x;
+    return clamp(x2 / (1.0 + x2) * 1.35, 0.0, 1.0);
+}
+
+// Per-voxel tint. One flat colour per material is what makes a voxel world
+// read as plastic. The variation is keyed to the CELL, not the pixel, so it is
+// stable under camera motion -- a per-pixel jitter would crawl and Ray
+// Reconstruction would fight it. Grass and leaves vary most and toward yellow,
+// which is most of what separates a lawn from a meadow.
+vec3 tintAmp(int m)
+{
+    if (m == 3)  return vec3(0.30, 0.15, 0.11);
+    if (m == 10) return vec3(0.34, 0.17, 0.11);
+    if (m == 2)  return vec3(0.13, 0.11, 0.10);
+    if (m == 4)  return vec3(0.10, 0.09, 0.08);
+    if (m == 8)  return vec3(0.03, 0.03, 0.04);
+    return vec3(0.08);
+}
+
+vec3 albedoOf(int m, ivec3 c)
+{
+    uint h = hashu(uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u);
+    float j = float(h & 0xFFFFu) * (1.0 / 65535.0);
+    return max(vec3(0.0), palette(m) * (1.0 + (j - 0.5) * 2.0 * tintAmp(m)));
+}
+
 int voxAt(ivec3 p)
 {
     if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, pc.volSize.xyz))) return 0;
     return int(imageLoad(vol, p).r);
 }
 
-bool traceVox(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nrm, out int mat)
+bool traceVox(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nrm, out int mat, out ivec3 cell)
 {
-    tHit = tmax; nrm = vec3(0.0); mat = 0;
+    tHit = tmax; nrm = vec3(0.0); mat = 0; cell = ivec3(0);
 
     ivec3 p = ivec3(floor(ro));
     ivec3 s = ivec3(rd.x >= 0.0 ? 1 : -1, rd.y >= 0.0 ? 1 : -1, rd.z >= 0.0 ? 1 : -1);
@@ -147,7 +220,7 @@ bool traceVox(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nrm, out in
         int m = voxAt(p);
         if (m != 0)
         {
-            tHit = t; mat = m;
+            tHit = t; mat = m; cell = p;
             nrm = vec3(axis == 0 ? -float(s.x) : 0.0,
                        axis == 1 ? -float(s.y) : 0.0,
                        axis == 2 ? -float(s.z) : 0.0);
@@ -196,22 +269,24 @@ void main()
     vec3 albedo = vec3(0.0);
     float depth = 0.0;
     vec3 gn = vec3(0.0);
-    if (traceVox(roV, rd, tmaxV, t, n, m))
+    ivec3 cell;
+    vec3 sun = normalize(pc.misc.yzw);
+    if (traceVox(roV, rd, tmaxV, t, n, m, cell))
     {
-        albedo = palette(m);
+        albedo = albedoOf(m, cell);
         depth = t * vs;          // world units, for the depth guide buffer
         gn = n;
-        vec3 sun = normalize(pc.misc.yzw);
         float lam = max(0.0, dot(n, sun));
         float shade = 0.0;
         // Start just off the face. Any smaller and the shadow ray starts
         // inside the voxel it just hit and every surface shadows itself.
         // This is in voxel units, so it scales with the cells automatically.
         vec3 hp = roV + rd * t + n * 0.001;
+        ivec3 scell;
         if (lam > 0.0)
         {
             float st; vec3 sn; int sm;
-            if (!traceVox(hp, sun, tmaxV, st, sn, sm)) { shade = lam; }
+            if (!traceVox(hp, sun, tmaxV, st, sn, sm, scell)) { shade = lam; }
         }
         // One diffuse bounce. Cosine-weighted sampling cancels the 1/pi and
         // the cosine term, so the bounce radiance is just averaged.
@@ -220,8 +295,8 @@ void main()
         for (int i = 0; i < spp; i++)
         {
             vec3 bd = cosineHemisphere(n);
-            float bt; vec3 bn; int bm;
-            if (traceVox(hp, bd, tmaxV, bt, bn, bm))
+            float bt; vec3 bn; int bm; ivec3 bcell;
+            if (traceVox(hp, bd, tmaxV, bt, bn, bm, bcell))
             {
                 float blam = max(0.0, dot(bn, sun));
                 float bshade = 0.0;
@@ -229,24 +304,31 @@ void main()
                 {
                     vec3 bp = hp + bd * bt + bn * 0.001;
                     float st2; vec3 sn2; int sm2;
-                    if (!traceVox(bp, sun, tmaxV, st2, sn2, sm2)) { bshade = blam; }
+                    if (!traceVox(bp, sun, tmaxV, st2, sn2, sm2, scell)) { bshade = blam; }
                 }
-                ind += palette(bm) * (0.25 + 0.75 * bshade + emissive(bm));
+                ind += albedoOf(bm, bcell) *
+                       (skyGradient(bn, sun) * 0.22 + sunColor(sun) * (bshade * 0.85) + vec3(emissive(bm)));
             }
             else
             {
-                ind += mix(vec3(0.52, 0.60, 0.72), vec3(0.14, 0.20, 0.34),
-                           clamp(bd.y * 0.5 + 0.5, 0.0, 1.0));
+                ind += skyGradient(bd, sun);
             }
         }
         if (spp > 0) { ind /= float(spp); }
 
-        // Albedo multiplies both terms, so colour bleeds from the bounce.
-        col = palette(m) * (0.25 + 0.75 * shade + emissive(m)) + palette(m) * ind;
+        // Ambient is the sky in the direction the surface faces, which is what
+        // turns shadowed faces sky-blue instead of flat grey. Albedo
+        // multiplies both terms, so colour bleeds from the bounce.
+        vec3 amb = skyGradient(n, sun) * 0.22;
+        col = albedo * (amb + sunColor(sun) * (shade * 0.85) + vec3(emissive(m))) + albedo * ind;
+
+        // Aerial perspective, toward the sky along this ray. Geometry only:
+        // a miss is already sky and would be a no-op.
+        col = mix(col, skyGradient(rd, sun), fogAmount(depth));
     }
     else
     {
-        col = mix(vec3(0.52, 0.60, 0.72), vec3(0.14, 0.20, 0.34), clamp(rd.y * 0.5 + 0.5, 0.0, 1.0));
+        col = skyColor(rd, sun);
     }
 
     // Reinhard, so an emissive surface stays coloured instead of clipping to

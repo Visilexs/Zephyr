@@ -245,7 +245,7 @@ g.immediate(fn(cb: int) {
 let pxb = g.read_image(dsti, W, H)
 
 // ---------------------------------------------------------------- CPU mirror
-struct Hit { hit: bool, t: float, nx: float, ny: float, nz: float, mat: int }
+struct Hit { hit: bool, t: float, nx: float, ny: float, nz: float, mat: int, cx: int, cy: int, cz: int }
 
 fn vox_at(v: Bytes, x: int, y: int, z: int) -> int {
     if x < 0 or y < 0 or z < 0 or x >= VX or y >= VY or z >= VZ { return 0 }
@@ -282,7 +282,7 @@ fn trace_vox(v: Bytes, ox: float, oy: float, oz: float,
     var t = 0.0
     var axis = 1
     for i in 0..MAXSTEP {
-        if t > tmax { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        if t > tmax { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0, cx: 0, cy: 0, cz: 0} }
         let m = vox_at(v, px, py, pz)
         if m != 0 {
             var nx = 0.0
@@ -291,11 +291,11 @@ fn trace_vox(v: Bytes, ox: float, oy: float, oz: float,
             if axis == 0 { nx = 0.0 - (sx as float) }
             if axis == 1 { ny = 0.0 - (sy as float) }
             if axis == 2 { nz = 0.0 - (sz as float) }
-            return Hit{hit: true, t: t, nx: nx, ny: ny, nz: nz, mat: m}
+            return Hit{hit: true, t: t, nx: nx, ny: ny, nz: nz, mat: m, cx: px, cy: py, cz: pz}
         }
-        if (py < 0 and sy < 0) or (py >= VY and sy > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
-        if (px < 0 and sx < 0) or (px >= VX and sx > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
-        if (pz < 0 and sz < 0) or (pz >= VZ and sz > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        if (py < 0 and sy < 0) or (py >= VY and sy > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0, cx: 0, cy: 0, cz: 0} }
+        if (px < 0 and sx < 0) or (px >= VX and sx > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0, cx: 0, cy: 0, cz: 0} }
+        if (pz < 0 and sz < 0) or (pz >= VZ and sz > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0, cx: 0, cy: 0, cz: 0} }
         if tsx < tsy and tsx < tsz {
             px += sx
             t = tsx
@@ -313,7 +313,7 @@ fn trace_vox(v: Bytes, ox: float, oy: float, oz: float,
             axis = 2
         }
     }
-    return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0}
+    return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0, cx: 0, cy: 0, cz: 0}
 }
 
 // ---------------------------------------------------------------- rng
@@ -396,6 +396,81 @@ fn pal(m: int) -> [float] {
     if m == 9 { return [0.31, 0.21, 0.12] }
     if m == 10 { return [0.17, 0.41, 0.13] }
     return [0.0, 0.0, 0.0]
+}
+
+// Mirrors sunColor(), skyGradient(), skyColor(), fogAmount(), tintAmp() and
+// albedoOf() in examples/shaders/voxel.comp. None of them uses exp, pow or
+// trig, which is what lets this stay an exact comparison -- Zephyr's fsin and
+// friends are polynomial approximations that would not match GLSL.
+fn sun_color(sy: float) -> [float] {
+    var h = sy
+    if h < 0.0 { h = 0.0 }
+    if h > 1.0 { h = 1.0 }
+    let k = h * h * (3.0 - 2.0 * h)
+    return [1.40 + (1.05 - 1.40) * k, 0.68 + (1.00 - 0.68) * k, 0.32 + (0.94 - 0.32) * k]
+}
+
+fn sky_gradient(dx: float, dy: float, dz: float, sy: float) -> [float] {
+    var h = dy * 0.5 + 0.5
+    if h < 0.0 { h = 0.0 }
+    if h > 1.0 { h = 1.0 }
+    let k = h * h * (3.0 - 2.0 * h)
+    var lo = sy
+    if lo < 0.0 { lo = 0.0 }
+    if lo > 1.0 { lo = 1.0 }
+    let warm = 1.0 - lo * lo * (3.0 - 2.0 * lo)
+    let hr = 0.70 + (0.95 - 0.70) * warm
+    let hg = 0.79 + (0.70 - 0.79) * warm
+    let hb = 0.90 + (0.46 - 0.90) * warm
+    let zr = 0.20 + (0.16 - 0.20) * warm
+    let zg = 0.41 + (0.26 - 0.41) * warm
+    let zb = 0.78 + (0.55 - 0.78) * warm
+    return [hr + (zr - hr) * k, hg + (zg - hg) * k, hb + (zb - hb) * k]
+}
+
+fn sky_color(dx: float, dy: float, dz: float, sx: float, sy: float, sz: float) -> [float] {
+    var d = dx * sx + dy * sy + dz * sz
+    if d < 0.0 { d = 0.0 }
+    let g = 1.0 - d
+    let disc = 1.0 / (1.0 + 900.0 * g * g)
+    let halo = 1.0 / (1.0 + 14.0 * g)
+    let base = sky_gradient(dx, dy, dz, sy)
+    let sc = sun_color(sy)
+    let w = disc * 1.8 + halo * 0.20
+    return [base[0] + sc[0] * w, base[1] + sc[1] * w, base[2] + sc[2] * w]
+}
+
+fn fog_amount(d: float) -> float {
+    let x = d * (1.0 / 170.0)
+    let x2 = x * x
+    var f = x2 / (1.0 + x2) * 1.35
+    if f < 0.0 { f = 0.0 }
+    if f > 1.0 { f = 1.0 }
+    return f
+}
+
+fn tint_amp(m: int) -> [float] {
+    if m == 3 { return [0.30, 0.15, 0.11] }
+    if m == 10 { return [0.34, 0.17, 0.11] }
+    if m == 2 { return [0.13, 0.11, 0.10] }
+    if m == 4 { return [0.10, 0.09, 0.08] }
+    if m == 8 { return [0.03, 0.03, 0.04] }
+    return [0.08, 0.08, 0.08]
+}
+
+fn albedo_of(m: int, cx: int, cy: int, cz: int) -> [float] {
+    let mixed = ((cx * 73856093) & U32) ^ ((cy * 19349663) & U32) ^ ((cz * 83492791) & U32)
+    let h = hashu(mixed)
+    let j = ((h & 65535) as float) * (1.0 / 65535.0)
+    let p = pal(m)
+    let a = tint_amp(m)
+    var r = p[0] * (1.0 + (j - 0.5) * 2.0 * a[0])
+    var g = p[1] * (1.0 + (j - 0.5) * 2.0 * a[1])
+    var b = p[2] * (1.0 + (j - 0.5) * 2.0 * a[2])
+    if r < 0.0 { r = 0.0 }
+    if g < 0.0 { g = 0.0 }
+    if b < 0.0 { b = 0.0 }
+    return [r, g, b]
 }
 
 // Mirrors surface() in the shader: roughness and specular albedo per material.
@@ -493,6 +568,11 @@ var depth_first = ""
 var lit_by_bounce = 0
 var bounce_sum = 0.0
 var motion_bad = 0
+var worst_note = ""
+var fog_a = 0.0
+var fog_r = 0.0
+var fog_g = 0.0
+var fog_b = 0.0
 var p_ind_r = 0.0
 var p_ind_g = 0.0
 var p_ind_b = 0.0
@@ -562,18 +642,18 @@ for y in 0..H {
                         let s2 = trace_vox(vox, bx2, by2, bz2, snx, sny, snz, TMAXV)
                         if not s2.hit { bshade = blam }
                     }
-                    let bk = 0.25 + 0.75 * bshade + emissive(bh.mat)
-                    let bp = pal(bh.mat)
-                    ir += bp[0] * bk
-                    ig += bp[1] * bk
-                    ib += bp[2] * bk
+                    let bamb = sky_gradient(bh.nx, bh.ny, bh.nz, sny)
+                    let bsc = sun_color(sny)
+                    let be = emissive(bh.mat)
+                    let bp = albedo_of(bh.mat, bh.cx, bh.cy, bh.cz)
+                    ir += bp[0] * (bamb[0] * 0.22 + bsc[0] * (bshade * 0.85) + be)
+                    ig += bp[1] * (bamb[1] * 0.22 + bsc[1] * (bshade * 0.85) + be)
+                    ib += bp[2] * (bamb[2] * 0.22 + bsc[2] * (bshade * 0.85) + be)
                 } else {
-                    var bf = bd[1] * 0.5 + 0.5
-                    if bf < 0.0 { bf = 0.0 }
-                    if bf > 1.0 { bf = 1.0 }
-                    ir += 0.52 + (0.14 - 0.52) * bf
-                    ig += 0.60 + (0.20 - 0.60) * bf
-                    ib += 0.72 + (0.34 - 0.72) * bf
+                    let bs = sky_gradient(bd[0], bd[1], bd[2], sny)
+                    ir += bs[0]
+                    ig += bs[1]
+                    ib += bs[2]
                 }
             }
             if SPP > 0 {
@@ -583,26 +663,50 @@ for y in 0..H {
             }
             if ir > 0.0 or ig > 0.0 or ib > 0.0 { lit_by_bounce += 1 }
             bounce_sum += ir + ig + ib
-            let k = 0.25 + 0.75 * shade + emissive(h.mat)
-            let p = pal(h.mat)
-            cr = p[0] * k + p[0] * ir
-            cg = p[1] * k + p[1] * ig
-            cb = p[2] * k + p[2] * ib
+            let amb = sky_gradient(h.nx, h.ny, h.nz, sny)
+            let sc = sun_color(sny)
+            let em = emissive(h.mat)
+            let p = albedo_of(h.mat, h.cx, h.cy, h.cz)
+            cr = p[0] * (amb[0] * 0.22 + sc[0] * (shade * 0.85) + em) + p[0] * ir
+            cg = p[1] * (amb[1] * 0.22 + sc[1] * (shade * 0.85) + em) + p[1] * ig
+            cb = p[2] * (amb[2] * 0.22 + sc[2] * (shade * 0.85) + em) + p[2] * ib
             p_ind_r = p[0] * ir
             p_ind_g = p[1] * ig
             p_ind_b = p[2] * ib
+            // Aerial perspective, toward the sky along this ray. Geometry
+            // only: a miss is already sky. Applied below rather than here,
+            // because pass 1 and pass 2 each get fogged on the GPU and
+            // subtracting an unfogged bounce from a fogged total is not the
+            // same number.
+            fog_a = fog_amount(h.t * VOXEL)
+            let fg = sky_gradient(ddx, ddy, ddz, sny)
+            fog_r = fg[0]
+            fog_g = fg[1]
+            fog_b = fg[2]
         } else {
-            var f = ddy * 0.5 + 0.5
-            if f < 0.0 { f = 0.0 }
-            if f > 1.0 { f = 1.0 }
-            cr = 0.52 + (0.14 - 0.52) * f
-            cg = 0.60 + (0.20 - 0.60) * f
-            cb = 0.72 + (0.34 - 0.72) * f
+            let sk = sky_color(ddx, ddy, ddz, snx, sny, snz)
+            cr = sk[0]
+            cg = sk[1]
+            cb = sk[2]
+            // A miss is already sky, so it takes no fog. These carry across
+            // pixels, so leaving the previous pixel's value here fogs the sky
+            // by whatever the last piece of geometry happened to be.
+            fog_a = 0.0
+            fog_r = 0.0
+            fog_g = 0.0
+            fog_b = 0.0
         }
-        // Direct-only, matching pass 1 exactly.
+        // Direct-only, matching pass 1 exactly: fog each pass on its own,
+        // which is what the GPU does when it renders them separately.
         var dcr = cr - p_ind_r
         var dcg = cg - p_ind_g
         var dcb = cb - p_ind_b
+        dcr = dcr + (fog_r - dcr) * fog_a
+        dcg = dcg + (fog_g - dcg) * fog_a
+        dcb = dcb + (fog_b - dcb) * fog_a
+        cr = cr + (fog_r - cr) * fog_a
+        cg = cg + (fog_g - cg) * fog_a
+        cb = cb + (fog_b - cb) * fog_a
         dcr = dcr * exposure
         dcg = dcg * exposure
         dcb = dcb * exposure
@@ -654,7 +758,7 @@ for y in 0..H {
             if not diverged { normal_bad += 1 }
         }
         var wa = [0.0, 0.0, 0.0]
-        if h.hit { wa = pal(h.mat) }
+        if h.hit { wa = albedo_of(h.mat, h.cx, h.cy, h.cz) }
         if (abs(ga.get8(o) - lin(wa[0])) > 2
             or abs(ga.get8(o + 1) - lin(wa[1])) > 2
             or abs(ga.get8(o + 2) - lin(wa[2])) > 2) {
@@ -719,7 +823,10 @@ for y in 0..H {
                 divergent_col += 1
             } else {
                 bad += 1
-                if d > worst { worst = d }
+                if d > worst {
+                    worst = d
+                    worst_note = "({x},{y}) hit={h.hit} mat={h.mat} depth={h.t * VOXEL} fog={fog_a} gpu=({px.get8(o)},{px.get8(o+1)},{px.get8(o+2)}) cpu=({enc(dcr)},{enc(dcg)},{enc(dcb)})"
+                }
             }
         }
     }
@@ -728,6 +835,7 @@ for y in 0..H {
 let total = W * H
 print("CPU mirror: {checked} of {total} pixels sampled, {hits} hit geometry, {shadowed} in shadow")
 print("disagreements beyond +/-2: {bad} of {checked} sampled, worst channel delta {worst}")
+if bad > 0 { print("  worst: {worst_note}") }
 
 // Measured exact on an RTX 5090: every pixel agrees within the tolerance. If a
 // later scene puts rays through voxel corners this is the knob to loosen, but

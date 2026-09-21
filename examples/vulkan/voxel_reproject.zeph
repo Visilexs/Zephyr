@@ -219,6 +219,10 @@ var matched = 0
 var disoccluded = 0
 var offscreen = 0
 var wrong = 0
+var h10 = 0
+var h14 = 0
+var h18 = 0
+var h26 = 0
 var sky = 0
 for y in 0..H {
     for x in 0..W {
@@ -268,7 +272,18 @@ for y in 0..H {
                 if d < best { best = d }
             }
         }
-        if best <= 6 { matched += 1 } else { wrong += 1 }
+        // 18, not 6. The per-voxel tint varies foliage albedo by +/-30%,
+        // which is around +/-20 of 255 once shaded and tonemapped, so a
+        // tighter threshold cannot tell "landed on the neighbouring voxel of
+        // the same surface" from "landed somewhere wrong". The histogram
+        // below is the evidence: the tail is diffuse rather than a cliff, and 18
+        // sits under that +/-20 bound, so the required match rate goes up
+        // from 98% to 99% to compensate.
+        if best <= 18 { matched += 1 } else { wrong += 1 }
+        if best <= 10 { h10 += 1 }
+        if best <= 14 { h14 += 1 }
+        if best <= 18 { h18 += 1 }
+        if best <= 26 { h26 += 1 }
     }
 }
 
@@ -278,13 +293,14 @@ print("  matched      {matched}")
 print("  disoccluded  {disoccluded}")
 print("  offscreen    {offscreen}")
 print("  mismatched   {wrong}")
+print("  best delta within 10/14/18/26: {h10} {h14} {h18} {h26}")
 
 // If the convention were wrong -- a flipped sign, or pixels versus normalised
 // units -- reprojection would land on unrelated surfaces and `wrong` would
 // dominate. Disocclusions are legitimate and are counted separately.
 let valid = matched + wrong
 assert(valid > geom / 2, "too few pixels had a usable history ({valid} of {geom})")
-assert(matched * 50 > valid * 49,
+assert(matched * 100 > valid * 99,
        "only {matched} of {valid} reprojected pixels matched; motion vectors look wrong")
 print("PASS: {matched} of {valid} reprojected pixels found the same surface within a pixel")
 
