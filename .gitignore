@@ -24,5 +24,8 @@ dist/*.zip
 zephyr_rt.dll
 __pycache__/
 *.pyc
-__pycache__/
-*.pyc
+
+# checkpoint artifacts from tests/ml/optim_test.zeph
+*.ckpt
+*.ckpt.tmp.*
+optim-child.log
