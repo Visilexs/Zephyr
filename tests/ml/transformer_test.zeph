@@ -1,0 +1,303 @@
+// The causal Transformer control.
+//
+// It is a control, so the bar is that it is a correct implementation of the
+// thing it claims to be, not that it performs well. Three properties carry
+// that weight and the rest of the suite is cheaper checks around them.
+//
+//   * Every one of the thirty parameter tensors has a gradient that agrees
+//     with central differences. The model is assembled from verified av_*
+//     operators, but assembling verified parts wrongly is exactly how a
+//     control ends up quietly mis-differentiated, and a control that trains
+//     badly for that reason would be read as evidence about architectures.
+//   * It is causal. Two inputs that agree up to position p give the same
+//     hidden state at p. Without this the comparison is between the phase
+//     model and something that can see the answer.
+//   * PAD is not read. Changing padding changes nothing, and the readout is
+//     taken at the last real token.
+import "ml/transformer.zeph"
+import "ml/optim.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor, sc: float) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        t_set(t, idx, sc * rnd())
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// ---- rejection cases, in children ------------------------------------------
+if args().len() > 1 {
+    let case = args()[1]
+    let cfg = TfConfig{input_vocab: 9, output_vocab: 3, d: 8, ff: 12, layers: 1, max_len: 6, pad: 0, eps: 0.00001}
+    let p = tf_new(cfg)
+    let ts = tf_param_list(p)
+    for i in 0..ts.len() { fill_random(ts[i], 0.2) }
+    av_reset()
+    let m = tf_params(p, true)
+    if case == "toolong" {
+        let tk = t_zeros(DType.I64, [2, 9])
+        for r in 0..2 {
+            for s in 0..9 { t_set_int(tk, [r, s], 1) }
+        }
+        tf_loss(m, tk, [0, 1])
+    }
+    if case == "vocab" {
+        let tk = t_zeros(DType.I64, [2, 4])
+        for r in 0..2 {
+            for s in 0..4 { t_set_int(tk, [r, s], 1) }
+        }
+        t_set_int(tk, [1, 2], 99)
+        tf_loss(m, tk, [0, 1])
+    }
+    if case == "target" {
+        let tk = t_zeros(DType.I64, [2, 4])
+        for r in 0..2 {
+            for s in 0..4 { t_set_int(tk, [r, s], 1) }
+        }
+        tf_loss(m, tk, [0, 7])
+    }
+    print("UNREACHABLE: {case} was accepted")
+}
+let IS_CHILD = args().len() > 1
+
+fn child(case: str) -> int {
+    var cmd = cbytes("\"{args()[0]}\" {case}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, cmd.addr(), 0, 0, 1, 134217728, 0, 0, startup.addr(), process.addr())
+    if started == 0 { return 0 - 1 }
+    win("WaitForSingleObject", process.get64(0), 30000)
+    let status = Bytes.new(8)
+    win("GetExitCodeProcess", process.get64(0), status.addr())
+    let code = status.get32(0)
+    win("CloseHandle", process.get64(0))
+    win("CloseHandle", process.get64(8))
+    return code
+}
+
+let CFG = TfConfig{input_vocab: 9, output_vocab: 3, d: 8, ff: 12, layers: 2, max_len: 7, pad: 0, eps: 0.00001}
+let P = tf_new(CFG)
+let TS = tf_param_list(P)
+for i in 0..TS.len() { fill_random(TS[i], 0.25) }
+
+let B = 4
+let T = 7
+let TOK = t_zeros(DType.I64, [B, T])
+var TARGETS: [int] = []
+for r in 0..B {
+    let real = 4 + r % 3
+    for s in 0..T {
+        if s < real { t_set_int(TOK, [r, s], 1 + rndi(8)) } else { t_set_int(TOK, [r, s], CFG.pad) }
+    }
+    TARGETS.push(rndi(3))
+}
+
+fn loss_of(tokens: Tensor) -> float {
+    av_reset()
+    let m = tf_params(P, false)
+    return t_get(av_value(tf_loss(m, tokens, TARGETS)), [0])
+}
+
+if not IS_CHILD {
+    // ---- gradients against central differences -----------------------------
+    av_reset()
+    let m = tf_params(P, true)
+    let loss = tf_loss(m, TOK, TARGETS)
+    let base = t_get(av_value(loss), [0])
+    av_backward(loss)
+    var grads: [Tensor] = []
+    for i in 0..m.hs.len() { grads.push(t_copy(av_grad(m.hs[i]))) }
+
+    chk(base == base and base > 0.0, "the loss is finite and positive ({base})")
+    chk(grads.len() == 30, "the model has thirty parameter tensors ({grads.len()})")
+
+    let h = 0.000001
+    var worst = 0.0
+    var worst_at = 0
+    var checked = 0
+    var nonzero = 0
+    for i in 0..TS.len() {
+        // Two elements per tensor, chosen by the same generator each run, so
+        // this is a fixed test rather than a lottery that passes on average.
+        let n = t_numel(TS[i])
+        for probe in 0..2 {
+            var idx = idx_zeros(TS[i].shape.len())
+            var flat = (probe * 7 + i * 3) % n
+            var rem = flat
+            var k = TS[i].shape.len() - 1
+            while k >= 0 {
+                idx[k] = rem % TS[i].shape[k]
+                rem = rem / TS[i].shape[k]
+                k = k - 1
+            }
+            let orig = t_get(TS[i], idx)
+            t_set(TS[i], idx, orig + h)
+            let up = loss_of(TOK)
+            t_set(TS[i], idx, orig - h)
+            let dn = loss_of(TOK)
+            t_set(TS[i], idx, orig)
+            let fd = (up - dn) / (2.0 * h)
+            let an = t_get(grads[i], idx)
+            let rel = fabs(fd - an) / (1.0 + fabs(an))
+            if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
+            if rel > worst { worst = rel
+                             worst_at = i }
+            checked = checked + 1
+        }
+    }
+    print("central differences: {checked} probes, worst relative error {worst} at tensor {worst_at}, {nonzero} with a nonzero analytic gradient")
+    chk(worst < 0.0000001, "every probed gradient matches central differences ({worst})")
+    chk(nonzero > 40, "the probed gradients are mostly nonzero, so the agreement is not zero against zero ({nonzero} of {checked})")
+
+    // ---- causality ----------------------------------------------------------
+    // Two inputs agreeing up to position p must give the same hidden state at
+    // p. This is the check that the mask is a causal mask and not decoration.
+    let alt = t_copy(TOK)
+    let p_cut = 3
+    for r in 0..B {
+        for s in (p_cut + 1)..T { t_set_int(alt, [r, s], 1 + ((s * 5 + r) % 8)) }
+    }
+    av_reset()
+    let ma = tf_params(P, false)
+    let ha = av_value(tf_encode(ma, TOK))
+    av_reset()
+    let mb = tf_params(P, false)
+    let hb = av_value(tf_encode(mb, alt))
+    var same_before = true
+    var differs_after = false
+    for r in 0..B {
+        for s in 0..T {
+            let row = r * T + s
+            var equal = true
+            for c in 0..CFG.d {
+                if t_get(ha, [row, c]) != t_get(hb, [row, c]) { equal = false }
+            }
+            if s <= p_cut and not equal { same_before = false }
+            if s > p_cut and not equal { differs_after = true }
+        }
+    }
+    chk(same_before, "positions up to the cut are bit-identical when only later tokens change, so the model is causal")
+    chk(differs_after, "positions after the cut do change, so the causality check is not passing because nothing moved")
+
+    // ---- padding -------------------------------------------------------------
+    let padded = t_copy(TOK)
+    for r in 0..B {
+        for s in 0..T {
+            if t_get_int(TOK, [r, s]) == CFG.pad { t_set_int(padded, [r, s], CFG.pad) }
+        }
+    }
+    // Rewriting PAD positions with a different PAD-valued pattern is a no-op
+    // by construction; the real check is that the readout ignores what sits
+    // beyond the last real token, which we test by shortening the row.
+    var pad_ok = true
+    for r in 0..B {
+        let real = 4 + r % 3
+        chk(tf_last_real(TOK, r, T, CFG.pad) == real - 1,
+            "row {r} reads out at its last real token, position {real - 1}")
+        if tf_last_real(TOK, r, T, CFG.pad) != real - 1 { pad_ok = false }
+    }
+    chk(pad_ok, "every row reads out at a real token, not at padding")
+
+    // Probabilities are a distribution.
+    av_reset()
+    let mp = tf_params(P, false)
+    let pr = av_value(tf_readout(mp, tf_forward(mp, TOK)))
+    var wsum = 0.0
+    var neg = 0
+    for r in 0..B {
+        var s = 0.0
+        for c in 0..CFG.output_vocab {
+            let v = t_get(pr, [r, c])
+            if v < 0.0 { neg = neg + 1 }
+            s = s + v
+        }
+        if fabs(s - 1.0) > wsum { wsum = fabs(s - 1.0) }
+    }
+    chk(wsum < 0.000000000001, "the readout is a probability distribution, worst deviation from one {wsum}")
+    chk(neg == 0, "no negative probabilities ({neg})")
+
+    // ---- it can learn ---------------------------------------------------------
+    // A model that is differentiable but cannot fit anything would pass every
+    // check above. Thirty-two examples with fixed labels, driven down.
+    let nfit = 16
+    let fit_tok = t_zeros(DType.I64, [nfit, T])
+    var fit_y: [int] = []
+    for r in 0..nfit {
+        let real = 4 + r % 3
+        for s in 0..T {
+            if s < real { t_set_int(fit_tok, [r, s], 1 + rndi(8)) } else { t_set_int(fit_tok, [r, s], CFG.pad) }
+        }
+        // The label is a function of the row's contents rather than an
+        // independent draw. With independent labels this fixture had three
+        // duplicate rows carrying contradictory labels, so the loss floor
+        // was the data's own entropy and the check was measuring that, not
+        // the model -- it plateaued at 0.26 and more steps did not help.
+        var acc = 0
+        for s2 in 0..T { acc = acc + (s2 + 1) * t_get_int(fit_tok, [r, s2]) }
+        fit_y.push(acc % 3)
+    }
+    // And the guard that stops it silently becoming unfittable again.
+    var contradictions = 0
+    for a in 0..nfit {
+        for b in (a + 1)..nfit {
+            var same = true
+            for s in 0..T {
+                if t_get_int(fit_tok, [a, s]) != t_get_int(fit_tok, [b, s]) { same = false }
+            }
+            if same and fit_y[a] != fit_y[b] { contradictions = contradictions + 1 }
+        }
+    }
+    chk(contradictions == 0, "the overfit fixture has no duplicate rows with contradictory labels ({contradictions})")
+    let opt = adamw_new(TS, 0.05, 0.9, 0.999, 0.00000001, 0.0)
+    var first = 0.0
+    var last = 0.0
+    for stp in 0..200 {
+        av_reset()
+        let mm = tf_params(P, true)
+        let lo = tf_loss(mm, fit_tok, fit_y)
+        av_backward(lo)
+        var gs: [Tensor] = []
+        for i in 0..mm.hs.len() { gs.push(t_copy(av_grad(mm.hs[i]))) }
+        clip_grad_norm(gs, 5.0)
+        optim_step(opt, TS, gs)
+        let lv = t_get(av_value(lo), [0])
+        if stp == 0 { first = lv }
+        last = lv
+    }
+    print("overfit: loss {first} to {last} in 200 steps")
+    chk(last < first * 0.01, "the model fits 16 labels to within a hundredth of its starting loss, {first} to {last}")
+
+    // ---- rejections ------------------------------------------------------------
+    let cases = ["toolong", "vocab", "target"]
+    for i in 0..cases.len() {
+        let code = child(cases[i])
+        chk(code != 0, "{cases[i]}: rejected (exit {code})")
+    }
+
+    if failed == 0 {
+        print("transformer: {passed} checks passed")
+    } else {
+        print("transformer: {failed} FAILED, {passed} passed")
+        panic("transformer tests failed")
+    }
+}

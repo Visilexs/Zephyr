@@ -65,6 +65,28 @@ fn pad_features(z: int) -> int {
 // fusion is checked against; a fused-only library could not be checked at all.
 var GIVENS_FUSE = true
 
+// ---------------------------------------------------------------------------
+// The two ablations the baselines document requires, as switches rather than
+// forked copies of the model. A fork would drift from the model it is an
+// ablation of, and then the comparison would be measuring the drift.
+//
+// Both are OFF by default, so the default model is the model.
+
+// "Incoherent phase readout". The coherent readout is |sum_d M_vd z_d|^2 --
+// the contributions are summed as complex amplitudes and can cancel, which
+// is the interference the hypothesis is about. The incoherent version sums
+// their squared magnitudes instead, sum_d |M_vd|^2 |z_d|^2, so every
+// contribution is positive and nothing can cancel. Same parameters, same
+// normalisation, same eps; the only thing removed is the interference.
+var READOUT_INCOHERENT = false
+
+// "No phase-angle modulation / real rotations". Removes the per-coordinate
+// phase multiplier from the update and forces every Givens rotation's phi to
+// zero, leaving real rotations in a complex container. The state stays
+// complex and the parameter count is unchanged -- what is removed is the
+// relative-phase mechanism, not the capacity.
+var PHASE_REAL_ROTATIONS = false
+
 // The controller's two bias-then-tanh stages, likewise switchable.
 var CTRL_FUSE = true
 
@@ -108,7 +130,25 @@ fn pad_update(m: PhaseAD, z: int, embedding: int) -> int {
         bounded = av_tanh(av_add(av_matmul(hidden, av_transpose(m.W2, 0, 1)), m.b2))
     }
     let angles = av_mul(bounded, pad_scalar(PI))
-    let phased = av_mul(z, av_expi(av_slice(angles, 1, 0, d), DType.C64))
+    // The phase modulation, and the ablation that removes it. Under the
+    // ablation the state passes through unmodulated and each stage's phi
+    // half is multiplied by zero, which leaves a real rotation.
+    var phased = z
+    if not PHASE_REAL_ROTATIONS {
+        phased = av_mul(z, av_expi(av_slice(angles, 1, 0, d), DType.C64))
+    }
+    if PHASE_REAL_ROTATIONS {
+        let keep = t_zeros(DType.F64, [1, d])
+        for j in 0..(d / 2) { t_set(keep, [0, j], 1.0) }
+        let kh = av_leaf(keep, false)
+        let tp0 = av_mul(av_slice(angles, 1, d, 2 * d), kh)
+        let tp1 = av_mul(av_slice(angles, 1, 2 * d, 3 * d), kh)
+        if GIVENS_FUSE {
+            return av_givens(av_givens(phased, tp0, 0), tp1, 1)
+        }
+        let ev = pad_givens(phased, av_slice(tp0, 1, 0, d / 2), av_slice(tp0, 1, d / 2, d), 0, d)
+        return pad_givens(ev, av_slice(tp1, 1, 0, d / 2), av_slice(tp1, 1, d / 2, d), 1, d)
+    }
     if GIVENS_FUSE {
         // theta and phi for a stage are adjacent halves of one angle block,
         // so the fused stage takes the block whole and the two slices go away
@@ -134,8 +174,15 @@ fn pad_initial(m: PhaseAD, batch: int) -> int {
 
 // probabilities = (|Mz|^2 + eps) normalized, denominator sum(w) + V*eps
 fn pad_readout(m: PhaseAD, z: int) -> int {
-    let amp = av_matmul(z, av_transpose(m.M, 0, 1))
-    let w = av_abs2(amp)
+    var w = 0
+    if READOUT_INCOHERENT {
+        // sum_d |M_vd|^2 |z_d|^2, as a real matmul of the two magnitude
+        // maps. Reaching it this way rather than by zeroing cross terms
+        // keeps it on the tape and keeps the parameters identical.
+        w = av_matmul(av_abs2(z), av_transpose(av_abs2(m.M), 0, 1))
+    } else {
+        w = av_abs2(av_matmul(z, av_transpose(m.M, 0, 1)))
+    }
     let s = av_add(w, pad_scalar(m.cfg.eps))
     return av_div(s, av_sum_dim(s, 1))
 }

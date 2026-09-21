@@ -1,0 +1,224 @@
+// M7 data pipeline: the frozen datasets in data/m7/ and the native loader.
+//
+// The point of freezing the data is that it never changes, so this suite
+// reads what is actually on disk and compares it against the manifest that
+// was written beside it: row counts, sequence length and both vocabulary
+// sizes, and then every token id and every target of every row -- not a
+// sample, because a single out-of-range id would embed a silent index error
+// in every run that used it.
+//
+// Rejection cases run in child processes. A panic cannot be caught in
+// process, and each malformed file is built by corrupting a real one in the
+// temp directory, so the corruption is the only difference from a file that
+// loads.
+import "ml/dataset.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+let DATA_DIR = "data/m7"
+let SRC = "data/m7/a_validation.bin"
+
+fn tmpdir() -> str {
+    let b = Bytes.new(600)
+    let n = win("GetTempPathA", 512, b.addr())
+    if n <= 0 { panic("dataset_test: GetTempPathA failed") }
+    return b.get_str(0, n)
+}
+fn bad_path(case: str) -> str { return tmpdir() + "zeph_ds_bad_" + case + ".bin" }
+
+// little-endian i32 as four raw bytes
+fn le32(v: int) -> str {
+    return chr(v & 255) + chr((v >> 8) & 255) + chr((v >> 16) & 255) + chr((v >> 24) & 255)
+}
+
+// ---- child processes: every malformed input must be rejected ---------------
+if args().len() > 1 {
+    let case = args()[1]
+    if case == "batch" {
+        let d = dataset_load(SRC)
+        dataset_batch(d, d.targets.len() - 2, 5)
+    } else {
+        dataset_load(bad_path(case))
+    }
+    print("UNREACHABLE: {case} was accepted")
+}
+let IS_CHILD = args().len() > 1
+
+fn child(case: str) -> int {
+    var cmd = cbytes("\"{args()[0]}\" {case}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, cmd.addr(), 0, 0, 1, 134217728, 0, 0, startup.addr(), process.addr())
+    if started == 0 { return 0 - 1 }
+    win("WaitForSingleObject", process.get64(0), 60000)
+    let status = Bytes.new(8)
+    win("GetExitCodeProcess", process.get64(0), status.addr())
+    let code = status.get32(0)
+    win("CloseHandle", process.get64(0))
+    win("CloseHandle", process.get64(8))
+    return code
+}
+
+// ---- the manifest, read without a JSON library -----------------------------
+// The manifest is written with sorted keys, so every numeric field of an
+// entry follows its "file" key and precedes the next one.
+fn jnum(chunk: str, key: str) -> int {
+    let k = "\"{key}\":"
+    let at = chunk.index_of(k)
+    if at < 0 { panic("dataset_test: manifest entry has no {key}") }
+    var i = at + k.len()
+    while i < chunk.len() and chunk.byte(i) == 32 { i += 1 }
+    var v = 0
+    var any = false
+    while i < chunk.len() and chunk.byte(i) >= 48 and chunk.byte(i) <= 57 {
+        v = v * 10 + (chunk.byte(i) - 48)
+        any = true
+        i += 1
+    }
+    if not any { panic("dataset_test: manifest field {key} is not a number") }
+    return v
+}
+fn entry_of(man: str, name: str) -> str {
+    let parts = man.split("\"file\":")
+    for i in 1..parts.len() {
+        if parts[i].trim().starts_with("\"{name}\"") { return parts[i] }
+    }
+    panic("dataset_test: manifest has no entry for {name}")
+    return ""
+}
+
+fn list_bins(dir: str) -> [str] {
+    var out: [str] = []
+    let pat = cbytes(dir + "/*.bin")
+    let data = Bytes.new(512)
+    let h = win("FindFirstFileA", pat.addr(), data.addr())
+    if h == 0 - 1 or h == 4294967295 { return out }
+    var more = true
+    while more {
+        var cs: [str] = []
+        var i = 44
+        while data.get8(i) != 0 {
+            cs.push(chr(data.get8(i)))
+            i += 1
+        }
+        out.push(cs.join())
+        more = win("FindNextFileA", h, data.addr()) != 0
+    }
+    win("FindClose", h)
+    return out
+}
+
+if not IS_CHILD {
+    // Vacuous success is the failure mode to avoid: no data, no test.
+    if not ds_file_exists(DATA_DIR) or not ds_file_exists("{DATA_DIR}/manifest.json") {
+        panic("dataset_test: {DATA_DIR}/manifest.json is missing. Run: python tools/ml_reference/freeze_datasets.py")
+    }
+    let man = read_file("{DATA_DIR}/manifest.json")
+    let n_entries = man.split("\"file\":").len() - 1
+    chk(man.contains("\"preset\": \"m7-reduced\""), "the manifest declares the m7-reduced preset")
+    chk(jnum(man, "seed") == 20260921, "the manifest records the generation seed")
+
+    let bins = list_bins(DATA_DIR)
+    chk(bins.len() == 8, "{DATA_DIR} holds eight dataset files ({bins.len()} found)")
+    chk(n_entries == bins.len(), "the manifest describes exactly those files ({n_entries} entries)")
+
+    var total_rows = 0
+    var idx = [0, 0]
+    for f in 0..bins.len() {
+        let name = bins[f]
+        let e = entry_of(man, name)
+        let d = dataset_load("{DATA_DIR}/{name}")
+        let rows = d.targets.len()
+        total_rows = total_rows + rows
+        chk(rows == jnum(e, "n_rows"), "{name}: {rows} rows, as the manifest says")
+        chk(d.seq_len == jnum(e, "seq_len"), "{name}: sequence length {d.seq_len}, as the manifest says")
+        chk(d.vocab == jnum(e, "vocab"), "{name}: input vocabulary {d.vocab}, as the manifest says")
+        chk(d.n_class == jnum(e, "n_class"), "{name}: {d.n_class} target classes, as the manifest says")
+        chk(d.pad_id == jnum(e, "pad_id"), "{name}: pad id {d.pad_id}, as the manifest says")
+        chk(d.tokens.shape[0] == rows and d.tokens.shape[1] == d.seq_len,
+            "{name}: the token tensor is [{rows}, {d.seq_len}]")
+        chk(d.tokens.dt == DType.I64, "{name}: the token tensor is I64")
+
+        // Every element, not a sample.
+        var bad_tok = 0
+        var non_pad = 0
+        for r in 0..rows {
+            idx[0] = r
+            for c in 0..d.seq_len {
+                idx[1] = c
+                let v = t_get_int(d.tokens, idx)
+                if v < 0 or v >= d.vocab { bad_tok = bad_tok + 1 }
+                if v != d.pad_id { non_pad = non_pad + 1 }
+            }
+        }
+        var bad_tgt = 0
+        for r in 0..rows {
+            let t = d.targets[r]
+            if t < 0 or t >= d.n_class { bad_tgt = bad_tgt + 1 }
+        }
+        chk(bad_tok == 0, "{name}: all {rows * d.seq_len} token ids are inside the vocabulary")
+        chk(bad_tgt == 0, "{name}: all {rows} targets are inside the class count")
+        chk(non_pad > rows, "{name}: the rows carry content, not padding ({non_pad} non-pad tokens)")
+    }
+    chk(total_rows == 2 * (4096 + 3 * 2048), "the frozen splits hold {total_rows} rows in total")
+
+    // ---- batching ----------------------------------------------------------
+    let d = dataset_load(SRC)
+    let n = d.targets.len()
+    let b = dataset_batch(d, 100, 16)
+    chk(b.targets.len() == 16, "a batch returns exactly the requested row count")
+    chk(b.tokens.shape[0] == 16 and b.tokens.shape[1] == d.seq_len, "and a [16, {d.seq_len}] token view")
+    chk(b.seq_len == d.seq_len and b.vocab == d.vocab and b.n_class == d.n_class and b.pad_id == d.pad_id,
+        "and carries the same header fields")
+    var same = 0
+    var bidx = [0, 0]
+    for r in 0..16 {
+        idx[0] = 100 + r
+        bidx[0] = r
+        var eq = d.targets[100 + r] == b.targets[r]
+        for c in 0..d.seq_len {
+            idx[1] = c
+            bidx[1] = c
+            if t_get_int(d.tokens, idx) != t_get_int(b.tokens, bidx) { eq = false }
+        }
+        if eq { same = same + 1 }
+    }
+    chk(same == 16, "every batch row equals the same row of the whole dataset ({same} of 16)")
+    chk(dataset_batch(d, 0, 0).targets.len() == 0, "an empty batch is empty, not an error")
+    chk(dataset_batch(d, n - 8, 8).targets.len() == 8, "the last eight rows are a legal batch")
+
+    // ---- malformed input, each in its own child ----------------------------
+    let raw = read_file(SRC)
+    let hdr = 36
+    let seq = d.seq_len
+    write_file(bad_path("magic"), "X" + raw.sub(1, raw.len()))
+    write_file(bad_path("version"), raw.sub(0, 8) + le32(2) + raw.sub(12, raw.len()))
+    write_file(bad_path("truncated"), raw.sub(0, raw.len() - 8))
+    write_file(bad_path("token"), raw.sub(0, hdr) + le32(d.vocab) + raw.sub(hdr + 4, raw.len()))
+    let toff = hdr + n * seq * 4
+    write_file(bad_path("target"), raw.sub(0, toff) + le32(d.n_class) + raw.sub(toff + 4, raw.len()))
+
+    // The corrupted files differ from a loadable one only in the corruption.
+    chk(read_file(bad_path("magic")).len() == raw.len(), "the corrupted files are otherwise the real file")
+
+    let cases = ["magic", "version", "truncated", "token", "target", "batch"]
+    for i in 0..cases.len() {
+        let code = child(cases[i])
+        chk(code != 0, "{cases[i]}: rejected in a child process (exit {code})")
+    }
+
+    if failed == 0 {
+        print("dataset: {passed} checks passed")
+    } else {
+        print("dataset: {failed} FAILED, {passed} passed")
+        panic("dataset tests failed")
+    }
+}
