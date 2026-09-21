@@ -1,0 +1,89 @@
+// How much training can this machine actually do? M7 needs both tasks, every
+// control, three seeds. The budget is set by steps per second at the sizes
+// the protocol uses, so measure that before promising a schedule.
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+var SEED = 7
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+fn bench(D: int, H: int, NB: int, T: int, K: int, reps: int) {
+    let E = 32
+    let IV = 12
+    let OV = 4
+    let cfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]),
+              t_zeros(DType.F64, [H, E + 3 * D]), t_zeros(DType.F64, [H]),
+              t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    let zi = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [OV, D])
+    fill_random(zi)
+    fill_random(Mo)
+    let p = PhaseParams{config: cfg, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                        W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+    let all = [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+    var nparam = 0
+    for i in 0..all.len() {
+        var n = t_numel(all[i])
+        if dtype_is_complex(all[i].dt) { n = n * 2 }
+        nparam = nparam + n
+    }
+    let tokens = t_zeros(DType.I64, [NB, T])
+    var targets: [int] = []
+    for row in 0..NB {
+        for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+        targets.push(rndi(OV))
+    }
+    let opt = adamw_new(all, 0.002, 0.9, 0.999, 0.00000001, 0.01)
+    let t0 = now_ms()
+    for r in 0..reps {
+        av_reset()
+        let m = pad_params(p, true)
+        let loss = pad_loss(m, tokens, targets)
+        av_backward(loss)
+        let hs = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+        var grads: [Tensor] = []
+        for i in 0..hs.len() { grads.push(t_copy(av_grad(hs[i]))) }
+        clip_grad_norm(grads, 5.0)
+        optim_step(opt, all, grads)
+    }
+    let per = (now_ms() - t0) / (reps as float)
+    let ex_s = 1000.0 * (NB as float) / per
+    print("D={D} H={H} batch={NB} T={T} K={K}  params {nparam}  {per} ms/step  {ex_s} examples/s")
+}
+
+print("phase reasoner training throughput, CPU, after the M6b optimizations")
+print("")
+bench(32, 64, 32, 8, 2, 5)
+bench(64, 128, 32, 8, 2, 5)
+bench(128, 128, 32, 8, 2, 3)
+bench(128, 128, 64, 8, 2, 3)
+bench(128, 256, 32, 16, 4, 2)

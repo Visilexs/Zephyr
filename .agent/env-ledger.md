@@ -536,3 +536,42 @@ Two notes worth keeping for anyone reading the profiler output later.
 replay overhead -- the replay interpreter materialises a transpose with
 `t_copy` because a node must have a value, while the eager tape keeps it as
 metadata -- so it should not be read as a fourth optimization target.
+
+## The device backend after M6b: the win is gone
+
+`tools/gpu_step_bench.zeph`, unchanged, re-run after the A25 optimizations.
+
+| Size | Forward CPU | Forward device | Full step CPU | Full step device |
+|---|---|---|---|---|
+| D=8 | 4.2 ms | 20.8 ms | 13.8 ms | 62.9 ms |
+| D=128 (spec) | 164 ms | 290 ms | 585 ms | 1298 ms |
+
+0.57x and 0.45x at the specification size. Before M6b the same benchmark
+reported 7.79x and 5.43x in the device's favour.
+
+Nothing about the device path changed. The CPU baseline it was beating was
+14.3x slower, and most of that gap was the reference matmul allocating an
+index list per element access rather than anything about the hardware. The
+earlier figure was a measurement of a bad CPU implementation as much as of a
+good device one, which is the failure mode "measure before optimizing" is
+supposed to prevent and did not, because the benchmark was written first.
+
+Agreement is unchanged: loss to 3e-15, 104,160 gradient components to 4e-14.
+The backend is correct and slower. Training runs use the CPU path.
+
+## Training throughput available for M7
+
+Phase reasoner, CPU, after the M6b optimizations. Full step: forward,
+backward, gradient clip and an AdamW update.
+
+| D | H | batch | T | K | params | ms/step | examples/s |
+|---|---|---|---|---|---|---|---|
+| 32 | 64 | 32 | 8 | 2 | 15,232 | 171 | 187 |
+| 64 | 128 | 32 | 8 | 2 | 54,624 | 482 | 66 |
+| 128 | 128 | 32 | 8 | 2 | 104,608 | 978 | 33 |
+| 128 | 128 | 64 | 8 | 2 | 104,608 | 1691 | 38 |
+| 128 | 256 | 32 | 16 | 4 | 207,136 | 3239 | 10 |
+
+Cost scales close to linearly in D and in T, and batching to 64 buys only
+15% per example, so the schedule for M7 is set by D and by the number of
+runs, not by batch tuning.
