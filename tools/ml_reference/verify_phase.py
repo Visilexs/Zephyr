@@ -139,12 +139,34 @@ nb = np.conj(zf) * np.roll(zf, -1, 1)
 want = np.concatenate([np.abs(zf) ** 2, nb.real, nb.imag], axis=1)
 ck('features match doc formula', np.allclose(features(zf, op), want, atol=1e-15))
 
-# INTERFERENCE.md constructed case: squared amplitude is 1 + cos(delta)
+# INTERFERENCE.md's constructed case. Recorded deviation: the document says
+# this squared amplitude "equals 1+cos(delta), ranging from 0 to 2" while also
+# specifying the normalized readout row (1,1)/sqrt(2). Both cannot hold. With
+# the normalized row the value is (1+cos(delta))/2, ranging 0 to 1; 1+cos is
+# what the UNnormalized row (1,1) gives. We keep the normalized row, because
+# the document states it explicitly and because it is what makes the following
+# two-orthonormal-row probability claim come out right, and assert the value
+# that row actually produces. See DESIGN.md D16.
 for delta in (0.0, np.pi / 2, np.pi):
     zc = np.array([1, np.exp(1j * delta)]) / np.sqrt(2)
     row = np.array([1, 1]) / np.sqrt(2)
     ck('interference delta={:.2f}'.format(delta),
-       abs(abs(zc @ row) ** 2 * 2 - (1 + np.cos(delta))) < 1e-14)
+       abs(abs(zc @ row) ** 2 - (1 + np.cos(delta)) / 2) < 1e-14)
+    ck('interference unnormalised row delta={:.2f}'.format(delta),
+       abs(abs(zc @ np.array([1, 1])) ** 2 - (1 + np.cos(delta))) < 1e-14)
+
+# the claim the document is really making: two orthonormal rows sweep the
+# probability from fully constructive to fully destructive, and global phase
+# moves neither
+rows = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
+for delta, want in ((0.0, [1.0, 0.0]), (np.pi / 2, [0.5, 0.5]), (np.pi, [0.0, 1.0])):
+    zc = np.array([1, np.exp(1j * delta)]) / np.sqrt(2)
+    w = np.abs(rows @ zc) ** 2
+    ck('interference probabilities delta={:.2f}'.format(delta),
+       np.allclose(w / w.sum(), want, atol=1e-14))
+    wg = np.abs(rows @ (zc * np.exp(1j * 0.9))) ** 2
+    ck('interference global phase inert delta={:.2f}'.format(delta),
+       np.allclose(wg, w, atol=1e-15))
 
 # ---------------------------------------------------------------- A12
 m = small()

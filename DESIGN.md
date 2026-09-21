@@ -151,3 +151,25 @@ the Givens matrix from the document, checks the module against that, and
 checks every gradient against central differences. 112 checks, independent of
 the 12 Codex wrote. Both are kept — agreement between two suites written from
 the same spec by different authors is the point.
+
+## D16 — INTERFERENCE.md's constructed example is internally inconsistent
+
+The document specifies the state `z=(1,exp(i*delta))/sqrt(2)` and the readout
+row `(1,1)/sqrt(2)`, then says the squared amplitude "equals 1+cos(delta),
+ranging from 0 to 2". Both cannot be true. With that normalized row the value
+is `(1+cos(delta))/2`, ranging 0 to 1. The figure 1+cos(delta) is what the
+*unnormalized* row `(1,1)` gives.
+
+We keep the normalized row and assert the value it actually produces, because
+the document states that row explicitly and because normalized rows are what
+make the two-orthonormal-row probability claim in the same paragraph come out
+right. Both forms are asserted in `verify_phase.py` so the arithmetic is on
+the record rather than papered over with a stray factor of two.
+
+Nothing scientific turns on this. The paragraph's actual claim -- that two
+orthonormal rows sweep the probability from fully constructive [1,0] through
+[0.5,0.5] to fully destructive [0,1] while global phase moves neither -- holds
+exactly, and is now asserted directly instead of being inferred from the
+scalar. This is a normalization bookkeeping error in the prose, recorded
+rather than silently corrected, and it needs a versioned fixture update only
+if a later document depends on the literal 0-to-2 range.

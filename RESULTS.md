@@ -15,9 +15,14 @@ passed on the strength of an exit code alone.
 | A01 | **partial** | Self-host fixpoint holds (stages A/B/C byte-identical, verified by hand at each rebuild). Linux crosscheck 7/7 including its own fixpoint; wasm 7/7; 12/12 self-hosted example and stdlib checks. `tests\run_tests.ps1` is **blocked** — no C compiler, so it aborts before its first assertion. |
 | A02 | **passed** | `tests/ml/tensor_test.zeph`, 73 checks, plus 15 rejection cases each in their own process. Covers dtype sizes, scalar and empty shapes, row-major strides, broadcasting including 1-against-0, and rejection of negative dimensions, element overflow, the byte cap, out-of-range and wrong-rank indices, bad reshape, non-contiguous reshape, slice and axis bounds, and incompatible broadcast. |
 | A03 | **passed** | Same suite. Owner/view sharing, writes visible in both directions, a view outliving the owner handle, version bumps through views, stale-save detection, and 50 allocate/release cycles returning to a zero baseline with peak at one buffer rather than fifty. |
+| A04 | **passed** | `tests/ml/ops_test.zeph`, 107 checks, plus 26 rejection cases in their own processes. Independently, `tools/ml_reference/check_ops.py` agrees with numpy on all 33 operators, most bit-exact. Non-contiguous inputs are covered by running the same operators through transposed and sliced views. |
+| A05 | **passed** | Same suites. Complex mul, div, conj, abs2, expi and matmul against analytic values; byte layout compared against numpy's `complex64`/`complex128`, which share PyTorch's memory format. |
+| A10 | **passed** | `tools/ml_reference/test_phase.py` (12 groups, D=4/8/128 and the spec defaults) *and* an independently written `tools/ml_reference/verify_phase.py`, 121 checks, coded from MATHEMATICS.md rather than from the module. Pair bijection and bounds at D=4/8/128, G^H G=I built from the doc's own matrix, inverse by G^H, norm preservation, simultaneity, and 10,000 fixed-angle gates drifting 1.1e-16. No renormalization exists anywhere in the update path. |
+| A11 | **passed** | Same two suites. Probabilities invariant and state equivariant under global phase at three angles, controller angles unchanged, features invariant under global phase but sensitive to relative phase and matching the doc formula bit-for-bit. The constructed interference example is internally inconsistent in the specification -- with the normalized row it states, the squared amplitude is (1+cos(delta))/2, not the 1+cos(delta) the prose claims -- so both forms are asserted explicitly and the discrepancy is recorded as DESIGN.md D16 rather than absorbed into a tolerance. The claim the paragraph actually makes, that two orthonormal rows sweep [1,0] to [0,1] while global phase moves neither, holds exactly. |
+| A12 | **passed** | Same two suites. The paired-real port agrees with the complex model on loss, probabilities, state and every one of the eight parameter gradients to 1e-12, and holds no complex array at all. Both are checked against central differences: worst relative error 3.7e-10, real and imaginary parts separately. The mapped optimizer step is the SGD check in test_phase.py; AdamW waits for M4. |
+| A06–A09, A13–A29, A32–A41 | **not_run** | Not started. A06 is partly evidenced already by the finite-difference sweep above, but the native autograd it refers to does not exist yet. |
 | A30 | **passed** | `tools/ml_reference/test_tasks.py`. Solver agrees with the label on 10,240 examples per task, recomputing from the token sequence alone. Task A query-only baseline sits within 0.125 ± 0.04 of chance on every split. Task B per-example: ≥2 feasible until the final clue, exactly 1 after, and the final clue combined with the original candidate list admits ≥2. |
 | A31 | **passed** | Same suite. Seeded split hashes reproducible and pairwise disjoint, no duplicates within a split, frozen vocabulary covering all test tokens, composition and length bins non-empty, exact class balance, and class mean lengths equal to 1e-12 so length does not leak the target. |
-| A04–A29, A32–A41 | **not_run** | Not started. |
 
 ## Measurements
 
@@ -87,7 +92,7 @@ sweep.
 | `tests/ml/ops_test.zeph` | 107 | instant |
 | ops rejection cases | 26 processes | ~8s |
 | `tools/ml_reference/test_phase.py` | 12 groups, D=4/8/128 | ~6s |
-| `tools/ml_reference/verify_phase.py` | 112 | ~5s |
+| `tools/ml_reference/verify_phase.py` | 121 | ~5s |
 | `tools/ml_reference/test_tasks.py` | 13 groups, 10,240 examples per task | ~8s |
 
 ### CPU operators against numpy
