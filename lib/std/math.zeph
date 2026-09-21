@@ -115,14 +115,19 @@ let HALF_PI = 1.5707963267948966
 let PI_6 = 0.5235987755982988
 let SQRT3 = 1.7320508075688772
 let TAN_PI_12 = 0.2679491924311227
+// Cody-Waite split of 2pi, as for ln2 above. HI has its low 20 mantissa bits
+// clear, so k*HI is exact out to k = 2^20 and the reduced argument does not
+// inherit k ulps of error from a single rounded TWO_PI.
+let TWO_PI_HI = 6.2831853069365025
+let TWO_PI_LO = 0.0000000002430840202602477
 
 // sin via range reduction to [-pi,pi] then Taylor. 13 terms reaches double
 // precision at +-pi; the old 9 stopped at ~5e-10, which capped every
 // reciprocal and inverse built on it (tan, csc, cot, gd_inv, digamma).
-// Reduction error still grows with |x0| -- TWO_PI is only good to 1 ulp.
 fn fsin(x0: float) -> float {
     let k = round_i(x0 / TWO_PI)
-    let x = x0 - (k as float) * TWO_PI
+    let kf = k as float
+    let x = (x0 - kf * TWO_PI_HI) - kf * TWO_PI_LO
     let x2 = x * x
     var term = x
     var sum = x
@@ -134,7 +139,22 @@ fn fsin(x0: float) -> float {
     return sum
 }
 
-fn fcos(x: float) -> float { return fsin(x + HALF_PI) }
+// Its own reduction and series rather than fsin(x + HALF_PI): that shift
+// rounds away the low bits of a large argument before the reduction sees it.
+fn fcos(x0: float) -> float {
+    let k = round_i(x0 / TWO_PI)
+    let kf = k as float
+    let x = (x0 - kf * TWO_PI_HI) - kf * TWO_PI_LO
+    let x2 = x * x
+    var term = 1.0
+    var sum = 1.0
+    for i in 1..15 {
+        let d = ((2 * i - 1) * (2 * i)) as float
+        term = term * (0.0 - x2) / d
+        sum += term
+    }
+    return sum
+}
 fn ftan(x: float) -> float { return fsin(x) / fcos(x) }
 
 fn fcsc(x: float) -> float { return 1.0 / fsin(x) }
