@@ -1,0 +1,85 @@
+// The project op-coverage ledger, derived rather than written down.
+//
+// A23 asks that every op the model requires be supported on the selected GPU
+// with its VJP, and A41 asks for a complete op-coverage ledger. Both need to
+// know which ops the model actually reaches, and a hand-maintained list of
+// that would be wrong within a week. This instead runs one real full step --
+// forward and backward, real and complex -- and counts the opcodes the tape
+// recorded, so the answer comes from the model rather than from memory.
+//
+// It also reports which recorded opcodes carried a complex value, because an
+// op needs a device kernel per dtype it is actually used at, not per dtype it
+// could in principle take.
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+var SEED = 20260921
+fn rnd() -> float { SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0 }
+fn rndi(n: int) -> int { SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n }
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+let D = 16
+let E = 8
+let H = 32
+let K = 2
+let IV = 6
+let OV = 3
+let N = 8
+let T = 4
+let config = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+let embedding = t_zeros(DType.F64, [IV, E])
+let think = t_zeros(DType.F64, [E])
+let W1 = t_zeros(DType.F64, [H, E + 3 * D])
+let b1 = t_zeros(DType.F64, [H])
+let W2 = t_zeros(DType.F64, [3 * D, H])
+let b2 = t_zeros(DType.F64, [3 * D])
+let z_init = t_zeros(DType.C64, [D])
+let Mo = t_zeros(DType.C64, [OV, D])
+let ps = [embedding, think, W1, b1, W2, b2, z_init, Mo]
+for i in 0..ps.len() { fill_random(ps[i]) }
+let p = PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: Mo}
+let tokens = t_zeros(DType.I64, [N, T])
+var targets: [int] = []
+for row in 0..N {
+    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+av_reset()
+let m = pad_params(p, true)
+let loss = pad_loss(m, tokens, targets)
+av_backward(loss)
+
+let NAMES = ["LEAF","ADD","SUB","MUL","DIV","NEG","MATMUL","TANH","SUM_DIM","SUM_ALL","MEAN_ALL","ABS2","CONJ","REAL","IMAG","EXPI","COMPLEX","CONCAT","INDEX_SELECT","ROLL","TRANSPOSE","RESHAPE","SLICE","CAST","EXPAND","COS","SIN","LN","EXP"]
+var count: [int] = []
+for i in 0..NAMES.len() { count.push(0) }
+var cplx: [int] = []
+for i in 0..NAMES.len() { cplx.push(0) }
+for i in 0..A_NODES.len() {
+    let o = A_NODES[i].op
+    count[o] = count[o] + 1
+    if dtype_is_complex(A_VARS[i].v.dt) { cplx[o] = cplx[o] + 1 }
+}
+print("tape nodes: {A_NODES.len()}")
+print("op                count   of which complex")
+var reached = 0
+for i in 0..NAMES.len() {
+    if count[i] > 0 {
+        reached = reached + 1
+        print("  OP_{NAMES[i]}  {count[i]}  {cplx[i]}")
+    }
+}
+print("reached {reached} of {NAMES.len()} opcodes")
+var missing = ""
+for i in 0..NAMES.len() {
+    if count[i] == 0 { missing = missing + " " + NAMES[i] }
+}
+print("never reached:{missing}")

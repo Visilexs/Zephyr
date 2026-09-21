@@ -194,6 +194,43 @@ The benchmark is a tool rather than a suite entry: two minutes at the
 specification size is too slow for `run_tests.ps1`, and the correctness it
 depends on is already covered there by `ml-gpu`.
 
+## Op-coverage ledger (A23 scope, A41 requirement)
+
+Derived by `tools/op_census.zeph`, which runs one real full step -- forward
+and backward, real and complex -- and counts the opcodes the tape recorded.
+A hand-maintained list would be wrong within a week; this asks the model.
+
+426 tape nodes at D=16 E=8 H=32 K=2 batch 8 T=4. 25 distinct ops are reached
+(LEAF is not a recorded node; SUB and COMPLEX are implemented and tested but
+the phase model never uses them).
+
+| op | nodes | of which complex | | op | nodes | of which complex |
+|---|---|---|---|---|---|---|
+| MUL | 101 | 55 | | TRANSPOSE | 13 | 9 |
+| ADD | 41 | 29 | | TANH | 12 | 8 |
+| INDEX_SELECT | 40 | 21 | | COS | 12 | 6 |
+| CONCAT | 30 | 19 | | SIN | 12 | 5 |
+| SLICE | 30 | 11 | | ABS2 | 8 | 6 |
+| CAST | 25 | 10 | | RESHAPE | 7 | 5 |
+| CONJ | 18 | 11 | | EXPAND | 7 | 4 |
+| EXPI | 18 | 11 | | REAL | 6 | 5 |
+| NEG | 13 | 4 | | IMAG | 6 | 5 |
+| MATMUL | 13 | 10 | | ROLL | 6 | 5 |
+| SUM_DIM | 2 | 2 | | LN | 2 | 1 |
+| SUM_ALL | 1 | 0 | | MEAN_ALL | 1 | 0 |
+| DIV | 1 | 1 | | EXP | 1 | 0 |
+
+Only MATMUL is currently on the device, so A23 covers the other 24.
+
+The census also settles a question the earlier measurements raised. MATMUL is
+13 of 426 nodes, and it is the only one that is O(n^3); every other op here is
+O(n) or O(n^2) in its operands. Moving an O(n) op to the device costs an
+upload and a download of the same order as its work, against a host transfer
+path measured at 327 MiB/s, so per-op dispatch would make those ops slower
+rather than faster. A23's coverage requirement is therefore only compatible
+with a useful backend if tensors stay resident on the device between ops,
+which is the same lifetime problem A22 tests.
+
 ## Existing compute surface in this repository
 
 Surveyed before planning M5, so the milestone starts from what is actually
