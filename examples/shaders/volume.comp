@@ -1,0 +1,16 @@
+#version 450
+
+// Writes a value that varies along all three axes, so a bug that collapses
+// the volume to one slice, or indexes z as a layer, shows up as a mismatch
+// rather than as plausible-looking data.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r8ui, binding = 0) uniform uimage3D vol;
+
+layout(push_constant) uniform Dims { ivec3 size; } dims;
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, dims.size))) { return; }
+    uint v = uint((p.x * 5 + p.y * 7 + p.z * 11) % 251);
+    imageStore(vol, p, uvec4(v, 0, 0, 0));
+}

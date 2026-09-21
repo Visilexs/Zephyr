@@ -1,0 +1,685 @@
+// Voxel tracer: primary ray, sun shadow ray, and the guide buffers Ray
+// Reconstruction needs.
+//
+// Builds a world on the CPU, uploads it to an R8_UINT 3D image, traces it in a
+// compute shader, and reads colour, depth, normal and albedo back. The same DDA
+// then runs here on the CPU and every texel of all four is compared.
+//
+// The GPU works in 32-bit floats and Zephyr in 64-bit, so a ray grazing a voxel
+// corner could in principle enter a different cell on each side. Measured on an
+// RTX 5090 it never does for this scene, so the tolerance is zero disagreeing
+// pixels and the knobs are the +/-2 quantisation slack and the depth relative
+// tolerance. Loosen them deliberately if a scene needs it.
+//
+// Headless. Build the GLSL with glslangValidator, not zspv.
+import "vk/gfx.zeph"
+
+let VX = 64
+let VY = 32
+let VZ = 64
+let W = 320
+let H = 180
+
+// ---------------------------------------------------------------- world
+// Materials match palette() in the shader: 1 stone, 2 dirt, 3 grass, 5 ore.
+fn world_at(x: int, y: int, z: int) -> int {
+    if y < 5 { return 2 }
+    if y == 5 { return 3 }
+    // one stone pillar, with an ore seam through it
+    if x >= 20 and x < 28 and z >= 20 and z < 28 and y >= 6 and y < 18 {
+        if y >= 11 and y < 13 { return 5 }
+        return 1
+    }
+    // a second, shorter block off to one side, to give the camera two silhouettes
+    if x >= 40 and x < 46 and z >= 34 and z < 40 and y >= 6 and y < 11 { return 1 }
+    return 0
+}
+
+var layers: [str] = []
+for arg in args() {
+    if arg == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+
+var g = Gfx.make("zephyr-voxel", layers, 0, 0)
+print("gpu: {g.gpu_name()}")
+
+var vox = Bytes.new(VX * VY * VZ)
+var solid = 0
+for z in 0..VZ {
+    for y in 0..VY {
+        for x in 0..VX {
+            let m = world_at(x, y, z)
+            if m != 0 { solid += 1 }
+            vox.put8((z * VY + y) * VX + x, m)
+        }
+    }
+}
+print("world {VX}x{VY}x{VZ}, {solid} solid voxels")
+
+let vol = g.storage_image_3d(VX, VY, VZ, VK_FORMAT_R8_UINT)
+g.write_volume(vol, vox, 1)
+
+// Readback proves the upload before anything depends on it being right.
+let back = g.read_volume_from(vol, 1, VK_IMAGE_LAYOUT_GENERAL)
+var upload_bad = 0
+for i in 0..(VX * VY * VZ) { if back.get8(i) != vox.get8(i) { upload_bad += 1 } }
+assert(upload_bad == 0, "volume upload round-trip lost {upload_bad} voxels")
+print("PASS: volume upload verified, {VX * VY * VZ} voxels round-tripped")
+
+let target = g.storage_image(W, H)
+// Guide buffers for Ray Reconstruction. Depth is linear ray t in a float
+// image; normal and albedo are 8-bit, which is all RR wants for them.
+let gdepth = g.storage_image_3d(W, H, 1, VK_FORMAT_R32_SFLOAT)
+let gnormal = g.storage_image(W, H)
+let galbedo = g.storage_image(W, H)
+let gmotion = g.storage_image_3d(W, H, 1, VK_FORMAT_R16G16B16A16_SFLOAT)
+let grough = g.storage_image(W, H)
+let descriptors = g.storage_images_set([vol, target, gdepth, gnormal, galbedo, gmotion, grough],
+                                       VK_SHADER_STAGE_COMPUTE_BIT)
+let shader = g.shader("examples/shaders/voxel.comp.spv")
+let entry = cbytes("main")
+// 192 bytes is past the 128 the spec guarantees, so say so plainly rather
+// than letting vkCreatePipelineLayout fail somewhere else.
+let PCSIZE = 192
+let pcmax = g.max_push_constants()
+assert(pcmax >= PCSIZE, "device allows {pcmax} push constant bytes, this needs {PCSIZE}")
+let layout = g.pipeline_layout([descriptors.layout], PCSIZE, VK_SHADER_STAGE_COMPUTE_BIT)
+let pipeline = g.compute_pipeline(shader, layout, entry)
+let sets = u64s([descriptors.set])
+
+// ---------------------------------------------------------------- camera
+// Fixed basis, no matrix code: the camera looks along +Z and tilts down, so
+// right is +X and up is derived from the forward vector.
+let cam_x = 32.0
+let cam_y = 22.0
+let cam_z = -18.0
+let fwd_x = 0.0
+let fwd_y = -0.35
+let fwd_z = 1.0
+let flen = sqrt(fwd_x * fwd_x + fwd_y * fwd_y + fwd_z * fwd_z)
+let fx = fwd_x / flen
+let fy = fwd_y / flen
+let fz = fwd_z / flen
+// right = normalize(cross(worldUp, fwd)) with worldUp = +Y
+let rx = 1.0 * fz - 0.0 * fy
+let ry = 0.0
+let rz = 0.0 * fy - 1.0 * fx
+let rlen = sqrt(rx * rx + ry * ry + rz * rz)
+let ux = fy * (rz / rlen) - fz * ry
+let uy = fz * (rx / rlen) - fx * (rz / rlen)
+let uz = fx * ry - fy * (rx / rlen)
+let tan_half = 0.5773502691896258       // 60 degree vertical field of view
+let exposure = 2.0        // must match the shader
+let SPP = 2               // bounce samples per pixel
+let FRAME = 0
+let sun_x = 0.4
+let sun_y = 0.82
+let sun_z = 0.41
+
+// Previous-frame camera. Shifted rather than equal, so the motion vectors
+// below are exercised instead of being uniformly zero.
+let prev_cam_x = cam_x - 1.5
+let prev_cam_y = cam_y
+let prev_cam_z = cam_z
+
+// Halton, the sequence Ray Reconstruction expects to be told about.
+fn halton(index: int, base: int) -> float {
+    var f = 1.0
+    var r = 0.0
+    var i = index
+    while i > 0 {
+        f = f / (base as float)
+        r = r + f * ((i % base) as float)
+        i = i / base
+    }
+    return r
+}
+let jitter_x = halton(FRAME + 1, 2) - 0.5
+let jitter_y = halton(FRAME + 1, 3) - 0.5
+
+var pc = Bytes.new(PCSIZE)
+pc.put32(0, VX)
+pc.put32(4, VY)
+pc.put32(8, VZ)
+pc.put32(16, W)
+pc.put32(20, H)
+pc.put32(24, SPP)
+pc.put32(28, FRAME)
+pc.putf32(32, cam_x)
+pc.putf32(36, cam_y)
+pc.putf32(40, cam_z)
+pc.putf32(48, rx / rlen)
+pc.putf32(52, ry)
+pc.putf32(56, rz / rlen)
+pc.putf32(64, ux)
+pc.putf32(68, uy)
+pc.putf32(72, uz)
+pc.putf32(80, fx)
+pc.putf32(84, fy)
+pc.putf32(88, fz)
+pc.putf32(96, tan_half)
+pc.putf32(100, sun_x)
+pc.putf32(104, sun_y)
+pc.putf32(108, sun_z)
+pc.putf32(112, prev_cam_x)
+pc.putf32(116, prev_cam_y)
+pc.putf32(120, prev_cam_z)
+pc.putf32(128, rx / rlen)
+pc.putf32(132, ry)
+pc.putf32(136, rz / rlen)
+pc.putf32(144, ux)
+pc.putf32(148, uy)
+pc.putf32(152, uz)
+pc.putf32(160, fx)
+pc.putf32(164, fy)
+pc.putf32(168, fz)
+pc.putf32(176, jitter_x)
+pc.putf32(180, jitter_y)
+
+let pca = pc.addr()
+let pl = layout
+let dsti = target.image
+let gdi = gdepth.image
+let gni = gnormal.image
+let gai = galbedo.image
+let gmi = gmotion.image
+let gri = grough.image
+g.immediate(fn(cb: int) {
+    image_barrier(cb, dsti, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    image_barrier(cb, gdi, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    image_barrier(cb, gni, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    image_barrier(cb, gai, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    image_barrier(cb, gmi, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    image_barrier(cb, gri, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, sets.addr(), 0, 0)
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, PCSIZE, pca)
+    vkCmdDispatch(cb, (W + 7) / 8, (H + 7) / 8, 1)
+    image_barrier(cb, dsti, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+})
+print("traced {W}x{H}")
+
+let px = g.read_image(dsti, W, H)
+let gd = g.read_volume_from(gdepth, 4, VK_IMAGE_LAYOUT_GENERAL)
+let gn = g.read_volume_from(gnormal, 4, VK_IMAGE_LAYOUT_GENERAL)
+let ga = g.read_volume_from(galbedo, 4, VK_IMAGE_LAYOUT_GENERAL)
+let gm = g.read_volume_from(gmotion, 8, VK_IMAGE_LAYOUT_GENERAL)
+let gr = g.read_volume_from(grough, 4, VK_IMAGE_LAYOUT_GENERAL)
+
+// ---------------------------------------------------------------- CPU mirror
+struct Hit { hit: bool, t: float, nx: float, ny: float, nz: float, mat: int }
+
+fn vox_at(v: Bytes, x: int, y: int, z: int) -> int {
+    if x < 0 or y < 0 or z < 0 or x >= VX or y >= VY or z >= VZ { return 0 }
+    return v.get8((z * VY + y) * VX + x)
+}
+
+fn ifloor(a: float) -> int {
+    let i = a as int
+    if (a < 0.0) and ((i as float) != a) { return i - 1 }
+    return i
+}
+
+fn trace_vox(v: Bytes, ox: float, oy: float, oz: float,
+             dx: float, dy: float, dz: float, tmax: float) -> Hit {
+    var px = ifloor(ox)
+    var py = ifloor(oy)
+    var pz = ifloor(oz)
+    var sx = 0 - 1
+    var sy = 0 - 1
+    var sz = 0 - 1
+    if dx >= 0.0 { sx = 1 }
+    if dy >= 0.0 { sy = 1 }
+    if dz >= 0.0 { sz = 1 }
+    var ax = abs(dx)
+    var ay = abs(dy)
+    var az = abs(dz)
+    if ax < 0.00000001 { ax = 0.00000001 }
+    if ay < 0.00000001 { ay = 0.00000001 }
+    if az < 0.00000001 { az = 0.00000001 }
+    let aix = 1.0 / ax
+    let aiy = 1.0 / ay
+    let aiz = 1.0 / az
+    var tsx = (ox - (px as float)) * aix
+    var tsy = (oy - (py as float)) * aiy
+    var tsz = (oz - (pz as float)) * aiz
+    if dx >= 0.0 { tsx = ((px as float) + 1.0 - ox) * aix }
+    if dy >= 0.0 { tsy = ((py as float) + 1.0 - oy) * aiy }
+    if dz >= 0.0 { tsz = ((pz as float) + 1.0 - oz) * aiz }
+
+    var t = 0.0
+    var axis = 1
+    for i in 0..700 {
+        if t > tmax { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        let m = vox_at(v, px, py, pz)
+        if m != 0 {
+            var nx = 0.0
+            var ny = 0.0
+            var nz = 0.0
+            if axis == 0 { nx = 0.0 - (sx as float) }
+            if axis == 1 { ny = 0.0 - (sy as float) }
+            if axis == 2 { nz = 0.0 - (sz as float) }
+            return Hit{hit: true, t: t, nx: nx, ny: ny, nz: nz, mat: m}
+        }
+        if (py < 0 and sy < 0) or (py >= VY and sy > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        if (px < 0 and sx < 0) or (px >= VX and sx > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        if (pz < 0 and sz < 0) or (pz >= VZ and sz > 0) { return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0} }
+        if tsx < tsy and tsx < tsz {
+            px += sx
+            t = tsx
+            tsx += aix
+            axis = 0
+        } else if tsy < tsz {
+            py += sy
+            t = tsy
+            tsy += aiy
+            axis = 1
+        } else {
+            pz += sz
+            t = tsz
+            tsz += aiz
+            axis = 2
+        }
+    }
+    return Hit{hit: false, t: tmax, nx: 0.0, ny: 0.0, nz: 0.0, mat: 0}
+}
+
+// ---------------------------------------------------------------- rng
+// The shader's hash, in 64-bit ints masked back to 32 bits after every step.
+// Bit-exact with the GLSL, which is what lets the comparison stay exact.
+let U32 = 4294967295
+
+fn hashu(x0: int) -> int {
+    var x = x0 & U32
+    x = (x ^ (x >> 16)) & U32
+    x = (x * 2146121005) & U32
+    x = (x ^ (x >> 15)) & U32
+    x = (x * 2221713035) & U32
+    x = (x ^ (x >> 16)) & U32
+    return x
+}
+
+var g_seed = 0
+
+fn rnd() -> float {
+    g_seed = hashu(g_seed)
+    return (g_seed as float) * (1.0 / 4294967296.0)
+}
+
+fn emissive(m: int) -> float {
+    if m == 5 { return 5.0 }
+    if m == 6 { return 18.0 }
+    return 0.0
+}
+
+// Mirrors cosineHemisphere() in the shader, including the rejection loop and
+// the basis choice. Returns a unit direction in the hemisphere around n.
+fn cos_hemi(nx: float, ny: float, nz: float) -> [float] {
+    var u = 0.0
+    var v = 0.0
+    var r2 = 0.0
+    for i in 0..32 {
+        u = rnd() * 2.0 - 1.0
+        v = rnd() * 2.0 - 1.0
+        r2 = u * u + v * v
+        if r2 <= 1.0 { break }
+        u = 0.0
+        v = 0.0
+        r2 = 0.0
+    }
+    var tx = 1.0
+    var ty = 0.0
+    var tz = 0.0
+    if abs(ny) < 0.99 {
+        // cross(vec3(0,1,0), n) = (n.z, 0, -n.x), then normalised
+        let cx = nz
+        let cz = 0.0 - nx
+        let cl = sqrt(cx * cx + cz * cz)
+        tx = cx / cl
+        ty = 0.0
+        tz = cz / cl
+    }
+    let bx = ny * tz - nz * ty
+    let by = nz * tx - nx * tz
+    let bz = nx * ty - ny * tx
+    var w = 1.0 - r2
+    if w < 0.0 { w = 0.0 }
+    let sw = sqrt(w)
+    var dx = tx * u + bx * v + nx * sw
+    var dy = ty * u + by * v + ny * sw
+    var dz = tz * u + bz * v + nz * sw
+    let dl = sqrt(dx * dx + dy * dy + dz * dz)
+    return [dx / dl, dy / dl, dz / dl]
+}
+
+fn pal(m: int) -> [float] {
+    if m == 1 { return [0.44, 0.44, 0.47] }
+    if m == 2 { return [0.40, 0.29, 0.19] }
+    if m == 3 { return [0.26, 0.52, 0.19] }
+    if m == 4 { return [0.80, 0.72, 0.50] }
+    if m == 5 { return [1.00, 0.70, 0.22] }
+    if m == 6 { return [1.00, 0.94, 0.84] }
+    if m == 7 { return [0.68, 0.70, 0.78] }
+    return [0.0, 0.0, 0.0]
+}
+
+// IEEE half. Zephyr has no 16-bit float, and the motion buffer is rgba16f,
+// so the two bytes are reassembled by hand. Infinities and NaNs cannot occur
+// here: the shader writes zero when the projection is invalid.
+fn f16_from(bits: int) -> float {
+    let sgn = (bits >> 15) & 1
+    let exp = (bits >> 10) & 31
+    let man = bits & 1023
+    var v = 0.0
+    if exp == 0 {
+        v = (man as float) / 1024.0 * pow2(0 - 14)
+    } else {
+        v = (1.0 + (man as float) / 1024.0) * pow2(exp - 15)
+    }
+    if sgn == 1 { return 0.0 - v }
+    return v
+}
+
+fn pow2(e: int) -> float {
+    var r = 1.0
+    var n = e
+    while n > 0 {
+        r = r * 2.0
+        n -= 1
+    }
+    while n < 0 {
+        r = r / 2.0
+        n += 1
+    }
+    return r
+}
+
+fn half_at(b: Bytes, off: int) -> float {
+    return f16_from(b.get8(off) | (b.get8(off + 1) << 8))
+}
+
+// Linear 8-bit quantisation, for buffers that are data rather than display.
+fn lin(c: float) -> int {
+    var x = c
+    if x < 0.0 { x = 0.0 }
+    if x > 1.0 { x = 1.0 }
+    let q = (x * 255.0 + 0.5) as int
+    if q > 255 { return 255 }
+    return q
+}
+
+fn enc(c: float) -> int {
+    var x = c
+    if x < 0.0 { x = 0.0 }
+    if x > 1.0 { x = 1.0 }
+    let q = (sqrt(x) * 255.0 + 0.5) as int
+    if q > 255 { return 255 }
+    return q
+}
+
+let slen = sqrt(sun_x * sun_x + sun_y * sun_y + sun_z * sun_z)
+let snx = sun_x / slen
+let sny = sun_y / slen
+let snz = sun_z / slen
+let aspect = (W as float) / (H as float)
+
+var bad = 0
+var worst = 0
+var hits = 0
+var shadowed = 0
+var depth_bad = 0
+var normal_bad = 0
+var albedo_bad = 0
+var depth_first = ""
+var lit_by_bounce = 0
+var bounce_sum = 0.0
+var motion_bad = 0
+var motion_nonzero = 0
+var rough_bad = 0
+var motion_first = ""
+for y in 0..H {
+    for x in 0..W {
+        let uvx = (((x as float) + 0.5 + jitter_x) / (W as float) * 2.0 - 1.0) * aspect
+        let uvy = (((y as float) + 0.5 + jitter_y) / (H as float) * 2.0 - 1.0)
+        var ddx = (rx / rlen) * (uvx * tan_half) + ux * (uvy * tan_half) + fx
+        var ddy = ry * (uvx * tan_half) + uy * (uvy * tan_half) + fy
+        var ddz = (rz / rlen) * (uvx * tan_half) + uz * (uvy * tan_half) + fz
+        let dl = sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
+        ddx = ddx / dl
+        ddy = ddy / dl
+        ddz = ddz / dl
+
+        g_seed = hashu(x * 1973 + y * 9277 + FRAME * 26699 + 1)
+        let h = trace_vox(vox, cam_x, cam_y, cam_z, ddx, ddy, ddz, 512.0)
+        var cr = 0.0
+        var cg = 0.0
+        var cb = 0.0
+        if h.hit {
+            hits += 1
+            var lam = h.nx * snx + h.ny * sny + h.nz * snz
+            if lam < 0.0 { lam = 0.0 }
+            var shade = 0.0
+            if lam > 0.0 {
+                let hx = cam_x + ddx * h.t + h.nx * 0.001
+                let hy = cam_y + ddy * h.t + h.ny * 0.001
+                let hz = cam_z + ddz * h.t + h.nz * 0.001
+                let sh = trace_vox(vox, hx, hy, hz, snx, sny, snz, 512.0)
+                if not sh.hit {
+                    shade = lam
+                } else {
+                    shadowed += 1
+                }
+            }
+            // One diffuse bounce, same sequence as the shader.
+            let hx = cam_x + ddx * h.t + h.nx * 0.001
+            let hy = cam_y + ddy * h.t + h.ny * 0.001
+            let hz = cam_z + ddz * h.t + h.nz * 0.001
+            var ir = 0.0
+            var ig = 0.0
+            var ib = 0.0
+            for si in 0..SPP {
+                let bd = cos_hemi(h.nx, h.ny, h.nz)
+                let bh = trace_vox(vox, hx, hy, hz, bd[0], bd[1], bd[2], 512.0)
+                if bh.hit {
+                    var blam = bh.nx * snx + bh.ny * sny + bh.nz * snz
+                    if blam < 0.0 { blam = 0.0 }
+                    var bshade = 0.0
+                    if blam > 0.0 {
+                        let bx2 = hx + bd[0] * bh.t + bh.nx * 0.001
+                        let by2 = hy + bd[1] * bh.t + bh.ny * 0.001
+                        let bz2 = hz + bd[2] * bh.t + bh.nz * 0.001
+                        let s2 = trace_vox(vox, bx2, by2, bz2, snx, sny, snz, 512.0)
+                        if not s2.hit { bshade = blam }
+                    }
+                    let bk = 0.25 + 0.75 * bshade + emissive(bh.mat)
+                    let bp = pal(bh.mat)
+                    ir += bp[0] * bk
+                    ig += bp[1] * bk
+                    ib += bp[2] * bk
+                } else {
+                    var bf = bd[1] * 0.5 + 0.5
+                    if bf < 0.0 { bf = 0.0 }
+                    if bf > 1.0 { bf = 1.0 }
+                    ir += 0.52 + (0.14 - 0.52) * bf
+                    ig += 0.60 + (0.20 - 0.60) * bf
+                    ib += 0.72 + (0.34 - 0.72) * bf
+                }
+            }
+            if SPP > 0 {
+                ir = ir / (SPP as float)
+                ig = ig / (SPP as float)
+                ib = ib / (SPP as float)
+            }
+            if ir > 0.0 or ig > 0.0 or ib > 0.0 { lit_by_bounce += 1 }
+            bounce_sum += ir + ig + ib
+            let k = 0.25 + 0.75 * shade + emissive(h.mat)
+            let p = pal(h.mat)
+            cr = p[0] * k + p[0] * ir
+            cg = p[1] * k + p[1] * ig
+            cb = p[2] * k + p[2] * ib
+        } else {
+            var f = ddy * 0.5 + 0.5
+            if f < 0.0 { f = 0.0 }
+            if f > 1.0 { f = 1.0 }
+            cr = 0.52 + (0.14 - 0.52) * f
+            cg = 0.60 + (0.20 - 0.60) * f
+            cb = 0.72 + (0.34 - 0.72) * f
+        }
+        cr = cr * exposure
+        cg = cg * exposure
+        cb = cb * exposure
+        cr = cr / (1.0 + cr)
+        cg = cg / (1.0 + cg)
+        cb = cb / (1.0 + cb)
+
+        let o = (y * W + x) * 4
+
+        // Guide buffers, against the same hit. Depth is compared with a
+        // relative tolerance because it is a float32 round-trip; normal and
+        // albedo are 8-bit quantised so they get the same +/-2 as colour.
+        var want_d = 0.0
+        if h.hit { want_d = h.t }
+        let got_d = gd.getf32(o)
+        var dscale = want_d
+        if dscale < 1.0 { dscale = 1.0 }
+        if abs(got_d - want_d) > dscale * 0.0005 {
+            depth_bad += 1
+            if depth_bad == 1 { depth_first = "({x},{y}) got {got_d} want {want_d}" }
+        }
+        var wnx = 0.0
+        var wny = 0.0
+        var wnz = 0.0
+        if h.hit {
+            wnx = h.nx
+            wny = h.ny
+            wnz = h.nz
+        }
+        if (abs(gn.get8(o) - lin(wnx * 0.5 + 0.5)) > 2
+            or abs(gn.get8(o + 1) - lin(wny * 0.5 + 0.5)) > 2
+            or abs(gn.get8(o + 2) - lin(wnz * 0.5 + 0.5)) > 2) { normal_bad += 1 }
+        var wa = [0.0, 0.0, 0.0]
+        if h.hit { wa = pal(h.mat) }
+        if (abs(ga.get8(o) - lin(wa[0])) > 2
+            or abs(ga.get8(o + 1) - lin(wa[1])) > 2
+            or abs(ga.get8(o + 2) - lin(wa[2])) > 2) { albedo_bad += 1 }
+
+        // Motion: project the hit point through the previous camera, exactly
+        // as the shader does, and compare in pixels.
+        var wmx = 0.0
+        var wmy = 0.0
+        if h.hit {
+            let hwx = cam_x + ddx * h.t
+            let hwy = cam_y + ddy * h.t
+            let hwz = cam_z + ddz * h.t
+            let vx2 = hwx - prev_cam_x
+            let vy2 = hwy - prev_cam_y
+            let vz2 = hwz - prev_cam_z
+            let pz = vx2 * fx + vy2 * fy + vz2 * fz
+            if pz > 0.0001 {
+                let prj = vx2 * (rx / rlen) + vy2 * ry + vz2 * (rz / rlen)
+                let pyv = vx2 * ux + vy2 * uy + vz2 * uz
+                let pxc = prj / (pz * tan_half * aspect)
+                let pyc = pyv / (pz * tan_half)
+                wmx = (pxc * 0.5 + 0.5) * (W as float) - ((x as float) + 0.5 + jitter_x)
+                wmy = (pyc * 0.5 + 0.5) * (H as float) - ((y as float) + 0.5 + jitter_y)
+            }
+        }
+        let mo = (y * W + x) * 8
+        let gmx = half_at(gm, mo)
+        let gmy = half_at(gm, mo + 2)
+        if abs(gmx) > 0.01 or abs(gmy) > 0.01 { motion_nonzero += 1 }
+        // Half has about three decimal digits, so the tolerance is relative
+        // to the magnitude with an absolute floor for values near zero.
+        var mtol = abs(wmx) * 0.01
+        if mtol < 0.05 { mtol = 0.05 }
+        var mtoly = abs(wmy) * 0.01
+        if mtoly < 0.05 { mtoly = 0.05 }
+        if abs(gmx - wmx) > mtol or abs(gmy - wmy) > mtoly {
+            motion_bad += 1
+            if motion_bad == 1 { motion_first = "({x},{y}) got ({gmx},{gmy}) want ({wmx},{wmy})" }
+        }
+        if abs(gr.get8(o) - 255) > 2 or abs(gr.get8(o + 1) - lin(0.04)) > 2 { rough_bad += 1 }
+
+        let dr = abs(px.get8(o) - enc(cr))
+        let dg = abs(px.get8(o + 1) - enc(cg))
+        let db = abs(px.get8(o + 2) - enc(cb))
+        var d = dr
+        if dg > d { d = dg }
+        if db > d { d = db }
+        if d > 2 {
+            bad += 1
+            if d > worst { worst = d }
+        }
+    }
+}
+
+let total = W * H
+print("CPU mirror: {hits} of {total} pixels hit geometry, {shadowed} in shadow")
+print("disagreements beyond +/-2: {bad} of {total}, worst channel delta {worst}")
+
+// Measured exact on an RTX 5090: every pixel agrees within the tolerance. If a
+// later scene puts rays through voxel corners this is the knob to loosen, but
+// loosen it deliberately rather than discovering it has drifted.
+assert(bad == 0, "{bad} of {total} pixels disagree with the CPU trace, worst delta {worst}")
+assert(depth_bad == 0, "{depth_bad} depth texels disagree, first {depth_first}")
+assert(normal_bad == 0, "{normal_bad} normal texels disagree")
+assert(albedo_bad == 0, "{albedo_bad} albedo texels disagree")
+assert(motion_bad == 0, "{motion_bad} motion texels disagree, first {motion_first}")
+assert(rough_bad == 0, "{rough_bad} roughness texels disagree")
+assert(motion_nonzero * 2 > hits, "motion vectors are near zero almost everywhere ({motion_nonzero} of {hits})")
+print("PASS: depth, normal, albedo, motion and roughness guide buffers match the CPU trace")
+print("      {motion_nonzero} of {hits} hit pixels have a non-zero motion vector")
+
+// Agreement alone would also hold if the bounce were zero on both sides,
+// so the indirect term has to be shown to exist and to vary.
+assert(lit_by_bounce * 4 > hits * 3,
+       "only {lit_by_bounce} of {hits} lit pixels received any bounce light")
+assert(bounce_sum > 0.0, "the diffuse bounce contributed nothing at all")
+print("PASS: {lit_by_bounce} of {hits} hit pixels received bounce light")
+
+// An axis-aligned probe has no corner ambiguity, so it must be exact. Straight
+// down from above the pillar must land on its top face at y=17.
+let probe = trace_vox(vox, 24.5, 30.0, 24.5, 0.0, 0.0 - 1.0, 0.0, 512.0)
+assert(probe.hit, "probe ray missed the pillar")
+assert(probe.mat == 1, "probe hit material {probe.mat}, expected stone")
+assert(probe.ny == 1.0, "probe normal is not +Y")
+let want_t = 30.0 - 18.0
+assert(abs(probe.t - want_t) < 0.0001, "probe t = {probe.t}, expected {want_t}")
+print("PASS: probe ray hit stone top face at t={probe.t}, normal +Y")
+
+// The image must not be uniform, which would pass a tolerance check trivially.
+var lo = 255
+var hi = 0
+for i in 0..total {
+    let v = px.get8(i * 4)
+    if v < lo { lo = v }
+    if v > hi { hi = v }
+}
+assert(hi - lo > 40, "rendered image is nearly uniform, red range {lo}..{hi}")
+print("PASS: red channel spans {lo}..{hi}")
+
+write_bmp("voxel.bmp", px, W, H)
+print("wrote voxel.bmp ({W}x{H})")
+
+g.destroy_image(grough)
+g.destroy_image(gmotion)
+g.destroy_image(galbedo)
+g.destroy_image(gnormal)
+g.destroy_image(gdepth)
+g.destroy_image(target)
+g.destroy_image(vol)
+print("PASS: tracer resources destroyed cleanly")

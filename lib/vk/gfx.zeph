@@ -36,6 +36,7 @@ struct Frame {
 // A presentable swapchain plus the per-image views and framebuffers.
 struct Swapchain {
     handle: int,
+    usage: int,
     format: int,
     w: int,
     h: int,
@@ -67,6 +68,23 @@ let FRAMES_IN_FLIGHT = 2
 
 struct GpuBuffer { buf: int, mem: int, size: int }
 
+// An owned RGBA8 storage image; layout transitions remain explicit commands.
+// `d` is 1 for a 2D image and the slice count for a 3D one; `fmt` is the
+// VK_FORMAT_* it was created with, which readback needs to size a texel.
+struct GpuImage { image: int, mem: int, view: int, w: int, h: int, d: int, fmt: int }
+
+// Transition one colour mip/layer on the same queue, with an explicit dependency.
+fn image_barrier(cb: int, image: int, old_layout: int, new_layout: int,
+                 src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+    let barrier = VkImageMemoryBarrier.new().image(image)
+        .oldLayout(old_layout).newLayout(new_layout)
+        .srcAccessMask(src_access).dstAccessMask(dst_access)
+        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+        .subresourceRange_aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+        .subresourceRange_levelCount(1).subresourceRange_layerCount(1)
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barrier.addr())
+}
+
 // an offscreen colour target: image + view + framebuffer
 struct Target { image: int, mem: int, view: int, fb: int, w: int, h: int }
 
@@ -82,6 +100,19 @@ impl Gfx {
     }
 
     fn make(appname: str, layers: [str], hwnd: int, hinst: int) -> Gfx {
+        var none_i: [str] = []
+        var none_d: [str] = []
+        return Gfx.make_ext(appname, layers, hwnd, hinst, none_i, none_d)
+    }
+
+    // As make(), plus extensions the caller needs enabled at creation time.
+    // NGX is the reason this exists: DLSS wants VK_NVX_binary_import,
+    // VK_NVX_image_view_handle, VK_EXT_buffer_device_address and
+    // VK_KHR_push_descriptor on the device and
+    // VK_KHR_get_physical_device_properties2 on the instance, and if they are
+    // missing it fails later and unhelpfully rather than here.
+    fn make_ext(appname: str, layers: [str], hwnd: int, hinst: int,
+                extra_inst: [str], extra_dev: [str]) -> Gfx {
         let windowed = hwnd != 0
         var nameb = cbytes(appname)
         var app = Bytes.new(VkApplicationInfo_sizeof)
@@ -105,6 +136,7 @@ impl Gfx {
             exts.push("VK_KHR_surface")
             exts.push("VK_KHR_win32_surface")
         }
+        for e in extra_inst { exts.push(e) }
         var enames = Bytes.new(8 * (exts.len() + 1))
         var ebufs: [Bytes] = []
         for i in 0..exts.len() {
@@ -121,9 +153,10 @@ impl Gfx {
         ici.put32(VkInstanceCreateInfo_enabledExtensionCount, exts.len())
         if exts.len() > 0 { ici.put64(VkInstanceCreateInfo_ppEnabledExtensionNames, enames.addr()) }
 
-        var pinst = Bytes.new(8)
+        var pinst = vk_output(8)
         vkcheck(vkCreateInstance(ici.addr(), 0, pinst.addr()), "vkCreateInstance")
         let instance = pinst.get64(0)
+        vk_free_output(pinst)
 
         // the surface must exist before device selection so we can require
         // presentation support on the queue family we pick
@@ -133,20 +166,21 @@ impl Gfx {
             sci.put32(VkWin32SurfaceCreateInfoKHR_sType, VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR)
             sci.put64(VkWin32SurfaceCreateInfoKHR_hinstance, hinst)
             sci.put64(VkWin32SurfaceCreateInfoKHR_hwnd, hwnd)
-            var ps = Bytes.new(8)
+            var ps = vk_output(8)
             vkcheck(vkCreateWin32SurfaceKHR(instance, sci.addr(), 0, ps.addr()), "vkCreateWin32SurfaceKHR")
             surface = ps.get64(0)
+            vk_free_output(ps)
         }
 
         // pick a physical device: prefer a discrete GPU
-        var pcount = Bytes.new(8)
+        var pcount = vk_output(8)
         vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), 0), "vkEnumeratePhysicalDevices")
         let ndev = pcount.get32(0)
         if ndev == 0 { panic("no Vulkan physical devices") }
-        var devs = Bytes.new(8 * ndev)
+        var devs = vk_output(8 * ndev)
         vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), devs.addr()), "vkEnumeratePhysicalDevices")
         var phys = devs.get64(0)
-        var props = Bytes.new(VkPhysicalDeviceProperties_sizeof)
+        var props = vk_output(VkPhysicalDeviceProperties_sizeof)
         for i in 0..ndev {
             let d = devs.get64(i * 8)
             vkGetPhysicalDeviceProperties(d, props.addr())
@@ -155,14 +189,18 @@ impl Gfx {
             }
         }
 
+        vk_free_output(pcount)
+        vk_free_output(devs)
+        vk_free_output(props)
+
         // a queue family that can do graphics
-        var qcount = Bytes.new(8)
+        var qcount = vk_output(8)
         vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), 0)
         let nq = qcount.get32(0)
-        var qprops = Bytes.new(VkQueueFamilyProperties_sizeof * nq)
+        var qprops = vk_output(VkQueueFamilyProperties_sizeof * nq)
         vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), qprops.addr())
         var qfam = 0 - 1
-        var psup = Bytes.new(8)
+        var psup = vk_output(8)
         for i in 0..nq {
             let f = qprops.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
             if qfam < 0 and (f & VK_QUEUE_GRAPHICS_BIT) != 0 {
@@ -175,6 +213,9 @@ impl Gfx {
                 }
             }
         }
+        vk_free_output(qcount)
+        vk_free_output(qprops)
+        vk_free_output(psup)
         if qfam < 0 { panic("no graphics queue family that can present") }
 
         var prio = Bytes.new(4)
@@ -187,6 +228,7 @@ impl Gfx {
 
         var dexts: [str] = []
         if windowed { dexts.push("VK_KHR_swapchain") }
+        for e in extra_dev { dexts.push(e) }
         var dnames = Bytes.new(8 * (dexts.len() + 1))
         var dbufs: [Bytes] = []
         for i in 0..dexts.len() {
@@ -201,25 +243,30 @@ impl Gfx {
         dci.put64(VkDeviceCreateInfo_pQueueCreateInfos, qci.addr())
         dci.put32(VkDeviceCreateInfo_enabledExtensionCount, dexts.len())
         if dexts.len() > 0 { dci.put64(VkDeviceCreateInfo_ppEnabledExtensionNames, dnames.addr()) }
-        var pdev = Bytes.new(8)
+        var pdev = vk_output(8)
         vkcheck(vkCreateDevice(phys, dci.addr(), 0, pdev.addr()), "vkCreateDevice")
         let dev = pdev.get64(0)
+        vk_free_output(pdev)
 
-        var pq = Bytes.new(8)
+        var pq = vk_output(8)
         vkGetDeviceQueue(dev, qfam, 0, pq.addr())
 
         var cpci = Bytes.new(VkCommandPoolCreateInfo_sizeof)
         cpci.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
         cpci.put32(VkCommandPoolCreateInfo_flags, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
         cpci.put32(VkCommandPoolCreateInfo_queueFamilyIndex, qfam)
-        var pool = Bytes.new(8)
+        var pool = vk_output(8)
         vkcheck(vkCreateCommandPool(dev, cpci.addr(), 0, pool.addr()), "vkCreateCommandPool")
 
-        var mp = Bytes.new(VkPhysicalDeviceMemoryProperties_sizeof)
+        var mp = vk_output(VkPhysicalDeviceMemoryProperties_sizeof)
         vkGetPhysicalDeviceMemoryProperties(phys, mp.addr())
 
-        return Gfx{instance: instance, phys: phys, dev: dev, queue: pq.get64(0),
-                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface}
+        let queue = pq.get64(0)
+        let cmdpool = pool.get64(0)
+        vk_free_output(pq)
+        vk_free_output(pool)
+        return Gfx{instance: instance, phys: phys, dev: dev, queue: queue,
+                   qfam: qfam, cmdpool: cmdpool, memprops: mp, surface: surface}
     }
 
     fn shutdown(self) {
@@ -228,10 +275,11 @@ impl Gfx {
         vkDestroyDevice(self.dev, 0)
         if self.surface != 0 { vkDestroySurfaceKHR(self.instance, self.surface, 0) }
         vkDestroyInstance(self.instance, 0)
+        vk_free_output(self.memprops)
     }
 
     fn gpu_name(self) -> str {
-        var props = Bytes.new(VkPhysicalDeviceProperties_sizeof)
+        var props = vk_output(VkPhysicalDeviceProperties_sizeof)
         vkGetPhysicalDeviceProperties(self.phys, props.addr())
         var out: [str] = []
         var i = 0
@@ -242,6 +290,7 @@ impl Gfx {
             else { out.push(chr(c)) }
             i += 1
         }
+        vk_free_output(props)
         return out.join()
     }
 
@@ -264,9 +313,11 @@ impl Gfx {
         mai.put32(VkMemoryAllocateInfo_sType, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
         mai.put64(VkMemoryAllocateInfo_allocationSize, size)
         mai.put32(VkMemoryAllocateInfo_memoryTypeIndex, self.find_mem_type(typebits, flags))
-        var pm = Bytes.new(8)
+        let pm = vk_output(8)
         vkcheck(vkAllocateMemory(self.dev, mai.addr(), 0, pm.addr()), "vkAllocateMemory")
-        return pm.get64(0)
+        let mem = pm.get64(0)
+        vk_free_output(pm)
+        return mem
     }
 
     fn buffer(self, size: int, usage: int, memflags: int) -> GpuBuffer {
@@ -275,14 +326,13 @@ impl Gfx {
         bci.put64(VkBufferCreateInfo_size, size)
         bci.put32(VkBufferCreateInfo_usage, usage)
         bci.put32(VkBufferCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
-        var pb = Bytes.new(8)
-        vkcheck(vkCreateBuffer(self.dev, bci.addr(), 0, pb.addr()), "vkCreateBuffer")
-        let buf = pb.get64(0)
-
-        var req = Bytes.new(VkMemoryRequirements_sizeof)
-        vkGetBufferMemoryRequirements(self.dev, buf, req.addr())
-        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
-                             req.get32(VkMemoryRequirements_memoryTypeBits), memflags)
+        let out = vk_output(VkMemoryRequirements_sizeof)
+        vkcheck(vkCreateBuffer(self.dev, bci.addr(), 0, out.addr()), "vkCreateBuffer")
+        let buf = out.get64(0)
+        vkGetBufferMemoryRequirements(self.dev, buf, out.addr())
+        let mem = self.alloc(out.get64(VkMemoryRequirements_size),
+                             out.get32(VkMemoryRequirements_memoryTypeBits), memflags)
+        vk_free_output(out)
         vkcheck(vkBindBufferMemory(self.dev, buf, mem, 0), "vkBindBufferMemory")
         return GpuBuffer{buf: buf, mem: mem, size: size}
     }
@@ -294,9 +344,11 @@ impl Gfx {
 
     // read a mapped host-visible buffer back into a Bytes
     fn read_buffer(self, b: GpuBuffer, n: int) -> Bytes {
-        var pp = Bytes.new(8)
+        assert(n >= 0 and n <= b.size, "read_buffer exceeds buffer size")
+        let pp = vk_output(8)
         vkcheck(vkMapMemory(self.dev, b.mem, 0, b.size, 0, pp.addr()), "vkMapMemory")
         let src = pp.get64(0)
+        vk_free_output(pp)
         var out = Bytes.new(n)
         for i in 0..n { out.put8(i, load8(src + i)) }
         vkUnmapMemory(self.dev, b.mem)
@@ -314,9 +366,11 @@ impl Gfx {
         smci.put32(VkShaderModuleCreateInfo_sType, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
         smci.put64(VkShaderModuleCreateInfo_codeSize, spv.len())
         smci.put64(VkShaderModuleCreateInfo_pCode, code.addr())
-        var pm = Bytes.new(8)
+        var pm = vk_output(8)
         vkcheck(vkCreateShaderModule(self.dev, smci.addr(), 0, pm.addr()), "vkCreateShaderModule")
-        return pm.get64(0)
+        let handle = pm.get64(0)
+        vk_free_output(pm)
+        return handle
     }
 
     // an offscreen RGBA8 colour target, ready to render into and copy out of
@@ -335,15 +389,17 @@ impl Gfx {
         ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
         ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
-        var pi = Bytes.new(8)
+        var pi = vk_output(8)
         vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage")
         let image = pi.get64(0)
+        vk_free_output(pi)
 
-        var req = Bytes.new(VkMemoryRequirements_sizeof)
+        var req = vk_output(VkMemoryRequirements_sizeof)
         vkGetImageMemoryRequirements(self.dev, image, req.addr())
         let mem = self.alloc(req.get64(VkMemoryRequirements_size),
                              req.get32(VkMemoryRequirements_memoryTypeBits),
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        vk_free_output(req)
         vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory")
 
         var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
@@ -355,9 +411,10 @@ impl Gfx {
         vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
         vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
         vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-        var pv = Bytes.new(8)
+        var pv = vk_output(8)
         vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
         let view = pv.get64(0)
+        vk_free_output(pv)
 
         var att = Bytes.new(8)
         att.put64(0, view)
@@ -369,10 +426,12 @@ impl Gfx {
         fci.put32(VkFramebufferCreateInfo_width, w)
         fci.put32(VkFramebufferCreateInfo_height, h)
         fci.put32(VkFramebufferCreateInfo_layers, 1)
-        var pf = Bytes.new(8)
+        var pf = vk_output(8)
         vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
 
-        return Target{image: image, mem: mem, view: view, fb: pf.get64(0), w: w, h: h}
+        let fb = pf.get64(0)
+        vk_free_output(pf)
+        return Target{image: image, mem: mem, view: view, fb: fb, w: w, h: h}
     }
 
     fn destroy_target(self, t: Target) {
@@ -391,9 +450,10 @@ impl Gfx {
         cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
         cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
         cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
-        var pcb = Bytes.new(8)
+        var pcb = vk_output(8)
         vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
         let cb = pcb.get64(0)
+        vk_free_output(pcb)
 
         var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
         bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
@@ -411,7 +471,7 @@ impl Gfx {
 
         var fci = Bytes.new(VkFenceCreateInfo_sizeof)
         fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
-        var pfence = Bytes.new(8)
+        var pfence = vk_output(8)
         vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pfence.addr()), "vkCreateFence")
         let fence = pfence.get64(0)
 
@@ -419,28 +479,127 @@ impl Gfx {
         // 5 second timeout in nanoseconds
         vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
 
+        vk_free_output(pfence)
         vkDestroyFence(self.dev, fence, 0)
         vkFreeCommandBuffers(self.dev, self.cmdpool, 1, pcbs.addr())
     }
 
     // copy a rendered target into a host-visible buffer and read it back as RGBA8
     fn readback(self, t: Target) -> Bytes {
-        let n = t.w * t.h * 4
+        return self.read_image(t.image, t.w, t.h)
+    }
+
+    // Read one RGBA8 colour mip/layer, already in TRANSFER_SRC_OPTIMAL with writes made
+    // visible to transfer reads. Wait for the copy before mapping coherent memory.
+    fn read_image(self, image: int, w: int, h: int) -> Bytes {
+        let n = w * h * 4
         var dst = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         var region = Bytes.new(VkBufferImageCopy_sizeof)
         let isr = VkBufferImageCopy_imageSubresource
         region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
         region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, t.w)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, t.h)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, w)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, h)
         region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, 1)
 
-        let img = t.image
+        let img = image
         let ra = region.addr()
         let db = dst.buf
         self.immediate(fn(cb: int) {
             vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, db, 1, ra)
+            let host = VkMemoryBarrier.new()
+                .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT)
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, host.addr(), 0, 0, 0, 0)
+        })
+        var px = self.read_buffer(dst, n)
+        self.destroy_buffer(dst)
+        return px
+    }
+
+    // Fill a 3D image from host memory and leave it in GENERAL, ready for a
+    // compute shader to read. `src` is slice 0 first, `bpp` bytes per texel.
+    fn write_volume(self, img: GpuImage, src: Bytes, bpp: int) {
+        let n = img.w * img.h * img.d * bpp
+        assert(src.len() >= n, "write_volume source is smaller than the image")
+        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let pp = vk_output(8)
+        vkcheck(vkMapMemory(self.dev, stage.mem, 0, n, 0, pp.addr()), "vkMapMemory (write_volume)")
+        let dstp = pp.get64(0)
+        vk_free_output(pp)
+        for i in 0..n { store8(dstp + i, src.get8(i)) }
+        vkUnmapMemory(self.dev, stage.mem)
+
+        var region = Bytes.new(VkBufferImageCopy_sizeof)
+        let isr = VkBufferImageCopy_imageSubresource
+        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, img.w)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, img.h)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, img.d)
+
+        let image = img.image
+        let ra = region.addr()
+        let sb = stage.buf
+        self.immediate(fn(cb: int) {
+            image_barrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT)
+            vkCmdCopyBufferToImage(cb, sb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, ra)
+            image_barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+        })
+        self.destroy_buffer(stage)
+    }
+
+    // Read a whole 3D image back, slice 0 first, `bpp` bytes per texel (1 for
+    // R8_UINT). One copy covers every slice: VkBufferImageCopy takes a depth
+    // extent, and the rows of slice z land at z * w * h * bpp.
+    // `from` is the layout the image is in now; it is restored afterwards, so
+    // a readback can be dropped into the middle of a frame without disturbing
+    // anything. Pass VK_IMAGE_LAYOUT_GENERAL for an image a compute shader is
+    // using, which is the usual case.
+    fn read_volume_from(self, img: GpuImage, bpp: int, from: int) -> Bytes {
+        let image = img.image
+        self.immediate(fn(cb: int) {
+            image_barrier(cb, image, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+        })
+        let px = self.read_volume(image, img.w, img.h, img.d, bpp)
+        self.immediate(fn(cb: int) {
+            image_barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, from,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT)
+        })
+        return px
+    }
+
+    // Raw readback: the image must already be in TRANSFER_SRC_OPTIMAL.
+    fn read_volume(self, image: int, w: int, h: int, d: int, bpp: int) -> Bytes {
+        let n = w * h * d * bpp
+        var dst = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        var region = Bytes.new(VkBufferImageCopy_sizeof)
+        let isr = VkBufferImageCopy_imageSubresource
+        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, w)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, h)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, d)
+
+        let img = image
+        let ra = region.addr()
+        let db = dst.buf
+        self.immediate(fn(cb: int) {
+            vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, db, 1, ra)
+            let host = VkMemoryBarrier.new()
+                .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT)
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, host.addr(), 0, 0, 0, 0)
         })
         var px = self.read_buffer(dst, n)
         self.destroy_buffer(dst)
@@ -453,12 +612,12 @@ impl Gfx {
     // Pick the surface format: prefer plain BGRA8 UNORM so the colours we write
     // land on screen unchanged (an _SRGB swapchain would re-encode them).
     fn surface_format(self) -> int {
-        var pc = Bytes.new(8)
+        var pc = vk_output(8)
         vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), 0),
                 "vkGetPhysicalDeviceSurfaceFormatsKHR")
         let n = pc.get32(0)
         if n == 0 { panic("surface reports no formats") }
-        var fmts = Bytes.new(VkSurfaceFormatKHR_sizeof * n)
+        var fmts = vk_output(VkSurfaceFormatKHR_sizeof * n)
         vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), fmts.addr()),
                 "vkGetPhysicalDeviceSurfaceFormatsKHR")
         var chosen = fmts.get32(VkSurfaceFormatKHR_format)
@@ -466,6 +625,8 @@ impl Gfx {
             let f = fmts.get32(i * VkSurfaceFormatKHR_sizeof + VkSurfaceFormatKHR_format)
             if f == VK_FORMAT_B8G8R8A8_UNORM { chosen = f }
         }
+        vk_free_output(pc)
+        vk_free_output(fmts)
         return chosen
     }
 
@@ -489,15 +650,17 @@ impl Gfx {
         ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
         ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
         ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
-        var pi = Bytes.new(8)
+        var pi = vk_output(8)
         vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage (depth)")
         let image = pi.get64(0)
+        vk_free_output(pi)
 
-        var req = Bytes.new(VkMemoryRequirements_sizeof)
+        var req = vk_output(VkMemoryRequirements_sizeof)
         vkGetImageMemoryRequirements(self.dev, image, req.addr())
         let mem = self.alloc(req.get64(VkMemoryRequirements_size),
                              req.get32(VkMemoryRequirements_memoryTypeBits),
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        vk_free_output(req)
         vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory (depth)")
 
         var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
@@ -509,13 +672,14 @@ impl Gfx {
         vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_DEPTH_BIT)
         vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
         vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-        var pv = Bytes.new(8)
+        var pv = vk_output(8)
         vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView (depth)")
 
         var out: [int] = []
         out.push(image)
         out.push(mem)
         out.push(pv.get64(0))
+        vk_free_output(pv)
         return out
     }
 
@@ -523,14 +687,23 @@ impl Gfx {
     // 1. `depth_format` of 0 means no depth, which is what swapchain() passes.
     // The render pass must agree: attachment 0 colour, attachment 1 depth.
     fn swapchain_depth(self, format: int, renderpass: int, old: int, depth_format: int) -> Swapchain {
-        var caps = Bytes.new(VkSurfaceCapabilitiesKHR_sizeof)
+        return self.swapchain_usage(format, renderpass, old, depth_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+    }
+
+    // A transfer-only swapchain needs no views or framebuffers (renderpass = 0).
+    // Existing render-pass callers retain their original usage and frame behavior.
+    fn swapchain_usage(self, format: int, renderpass: int, old: int, depth_format: int, usage: int) -> Swapchain {
+        var caps = vk_output(VkSurfaceCapabilitiesKHR_sizeof)
         vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
         let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
         let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        assert((caps.get32(VkSurfaceCapabilitiesKHR_supportedUsageFlags) & usage) == usage,
+               "surface does not support requested swapchain image usage")
         var want = caps.get32(VkSurfaceCapabilitiesKHR_minImageCount) + 1
         let maxi = caps.get32(VkSurfaceCapabilitiesKHR_maxImageCount)
         if maxi > 0 and want > maxi { want = maxi }
+        vk_free_output(caps)
 
         var sci = Bytes.new(VkSwapchainCreateInfoKHR_sizeof)
         sci.put32(VkSwapchainCreateInfoKHR_sType, VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR)
@@ -541,7 +714,7 @@ impl Gfx {
         sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_width, w)
         sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_height, h)
         sci.put32(VkSwapchainCreateInfoKHR_imageArrayLayers, 1)
-        sci.put32(VkSwapchainCreateInfoKHR_imageUsage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        sci.put32(VkSwapchainCreateInfoKHR_imageUsage, usage)
         sci.put32(VkSwapchainCreateInfoKHR_imageSharingMode, VK_SHARING_MODE_EXCLUSIVE)
         sci.put32(VkSwapchainCreateInfoKHR_preTransform, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
         sci.put32(VkSwapchainCreateInfoKHR_compositeAlpha, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
@@ -549,14 +722,15 @@ impl Gfx {
         sci.put32(VkSwapchainCreateInfoKHR_clipped, VK_TRUE)
         sci.put64(VkSwapchainCreateInfoKHR_oldSwapchain, old)
 
-        var psc = Bytes.new(8)
+        var psc = vk_output(8)
         vkcheck(vkCreateSwapchainKHR(self.dev, sci.addr(), 0, psc.addr()), "vkCreateSwapchainKHR")
         let handle = psc.get64(0)
+        vk_free_output(psc)
 
-        var pn = Bytes.new(8)
+        var pn = vk_output(8)
         vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), 0), "vkGetSwapchainImagesKHR")
         let n = pn.get32(0)
-        var imgbuf = Bytes.new(8 * n)
+        var imgbuf = vk_output(8 * n)
         vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), imgbuf.addr()), "vkGetSwapchainImagesKHR")
 
         var images: [int] = []
@@ -569,6 +743,8 @@ impl Gfx {
             let img = imgbuf.get64(i * 8)
             images.push(img)
 
+            if renderpass == 0 { continue }
+
             var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
             vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
             vci.put64(VkImageViewCreateInfo_image, img)
@@ -578,9 +754,10 @@ impl Gfx {
             vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
             vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
             vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-            var pv = Bytes.new(8)
+            var pv = vk_output(8)
             vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
             let view = pv.get64(0)
+            vk_free_output(pv)
             views.push(view)
 
             var nattach = 1
@@ -602,10 +779,14 @@ impl Gfx {
             fci.put32(VkFramebufferCreateInfo_width, w)
             fci.put32(VkFramebufferCreateInfo_height, h)
             fci.put32(VkFramebufferCreateInfo_layers, 1)
-            var pf = Bytes.new(8)
+            var pf = vk_output(8)
             vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
             fbs.push(pf.get64(0))
+            vk_free_output(pf)
         }
+
+        vk_free_output(pn)
+        vk_free_output(imgbuf)
 
         // per-frame command buffers, semaphores and fences
         var frames: [Frame] = []
@@ -615,11 +796,12 @@ impl Gfx {
             cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
             cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
             cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
-            var pcb = Bytes.new(8)
+            var pcb = vk_output(8)
             vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
             // created signalled so the first wait on it returns immediately
             frames.push(Frame{cb: pcb.get64(0), acquired: self.semaphore(),
                               fence: self.fence(true)})
+            vk_free_output(pcb)
         }
         var img_fence: [int] = []
         var img_sem: [int] = []
@@ -628,7 +810,7 @@ impl Gfx {
             img_sem.push(self.semaphore())
         }
 
-        return Swapchain{handle: handle, format: format, w: w, h: h,
+        return Swapchain{handle: handle, usage: usage, format: format, w: w, h: h,
                          images: images, views: views, fbs: fbs,
                          frames: frames, img_fence: img_fence, img_sem: img_sem, cur: 0,
                          depth_format: depth_format, depth_imgs: depth_imgs,
@@ -639,17 +821,21 @@ impl Gfx {
         var fci = Bytes.new(VkFenceCreateInfo_sizeof)
         fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
         if signalled { fci.put32(VkFenceCreateInfo_flags, VK_FENCE_CREATE_SIGNALED_BIT) }
-        var pf = Bytes.new(8)
+        var pf = vk_output(8)
         vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFence")
-        return pf.get64(0)
+        let handle = pf.get64(0)
+        vk_free_output(pf)
+        return handle
     }
 
     fn semaphore(self) -> int {
         var sci = Bytes.new(VkSemaphoreCreateInfo_sizeof)
         sci.put32(VkSemaphoreCreateInfo_sType, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
-        var ps = Bytes.new(8)
+        var ps = vk_output(8)
         vkcheck(vkCreateSemaphore(self.dev, sci.addr(), 0, ps.addr()), "vkCreateSemaphore")
-        return ps.get64(0)
+        let handle = ps.get64(0)
+        vk_free_output(ps)
+        return handle
     }
 
     fn destroy_swapchain(self, s: Swapchain) {
@@ -674,15 +860,16 @@ impl Gfx {
     // driver can hand over its images. Returns none while the window is
     // minimised (a zero-sized extent cannot back a swapchain).
     fn rebuild(self, s: Swapchain, renderpass: int) -> Swapchain? {
-        var caps = Bytes.new(VkSurfaceCapabilitiesKHR_sizeof)
+        var caps = vk_output(VkSurfaceCapabilitiesKHR_sizeof)
         vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
         let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
         let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        vk_free_output(caps)
         if w == 0 or h == 0 { return none }
         vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
         // depth_format carries over, so a depth swapchain stays one across resizes
-        let fresh = self.swapchain_depth(s.format, renderpass, s.handle, s.depth_format)
+        let fresh = self.swapchain_usage(s.format, renderpass, s.handle, s.depth_format, s.usage)
         self.destroy_swapchain(s)
         return fresh
     }
@@ -699,18 +886,27 @@ impl Gfx {
     //     swapchain hands out images in its own order, so image i can come back
     //     while a different in-flight frame is still writing it.
     fn frame(self, s: Swapchain, rec: fn(int, int)) -> bool {
+        return self.frame_at_stage(s, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, rec)
+    }
+
+    // Wait for acquisition at the first stage that accesses the swapchain image.
+    fn frame_at_stage(self, s: Swapchain, wait_stage: int, rec: fn(int, int)) -> bool {
         let f = s.frames[s.cur]
         var pfence = Bytes.new(8)
         pfence.put64(0, f.fence)
         vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
 
-        var pidx = Bytes.new(8)
+        var pidx = vk_output(8)
         let acq = vkAcquireNextImageKHR(self.dev, s.handle, 5000000000, f.acquired, 0, pidx.addr())
-        if acq == VK_ERROR_OUT_OF_DATE_KHR { return false }
+        if acq == VK_ERROR_OUT_OF_DATE_KHR {
+            vk_free_output(pidx)
+            return false
+        }
         if acq != VK_SUCCESS and acq != VK_SUBOPTIMAL_KHR {
             panic("vkAcquireNextImageKHR: VkResult {acq}")
         }
         let idx = pidx.get32(0)
+        vk_free_output(pidx)
 
         // another in-flight frame may still be drawing into this image
         if s.img_fence[idx] != 0 and s.img_fence[idx] != f.fence {
@@ -736,7 +932,7 @@ impl Gfx {
         var sigsem = Bytes.new(8)
         sigsem.put64(0, s.img_sem[idx])          // per-image: safe to reuse now
         var stage = Bytes.new(8)
-        stage.put32(0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+        stage.put32(0, wait_stage)
         var pcbs = Bytes.new(8)
         pcbs.put64(0, f.cb)
 
@@ -779,6 +975,164 @@ impl Gfx {
 struct DescSet { layout: int, pool: int, set: int }
 
 impl Gfx {
+    // Query optimal-tiling capabilities before creating storage/blit resources.
+    fn format_features(self, format: int) -> int {
+        let out = vk_output(VkFormatProperties_sizeof)
+        vkGetPhysicalDeviceFormatProperties(self.phys, format, out.addr())
+        let features = out.get32(VkFormatProperties_optimalTilingFeatures)
+        vk_free_output(out)
+        return features
+    }
+
+    // The largest extent a 3D image may have on this device, in any axis. The
+    // spec floor is 256, so a volume deeper than that is not portable even
+    // where it happens to work here.
+    fn max_image_dimension_3d(self) -> int {
+        let out = vk_output(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.phys, out.addr())
+        let lim = out.get32(VkPhysicalDeviceProperties_limits_maxImageDimension3D)
+        vk_free_output(out)
+        return lim
+    }
+
+    // The spec floor is 128 bytes. Anything larger works here but is not
+    // portable, so a caller that wants more should check first and say so.
+    fn max_push_constants(self) -> int {
+        let out = vk_output(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.phys, out.addr())
+        let lim = out.get32(VkPhysicalDeviceProperties_limits_maxPushConstantsSize)
+        vk_free_output(out)
+        return lim
+    }
+
+    // RGBA8, one mip/layer, device-local storage with transfer readback support.
+    fn storage_image(self, w: int, h: int) -> GpuImage {
+        return self.storage_image_3d(w, h, 1, VK_FORMAT_R8G8B8A8_UNORM)
+    }
+
+    // A storage image of any depth and format. `d` of 1 gives a 2D image and a
+    // 2D view; anything larger gives VK_IMAGE_TYPE_3D and a 3D view, which is
+    // what an image3D binding in a compute shader expects. The voxel volume is
+    // the motivating case: one R8_UINT 3D image the tracer reads.
+    fn storage_image_3d(self, w: int, h: int, d: int, fmt: int) -> GpuImage {
+        assert(w > 0 and h > 0 and d > 0, "storage image dimensions must be positive")
+        assert((self.format_features(fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0,
+               "optimal-tiling storage images unsupported for this format")
+        var itype = VK_IMAGE_TYPE_2D
+        var vtype = VK_IMAGE_VIEW_TYPE_2D
+        if d > 1 {
+            itype = VK_IMAGE_TYPE_3D
+            vtype = VK_IMAGE_VIEW_TYPE_3D
+            let lim = self.max_image_dimension_3d()
+            assert(w <= lim and h <= lim and d <= lim,
+                   "3D storage image exceeds maxImageDimension3D")
+        }
+        let ci = VkImageCreateInfo.new().imageType(itype)
+            .format(fmt).extent_width(w).extent_height(h).extent_depth(d)
+            .mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
+            .tiling(VK_IMAGE_TILING_OPTIMAL)
+            .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+            .sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+        let out = vk_output(VkMemoryRequirements_sizeof)
+        vkcheck(vkCreateImage(self.dev, ci.addr(), 0, out.addr()), "vkCreateImage (storage)")
+        let image = out.get64(0)
+        vkGetImageMemoryRequirements(self.dev, image, out.addr())
+        let size = out.get64(VkMemoryRequirements_size)
+        let typebits = out.get32(VkMemoryRequirements_memoryTypeBits)
+        let ai = VkMemoryAllocateInfo.new().allocationSize(size)
+            .memoryTypeIndex(self.find_mem_type(typebits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        vkcheck(vkAllocateMemory(self.dev, ai.addr(), 0, out.addr()), "vkAllocateMemory (storage)")
+        let mem = out.get64(0)
+        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory (storage)")
+        let vi = VkImageViewCreateInfo.new().image(image).viewType(vtype).format(fmt)
+        store32(vi.subresourceRange_at() + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        store32(vi.subresourceRange_at() + VkImageSubresourceRange_levelCount, 1)
+        store32(vi.subresourceRange_at() + VkImageSubresourceRange_layerCount, 1)
+        vkcheck(vkCreateImageView(self.dev, vi.addr(), 0, out.addr()), "vkCreateImageView (storage)")
+        let view = out.get64(0)
+        vk_free_output(out)
+        return GpuImage{image: image, mem: mem, view: view, w: w, h: h, d: d, fmt: fmt}
+    }
+
+    fn destroy_image(self, image: GpuImage) {
+        vkDestroyImageView(self.dev, image.view, 0)
+        vkDestroyImage(self.dev, image.image, 0)
+        vkFreeMemory(self.dev, image.mem, 0)
+    }
+
+    // Bind several storage images at bindings 0..n-1, all in GENERAL. The
+    // tracer wants two: the volume it reads and the target it writes.
+    fn storage_images_set(self, images: [GpuImage], stages: int) -> DescSet {
+        let n = images.len()
+        assert(n > 0, "storage_images_set needs at least one image")
+        var bindings = Bytes.new(n * VkDescriptorSetLayoutBinding_sizeof)
+        for i in 0..n {
+            let b = i * VkDescriptorSetLayoutBinding_sizeof
+            bindings.put32(b + VkDescriptorSetLayoutBinding_binding, i)
+            bindings.put32(b + VkDescriptorSetLayoutBinding_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            bindings.put32(b + VkDescriptorSetLayoutBinding_descriptorCount, 1)
+            bindings.put32(b + VkDescriptorSetLayoutBinding_stageFlags, stages)
+        }
+        let lci = VkDescriptorSetLayoutCreateInfo.new().bindingCount(n).pBindings(bindings.addr())
+        let out = vk_output(8)
+        vkcheck(vkCreateDescriptorSetLayout(self.dev, lci.addr(), 0, out.addr()), "vkCreateDescriptorSetLayout (images)")
+        let layout = out.get64(0)
+        let size = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(n)
+        let pci = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(size.addr())
+        vkcheck(vkCreateDescriptorPool(self.dev, pci.addr(), 0, out.addr()), "vkCreateDescriptorPool (images)")
+        let pool = out.get64(0)
+        let layouts = u64s([layout])
+        let ai = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
+            .descriptorSetCount(1).pSetLayouts(layouts.addr())
+        vkcheck(vkAllocateDescriptorSets(self.dev, ai.addr(), out.addr()), "vkAllocateDescriptorSets (images)")
+        let set = out.get64(0)
+        // The infos must all stay alive until vkUpdateDescriptorSets returns,
+        // so they are one flat block rather than n separate builders.
+        var infos = Bytes.new(n * VkDescriptorImageInfo_sizeof)
+        var writes = Bytes.new(n * VkWriteDescriptorSet_sizeof)
+        for i in 0..n {
+            let io = i * VkDescriptorImageInfo_sizeof
+            infos.put64(io + VkDescriptorImageInfo_imageView, images[i].view)
+            infos.put32(io + VkDescriptorImageInfo_imageLayout, VK_IMAGE_LAYOUT_GENERAL)
+            let w = i * VkWriteDescriptorSet_sizeof
+            writes.put32(w + VkWriteDescriptorSet_sType, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+            writes.put64(w + VkWriteDescriptorSet_dstSet, set)
+            writes.put32(w + VkWriteDescriptorSet_dstBinding, i)
+            writes.put32(w + VkWriteDescriptorSet_descriptorCount, 1)
+            writes.put32(w + VkWriteDescriptorSet_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            writes.put64(w + VkWriteDescriptorSet_pImageInfo, infos.addr() + io)
+        }
+        vkUpdateDescriptorSets(self.dev, n, writes.addr(), 0, 0)
+        vk_free_output(out)
+        return DescSet{layout: layout, pool: pool, set: set}
+    }
+
+    // Bind one storage image at binding 0. Its dispatch-time layout is GENERAL.
+    fn storage_image_set(self, image: GpuImage, stages: int) -> DescSet {
+        let binding = VkDescriptorSetLayoutBinding.new().binding(0)
+            .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).stageFlags(stages)
+        let lci = VkDescriptorSetLayoutCreateInfo.new().bindingCount(1).pBindings(binding.addr())
+        let out = vk_output(8)
+        vkcheck(vkCreateDescriptorSetLayout(self.dev, lci.addr(), 0, out.addr()), "vkCreateDescriptorSetLayout (image)")
+        let layout = out.get64(0)
+        let size = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
+        let pci = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(size.addr())
+        vkcheck(vkCreateDescriptorPool(self.dev, pci.addr(), 0, out.addr()), "vkCreateDescriptorPool (image)")
+        let pool = out.get64(0)
+        let layouts = u64s([layout])
+        let ai = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
+            .descriptorSetCount(1).pSetLayouts(layouts.addr())
+        vkcheck(vkAllocateDescriptorSets(self.dev, ai.addr(), out.addr()), "vkAllocateDescriptorSets (image)")
+        let set = out.get64(0)
+        let info = VkDescriptorImageInfo.new().imageView(image.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL)
+        let write = VkWriteDescriptorSet.new().dstSet(set).dstBinding(0).descriptorCount(1)
+            .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info.addr())
+        vkUpdateDescriptorSets(self.dev, 1, write.addr(), 0, 0)
+        vk_free_output(out)
+        return DescSet{layout: layout, pool: pool, set: set}
+    }
+
     // One set binding `buffers` as storage buffers at bindings 0..n-1 -- the
     // shape almost every compute pass wants. The layout/pool/set/update dance is
     // four objects and an array of writes; getting the lifetimes wrong here is

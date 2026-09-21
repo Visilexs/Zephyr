@@ -75,6 +75,10 @@ static void fld(const char *name, size_t off, size_t size, const char *cls)
 #define OFN2(T, F, ST, SF, SST, SSF) fld(#F "_" #SF "_" #SSF, \
         offsetof(T, F) + offsetof(ST, SF) + offsetof(SST, SSF), \
         sizeof(((SST *)0)->SSF), CLS(((SST *)0)->SSF))
+/* array element member: srcOffsets[0].x -> srcOffsets_0_x */
+#define OFA(T, F, I, ST, SF) fld(#F "_" #I "_" #SF, \
+        offsetof(T, F) + (I) * sizeof(ST) + offsetof(ST, SF), \
+        sizeof(((ST *)0)->SF), CLS(((ST *)0)->SF))
 /* vkCreateX(device, pCreateInfo, pAllocator, pHandle) is a rigid convention, so
  * the allocate/call/check/unwrap dance around it can be generated too. */
 /* vkCreateX(device, pCreateInfo, pAllocator, pHandle) is a rigid convention, so
@@ -83,9 +87,9 @@ static void creator(const char *fn, const char *type, const char *name)
 {
     if (g_mode != 1) return;
     printf("\nfn %s(dev: int, ci: %s) -> int {\n", name, type);
-    printf("    var p = Bytes.new(8)\n");
+    printf("    var p = vk_output(8)\n");
     printf("    vkcheck(%s(dev, ci.addr(), 0, p.addr()), \"%s\")\n", fn, fn);
-    printf("    return p.get64(0)\n}\n");
+    printf("    let handle = p.get64(0)\n    vk_free_output(p)\n    return handle\n}\n");
 }
 #define CREATE(FN, T, NAME) creator(#FN, #T, NAME)
 
@@ -93,9 +97,9 @@ static void creator(const char *fn, const char *type, const char *name)
 static void oneoff(const char *sig, const char *call, const char *what)
 {
     printf("\nfn %s -> int {\n", sig);
-    printf("    var p = Bytes.new(8)\n");
+    printf("    var p = vk_output(8)\n");
     printf("    vkcheck(%s, \"%s\")\n", call, what);
-    printf("    return p.get64(0)\n}\n");
+    printf("    let handle = p.get64(0)\n    vk_free_output(p)\n    return handle\n}\n");
 }
 #define CO(N)       do { if (g_mode == 0) printf("let %s = %lld\n", #N, (long long)(N)); } while (0)
 
@@ -154,13 +158,24 @@ int main(int argc, char **argv) {
     CO(VK_STRUCTURE_TYPE_SUBMIT_INFO);
     CO(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
     CO(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+    CO(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
 
     printf("\n// ---- formats / enums / flags ----\n");
     CO(VK_FORMAT_R8G8B8A8_UNORM); CO(VK_FORMAT_B8G8R8A8_UNORM);
     CO(VK_IMAGE_TYPE_2D); CO(VK_IMAGE_VIEW_TYPE_2D); CO(VK_IMAGE_TILING_OPTIMAL);
+    /* 3D: the voxel volume is a single R8_UINT image3D */
+    CO(VK_IMAGE_TYPE_3D); CO(VK_IMAGE_VIEW_TYPE_3D);
+    CO(VK_FORMAT_R8_UINT); CO(VK_FORMAT_R8_UNORM);
+    /* G-buffer targets: depth is linear ray t, normals want signed range */
+    CO(VK_FORMAT_R32_SFLOAT); CO(VK_FORMAT_R16G16B16A16_SFLOAT);
+    CO(VK_FORMAT_R8G8B8A8_SNORM);
     CO(VK_IMAGE_TILING_LINEAR); CO(VK_IMAGE_LAYOUT_UNDEFINED);
     CO(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     CO(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    CO(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); CO(VK_IMAGE_LAYOUT_GENERAL);
+    CO(VK_FILTER_NEAREST);
+    CO(VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    CO(VK_FORMAT_FEATURE_BLIT_SRC_BIT); CO(VK_FORMAT_FEATURE_BLIT_DST_BIT);
     CO(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     CO(VK_IMAGE_ASPECT_COLOR_BIT);
     /* depth */
@@ -183,6 +198,7 @@ int main(int argc, char **argv) {
     CO(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); CO(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     CO(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT); CO(VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     CO(VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    CO(VK_IMAGE_USAGE_STORAGE_BIT);
     CO(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     CO(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     CO(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -249,9 +265,19 @@ int main(int argc, char **argv) {
     OF(VkPhysicalDeviceProperties, deviceType);
     OF(VkPhysicalDeviceProperties, deviceName);
     OF(VkPhysicalDeviceProperties, limits);
+    /* limits a 3D storage image has to fit inside. These are nested inside
+       VkPhysicalDeviceLimits, so the offset must be composed with `limits`. */
+    OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxImageDimension2D);
+    OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxImageDimension3D);
+    OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxComputeWorkGroupInvocations);
+    OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxPushConstantsSize);
 
     SZ(VkQueueFamilyProperties);
     OF(VkQueueFamilyProperties, queueFlags); OF(VkQueueFamilyProperties, queueCount);
+
+    SZ(VkFormatProperties);
+    OF(VkFormatProperties, linearTilingFeatures); OF(VkFormatProperties, optimalTilingFeatures);
+    OF(VkFormatProperties, bufferFeatures);
 
     SZ(VkMemoryType); OF(VkMemoryType, propertyFlags); OF(VkMemoryType, heapIndex);
     SZ(VkMemoryHeap); OF(VkMemoryHeap, size); OF(VkMemoryHeap, flags);
@@ -509,6 +535,32 @@ int main(int argc, char **argv) {
     OFN(VkBufferImageCopy, imageExtent, VkExtent3D, height);
     OFN(VkBufferImageCopy, imageExtent, VkExtent3D, depth);
 
+    SZ(VkImageBlit);
+    OF(VkImageBlit, srcSubresource);
+    OFN(VkImageBlit, srcSubresource, VkImageSubresourceLayers, aspectMask);
+    OFN(VkImageBlit, srcSubresource, VkImageSubresourceLayers, mipLevel);
+    OFN(VkImageBlit, srcSubresource, VkImageSubresourceLayers, baseArrayLayer);
+    OFN(VkImageBlit, srcSubresource, VkImageSubresourceLayers, layerCount);
+    OF(VkImageBlit, srcOffsets);
+    OFA(VkImageBlit, srcOffsets, 0, VkOffset3D, x);
+    OFA(VkImageBlit, srcOffsets, 0, VkOffset3D, y);
+    OFA(VkImageBlit, srcOffsets, 0, VkOffset3D, z);
+    OFA(VkImageBlit, srcOffsets, 1, VkOffset3D, x);
+    OFA(VkImageBlit, srcOffsets, 1, VkOffset3D, y);
+    OFA(VkImageBlit, srcOffsets, 1, VkOffset3D, z);
+    OF(VkImageBlit, dstSubresource);
+    OFN(VkImageBlit, dstSubresource, VkImageSubresourceLayers, aspectMask);
+    OFN(VkImageBlit, dstSubresource, VkImageSubresourceLayers, mipLevel);
+    OFN(VkImageBlit, dstSubresource, VkImageSubresourceLayers, baseArrayLayer);
+    OFN(VkImageBlit, dstSubresource, VkImageSubresourceLayers, layerCount);
+    OF(VkImageBlit, dstOffsets);
+    OFA(VkImageBlit, dstOffsets, 0, VkOffset3D, x);
+    OFA(VkImageBlit, dstOffsets, 0, VkOffset3D, y);
+    OFA(VkImageBlit, dstOffsets, 0, VkOffset3D, z);
+    OFA(VkImageBlit, dstOffsets, 1, VkOffset3D, x);
+    OFA(VkImageBlit, dstOffsets, 1, VkOffset3D, y);
+    OFA(VkImageBlit, dstOffsets, 1, VkOffset3D, z);
+
     printf("\n// ---- WSI: surface, swapchain, present ----\n");
     CO(VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR);
     CO(VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
@@ -583,6 +635,7 @@ int main(int argc, char **argv) {
     CO(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
     CO(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO);
     CO(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    CO(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     CO(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
     CO(VK_SHADER_STAGE_COMPUTE_BIT);
     CO(VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -650,12 +703,25 @@ int main(int argc, char **argv) {
     OF(VkPushConstantRange, stageFlags); OF(VkPushConstantRange, offset);
     OF(VkPushConstantRange, size);
 
+    SZ(VkDescriptorImageInfo);
+    OF(VkDescriptorImageInfo, sampler); OF(VkDescriptorImageInfo, imageView);
+    OF(VkDescriptorImageInfo, imageLayout);
+
+    SZS(VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER);
+    OF(VkMemoryBarrier, sType); OF(VkMemoryBarrier, pNext);
+    OF(VkMemoryBarrier, srcAccessMask); OF(VkMemoryBarrier, dstAccessMask);
+
     SZS(VkImageMemoryBarrier, VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
     OF(VkImageMemoryBarrier, sType); OF(VkImageMemoryBarrier, pNext);
     OF(VkImageMemoryBarrier, srcAccessMask); OF(VkImageMemoryBarrier, dstAccessMask);
     OF(VkImageMemoryBarrier, oldLayout); OF(VkImageMemoryBarrier, newLayout);
     OF(VkImageMemoryBarrier, srcQueueFamilyIndex); OF(VkImageMemoryBarrier, dstQueueFamilyIndex);
     OF(VkImageMemoryBarrier, image); OF(VkImageMemoryBarrier, subresourceRange);
+    OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, aspectMask);
+    OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, baseMipLevel);
+    OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, levelCount);
+    OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, baseArrayLayer);
+    OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, layerCount);
 
     sclose();
 

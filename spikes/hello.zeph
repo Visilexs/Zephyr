@@ -1,0 +1,4 @@
+fn main() {
+    let n = 21
+    print("zephyr toolchain ok: {n * 2}")
+}

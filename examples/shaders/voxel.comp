@@ -1,0 +1,267 @@
+#version 450
+// Primary-ray voxel tracer. The grid is the acceleration structure: one
+// Amanatides-Woo walk resolves visibility, no BVH and no mesh. Ported from
+// trace.frag.glsl in the C# reference, minus lighting and accumulation --
+// this step only has to prove traversal and the two-image binding.
+//
+// Kept deterministic on purpose: examples/vulkan/voxel.zeph walks the same
+// algorithm on the CPU and compares every pixel, which only works if there
+// is no RNG in here.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r8ui,  binding = 0) uniform readonly uimage3D vol;
+layout(rgba8, binding = 1) uniform writeonly image2D dst;
+// Guide buffers. Ray Reconstruction consumes depth, normals and albedo
+// alongside the noisy colour, so they are produced here rather than bolted
+// on later. Depth is linear ray t, not a projected z.
+layout(r32f,  binding = 2) uniform writeonly image2D gDepth;
+layout(rgba8, binding = 3) uniform writeonly image2D gNormal;
+layout(rgba8, binding = 4) uniform writeonly image2D gAlbedo;
+// Motion is signed and can exceed a pixel, so it needs a float format rather
+// than the 8-bit ones above.
+layout(rgba16f, binding = 5) uniform writeonly image2D gMotion;
+layout(rgba8,   binding = 6) uniform writeonly image2D gRough;   // r = roughness, g = specular
+
+layout(push_constant) uniform P {
+    ivec4 volSize;   // xyz
+    ivec4 res;       // xy = resolution, z = spp, w = frame index
+    vec4  camPos;    // xyz
+    vec4  right;
+    vec4  up;
+    vec4  fwd;
+    vec4  misc;      // x = tanHalfFov, y = sun.x, z = sun.y, w = sun.z
+    // Previous frame, for motion vectors. On the first frame these equal the
+    // current ones, which makes every motion vector zero.
+    vec4  prevCamPos;
+    vec4  prevRight;
+    vec4  prevUp;
+    vec4  prevFwd;
+    vec4  jitter;    // xy = subpixel offset in pixels, already Halton
+} pc;
+
+// ---------------------------------------------------------------- rng
+// Exactly the hash from trace.frag.glsl. It is mirrored bit-for-bit in
+// voxel.zeph with 32-bit masking, which is what keeps the CPU comparison
+// exact even though the shading is now stochastic.
+uint gSeed;
+uint hashu(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16; return x;
+}
+float rnd()
+{
+    gSeed = hashu(gSeed);
+    return float(gSeed) * (1.0 / 4294967296.0);
+}
+
+// Cosine-weighted hemisphere by Malley's method, with the disk sampled by
+// rejection rather than by polar coordinates. The reference uses sin/cos, but
+// Zephyr's fsin is a polynomial approximation that will not agree with the
+// GPU's bit-for-bit, and keeping the CPU mirror exact is worth more here than
+// matching the reference line for line. Same distribution either way.
+vec3 cosineHemisphere(vec3 n)
+{
+    float u, v, r2;
+    for (int i = 0; i < 32; i++)
+    {
+        u = rnd() * 2.0 - 1.0;
+        v = rnd() * 2.0 - 1.0;
+        r2 = u * u + v * v;
+        if (r2 <= 1.0) { break; }
+        u = 0.0; v = 0.0; r2 = 0.0;
+    }
+    vec3 t = abs(n.y) < 0.99 ? normalize(cross(vec3(0.0, 1.0, 0.0), n)) : vec3(1.0, 0.0, 0.0);
+    vec3 b = cross(n, t);
+    return normalize(t * u + b * v + n * sqrt(max(0.0, 1.0 - r2)));
+}
+
+vec3 palette(int m)
+{
+    if (m == 1) return vec3(0.44, 0.44, 0.47);
+    if (m == 2) return vec3(0.40, 0.29, 0.19);
+    if (m == 3) return vec3(0.26, 0.52, 0.19);
+    if (m == 4) return vec3(0.80, 0.72, 0.50);
+    if (m == 5) return vec3(1.00, 0.70, 0.22);
+    if (m == 6) return vec3(1.00, 0.94, 0.84);
+    if (m == 7) return vec3(0.68, 0.70, 0.78);
+    return vec3(0.0);
+}
+
+// Radiant power of a material. Ore seams light the caves, lamps light the loot
+// rooms. Matches emissive() in trace.frag.glsl.
+float emissive(int m)
+{
+    if (m == 5) return 5.0;
+    if (m == 6) return 18.0;
+    return 0.0;
+}
+
+int voxAt(ivec3 p)
+{
+    if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, pc.volSize.xyz))) return 0;
+    return int(imageLoad(vol, p).r);
+}
+
+bool traceVox(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nrm, out int mat)
+{
+    tHit = tmax; nrm = vec3(0.0); mat = 0;
+
+    ivec3 p = ivec3(floor(ro));
+    ivec3 s = ivec3(rd.x >= 0.0 ? 1 : -1, rd.y >= 0.0 ? 1 : -1, rd.z >= 0.0 ? 1 : -1);
+    vec3 adinv = 1.0 / max(abs(rd), vec3(1e-8));
+    vec3 tside = vec3(
+        rd.x >= 0.0 ? (float(p.x) + 1.0 - ro.x) : (ro.x - float(p.x)),
+        rd.y >= 0.0 ? (float(p.y) + 1.0 - ro.y) : (ro.y - float(p.y)),
+        rd.z >= 0.0 ? (float(p.z) + 1.0 - ro.z) : (ro.z - float(p.z))) * adinv;
+
+    float t = 0.0;
+    int axis = 1;
+
+    for (int i = 0; i < 700; i++)
+    {
+        if (t > tmax) return false;
+
+        int m = voxAt(p);
+        if (m != 0)
+        {
+            tHit = t; mat = m;
+            nrm = vec3(axis == 0 ? -float(s.x) : 0.0,
+                       axis == 1 ? -float(s.y) : 0.0,
+                       axis == 2 ? -float(s.z) : 0.0);
+            return true;
+        }
+
+        // Escaped the volume with no way back in.
+        if ((p.y < 0 && s.y < 0) || (p.y >= pc.volSize.y && s.y > 0)) return false;
+        if ((p.x < 0 && s.x < 0) || (p.x >= pc.volSize.x && s.x > 0)) return false;
+        if ((p.z < 0 && s.z < 0) || (p.z >= pc.volSize.z && s.z > 0)) return false;
+
+        if (tside.x < tside.y && tside.x < tside.z) { p.x += s.x; t = tside.x; tside.x += adinv.x; axis = 0; }
+        else if (tside.y < tside.z)                 { p.y += s.y; t = tside.y; tside.y += adinv.y; axis = 1; }
+        else                                        { p.z += s.z; t = tside.z; tside.z += adinv.z; axis = 2; }
+    }
+    return false;
+}
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, pc.res.xy))) { return; }
+
+    // Seed from the pixel and the frame, so the sequence is reproducible and
+    // the CPU mirror can walk the identical one.
+    gSeed = hashu(uint(q.x) * 1973u + uint(q.y) * 9277u + uint(pc.res.w) * 26699u + 1u);
+
+    vec2 res = vec2(pc.res.xy);
+    float aspect = res.x / res.y;
+    // The jitter is a known per-frame offset, not a per-pixel random one:
+    // Ray Reconstruction has to be told the sequence and cannot infer it.
+    vec2 uv = (vec2(q) + 0.5 + pc.jitter.xy) / res * 2.0 - 1.0;
+    uv.x *= aspect;
+
+    vec3 rd = normalize(pc.right.xyz * (uv.x * pc.misc.x)
+                      + pc.up.xyz    * (uv.y * pc.misc.x)
+                      + pc.fwd.xyz);
+
+    float t; vec3 n; int m;
+    vec3 col;
+    vec3 albedo = vec3(0.0);
+    float depth = 0.0;
+    vec3 gn = vec3(0.0);
+    if (traceVox(pc.camPos.xyz, rd, 512.0, t, n, m))
+    {
+        albedo = palette(m);
+        depth = t;
+        gn = n;
+        vec3 sun = normalize(pc.misc.yzw);
+        float lam = max(0.0, dot(n, sun));
+        float shade = 0.0;
+        if (lam > 0.0)
+        {
+            // Start just off the face. Any smaller and the shadow ray starts
+            // inside the voxel it just hit and every surface shadows itself.
+            vec3 hp = pc.camPos.xyz + rd * t + n * 0.001;
+            float st; vec3 sn; int sm;
+            if (!traceVox(hp, sun, 512.0, st, sn, sm)) { shade = lam; }
+        }
+        // One diffuse bounce. Cosine-weighted sampling cancels the 1/pi and
+        // the cosine term, so the bounce radiance is just averaged.
+        vec3 hp = pc.camPos.xyz + rd * t + n * 0.001;
+        vec3 ind = vec3(0.0);
+        int spp = pc.res.z;
+        for (int i = 0; i < spp; i++)
+        {
+            vec3 bd = cosineHemisphere(n);
+            float bt; vec3 bn; int bm;
+            if (traceVox(hp, bd, 512.0, bt, bn, bm))
+            {
+                float blam = max(0.0, dot(bn, sun));
+                float bshade = 0.0;
+                if (blam > 0.0)
+                {
+                    vec3 bp = hp + bd * bt + bn * 0.001;
+                    float st2; vec3 sn2; int sm2;
+                    if (!traceVox(bp, sun, 512.0, st2, sn2, sm2)) { bshade = blam; }
+                }
+                ind += palette(bm) * (0.25 + 0.75 * bshade + emissive(bm));
+            }
+            else
+            {
+                ind += mix(vec3(0.52, 0.60, 0.72), vec3(0.14, 0.20, 0.34),
+                           clamp(bd.y * 0.5 + 0.5, 0.0, 1.0));
+            }
+        }
+        if (spp > 0) { ind /= float(spp); }
+
+        // Albedo multiplies both terms, so colour bleeds from the bounce.
+        col = palette(m) * (0.25 + 0.75 * shade + emissive(m)) + palette(m) * ind;
+    }
+    else
+    {
+        col = mix(vec3(0.52, 0.60, 0.72), vec3(0.14, 0.20, 0.34), clamp(rd.y * 0.5 + 0.5, 0.0, 1.0));
+    }
+
+    // Reinhard, so an emissive surface stays coloured instead of clipping to
+    // white. The exposure is there because Reinhard on its own drags every
+    // already-dim value down by half and the whole scene goes flat; 2.0 puts
+    // mid-tones back roughly where they were. Tune it here, not per material.
+    // The guide buffers below stay linear and untonemapped.
+    const float exposure = 2.0;
+    col = col * exposure;
+    col = col / (1.0 + col);
+    imageStore(dst, q, vec4(sqrt(clamp(col, 0.0, 1.0)), 1.0));
+    // Motion: where this surface point sat in the previous frame, in pixels,
+    // as (previous - current). A miss gets zero, as does anything that falls
+    // behind the previous camera, which has no valid projection.
+    vec2 motion = vec2(0.0);
+    if (depth > 0.0)
+    {
+        vec3 hpw = pc.camPos.xyz + rd * depth;
+        vec3 v = hpw - pc.prevCamPos.xyz;
+        float pz = dot(v, pc.prevFwd.xyz);
+        if (pz > 1e-4)
+        {
+            float pxc = dot(v, pc.prevRight.xyz) / (pz * pc.misc.x * aspect);
+            float pyc = dot(v, pc.prevUp.xyz)    / (pz * pc.misc.x);
+            // The forward path builds ndc from the sample position
+            // (q + 0.5 + jitter), so inverting gives that same sample
+            // position back. Subtracting a further half pixel here is the
+            // classic off-by-half: with a stationary camera every motion
+            // vector came out as -0.5 instead of 0.
+            vec2 prevPix = (vec2(pxc, pyc) * 0.5 + 0.5) * res;
+            motion = prevPix - (vec2(q) + 0.5 + pc.jitter.xy);
+        }
+    }
+
+    // A miss writes depth 0 and a zero normal, which is how a consumer tells
+    // sky from geometry without a separate mask.
+    imageStore(gDepth,  q, vec4(depth, 0.0, 0.0, 0.0));
+    imageStore(gNormal, q, vec4(gn * 0.5 + 0.5, 1.0));
+    imageStore(gAlbedo, q, vec4(albedo, 1.0));
+    imageStore(gMotion, q, vec4(motion, 0.0, 0.0));
+    // Voxels are matte. Roughness is 1 and the specular albedo is the usual
+    // dielectric 0.04; both are constants until materials grow a spec term.
+    imageStore(gRough,  q, vec4(1.0, 0.04, 0.0, 1.0));
+}

@@ -1,0 +1,66 @@
+// Spike 2 - can Zephyr reach NVIDIA NGX at all?
+//
+// NVIDIA ships the app-facing NGX API only as a static library. Zephyr's FFI is
+// LoadLibraryA + GetProcAddress, so it cannot touch a .lib. vxngx.dll is a thin
+// C shim that links the static lib and re-exports flat scalar entry points.
+//
+// This probe calls NVSDK_NGX_VULKAN_RequiredExtensions through that shim. That
+// call needs no VkInstance and no VkDevice, so it isolates the FFI chain from
+// every other moving part: if this prints real extension names, the whole
+// Zephyr -> shim -> NGX path works.
+
+extern fn vxngx_abi() -> i32 from "vxngx.dll"
+extern fn vxngx_required_extensions(buf: int, buflen: int, pic: int, pdc: int) -> i32 from "vxngx.dll"
+
+// There is no load32 builtin, so read 8 bytes and mask. Safe here because the
+// scratch page comes from VirtualAlloc, which hands back zeroed memory.
+fn load32(p: int) -> int {
+    return load64(p) & 4294967295
+}
+
+fn cstr(p: int, maxn: int) -> str {
+    var s = ""
+    var i = 0
+    var done = false
+    while i < maxn and not done {
+        let b = load8(p + i)
+        if b == 0 { done = true }
+        else { s = "{s}{chr(b)}" }
+        i = i + 1
+    }
+    return s
+}
+
+let NGX_SUCCESS = 1
+
+let scratch = win("VirtualAlloc", 0, 16384, 12288, 4)
+assert(scratch != 0, "VirtualAlloc failed")
+
+let buf = scratch
+let pic = scratch + 8192
+let pdc = scratch + 8200
+
+print("=== Spike 2: Zephyr -> vxngx.dll -> NGX ===")
+
+let abi = vxngx_abi()
+print("shim abi version: {abi}")
+assert(abi == 1, "vxngx.dll ABI mismatch - rebuild the shim")
+
+let r = vxngx_required_extensions(buf, 8192, pic, pdc)
+print("NVSDK_NGX_VULKAN_RequiredExtensions -> {r}")
+
+if r != NGX_SUCCESS {
+    print("")
+    print("FAIL: NGX returned a non-success result.")
+    print("  0xBAD00000 | n is the NGX failure family; 4 = InvalidParameter,")
+    print("  7 = NotInitialized, 1 = FeatureNotSupported.")
+    print("  The FFI chain still worked if this printed at all - the call was made.")
+} else {
+    let ic = load32(pic)
+    let dc = load32(pdc)
+    print("instance extensions required: {ic}")
+    print("device extensions required:   {dc}")
+    print("")
+    print(cstr(buf, 8192))
+    print("PASS: Zephyr called into NGX and got real data back.")
+}

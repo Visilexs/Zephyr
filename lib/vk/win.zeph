@@ -6,6 +6,7 @@
 // OS -- Vulkan never calls us, so nothing here needs a thunk.
 
 import "std/bytes.zeph"
+import "vk/raw.zeph"
 
 extern fn GetModuleHandleA(name: int) -> int from "kernel32.dll"
 extern fn RegisterClassA(wc: int) -> int from "user32.dll"
@@ -58,8 +59,8 @@ fn window_open(title: str, w: int, h: int) -> Window {
                                120, 90, w, h, 0, 0, hinst, 0)
     if hwnd == 0 { panic("CreateWindowExA failed") }
     let s = ShowWindow(hwnd, 5)
-    return Window{hwnd: hwnd, hinst: hinst, msg: Bytes.new(64),
-                  rect: Bytes.new(16), cls: cls, name: name}
+    return Window{hwnd: hwnd, hinst: hinst, msg: vk_output(64),
+                  rect: vk_output(16), cls: cls, name: name}
 }
 
 impl Window {
@@ -84,5 +85,9 @@ impl Window {
         let r = GetClientRect(self.hwnd, self.rect.addr())
         return self.rect.get32(12)
     }
-    fn close(self) { let r = DestroyWindow(self.hwnd) }
+    fn close(self) {
+        let r = DestroyWindow(self.hwnd)
+        vk_free_output(self.msg)
+        vk_free_output(self.rect)
+    }
 }

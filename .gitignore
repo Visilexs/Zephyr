@@ -22,3 +22,18 @@ dist/*.zip
 
 # copied next to test outputs by bootstrap/build.ps1
 zephyr_rt.dll
+
+# Native link artifacts. No .dll/.lib/.exp/.def is a source in this repo.
+#
+# vxngx.dll matters most: spikes/ngx/build.bat links it against
+# nvsdk_ngx_s.lib, so the built DLL contains NVIDIA's proprietary NGX code.
+# The shim source (vxngx.c) and its build script are tracked; the binary is
+# rebuilt from the SDK via the DLSS_SDK environment variable and must never
+# be committed.
+*.dll
+*.lib
+*.exp
+*.def
+
+# rendered output
+voxel.bmp
