@@ -63,10 +63,26 @@ var count: [int] = []
 for i in 0..NAMES.len() { count.push(0) }
 var cplx: [int] = []
 for i in 0..NAMES.len() { cplx.push(0) }
+// A_VARS and A_NODES are NOT index-aligned: av_leaf pushes a variable with
+// node = -1 and no node at all, so variables outnumber nodes and the indices
+// drift apart. An earlier version of this file read A_VARS[i] for node i,
+// which made the per-op counts right and the complex column wrong. The map
+// below goes the only direction that is defined: variable to its node.
+var node_var: [int] = []
+for i in 0..A_NODES.len() { node_var.push(0 - 1) }
+for v in 0..A_VARS.len() {
+    let n = A_VARS[v].node
+    if n >= 0 { node_var[n] = v }
+}
 for i in 0..A_NODES.len() {
     let o = A_NODES[i].op
     count[o] = count[o] + 1
-    if dtype_is_complex(A_VARS[i].v.dt) { cplx[o] = cplx[o] + 1 }
+    let v = node_var[i]
+    if v >= 0 {
+        if dtype_is_complex(A_VARS[v].v.dt) { cplx[o] = cplx[o] + 1 }
+    } else {
+        print("WARNING: node {i} has no variable, which should be impossible")
+    }
 }
 print("tape nodes: {A_NODES.len()}")
 print("op                count   of which complex")

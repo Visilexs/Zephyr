@@ -390,21 +390,32 @@ A hand-maintained list would be wrong within a week; this asks the model.
 (LEAF is not a recorded node; SUB and COMPLEX are implemented and tested but
 the phase model never uses them).
 
-| op | nodes | of which complex | | op | nodes | of which complex |
+| op | nodes | complex output | | op | nodes | complex output |
 |---|---|---|---|---|---|---|
-| MUL | 101 | 55 | | TRANSPOSE | 13 | 9 |
-| ADD | 41 | 29 | | TANH | 12 | 8 |
-| INDEX_SELECT | 40 | 21 | | COS | 12 | 6 |
-| CONCAT | 30 | 19 | | SIN | 12 | 5 |
-| SLICE | 30 | 11 | | ABS2 | 8 | 6 |
-| CAST | 25 | 10 | | RESHAPE | 7 | 5 |
-| CONJ | 18 | 11 | | EXPAND | 7 | 4 |
-| EXPI | 18 | 11 | | REAL | 6 | 5 |
-| NEG | 13 | 4 | | IMAG | 6 | 5 |
-| MATMUL | 13 | 10 | | ROLL | 6 | 5 |
-| SUM_DIM | 2 | 2 | | LN | 2 | 1 |
+| MUL | 101 | 93 | | TRANSPOSE | 13 | 1 |
+| ADD | 41 | 28 | | TANH | 12 | 0 |
+| INDEX_SELECT | 40 | 36 | | COS | 12 | 0 |
+| CONCAT | 30 | 12 | | SIN | 12 | 0 |
+| SLICE | 30 | 0 | | ABS2 | 8 | 0 |
+| CAST | 25 | 25 | | RESHAPE | 7 | 1 |
+| CONJ | 18 | 18 | | EXPAND | 7 | 1 |
+| EXPI | 18 | 18 | | REAL | 6 | 0 |
+| NEG | 13 | 12 | | IMAG | 6 | 0 |
+| MATMUL | 13 | 1 | | ROLL | 6 | 6 |
+| SUM_DIM | 2 | 0 | | LN | 2 | 0 |
 | SUM_ALL | 1 | 0 | | MEAN_ALL | 1 | 0 |
-| DIV | 1 | 1 | | EXP | 1 | 0 |
+| DIV | 1 | 0 | | EXP | 1 | 0 |
+
+**Correction.** An earlier revision of this table gave different figures in
+the second column -- among them "ABS2, 6 of 8 complex", which is impossible,
+since `abs2` returns a real tensor by construction. The cause was in
+`tools/op_census.zeph`: it read `A_VARS[i]` for node `i`, but `A_VARS` and
+`A_NODES` are not index-aligned. `av_leaf` pushes a variable with `node = -1`
+and no node at all, so variables outnumber nodes and the indices drift. The
+per-op counts in the first column were always right, because that loop
+iterates nodes; the second column was reading an unrelated variable. The
+census now builds an explicit node-to-variable map and warns if any node
+lacks one.
 
 Only MATMUL is currently on the device, so A23 covers the other 24.
 
