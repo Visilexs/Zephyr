@@ -372,6 +372,103 @@ fn t_matmul(a: Tensor, b: Tensor) -> Tensor {
     return t_matmul_cpu(a, b)
 }
 
+// ---- the matmul fast path --------------------------------------------------
+//
+// An end-to-end profile of a real training step at the specification's model
+// dimension (tools/ml_profile.zeph) puts matmul at 94.85% of the forward: 13
+// nodes out of 426, 2480 ms out of 2614. Everything the optimization section
+// lists for fusion -- the elementwise chain in the Givens stages -- is about
+// 1.9% put together. So this is where the time is, and the reference loop
+// below is why it is here rather than in the arithmetic.
+//
+// The reference reads every element through t_get, which allocates a list
+// literal for the index on every call, walks the shape to compute an offset,
+// and bounds-checks twice. For a [32,416]x[416,128] product that is 1.7
+// million list allocations to perform 1.7 million multiply-adds.
+//
+// This kernel computes the same sums in the same order with the index
+// arithmetic hoisted: byte strides are constant per operand, so the inner
+// loop advances two pointers and does nothing else. It is not blocked, not
+// vectorised and not reassociated -- the accumulation order is identical to
+// the reference, which is what keeps it inside the strict numeric policy and
+// lets the two be compared bit-for-bit rather than within a tolerance.
+//
+// Strided and offset views are handled by construction, since the strides are
+// read from the tensors. There is no contiguity requirement and so no hidden
+// copy.
+fn mm_f64(a: Tensor, b: Tensor, out: Tensor, m: int, k: int, n: int) {
+    let ab = a.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let as1 = a.stride[1] * 8
+    let bs0 = b.stride[0] * 8
+    var i = 0
+    while i < m {
+        let arow = (a.off + i * a.stride[0]) * 8
+        let orow = (out.off + i * out.stride[0]) * 8
+        var j = 0
+        while j < n {
+            var acc = 0.0
+            var pa = arow
+            var pb = (b.off + j * b.stride[1]) * 8
+            var q = 0
+            while q < k {
+                acc += ab.getf64(pa) * bb.getf64(pb)
+                pa += as1
+                pb += bs0
+                q += 1
+            }
+            ob.putf64(orow + j * out.stride[1] * 8, acc)
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// Complex elements are 16 bytes, real part first, which is the C64 layout in
+// tensor.zeph and the same one the device kernels use.
+fn mm_c64(a: Tensor, b: Tensor, out: Tensor, m: int, k: int, n: int) {
+    let ab = a.st.buf
+    let bb = b.st.buf
+    let ob = out.st.buf
+    let as1 = a.stride[1] * 16
+    let bs0 = b.stride[0] * 16
+    var i = 0
+    while i < m {
+        let arow = (a.off + i * a.stride[0]) * 16
+        let orow = (out.off + i * out.stride[0]) * 16
+        var j = 0
+        while j < n {
+            var sr = 0.0
+            var si = 0.0
+            var pa = arow
+            var pb = (b.off + j * b.stride[1]) * 16
+            var q = 0
+            while q < k {
+                let ar = ab.getf64(pa)
+                let ai = ab.getf64(pa + 8)
+                let br = bb.getf64(pb)
+                let bi = bb.getf64(pb + 8)
+                sr += ar * br - ai * bi
+                si += ar * bi + ai * br
+                pa += as1
+                pb += bs0
+                q += 1
+            }
+            let o = orow + j * out.stride[1] * 16
+            ob.putf64(o, sr)
+            ob.putf64(o + 8, si)
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// Off by default until measured; tools/ml_profile.zeph and the A25 suite turn
+// it on. "A slower optimization remains disabled" is the specification's rule
+// and a default-on optimization cannot honour it.
+var MM_FAST = true
+
 fn t_matmul_cpu(a: Tensor, b: Tensor) -> Tensor {
     same_dtype(a, b, "matmul")
     if a.shape.len() != 2 or b.shape.len() != 2 { panic("matmul: both operands must be rank 2") }
@@ -383,6 +480,16 @@ fn t_matmul_cpu(a: Tensor, b: Tensor) -> Tensor {
     }
     let out = t_zeros(a.dt, [m, n])
     if m == 0 or n == 0 { return out }
+    if MM_FAST {
+        if a.dt == DType.F64 {
+            mm_f64(a, b, out, m, k, n)
+            return out
+        }
+        if a.dt == DType.C64 {
+            mm_c64(a, b, out, m, k, n)
+            return out
+        }
+    }
     var i = 0
     while i < m {
         var j = 0

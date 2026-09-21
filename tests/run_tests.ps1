@@ -341,6 +341,7 @@ $adSuites = [ordered]@{
     "ml-optim"    = @("tests\ml\optim_test.zeph", "optim: 82 checks passed")
     "ml-overfit"  = @("tests\ml\overfit_test.zeph", "overfit: 132 checks passed")
     "ml-ir"       = @("tests\ml\ir_test.zeph", "ir: 58 checks passed")
+    "ml-opt"      = @("tests\ml\opt_test.zeph", "opt: 23 checks passed")
 }
 foreach ($nm in $adSuites.Keys) {
     $src = $adSuites[$nm][0]

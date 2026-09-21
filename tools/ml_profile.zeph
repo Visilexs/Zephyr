@@ -1,0 +1,231 @@
+// Where does a real native training step actually spend its time?
+//
+// The optimization section of the specification opens with "Optimization only
+// after an end-to-end profile" and "First optimize operations that dominate a
+// real native training step", so this runs before any fusion is written and
+// decides what gets fused. It also warns against implementing "a broad
+// autotuner before measuring fixed model shapes", which is why this measures
+// one fixed configuration rather than sweeping.
+//
+// The forward profile comes from replaying the captured IR node by node with
+// a timer around each. That covers all 26 opcodes the model reaches, which a
+// hook-based profiler would not: only six op families are hooked, leaving
+// concat, slice, cast, transpose, reshape, expand and roll -- 118 of 426
+// nodes -- unmeasured.
+//
+// Replay timing carries per-node overhead, and that overhead is roughly
+// constant per node rather than per element. So the cost of a cheap op is
+// overstated and the cost of an expensive one is not. The count column is
+// printed next to the time for exactly that reason: an op with a large share
+// and a large count may be telling you about dispatch overhead, while one
+// with a large share and a small count is real work.
+import "ml/ir.zeph"
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// The specification's model dimension, which is the shape the profile has to
+// be about. A profile at a toy size would rank dispatch overhead first and
+// send the optimization work to the wrong place.
+let D = 128
+let E = 32
+let H = 128
+let K = 2
+let IV = 6
+let OV = 3
+let NB = 32
+let T = 4
+
+let cfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+let embedding = t_zeros(DType.F64, [IV, E])
+let think = t_zeros(DType.F64, [E])
+let W1 = t_zeros(DType.F64, [H, E + 3 * D])
+let b1 = t_zeros(DType.F64, [H])
+let W2 = t_zeros(DType.F64, [3 * D, H])
+let b2 = t_zeros(DType.F64, [3 * D])
+let z_init = t_zeros(DType.C64, [D])
+let Mo = t_zeros(DType.C64, [OV, D])
+let ps = [embedding, think, W1, b1, W2, b2, z_init, Mo]
+for i in 0..ps.len() { fill_random(ps[i]) }
+let p = PhaseParams{config: cfg, embedding: embedding, think: think, W1: W1, b1: b1,
+                    W2: W2, b2: b2, z_init: z_init, M: Mo}
+let tokens = t_zeros(DType.I64, [NB, T])
+var targets: [int] = []
+for row in 0..NB {
+    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+
+print("phase model D={D} E={E} H={H} K={K} batch={NB} T={T}")
+print("")
+
+// ---- forward against backward, the first thing worth knowing ---------------
+let opt = adamw_new(ps, 0.02, 0.9, 0.999, 0.00000001, 0.0)
+let REPS = 3
+var fwd_total = 0.0
+var bwd_total = 0.0
+var opt_total = 0.0
+var nodes = 0
+for r in 0..REPS {
+    av_reset()
+    let t0 = now_ms()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    let t1 = now_ms()
+    av_backward(loss)
+    let t2 = now_ms()
+    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
+    clip_grad_norm(grads, 5.0)
+    optim_step(opt, ps, grads)
+    let t3 = now_ms()
+    fwd_total = fwd_total + (t1 - t0)
+    bwd_total = bwd_total + (t2 - t1)
+    opt_total = opt_total + (t3 - t2)
+    nodes = av_nodes()
+}
+let fwd = fwd_total / (REPS as float)
+let bwd = bwd_total / (REPS as float)
+let opt_ms = opt_total / (REPS as float)
+let step = fwd + bwd + opt_ms
+print("step {step} ms = forward {fwd} + backward {bwd} + optimizer {opt_ms}")
+print("  forward {100.0 * fwd / step}%, backward {100.0 * bwd / step}%, optimizer {100.0 * opt_ms / step}%")
+print("  tape nodes {nodes}")
+print("")
+
+// ---- per-op forward profile, by replaying the captured graph ---------------
+av_reset()
+let m2 = pad_params(p, true)
+let loss2 = pad_loss(m2, tokens, targets)
+let g = ir_capture(loss2)
+let errs = ir_verify(g)
+if errs.len() > 0 {
+    print("WARNING: the captured graph does not verify, so this profile is of something malformed")
+    for i in 0..errs.len() {
+        if i < 5 { print("  {errs[i]}") }
+    }
+}
+
+let NOPS = 29
+var t_by_op: [float] = []
+var n_by_op: [int] = []
+var el_by_op: [int] = []
+for i in 0..NOPS {
+    t_by_op.push(0.0)
+    n_by_op.push(0)
+    el_by_op.push(0)
+}
+
+var vals: [Tensor] = []
+let placeholder = t_zeros(DType.F64, [1])
+for i in 0..g.values.len() { vals.push(placeholder) }
+for i in 0..g.inputs.len() { vals[g.inputs[i]] = A_VARS[g.var_of[g.inputs[i]]].v }
+
+let rt0 = now_ms()
+for i in 0..g.nodes.len() {
+    let nd = g.nodes[i]
+    let ov = g.values[nd.out]
+    // Executed here through the same rules ir_replay uses, with a timer
+    // around each node. Calling ir_replay per node would pay a full graph
+    // setup every time and measure that instead.
+    var x = placeholder
+    var y = placeholder
+    if nd.a >= 0 { x = vals[nd.a] }
+    if nd.b >= 0 { y = vals[nd.b] }
+    let a0 = now_ms()
+    var r = placeholder
+    if nd.op == OP_ADD { r = t_add(x, y) }
+    if nd.op == OP_SUB { r = t_sub(x, y) }
+    if nd.op == OP_MUL { r = t_mul(x, y) }
+    if nd.op == OP_DIV { r = t_div(x, y) }
+    if nd.op == OP_NEG { r = t_neg(x) }
+    if nd.op == OP_MATMUL { r = t_matmul(x, y) }
+    if nd.op == OP_TANH { r = t_tanh(x) }
+    if nd.op == OP_COS { r = t_cos(x) }
+    if nd.op == OP_SIN { r = t_sin(x) }
+    if nd.op == OP_LN { r = t_ln(x) }
+    if nd.op == OP_EXP { r = t_exp(x) }
+    if nd.op == OP_ABS2 { r = t_abs2(x) }
+    if nd.op == OP_CONJ { r = t_conj(x) }
+    if nd.op == OP_REAL { r = t_real(x) }
+    if nd.op == OP_IMAG { r = t_imag(x) }
+    if nd.op == OP_EXPI { r = t_expi(x, ov.dt) }
+    if nd.op == OP_COMPLEX { r = t_complex(x, y, ov.dt) }
+    if nd.op == OP_SUM_DIM { r = t_sum_dim(x, nd.ia[0]) }
+    if nd.op == OP_SUM_ALL { r = t_sum_to_one(x) }
+    if nd.op == OP_MEAN_ALL { r = t_div(t_sum_to_one(x), t_full(x.dt, [1], t_numel(x) as float)) }
+    if nd.op == OP_CONCAT { r = t_concat(x, y, nd.ia[0]) }
+    if nd.op == OP_ROLL { r = t_roll(x, nd.ia[0], nd.ia[1]) }
+    if nd.op == OP_TRANSPOSE { r = t_copy(t_transpose(x, nd.ia[0], nd.ia[1])) }
+    if nd.op == OP_RESHAPE { r = t_reshape(t_copy(x), ov.shape) }
+    if nd.op == OP_EXPAND { r = t_copy(t_expand(x, ov.shape)) }
+    if nd.op == OP_SLICE { r = t_copy(t_slice(x, nd.ia[0], nd.ia[1], nd.ia[2])) }
+    if nd.op == OP_CAST { r = t_cast(x, ov.dt) }
+    if nd.op == OP_INDEX_SELECT {
+        var sel: [int] = []
+        for k in 2..nd.ia.len() { sel.push(nd.ia[k]) }
+        r = t_index_select(x, nd.ia[0], sel)
+    }
+    let dt = now_ms() - a0
+    vals[nd.out] = r
+    t_by_op[nd.op] = t_by_op[nd.op] + dt
+    n_by_op[nd.op] = n_by_op[nd.op] + 1
+    el_by_op[nd.op] = el_by_op[nd.op] + ir_numel(ov.shape)
+}
+let replay_ms = now_ms() - rt0
+
+// Agreement between the replayed result and the eager one, so a profile of a
+// computation that is not the model does not get reported as if it were.
+let eager_loss = t_get(av_value(loss2), [0])
+let replay_loss = t_get(vals[g.result], [0])
+print("replayed forward in {replay_ms} ms; loss {replay_loss} against eager {eager_loss}")
+assert(fabs(replay_loss - eager_loss) / (1.0 + fabs(eager_loss)) < 0.000000000001,
+       "the replayed graph disagrees with eager, so this profile is not of the model")
+print("")
+print("op              nodes    elements      ms     share")
+var total = 0.0
+for i in 0..NOPS { total = total + t_by_op[i] }
+for pass in 0..NOPS {
+    // print in descending order of time, without sorting structures
+    var best = 0 - 1
+    var bestv = 0.0 - 1.0
+    for i in 0..NOPS {
+        if n_by_op[i] > 0 and t_by_op[i] > bestv {
+            best = i
+            bestv = t_by_op[i]
+        }
+    }
+    if best < 0 { break }
+    print("{ir_op_name(best)}   {n_by_op[best]}   {el_by_op[best]}   {t_by_op[best]}   {100.0 * t_by_op[best] / total}%")
+    t_by_op[best] = 0.0 - 2.0
+}
