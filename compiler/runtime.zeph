@@ -5,17 +5,24 @@
 // Values are laid out exactly as the C runtime expects:
 // str = {i64 len; bytes}, list = {i64 len; i64 cap; i64 data}.
 
-// ---- heap: conservative mark-sweep GC over one reserved region ----
+// ---- heap: reference counting, with a mark-sweep collector as backstop ----
 // The heap is a single contiguous reservation, committed as it grows, so a
 // candidate pointer maps to a bit index in O(1). Every object is
-// [8-byte header][payload]; the header holds the payload size (a multiple of
-// 8, so the low 3 bits are free) plus flags. A start bit marks each payload
-// address, which is how a conservatively-scanned word is recognised as a real
-// object pointer. Roots are the machine stack and the globals array.
+// [24-byte header][payload]:
+//   [obj-24] reference count
+//   [obj-16] shape descriptor address, or 0 for an object with no children
+//   [obj-8]  payload size (a multiple of 8, so the low 3 bits are free) | flags
+// Objects die when their count reaches zero (rx_drop); the descriptor says
+// which payload words are references so their counts fall too. The
+// conservative collector below is kept as a backstop for cycles and for
+// anything the compiler's dup/drop insertion misses: a start bit marks each
+// payload address, which is how a conservatively-scanned word is recognised
+// as a real object pointer. Roots are the machine stack and the globals array.
 let HEAP_RESERVE = 1073741824       // 1 GiB of address space (reserved, not committed)
 let COMMIT_STEP = 4194304           // commit 4 MiB at a time
 let F_MARK = 1
 let F_FREE = 2
+let HDR = 24                        // header bytes before every payload
 
 var __hbase = 0      // heap base
 var __hbump = 0      // next never-yet-used address
@@ -38,6 +45,7 @@ var __wl = 0         // mark worklist
 var __wlcommit = 0
 var __wltop = 0
 var __gc_on = 0      // 1 once the heap is initialised
+var __leaked = 0     // objects the backstop collector found that counting missed
 
 fn rx_bit_set(base: int, idx: int) {
     let b = base + (idx >> 3)
@@ -76,6 +84,7 @@ fn rx_free_push(obj: int, size: int) {
 fn rx_heap_init() {
     __fl = win("VirtualAlloc", 0, 4096, 12288, 4)     // (NCLASS+1) heads, off-heap
     if __fl == 0 { rt_die("out of memory") }
+    rx_desc_init()
     __hbase = rx_reserve(HEAP_RESERVE)
     __hbump = __hbase
     __hcommit = __hbase
@@ -314,20 +323,208 @@ fn rx_collect() {
     }
     __flbig = 0
     __live = 0
-    var obj = __hbase + 8
+    __leaked = 0
+    var obj = __hbase + HDR
     while obj < __hbump {
         let h = load64(obj - 8)
         let size = h & (0 - 8)
         let idx = (obj - __hbase) >> 3
         if rx_bit_get(__markb, idx) == 0 {
+            // Unreachable but not yet freed: under reference counting that is
+            // either a cycle or a missed drop. Counted so it can be reported.
+            if (h & F_FREE) == 0 { __leaked += 1 }
             store64(obj - 8, size | F_FREE)          // dead (or already free)
             rx_free_push(obj, size)
         } else {
             store64(obj - 8, size)                   // clear mark/free flags
-            __live += size + 8
+            __live += size + HDR
         }
-        obj = obj + 8 + size
+        obj = obj + HDR + size
     }
+}
+
+// ---- reference counting ----
+// Every reference-typed value the compiler holds carries one count. Locals and
+// stored fields own theirs; parameters borrow the caller's. rx_dup and rx_drop
+// are what the compiler emits; nothing else touches the count. Both ignore
+// addresses outside the heap, because a `str` may point at a literal in the
+// data section and a closure's env may be 0.
+fn rx_dup(v: int) -> int {
+    if v < __hbase or v >= __hbump { return v }
+    store64(v - 24, load64(v - 24) + 1)
+    return v
+}
+
+// `*addr = v` for a reference slot: the old holder's count goes away with it.
+// rx_drop's body is inlined rather than called -- this runs 37M times in a
+// self-build, and the old value is very often 0 (a slot's first store) or a
+// string literal outside the heap, where the whole job is one compare.
+fn rx_assign(addr: int, v: int) {
+    let old = load64(addr)
+    store64(addr, v)
+    if old >= __hbase and old < __hbump {
+        let rc = load64(old - 24)
+        if rc > 1 {
+            store64(old - 24, rc - 1)
+        } else {
+            if rc < 1 { rt_die("reference count underflow") }
+            store64(old - 24, 0)
+            rx_release(old)
+        }
+    }
+}
+
+// whether a container's keys / values / elements are references, per its descriptor
+fn rx_kref(m: int) -> int {
+    let d = load64(m - 16)
+    if d == 0 { return 0 }
+    return load64(d + 8)
+}
+fn rx_vref(m: int) -> int {
+    let d = load64(m - 16)
+    if d == 0 { return 0 }
+    return load64(d + 16)
+}
+
+fn rx_drop(v: int) {
+    if v < __hbase or v >= __hbump { return }
+    let rc = load64(v - 24)
+    if rc > 1 {
+        store64(v - 24, rc - 1)
+        return
+    }
+    if rc < 1 { rt_die("reference count underflow") }
+    store64(v - 24, 0)
+    rx_release(v)
+}
+
+// Releasing a frame's reference slots. A function with several of them used to
+// pay a call per slot on every single return, which measured at 403M calls --
+// 80% of all counting work -- to free something only 2.5% of the time. The
+// compiler emits the slot offsets as a static table instead, so a return costs
+// one call and a loop, with rx_drop's body inlined here.
+fn rx_drop_slots(fp: int, tbl: int, n: int) {
+    var i = 0
+    while i < n {
+        let v = load64(fp - load64(tbl + i * 8))
+        if v >= __hbase and v < __hbump {
+            let rc = load64(v - 24)
+            if rc > 1 {
+                store64(v - 24, rc - 1)
+            } else {
+                if rc < 1 { rt_die("reference count underflow") }
+                store64(v - 24, 0)
+                rx_release(v)
+            }
+        }
+        i += 1
+    }
+}
+
+// A child reference losing its holder: decrement, and queue it for release
+// when that was the last one. Queuing instead of recursing is what keeps a
+// million-element linked structure from overflowing the stack.
+fn rx_drop_child(c: int) {
+    if c < __hbase or c >= __hbump { return }
+    let rc = load64(c - 24)
+    if rc > 1 {
+        store64(c - 24, rc - 1)
+        return
+    }
+    if rc < 1 { rt_die("reference count underflow") }
+    store64(c - 24, 0)
+    rx_wl_push(c)
+}
+
+// Frees `v` and, transitively, everything only it kept alive. Shares the
+// collector's worklist; the two never run at once because the collector is only
+// ever entered from allocation, which release never performs.
+fn rx_release(v: int) {
+    rt_lock()
+    rx_wl_push(v)
+    while __wltop > 0 {
+        __wltop -= 1
+        let obj = load64(__wl + __wltop * 8)
+        let desc = load64(obj - 16)
+        if desc != 0 { rx_drop_children(obj, desc) }
+        let size = load64(obj - 8) & (0 - 8)
+        store64(obj - 8, size | F_FREE)
+        rx_free_push(obj, size)
+    }
+    rt_unlock()
+}
+
+// Shape descriptors. The compiler emits one per type into the data section; the
+// runtime keeps a few of its own (rx_desc_init) for the objects it builds itself.
+//   [0] kind   1 = fixed slots: [8] slot count, [16..] bitmask, bit i = slot i is a reference
+//              2 = list cell {len, cap, data}: [8] 1 if the elements are references
+//              3 = map: [8] 1 if keys are references, [16] 1 if values are
+fn rx_drop_children(obj: int, desc: int) {
+    let kind = load64(desc)
+    if kind == 1 {
+        let n = load64(desc + 8)
+        var i = 0
+        while i < n {
+            if (load64(desc + 16 + (i >> 6) * 8) >> (i & 63)) & 1 == 1 {
+                rx_drop_child(load64(obj + i * 8))
+            }
+            i += 1
+        }
+    } else if kind == 2 {
+        let data = load64(obj + 16)
+        if load64(desc + 8) == 1 {
+            let n = load64(obj)
+            var i = 0
+            while i < n {
+                rx_drop_child(load64(data + i * 8))
+                i += 1
+            }
+        }
+        rx_drop_child(data)
+    } else if kind == 3 {
+        let cap = load64(obj + 8)
+        let keys = load64(obj + 16)
+        let vals = load64(obj + 24)
+        let state = load64(obj + 32)
+        let kref = load64(desc + 8)
+        let vref = load64(desc + 16)
+        var i = 0
+        while i < cap {
+            if load8(state + i) == 1 {
+                if kref == 1 { rx_drop_child(load64(keys + i * 8)) }
+                if vref == 1 { rx_drop_child(load64(vals + i * 8)) }
+            }
+            i += 1
+        }
+        rx_drop_child(keys)
+        rx_drop_child(vals)
+        rx_drop_child(state)
+    }
+}
+
+// The runtime's own descriptors, on one off-heap page.
+var __d_list_val = 0
+var __d_list_ref = 0
+var __d_box_val = 0
+var __d_box_ref = 0
+var __d_map_val = 0
+fn rx_desc_init() {
+    let page = win("VirtualAlloc", 0, 4096, 12288, 4)
+    if page == 0 { rt_die("out of memory") }
+    __d_map_val = page + 128         // kind 3, plain keys and values
+    store64(page + 128, 3)
+    __d_list_val = page              // kind 2, elements are values
+    store64(page, 2)
+    __d_list_ref = page + 32         // kind 2, elements are references
+    store64(page + 32, 2)
+    store64(page + 40, 1)
+    __d_box_val = page + 64          // kind 1, one slot, not a reference
+    store64(page + 64, 1)
+    store64(page + 72, 1)
+    __d_box_ref = page + 96          // kind 1, one slot, a reference
+    store64(page + 96, 1)
+    store64(page + 104, 1)
+    store64(page + 112, 1)
 }
 
 // a small scratch page for out-params (never freed, not on the GC heap)
@@ -359,10 +556,10 @@ fn rx_take_free(need: int) -> int {
         let nxt = load64(cur)
         if sz >= need {
             if prev == 0 { __flbig = nxt } else { store64(prev, nxt) }
-            if sz >= need + 16 {                     // split off the tail
-                let rest = sz - need - 8
+            if sz >= need + HDR + 8 {                // split off the tail
+                let rest = sz - need - HDR
                 store64(cur - 8, need)
-                let nb = cur + need + 8              // payload of the remainder
+                let nb = cur + need + HDR            // payload of the remainder
                 store64(nb - 8, rest | F_FREE)
                 rx_bit_set(__startb, (nb - __hbase) >> 3)
                 rx_free_push(nb, rest)
@@ -378,9 +575,20 @@ fn rx_take_free(need: int) -> int {
     return 0
 }
 
+// An object with no children (a string, a list's data buffer). The compiler
+// still calls this by name, so the signature must not change.
 fn rt_alloc(size: int) -> int {
+    return rt_alloc_d(size, 0)
+}
+
+// An object whose payload holds references: `desc` (see rx_drop_children) says
+// which words, so dropping it can drop them. Count starts at 1 - the caller
+// owns the fresh object.
+fn rt_alloc_d(size: int, desc: int) -> int {
     rt_lock()
     let r = rx_alloc_body(size)
+    store64(r - 24, 1)
+    store64(r - 16, desc)
     rt_unlock()
     return r
 }
@@ -416,10 +624,10 @@ fn rx_alloc_body(size: int) -> int {
         if b != 0 { return b }
     }
     // bump
-    rx_grow(__hbump + 8 + need)
-    let obj = __hbump + 8
-    store64(__hbump, need)
-    __hbump = __hbump + 8 + need
+    rx_grow(__hbump + HDR + need)
+    let obj = __hbump + HDR
+    store64(obj - 8, need)
+    __hbump = obj + need
     rx_bit_set(__startb, (obj - __hbase) >> 3)
     return obj                                       // committed pages start zeroed
 }
@@ -567,7 +775,7 @@ fn rt_str_ends_with(s: int, p: int) -> int {
 fn rt_str_split(s: int, sep: int) -> int {
     let n = load64(s)
     let m = load64(sep)
-    let out = rt_list_new(0)
+    let out = rt_list_new_d(0, __d_list_ref)
     if m == 0 {
         var i = 0
         while i < n {
@@ -687,8 +895,16 @@ fn rt_list_contains_str(l: int, v: int) -> int {
 // ---- hash map ----
 // layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind
 // state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.
+// Called by name from the compiler; a map whose keys and values it will not drop.
 fn rt_map_new(keykind: int) -> int {
-    let m = rt_alloc(48)
+    return rt_map_new_d(keykind, 0)
+}
+
+// `desc` is a kind-3 descriptor saying whether keys and values are references.
+fn rt_map_new_d(keykind: int, desc: int) -> int {
+    var d = desc
+    if d == 0 { d = __d_map_val }     // the buffers still have to go when the map does
+    let m = rt_alloc_d(48, d)
     let cap = 8
     store64(m, 0)
     store64(m + 8, cap)
@@ -752,7 +968,9 @@ fn rx_map_insert(m: int, k: int, v: int) {
     while probes < cap {
         let st = load8(state + i)
         if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 {
-            store64(vals + i * 8, v)          // update in place
+            if rx_vref(m) == 1 { rx_assign(vals + i * 8, v) }   // update in place
+            else { store64(vals + i * 8, v) }
+            if rx_kref(m) == 1 { rx_drop(k) }                    // the old key stays
             return
         }
         if st == 2 and tomb < 0 { tomb = i }
@@ -790,6 +1008,10 @@ fn rx_map_grow(m: int) {
         }
         i += 1
     }
+    // The entries moved, not their counts: only the old arrays themselves die.
+    rx_drop(oldkeys)
+    rx_drop(oldvals)
+    rx_drop(oldstate)
 }
 // ---- int-key fast paths: hash and == inlined, no call per probe ----
 fn rx_ilookup(m: int, k: int) -> int {
@@ -826,7 +1048,8 @@ fn rx_iinsert(m: int, k: int, v: int) {
     while probes < cap {
         let st = load8(state + i)
         if st == 1 and load64(keys + i * 8) == k {
-            store64(vals + i * 8, v)
+            if rx_vref(m) == 1 { rx_assign(vals + i * 8, v) }
+            else { store64(vals + i * 8, v) }
             return
         }
         if st == 2 and tomb < 0 { tomb = i }
@@ -852,16 +1075,24 @@ fn rt_map_set(m: int, k: int, v: int) {
     }
     rx_map_insert(m, k, v)
 }
+// Lookups hand back a +1 of their own when the values are references: the
+// caller owns what it gets, the map keeps what it holds. rt_map_set and
+// rt_list_push are the only runtime entry points that take ownership of an
+// argument; everything else borrows.
 fn rt_map_get(m: int, k: int) -> int {
     let i = rx_lookup(m, k)
     if i < 0 { rt_die("map key not found") }
-    return load64(load64(m + 24) + i * 8)
+    let v = load64(load64(m + 24) + i * 8)
+    if rx_vref(m) == 1 { let d = rx_dup(v) }
+    return v
 }
 // fused m.get(k).or(d): the value or the default, no optional cell allocated
 fn rt_map_get_or(m: int, k: int, d: int) -> int {
     let i = rx_lookup(m, k)
-    if i < 0 { return d }
-    return load64(load64(m + 24) + i * 8)
+    var v = d
+    if i >= 0 { v = load64(load64(m + 24) + i * 8) }
+    if rx_vref(m) == 1 { let d = rx_dup(v) }
+    return v
 }
 // dispatch: int-keyed maps take the inlined fast path
 fn rx_lookup(m: int, k: int) -> int {
@@ -872,8 +1103,15 @@ fn rx_lookup(m: int, k: int) -> int {
 fn rt_map_get_opt(m: int, k: int) -> int {
     let i = rx_lookup(m, k)
     if i < 0 { return 0 }
-    let cell = rt_alloc(8)
-    store64(cell, load64(load64(m + 24) + i * 8))
+    let v = load64(load64(m + 24) + i * 8)
+    var cell = 0
+    if rx_vref(m) == 1 {
+        cell = rt_alloc_d(8, __d_box_ref)
+        let d = rx_dup(v)
+    } else {
+        cell = rt_alloc_d(8, __d_box_val)
+    }
+    store64(cell, v)
     return cell
 }
 fn rt_map_has(m: int, k: int) -> int {
@@ -885,15 +1123,19 @@ fn rt_map_remove(m: int, k: int) {
     if i < 0 { return }
     store8(load64(m + 32) + i, 2)         // tombstone
     store64(m, load64(m) - 1)
+    if rx_kref(m) == 1 { rx_drop(load64(load64(m + 16) + i * 8)) }
+    if rx_vref(m) == 1 { rx_drop(load64(load64(m + 24) + i * 8)) }
 }
 fn rt_map_keys(m: int) -> int {
     let cap = load64(m + 8)
     let keys = load64(m + 16)
     let state = load64(m + 32)
-    let out = rt_list_new(0)
+    var ld = __d_list_val
+    if rx_kref(m) == 1 { ld = __d_list_ref }
+    let out = rt_list_new_d(0, ld)
     var i = 0
     while i < cap {
-        if load8(state + i) == 1 { rt_list_push(out, load64(keys + i * 8)) }
+        if load8(state + i) == 1 { rt_list_push(out, rx_dup(load64(keys + i * 8))) }
         i += 1
     }
     return out
@@ -902,10 +1144,12 @@ fn rt_map_values(m: int) -> int {
     let cap = load64(m + 8)
     let vals = load64(m + 24)
     let state = load64(m + 32)
-    let out = rt_list_new(0)
+    var ld = __d_list_val
+    if rx_vref(m) == 1 { ld = __d_list_ref }
+    let out = rt_list_new_d(0, ld)
     var i = 0
     while i < cap {
-        if load8(state + i) == 1 { rt_list_push(out, load64(vals + i * 8)) }
+        if load8(state + i) == 1 { rt_list_push(out, rx_dup(load64(vals + i * 8))) }
         i += 1
     }
     return out
@@ -1228,8 +1472,15 @@ fn rt_list_slice(l: int, lo: int, hi: int) -> int {
     let n = load64(l)
     if lo < 0 or hi < lo or hi > n { rt_die("invalid slice") }
     let data = load64(l + 16)
-    let out = rt_list_new(hi - lo)
+    let out = rt_list_new_d(hi - lo, load64(l - 16))
     rx_mcopy(load64(out + 16), data + lo * 8, (hi - lo) * 8)
+    if rx_kref(l) == 1 {                  // kind 2: [8] is the element flag
+        var i = lo
+        while i < hi {
+            let d = rx_dup(load64(data + i * 8))
+            i += 1
+        }
+    }
     return out
 }
 
@@ -1364,8 +1615,16 @@ fn rt_str_to_float(s: int) -> int {
 }
 
 // ---- lists ----  (a list value points to {i64 len; i64 cap; i64 data})
+// Called by name from the compiler; a list whose elements it will not drop.
 fn rt_list_new(n: int) -> int {
-    let l = rt_alloc(24)
+    return rt_list_new_d(n, 0)
+}
+
+// `desc` is a kind-2 descriptor saying whether the elements are references.
+fn rt_list_new_d(n: int, desc: int) -> int {
+    var d = desc
+    if d == 0 { d = __d_list_val }    // the data buffer still has to go when the list does
+    let l = rt_alloc_d(24, d)
     var cap = n
     if cap < 4 { cap = 4 }
     let data = rt_alloc(cap * 8)
@@ -1381,9 +1640,11 @@ fn rt_list_push(l: int, v: int) {
     if n == cap {
         let ncap = cap * 2
         let nd = rt_alloc(ncap * 8)
-        rx_mcopy(nd, load64(l + 16), n * 8)
+        let od = load64(l + 16)
+        rx_mcopy(nd, od, n * 8)
         store64(l + 8, ncap)
         store64(l + 16, nd)
+        rx_drop(od)                       // the cell was the buffer's only holder
     }
     store64(load64(l + 16) + n * 8, v)
     store64(l, n + 1)
@@ -1821,7 +2082,7 @@ fn rt_sb_end(mark: int) -> int {
 // ---- command-line args ----
 fn rt_args() -> int {
     let cl = win("GetCommandLineA")       // LPSTR
-    let l = rt_list_new(0)
+    let l = rt_list_new_d(0, __d_list_ref)
     var i = 0
     var going = true
     while going {

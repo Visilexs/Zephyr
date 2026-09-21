@@ -3226,6 +3226,295 @@ fn starts_rt(name: str) -> bool {
     return name.len() >= 3 and name.sub(0, 3) == "rt_"
 }
 
+// ---------------- reference counting ----------------
+// Ownership contract of the x86 backend. gen_expr leaves an OWNED (+1) value
+// in rax whenever the type is a reference. Every STORED slot -- local, global,
+// field, element, capture -- owns +1 of what it holds, so a store goes through
+// rx_assign (drop the old holder) and a function drops its locals on exit.
+// Functions return owned values.
+//
+// PARAMETERS ARE BORROWED. A call takes no count and the callee releases
+// nothing: the caller is holding the value for the duration, either in one of
+// its own slots or in an owned temporary it keeps pushed across the call and
+// drops afterwards. That is sound by induction, because every borrow bottoms
+// out in one of those two and a suspended frame can release neither. It is
+// also why reading a parameter still takes a count -- storing it anywhere that
+// outlives the call goes through gen_expr, which dups. Zephyr parameters are
+// immutable, so a borrowed slot is never written.
+//
+// Runtime rt_ entry points borrow their arguments and return owned results;
+// rt_list_push and rt_map_set are the two that take ownership instead. A value
+// needed only for one operation is fetched with gen_tmp, which skips the +1
+// when something already pins it (borrow_ok) and otherwise tells the caller to
+// drop it afterwards. borrow_ok's `safe` flag is the difference between "this
+// expression is next" and "an arbitrary callee runs next": across a call only
+// a constant or a local/param/capture may be borrowed, never a global or a
+// container element the callee could remove.
+// ponytail: values live until overwritten or function exit, not scope exit --
+// a per-scope drop is the upgrade if loop temporaries ever hold too much.
+fn is_ref(t: int) -> bool {
+    let k = ty_kind[t]
+    return k == K_STR or k == K_LIST or k == K_STRUCT or k == K_MAP or k == K_FN or k == K_OPT or k == K_IFACE or k == K_NONE
+}
+fn ref_bit(t: int) -> int {
+    if is_ref(t) { return 1 }
+    return 0
+}
+
+var g_borrow = false        // gen_expr: leave a borrowed value (no dup); consumed by the very next node
+var g_dslots: [str] = []    // per-function frame-offset tables for the exit drop
+var g_dts: [str] = []       // shape descriptors, ".quad" words comma-separated (layout: rx_drop_children)
+var g_ia_tmp = 0            // gen_index_addr: 0 nothing pushed, 1 borrowed base at [rsp], 2 owned base at [rsp]
+var g_refslot: [bool] = []  // per function: local slots holding a reference
+var g_cur_ptypes: [int] = []
+
+fn dt_add(words: str) -> int {
+    for i in 0..g_dts.len() {
+        if g_dts[i] == words { return i }
+    }
+    g_dts.push(words)
+    return g_dts.len() - 1
+}
+// kind 1: n fixed slots, bitmask words saying which hold references
+fn dt_slots(types: [int]) -> int {
+    var w = "1, {types.len()}"
+    var i = 0
+    while i < types.len() {
+        var mask = 0
+        var b = 0
+        while b < 64 and i + b < types.len() {
+            if is_ref(types[i + b]) { mask = mask | (1 << b) }
+            b += 1
+        }
+        w = w + ", {mask}"
+        i += 64
+    }
+    return dt_add(w)
+}
+fn dt_list(t: int) -> int { return dt_add("2, {ref_bit(ty_el[t])}") }
+fn dt_map(t: int) -> int { return dt_add("3, {ref_bit(ty_sd[t])}, {ref_bit(ty_el[t])}") }
+fn dt_ref() -> str {                       // {code|vtable, ref} cells
+    let i = dt_add("1, 2, 2")
+    return "lea rdx, [rip + __dt{i}]"
+}
+
+// the value can be read without taking a +1: a local pins it, or it is a constant.
+// `safe` says nothing that could drop it (a call, a store) runs before the use.
+fn borrow_ok(x: Node, safe: bool) -> bool {
+    if not is_ref(x.ty) { return true }
+    if x.k == N_STRLIT { return x.kids.len() == 1 and x.kids[0].k == N_STRTXT }
+    if x.k == N_NONELIT { return true }
+    if x.k == N_ID { return x.aux == ID_LOCAL or x.aux == ID_PARAM or x.aux == ID_CAPTURE }
+    if not safe { return false }
+    if x.k == N_MEMBER { return borrow_ok(x.kids[0], true) }
+    if x.k == N_INDEX and ty_kind[x.kids[0].ty] == K_LIST {
+        return borrow_ok(x.kids[0], true) and not has_call(x.kids[1])
+    }
+    return false
+}
+// An inlined call's argument temporary IS a parameter, so it borrows like one.
+// The hoisted decl, the inlined body and the statement that consumes the result
+// are adjacent in the same block, so the caller's slot pins the value for
+// exactly the span a real call would. Borrowing means the temp neither takes a
+// count nor needs releasing, which keeps it out of the frame's exit-drop table
+// -- and those temporaries were the bulk of it, one per argument per inlined
+// call site, all still being visited on every return.
+fn inl_borrow_decl(s: Node) -> bool {
+    if s.k != N_DECL or s.aux != ID_LOCAL { return false }
+    if s.name != "(inlined arg)" { return false }
+    if not is_ref(s.ty) { return false }
+    return borrow_ok(s.kids[0], false)
+}
+
+// value -> rax; true when it is an owned temporary the caller must drop
+fn gen_tmp(x: Node, safe: bool) -> bool {
+    if borrow_ok(x, safe) {
+        g_borrow = true
+        gen_expr(x)
+        return false
+    }
+    gen_expr(x)
+    return true
+}
+// Taking a count is the most frequent thing the counter does -- half of every
+// call site in a reference-heavy program -- so it skips rcall's alignment
+// dance. That is safe only because rx_dup is a leaf: a range check and an
+// increment, no Win32 call, nothing that needs a 16-byte rsp or shadow space.
+// Keep it a leaf. (Inlining it outright costs more than it saves: each site
+// would need a label, and the assembler's symbol table is already two thirds
+// full at this program size.)
+fn dup_rax() {
+    o("mov rcx, rax")
+    o("call " + fn_label("rx_dup"))           // returns its argument: rax survives
+}
+fn drop_rax() {
+    o("mov rcx, rax")
+    rcall(fn_label("rx_drop"))
+}
+fn tmp_hold(t: bool) { if t { o("push rax") } }
+fn tmp_done(t: bool) {
+    if t {
+        o("pop rcx")
+        rcall(fn_label("rx_drop"))
+    }
+}
+// the temp at [rsp] goes; rax (a result) stays
+fn tmp_done_keep(t: bool) {
+    if t {
+        o("mov rcx, [rsp]")
+        o("mov [rsp], rax")
+        rcall(fn_label("rx_drop"))
+        o("pop rax")
+    }
+}
+// the value was pushed whether owned or not
+fn tmp_pop(t: bool) {
+    if t { tmp_done(t) } else { o("add rsp, 8") }
+}
+fn tmp_pop_keep(t: bool) {
+    if t { tmp_done_keep(t) } else { o("add rsp, 8") }
+}
+// n values pushed in order sit at [rsp .. rsp+8n); release the owned ones, pop all, keep rax
+fn drop_temps(owned: [bool]) {
+    let n = owned.len()
+    var any = false
+    for i in 0..n { if owned[i] { any = true } }
+    if any {
+        o("push rax")
+        for i in 0..n {
+            if owned[i] {
+                o("mov rcx, [rsp + {8 + 8 * (n - 1 - i)}]")
+                rcall(fn_label("rx_drop"))
+            }
+        }
+        o("pop rax")
+    }
+    if n > 0 { o("add rsp, {8 * n}") }
+}
+// rax -> the reference slot, releasing what it held
+fn store_ref(kind: int, idx: int) {
+    // A reference slot must live in memory: rx_assign takes its address, and
+    // `lea` on a register is not an instruction. compute_promotions is what
+    // guarantees this, by refusing to promote anything mark_ref_slots claimed.
+    if not addr_is_mem(slot_addr(kind, idx)) {
+        panic("internal: reference slot {kind}/{idx} was register-promoted")
+    }
+    o("lea rcx, " + slot_addr(kind, idx))
+    o("mov rdx, rax")
+    rcall(fn_label("rx_assign"))
+}
+// finish an element access that gen_index_addr left a base for; rax stays
+fn index_fin_keep() {
+    if g_ia_tmp == 2 { tmp_done_keep(true) }
+    else if g_ia_tmp == 1 { o("add rsp, 8") }
+    g_ia_tmp = 0
+}
+// ---- ownership inference: move on last use ----
+// A reference read that is the LAST read of its local needs no new count: the
+// slot hands over the one it already holds, and is cleared so the exit drop
+// finds nothing. That removes the dup/drop pair around the shape this compiler
+// is built out of -- allocate a node, fill it in, then store or return it.
+//
+// Three things make it sound:
+//  * the counter is decremented as reads are EMITTED, so the decision never
+//    depends on textual order matching evaluation order (the backend reorders
+//    operands freely, though only for non-reference types today);
+//  * a read inside a loop the declaration sits outside of runs many times
+//    against one initialisation, so any such read disqualifies the slot;
+//  * everything else errs safe. A read scanned but never emitted (a branch the
+//    backend replaced with a vector kernel), or emitted but never scanned,
+//    only leaves the counter above zero, and no move happens.
+// Borrowed reads still decrement but never move: the slot keeps its count and
+// the exit drop releases it, which is already optimal.
+var g_reads: [int] = []     // reads of each local the body contains
+var g_left: [int] = []      // ... still to be emitted
+var g_movable: [bool] = []  // no read sits in a loop the declaration is outside of
+var g_decld: [int] = []     // loop depth of the declaration, -1 if never seen
+
+fn mv_scan(e: Node, depth: int) {
+    if e.k == N_ID {
+        if e.aux == ID_LOCAL and e.slot < g_reads.len() and is_ref(e.ty) {
+            g_reads[e.slot] += 1
+            if g_decld[e.slot] != depth { g_movable[e.slot] = false }
+        }
+        return
+    }
+    if e.k == N_FNLIT {                     // only the captures run in this frame
+        var ci = 3
+        while ci < e.kids.len() {
+            mv_scan(e.kids[ci], depth)
+            ci += 1
+        }
+        return
+    }
+    if e.k == N_DECL and e.aux == ID_LOCAL and e.slot < g_decld.len() {
+        // a borrowed temporary holds no count of its own, so it has none to give
+        if inl_borrow_decl(e) { g_decld[e.slot] = 0 - 2 } else { g_decld[e.slot] = depth }
+    }
+    if e.k == N_INLINE and e.slot < g_decld.len() { g_decld[e.slot] = depth }
+    if e.k == N_WHILE {
+        mv_scan(e.kids[0], depth)
+        mv_scan(e.kids[1], depth + 1)
+        return
+    }
+    if e.k == N_FORR {
+        mv_scan(e.kids[0], depth)
+        mv_scan(e.kids[1], depth)
+        mv_scan(e.kids[2], depth + 1)
+        return
+    }
+    if e.k == N_FORIN {
+        mv_scan(e.kids[0], depth)           // the list expression runs once, outside
+        // the element variable is stored afresh on every iteration, so as far as
+        // ownership goes it is declared inside the body
+        if e.slot < g_decld.len() { g_decld[e.slot] = depth + 1 }
+        mv_scan(e.kids[1], depth + 1)
+        return
+    }
+    for c in e.kids { mv_scan(c, depth) }
+}
+
+fn mv_reset(nslots: int, stmts: [Node]) {
+    iclear(g_reads)
+    iclear(g_left)
+    iclear(g_decld)
+    bclear(g_movable)
+    for i in 0..nslots {
+        g_reads.push(0)
+        g_decld.push(0 - 1)
+        g_movable.push(true)
+    }
+    for s in stmts { mv_scan(s, 0) }
+    for i in 0..nslots { g_left.push(g_reads[i]) }
+}
+
+// account for one emitted read; true when it was the last one and may move
+fn mv_use(slot: int) -> bool {
+    if slot >= g_left.len() { return false }
+    if g_left[slot] <= 0 { return false }      // emitted more than scanned: never move
+    g_left[slot] -= 1
+    return g_left[slot] == 0 and g_movable[slot]
+}
+
+fn mark_ref_slots(e: Node) {
+    if e.k == N_DECL and e.aux == ID_LOCAL {
+        if is_ref(e.ty) and not inl_borrow_decl(e) { g_refslot[e.slot] = true }
+    } else if e.k == N_FORIN {
+        if is_ref(ty_el[e.kids[0].ty]) { g_refslot[e.slot] = true }
+        g_refslot[e.aux] = true
+    } else if e.k == N_INLINE {
+        if is_ref(e.ty) { g_refslot[e.slot] = true }
+    } else if e.k == N_FNLIT {                 // only the captures run in this frame
+        var ci = 3
+        while ci < e.kids.len() {
+            mark_ref_slots(e.kids[ci])
+            ci += 1
+        }
+        return
+    }
+    for c in e.kids { mark_ref_slots(c) }
+}
+
 fn addr_is_mem(a: str) -> bool { return a.byte(0) == 91 }   // '['
 
 // increment a slot in place, whether it lives in memory or a register
@@ -3345,6 +3634,13 @@ fn compute_promotions(stmts: [Node], nslots: int, nparams: int) {
         g_pbad.push(false)
     }
     for s in stmts { count_refs(s, 1) }
+    // reference slots stay in memory whatever the reads say
+    for i in 0..nslots {
+        if i < g_refslot.len() and g_refslot[i] { g_lbad[i] = true }
+    }
+    for i in 0..nparams {
+        if i < g_cur_ptypes.len() and is_ref(g_cur_ptypes[i]) { g_pbad[i] = true }
+    }
     // A register-convention function receives its arguments in registers, so a
     // param that stays in one costs nothing to set up -- only the callee-saved
     // register's save/restore. Promote those on any use at all, rather than
@@ -3544,6 +3840,7 @@ fn expand_call(parent: Node, i: int) {
     var inl = nnode(N_INLINE, call.line)
     inl.name = f.name
     inl.slot = res
+    inl.ty = call.ty
     for st in f.pristine.kids { inl.kids.push(inl_clone(st, pbase, lbase, res, depth)) }
     g_hoisted.push(inl)
     g_inl_hits += 1
@@ -4293,6 +4590,8 @@ fn has_call(e: Node) -> bool {
     if k == N_INLINE or k == N_IRET { return true }   // inlined body may make an FFI call that clobbers xmm
     if k == N_CAST and (e.aux == C_TOSTR or e.aux == C_S2I or e.aux == C_S2F) { return true }
     if k == N_INDEX and ty_kind[e.kids[0].ty] == K_MAP { return true }
+    if k == N_BIN and e.aux == BC_STR { return true }
+    if is_ref(e.ty) and not borrow_ok(e, true) { return true }   // takes a +1 through rx_dup
     for c in e.kids { if has_call(c) { return true } }
     return false
 }
@@ -4327,6 +4626,7 @@ fn gen_fexpr_into(e: Node, x: str) {
         if e.k == N_INDEX and ty_kind[e.ty] == K_FLOAT and ty_kind[e.kids[0].ty] == K_LIST {
             let ir = gen_index_addr(e)
             o("movsd " + x + ", [rcx + " + ir + "*8]")
+            index_fin_keep()           // x is callee-saved or a spill: the drop cannot touch it
             return
         }
         if is_float_arith(e) and not has_call(e) {
@@ -4382,6 +4682,13 @@ fn gen_fexpr(e: Node) {
     if e.k == N_INDEX and ty_kind[e.ty] == K_FLOAT and ty_kind[e.kids[0].ty] == K_LIST {
         let ir = gen_index_addr(e)
         o("movsd xmm0, [rcx + " + ir + "*8]")
+        if g_ia_tmp == 2 {                 // releasing the base is a call: bounce through rax
+            o("movq rax, xmm0")
+            index_fin_keep()
+            o("movq xmm0, rax")
+        } else {
+            index_fin_keep()
+        }
         return
     }
     // sqrt is one instruction: keep it in xmm instead of the generic path's
@@ -4578,32 +4885,32 @@ fn gen_binop(e: Node) {
     if cat != BC_STR and cat != BC_FLOAT {
         if gen_into_try(e, "rax") { return }
     }
+    if cat == BC_STR {                 // both operands are only read
+        var owned: [bool] = []
+        owned.push(gen_tmp(e.kids[0], not has_call(e.kids[1])))
+        o("push rax")
+        owned.push(gen_tmp(e.kids[1], true))
+        o("push rax")
+        o("mov rdx, [rsp]")
+        o("mov rcx, [rsp + 8]")
+        if op == T_PLUS {
+            rcall("rt_str_concat")
+        } else if op == T_EQEQ or op == T_NE {
+            rcall("rt_str_eq")
+            if op == T_NE { o("xor rax, 1") }
+        } else {
+            rcall("rt_str_cmp")
+            o("cmp rax, 0")
+            o("set{cc_of(op)} al")
+            o("movzx eax, al")
+        }
+        drop_temps(owned)
+        return
+    }
     if cat == BC_FLOAT {
         gen_float_operands(e.kids[0], e.kids[1])
     } else {
         gen_int_operands(e.kids[0], e.kids[1])
-    }
-    if cat == BC_STR {
-        if op == T_PLUS {
-            o("mov rdx, rcx")
-            o("mov rcx, rax")
-            rcall("rt_str_concat")
-            return
-        }
-        if op == T_EQEQ or op == T_NE {
-            o("mov rdx, rcx")
-            o("mov rcx, rax")
-            rcall("rt_str_eq")
-            if op == T_NE { o("xor rax, 1") }
-            return
-        }
-        o("mov rdx, rcx")
-        o("mov rcx, rax")
-        rcall("rt_str_cmp")
-        o("cmp rax, 0")
-        o("set{cc_of(op)} al")
-        o("movzx eax, al")
-        return
     }
     if cat == BC_FLOAT {
         if op == T_PLUS { o("addsd xmm0, xmm1") }
@@ -4746,7 +5053,7 @@ fn scratch_free(r: str) {
 // and interpolation all reach the runtime even though they are not N_CALL.
 fn tmp_safe(e: Node) -> bool {
     if e.k == N_INT or e.k == N_FLOAT or e.k == N_BOOL { return true }
-    if e.k == N_ID { return e.aux != ID_FUNC }
+    if e.k == N_ID { return e.aux != ID_FUNC and not is_ref(e.ty) }
     if e.k == N_CALL {
         if e.aux != CK_LOAD64 and e.aux != CK_LOAD8 { return false }
     } else if e.k == N_BIN {
@@ -5093,16 +5400,21 @@ fn gen_index_addr(e: Node) -> str {
         if inreg { ir = iop } else { gen_expr(e.kids[1]) }
         gen_bounds_check_slot(lb_lslot(p), ir)
         o("mov rcx, " + lb_dslot(p))
+        g_ia_tmp = 0                   // nothing parked: every caller ends with index_fin_keep
         return ir
     }
     if is_leaf(e.kids[0]) {            // list is a simple var: no stack shuffle
         if inreg { ir = iop } else { gen_expr(e.kids[1]) }
         gen_leaf("rcx", e.kids[0])     // list ptr -> rcx
+        g_ia_tmp = 0
     } else {
-        gen_expr(e.kids[0])
+        // the base stays at [rsp] until the caller's index_fin_keep
+        let t = gen_tmp(e.kids[0], not has_call(e.kids[1]))
         o("push rax")
         gen_expr(e.kids[1])
-        o("pop rcx")
+        o("mov rcx, [rsp]")
+        g_ia_tmp = 1
+        if t { g_ia_tmp = 2 }
     }
     gen_bounds_check("rcx", ir)
     o("mov rcx, [rcx + 16]")
@@ -5270,6 +5582,8 @@ fn gen_leaf(reg: str, e: Node) {
         o("mov {reg}, [{reg} + {8 * e.slot}]")
     }
     else {                                                  // N_ID
+        // borrowed, never moved -- but it is still a read, so it counts
+        if e.k == N_ID and e.aux == ID_LOCAL and is_ref(e.ty) { let x = mv_use(e.slot) }
         // a float local promoted into an xmm register has no live memory slot;
         // pull its bits straight out of the register
         let fr = float_reg(e.aux, e.slot)
@@ -5286,14 +5600,16 @@ fn gen_leaf(reg: str, e: Node) {
 fn gen_call(e: Node) {
     let k = e.aux
     if k == CK_PRINT {
-        gen_expr(e.kids[1])
+        let t = gen_tmp(e.kids[1], true)
+        tmp_hold(t)
         o("mov rcx, rax")
         o("lea rdx, [rip + __td{e.slot}]")
         rcall("rt_print_val")
+        tmp_done(t)
         return
     }
     if k == CK_PANIC {
-        gen_expr(e.kids[1])
+        let t = gen_tmp(e.kids[1], true)       // borrowed; the process does not come back
         o("mov rcx, rax")
         rcall("rt_panic_str")
         return
@@ -5306,23 +5622,28 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_LEN {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         o("mov rax, [rax]")
+        tmp_done_keep(t)
         return
     }
     if k == CK_PUSH {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], not has_call(e.kids[1]))
         o("push rax")
-        gen_expr(e.kids[1])
+        gen_expr(e.kids[1])              // owned: the list takes it
         o("mov rdx, rax")
-        o("pop rcx")
+        o("mov rcx, [rsp]")
         rcall("rt_list_push")
+        tmp_pop(t)
         return
     }
     if k == CK_POP {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         o("mov rcx, rax")
-        rcall("rt_list_pop")
+        rcall("rt_list_pop")             // ownership moves out of the list
+        tmp_done_keep(t)
         return
     }
     if k == CK_ARGS {
@@ -5336,14 +5657,17 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_OPT_HAS {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         o("cmp rax, 0")
         o("setne al")
         o("movzx eax, al")
+        tmp_done_keep(t)
         return
     }
     if k == CK_OPT_GET {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         let ok = newlabel()
         o("cmp rax, 0")
         o("jne {lbl(ok)}")
@@ -5352,41 +5676,50 @@ fn gen_call(e: Node) {
         rcall("rt_panic_str")
         olabel(ok)
         o("mov rax, [rax]")
+        if is_ref(e.ty) { dup_rax() }
+        tmp_done_keep(t)
         return
     }
     if k == CK_OPT_OR {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         let done = newlabel()
         let isnone = newlabel()
         o("cmp rax, 0")
         o("je {lbl(isnone)}")
         o("mov rax, [rax]")
+        if is_ref(e.ty) { dup_rax() }
         o("jmp {lbl(done)}")
         olabel(isnone)
         gen_expr(e.kids[1])
         olabel(done)
+        tmp_done_keep(t)
         return
     }
     if k == CK_INDIRECT {
         // Call through a {code, env} cell. env is pushed FIRST so it lands deepest,
         // at [rbp + 16 + 8*nparams] â€” past the args. A plain function simply never
         // looks there; a closure reads its captures from it.
-        gen_expr(e.kids[0])                    // rax = cell
+        var csafe = true
+        for i in 1..e.kids.len() { if has_call(e.kids[i]) { csafe = false } }
+        let ct = gen_tmp(e.kids[0], csafe)     // rax = cell
         o("push rax")                          // keep the cell (also a GC root)
         o("mov rax, [rsp]")
         o("mov rax, [rax + 8]")
         o("push rax")                          // env
+        var owned: [bool] = []
         var n = 0
         for i in 1..e.kids.len() {
-            gen_expr(e.kids[i])
+            owned.push(gen_tmp(e.kids[i], false))   // borrowed, like any call
             o("push rax")
             n += 1
         }
         o("mov rax, [rsp + {8 * (n + 1)}]")    // the cell, under args+env
         o("mov rax, [rax]")                    // code pointer
         o("call rax")
-        o("add rsp, {8 * (n + 1)}")            // drop args + env
-        o("pop rcx")                           // drop the cell (rax holds the result)
+        drop_temps(owned)                      // owned args go, then all n pop
+        o("add rsp, 8")                        // env
+        tmp_pop_keep(ct)                       // drop the cell (rax holds the result)
         return
     }
     if k == CK_IDISPATCH {
@@ -5394,12 +5727,16 @@ fn gen_call(e: Node) {
         // data (self) then the args (stack convention, like any user method),
         // then call through the vtable slot. The cell is parked deepest so we
         // can still reach its vtable after the args are pushed.
-        gen_expr(e.kids[0].kids[0])            // rax = cell
+        var dsafe = true
+        for i in 1..e.kids.len() { if has_call(e.kids[i]) { dsafe = false } }
+        let ct = gen_tmp(e.kids[0].kids[0], dsafe)   // rax = cell
         o("push rax")                          // cell (deepest; a GC root too)
-        o("mov rax, [rax + 8]")                // data = self
+        o("mov rax, [rax + 8]")                // data = self, borrowed: the cell holds it
         o("push rax")                          // self = arg 0
+        var owned: [bool] = []
+        owned.push(false)                      // self
         for i in 1..e.kids.len() {
-            gen_expr(e.kids[i])
+            owned.push(gen_tmp(e.kids[i], false))
             o("push rax")
         }
         let np = e.kids.len()                  // self + args pushed above the cell
@@ -5407,23 +5744,26 @@ fn gen_call(e: Node) {
         o("mov rax, [rax]")                    // vtable
         o("mov rax, [rax + {8 * e.slot}]")     // method code pointer
         o("call rax")
-        o("add rsp, {8 * np}")                 // drop self + args
-        o("pop rcx")                           // drop the cell (rax = result)
+        drop_temps(owned)                      // owned args go, then self + args pop
+        tmp_pop_keep(ct)                       // drop the cell (rax = result)
         return
     }
-    if k == CK_RTCALL {         // method -> rt_ call: receiver + args in rcx/rdx/r8/r9
-        gen_expr(e.kids[0].kids[0])
-        o("push rax")
-        var n = 1
-        for i in 1..e.kids.len() {
-            gen_expr(e.kids[i])
+    if k == CK_RTCALL {         // method -> rt_ call: receiver + args in rcx/rdx/r8/r9; all borrowed
+        var owned: [bool] = []
+        var n = 0
+        for i in 0..e.kids.len() {
+            var a = e.kids[i]
+            if i == 0 { a = a.kids[0] }
+            var safe = true
+            for j in (i + 1)..e.kids.len() { if has_call(e.kids[j]) { safe = false } }
+            owned.push(gen_tmp(a, safe))
             o("push rax")
             n += 1
         }
         let ar = ["rcx", "rdx", "r8", "r9"]
         for i in 0..n { o("mov " + ar[i] + ", [rsp + {8 * (n - 1 - i)}]") }
         o("call {fn_label(e.name)}")
-        if n > 0 { o("add rsp, {8 * n}") }
+        drop_temps(owned)
         return
     }
     if k == CK_ABS {
@@ -5486,22 +5826,29 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_BITS {
-        gen_expr(e.kids[1])
+        // ponytail: addr()/bits() of an owned temporary is never dropped -- the
+        // raw address outlives no one that way. A local costs nothing.
+        let t = gen_tmp(e.kids[1], true)
         return
     }
     if k == CK_READF {
-        gen_expr(e.kids[1])
+        let t = gen_tmp(e.kids[1], true)
+        tmp_hold(t)
         o("mov rcx, rax")
         rcall("rt_read_file")
+        tmp_done_keep(t)
         return
     }
     if k == CK_WRITEF {
-        gen_expr(e.kids[1])
+        var owned: [bool] = []
+        owned.push(gen_tmp(e.kids[1], not has_call(e.kids[2])))
         o("push rax")
-        gen_expr(e.kids[2])
-        o("mov rdx, rax")
-        o("pop rcx")
+        owned.push(gen_tmp(e.kids[2], true))
+        o("push rax")
+        o("mov rdx, [rsp]")
+        o("mov rcx, [rsp + 8]")
         rcall("rt_write_file")
+        drop_temps(owned)
         return
     }
     if k == CK_CHR {
@@ -5511,9 +5858,11 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_EMIT {
-        gen_expr(e.kids[1])
+        let t = gen_tmp(e.kids[1], true)
+        tmp_hold(t)
         o("mov rcx, rax")
         rcall("rt_emit")
+        tmp_done(t)
         return
     }
     if k == CK_LOAD64 {
@@ -5679,30 +6028,34 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_BYTE {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], not has_call(e.kids[1]))
         o("push rax")
         gen_expr(e.kids[1])
-        o("pop rcx")
+        o("mov rcx, [rsp]")
         gen_bounds_check("rcx", "rax")
         o("movzx eax, byte ptr [rcx + rax + 8]")
+        tmp_pop_keep(t)
         return
     }
     if k == CK_SUB {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], not has_call(e.kids[1]) and not has_call(e.kids[2]))
         o("push rax")
         gen_expr(e.kids[1])
         o("push rax")
         gen_expr(e.kids[2])
         o("mov r8, rax")
         o("pop rdx")
-        o("pop rcx")
+        o("mov rcx, [rsp]")
         rcall("rt_str_sub")
+        tmp_pop_keep(t)
         return
     }
     if k == CK_JOIN {
-        gen_expr(e.kids[0].kids[0])
+        let t = gen_tmp(e.kids[0].kids[0], true)
+        tmp_hold(t)
         o("mov rcx, rax")
         rcall("rt_join")
+        tmp_done_keep(t)
         return
     }
     // user function (plain or UFCS)
@@ -5711,21 +6064,34 @@ fn gen_call(e: Node) {
     if e.op == 1 { cargs.push(e.kids[0].kids[0]) }        // UFCS receiver
     for i in 1..e.kids.len() { cargs.push(e.kids[i]) }
     var ncargs = cargs.len()
+    // Arguments are BORROWED (see the ownership contract above is_ref): the
+    // callee is handed a reference the caller is already keeping alive, so no
+    // count changes hands and the callee drops nothing on the way out. That is
+    // sound by induction -- every borrow bottoms out in a caller's local slot
+    // or a caller's owned temporary, and a suspended frame cannot release
+    // either while the call runs.
+    //
+    // borrow_ok(a, false) is what decides it. An argument the caller does not
+    // already pin -- a fresh allocation, a call result, a global, a container
+    // element the callee could remove out from under us -- is materialised as
+    // an owned temporary that stays pushed across the call and is dropped
+    // after it.
+    //
     // Register convention with no stack traffic: every argument after the
     // first is a leaf, so it can be loaded straight into its register after
     // the first one has been evaluated (leaves only read slots and promoted
     // registers, never the argument registers).
     if fn_is_regcall(e.refi) and ncargs > 0 and ncargs <= 4 {
-        var tail_simple = true
+        var tail_simple = borrow_ok(cargs[0], false)
         for i in 1..ncargs {
-            if not is_leaf(cargs[i]) { tail_simple = false }
+            if not is_leaf(cargs[i]) or not borrow_ok(cargs[i], false) { tail_simple = false }
         }
         if tail_simple {
             let ar = ["rcx", "rdx", "r8", "r9"]
-            gen_expr(cargs[0])
+            let t0 = gen_tmp(cargs[0], false)      // borrowed: no count taken
             var i = ncargs - 1
             while i >= 1 {
-                gen_leaf(ar[i], cargs[i])
+                gen_leaf(ar[i], cargs[i])          // borrowed likewise -- gen_leaf never dups
                 i -= 1
             }
             o("mov rcx, rax")
@@ -5733,22 +6099,24 @@ fn gen_call(e: Node) {
             return
         }
     }
+    var owned: [bool] = []
     for i in 0..ncargs {
-        gen_expr(cargs[i])
+        owned.push(gen_tmp(cargs[i], false))
         o("push rax")
     }
     if starts_rt(f.name) or fn_is_regcall(e.refi) {   // register convention
         let ar = ["rcx", "rdx", "r8", "r9"]
         for i in 0..ncargs { o("mov " + ar[i] + ", [rsp + {8 * (ncargs - 1 - i)}]") }
         o("call {fn_label(f.label)}")
-        if ncargs > 0 { o("add rsp, {8 * ncargs}") }
     } else {                        // stack convention
         o("call {fn_label(f.label)}")
-        if ncargs > 0 { o("add rsp, {8 * ncargs}") }
     }
+    drop_temps(owned)               // releases the owned ones, then pops them all
 }
 
 fn gen_expr(e: Node) {
+    let bor = g_borrow          // set by gen_tmp for this node only
+    g_borrow = false
     if e.k == N_INT {
         o("movabs rax, {e.ival}")
         return
@@ -5780,10 +6148,12 @@ fn gen_expr(e: Node) {
                 o("lea rcx, [rip + __s{add_dstr(p.name)}]")
                 rcall("rt_sb_txt")
             } else {
-                gen_expr(p.kids[0])      // value -> rax (may itself build a string; sb nests via marks)
+                let t = gen_tmp(p.kids[0], true)   // value -> rax (may itself build a string; sb nests via marks)
+                tmp_hold(t)
                 o("mov rcx, rax")
                 o("lea rdx, [rip + __td{p.slot}]")
                 rcall("rt_sb_val")
+                tmp_done(t)
             }
         }
         o("pop rcx")                     // mark
@@ -5802,6 +6172,7 @@ fn gen_expr(e: Node) {
         if e.aux == ID_CAPTURE {                 // captured by value into the env
             o("mov rax, " + env_addr())
             o("mov rax, [rax + {8 * e.slot}]")
+            if is_ref(e.ty) and not bor { dup_rax() }
             return
         }
         let fr = float_reg(e.aux, e.slot)
@@ -5809,14 +6180,26 @@ fn gen_expr(e: Node) {
             o("movq rax, " + fr)
             return
         }
-        o("mov rax, " + slot_addr(e.aux, e.slot))
+        let sa = slot_addr(e.aux, e.slot)
+        o("mov rax, " + sa)
+        if is_ref(e.ty) {
+            var last = false
+            if e.aux == ID_LOCAL { last = mv_use(e.slot) }
+            if not bor {
+                if last { o("mov qword ptr " + sa + ", 0") }   // moved: the slot gives up its count
+                else { dup_rax() }
+            }
+        }
         return
     }
     if e.k == N_FNLIT {                          // closure: snapshot captures, build {code, env}
         let f = g_fns[e.refi]
         let ncap = e.kids.len() - 3
+        var captypes: [int] = []
+        for i in 0..ncap { captypes.push(e.kids[3 + i].ty) }
         o("mov rcx, {8 * ncap}")
-        rcall("rt_alloc")
+        o("lea rdx, [rip + __dt{dt_slots(captypes)}]")
+        rcall("rt_alloc_d")
         o("push rax")                            // env stays at [rsp] (a GC root)
         for i in 0..ncap {
             gen_expr(e.kids[3 + i])
@@ -5824,7 +6207,8 @@ fn gen_expr(e: Node) {
             o("mov [rdx + {8 * i}], rax")
         }
         o("mov rcx, 16")
-        rcall("rt_alloc")                        // rax = cell
+        o(dt_ref())
+        rcall("rt_alloc_d")                      // rax = cell
         o("pop rcx")                             // env
         o("mov [rax + 8], rcx")
         o("lea rdx, [rip + " + fn_label(f.label) + "]")
@@ -5839,7 +6223,10 @@ fn gen_expr(e: Node) {
         gen_expr(e.kids[0])
         o("push rax")
         o("mov rcx, 8")
-        rcall("rt_alloc")
+        var boxt: [int] = []
+        boxt.push(e.kids[0].ty)
+        o("lea rdx, [rip + __dt{dt_slots(boxt)}]")
+        rcall("rt_alloc_d")
         o("pop rcx")
         o("mov [rax], rcx")
         return
@@ -5848,7 +6235,8 @@ fn gen_expr(e: Node) {
         gen_expr(e.kids[0])                 // rax = struct pointer (data)
         o("push rax")
         o("mov rcx, 16")
-        rcall("rt_alloc")
+        o(dt_ref())
+        rcall("rt_alloc_d")
         o("pop rcx")                        // data
         o("mov [rax + 8], rcx")
         o("lea rdx, [rip + __vt{e.op}]")
@@ -5858,7 +6246,8 @@ fn gen_expr(e: Node) {
     if e.k == N_MAPLIT {
         let setfn = map_setfn(e.ty)
         o("mov rcx, {map_keykind(e.ty)}")
-        rcall("rt_map_new")
+        o("lea rdx, [rip + __dt{dt_map(e.ty)}]")
+        rcall("rt_map_new_d")
         o("push rax")                      // map stays at [rsp]
         var mi = 0
         while mi < e.kids.len() {
@@ -5876,7 +6265,8 @@ fn gen_expr(e: Node) {
     }
     if e.k == N_LIST {
         o("mov rcx, {e.kids.len()}")
-        rcall("rt_list_new")
+        o("lea rdx, [rip + __dt{dt_list(e.ty)}]")
+        rcall("rt_list_new_d")
         o("push rax")
         for i in 0..e.kids.len() {
             gen_expr(e.kids[i])
@@ -5890,7 +6280,8 @@ fn gen_expr(e: Node) {
     if e.k == N_SLIT {
         let sd = g_structs[e.refi]
         o("mov rcx, {8 * sd.fnames.len()}")
-        rcall("rt_alloc")
+        o("lea rdx, [rip + __dt{dt_slots(sd.ftypes)}]")
+        rcall("rt_alloc_d")
         o("push rax")
         for f in e.kids {
             gen_expr(f.kids[0])
@@ -5925,8 +6316,23 @@ fn gen_expr(e: Node) {
         return
     }
     if e.k == N_CAST {
-        gen_expr(e.kids[0])
         let c = e.aux
+        if c == C_TOSTR or c == C_S2I or c == C_S2F {   // the source is only read
+            let t = gen_tmp(e.kids[0], true)
+            tmp_hold(t)
+            o("mov rcx, rax")
+            if c == C_TOSTR {
+                o("lea rdx, [rip + __td{e.slot}]")
+                rcall("rt_to_str")
+            } else if c == C_S2I {
+                rcall("rt_str_to_int")
+            } else {
+                rcall("rt_str_to_float")
+            }
+            tmp_done_keep(t)
+            return
+        }
+        gen_expr(e.kids[0])
         if c == C_I2F {
             o("cvtsi2sd xmm0, rax")
             o("movq rax, xmm0")
@@ -5948,21 +6354,29 @@ fn gen_expr(e: Node) {
     }
     if e.k == N_INDEX {
         if ty_kind[e.kids[0].ty] == K_MAP {
-            gen_expr(e.kids[0])
+            var owned: [bool] = []
+            owned.push(gen_tmp(e.kids[0], not has_call(e.kids[1])))
             o("push rax")
-            gen_expr(e.kids[1])
-            o("mov rdx, rax")          // key
-            o("pop rcx")               // map
-            rcall(map_getfn(e.kids[0].ty))
+            owned.push(gen_tmp(e.kids[1], true))
+            o("push rax")
+            o("mov rdx, [rsp]")        // key
+            o("mov rcx, [rsp + 8]")    // map
+            rcall(map_getfn(e.kids[0].ty))   // hands back its own +1
+            drop_temps(owned)
             return
         }
         let ir = gen_index_addr(e)     // data pointer -> rcx, index in ir
         o("mov rax, [rcx + " + ir + "*8]")
+        if is_ref(e.ty) and not bor { dup_rax() }
+        index_fin_keep()
         return
     }
     if e.k == N_MEMBER {
-        gen_expr(e.kids[0])
+        let t = gen_tmp(e.kids[0], true)
+        tmp_hold(t)
         o("mov rax, [rax + {8 * e.slot}]")
+        if is_ref(e.ty) and not bor { dup_rax() }
+        tmp_done_keep(t)
         return
     }
     if e.k == N_CALL {
@@ -6406,7 +6820,13 @@ fn gen_stmt(s: Node, retlabel: int) {
     // -g: mark the .text position of each main-file statement (skips runtime/std/imports)
     if g_debug and g_cur_user and s.file == g_main_file and s.line > 0 { raw(".zloc {s.line}") }
     if s.k == N_DECL {
-        if ty_kind[s.kids[0].ty] == K_FLOAT {
+        if is_ref(s.ty) and inl_borrow_decl(s) {
+            let t = gen_tmp(s.kids[0], false)          // borrowed: nothing to release
+            o("mov " + slot_addr(s.aux, s.slot) + ", rax")
+        } else if is_ref(s.ty) {
+            gen_expr(s.kids[0])
+            store_ref(s.aux, s.slot)         // the slot may hold a previous iteration's value
+        } else if ty_kind[s.kids[0].ty] == K_FLOAT {
             if not gen_store_float_direct(s.aux, s.slot, s.kids[0]) {
                 gen_fexpr(s.kids[0])
                 store_float(s.aux, s.slot)
@@ -6420,7 +6840,10 @@ fn gen_stmt(s: Node, retlabel: int) {
     if s.k == N_ASSIGN {
         let t = s.kids[0]
         if t.k == N_ID {
-            if ty_kind[s.kids[1].ty] == K_FLOAT {
+            if is_ref(t.ty) {
+                gen_expr(s.kids[1])
+                store_ref(t.aux, t.slot)
+            } else if ty_kind[s.kids[1].ty] == K_FLOAT {
                 if not gen_store_float_direct(t.aux, t.slot, s.kids[1]) {
                     gen_fexpr(s.kids[1])
                     store_float(t.aux, t.slot)
@@ -6430,21 +6853,30 @@ fn gen_stmt(s: Node, retlabel: int) {
                 o("mov " + slot_addr(t.aux, t.slot) + ", rax")
             }
         } else if t.k == N_MEMBER {
-            gen_expr(t.kids[0])
+            let bt = gen_tmp(t.kids[0], not has_call(s.kids[1]))
             o("push rax")
             gen_expr(s.kids[1])
-            o("pop rcx")
-            o("mov [rcx + {8 * t.slot}], rax")
+            if is_ref(t.ty) {
+                o("mov rdx, rax")
+                o("mov rcx, [rsp]")
+                o("add rcx, {8 * t.slot}")
+                rcall(fn_label("rx_assign"))
+            } else {
+                o("mov rcx, [rsp]")
+                o("mov [rcx + {8 * t.slot}], rax")
+            }
+            tmp_pop(bt)
         } else if ty_kind[t.kids[0].ty] == K_MAP {
-            gen_expr(t.kids[0])              // map
+            let mt = gen_tmp(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
+            o("push rax")                    // map
+            gen_expr(t.kids[1])              // key (owned: the map takes it)
             o("push rax")
-            gen_expr(t.kids[1])              // key
-            o("push rax")
-            gen_expr(s.kids[1])              // value
+            gen_expr(s.kids[1])              // value (owned: the map takes it)
             o("mov r8, rax")
             o("pop rdx")                     // key
-            o("pop rcx")                     // map
+            o("mov rcx, [rsp]")              // map
             rcall(map_setfn(t.kids[0].ty))
+            tmp_pop(mt)
         } else {
             if try_index_rmw(t, s.kids[1]) { return }
             var ixr = "rdx"
@@ -6453,12 +6885,14 @@ fn gen_stmt(s: Node, retlabel: int) {
             // cannot disturb it. `a[i] = <expr>` loses its push/pop pair.
             let iop = cmp_operand(t.kids[1])
             if iop != "" and not starts_with(iop, "[") { ixr = iop }
+            var bt = false
+            var pushed = false
             if is_leaf(t.kids[0]) {          // list is a var: load it last, skip its push/pop
                 if ixr != "rdx" {
                     gen_expr(s.kids[1])      // value -> rax
                 } else {
                     gen_expr(t.kids[1])      // index -> rax
-                    if is_leaf(s.kids[1]) {
+                    if is_leaf(s.kids[1]) and not is_ref(t.ty) {   // a ref leaf needs its +1 (a call)
                         o("mov rdx, rax")        // index -> rdx
                         gen_leaf("rax", s.kids[1]) // value -> rax
                     } else {
@@ -6469,25 +6903,32 @@ fn gen_stmt(s: Node, retlabel: int) {
                 }
                 if t.op == 0 { gen_leaf("rcx", t.kids[0]) }   // list -> rcx
             } else {
-                gen_expr(t.kids[0])
-                o("push rax")
+                bt = gen_tmp(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
+                pushed = true
+                o("push rax")                // base stays at [rsp] until the store is done
                 gen_expr(t.kids[1])
                 o("push rax")
                 gen_expr(s.kids[1])
                 o("pop rdx")
-                o("pop rcx")
+                o("mov rcx, [rsp]")
                 ixr = "rdx"
             }
             if t.op > 0 {                       // hoisted base (see lb_promote_loop)
                 let p = t.op - 1
                 gen_bounds_check_slot(lb_lslot(p), ixr)
                 o("mov r8, " + lb_dslot(p))
-                o("mov [r8 + " + ixr + "*8], rax")
             } else {
                 gen_bounds_check("rcx", ixr)
                 o("mov r8, [rcx + 16]")
+            }
+            if is_ref(t.ty) {
+                o("lea rcx, [r8 + " + ixr + "*8]")
+                o("mov rdx, rax")
+                rcall(fn_label("rx_assign"))
+            } else {
                 o("mov [r8 + " + ixr + "*8], rax")
             }
+            if pushed { tmp_pop(bt) }
         }
         return
     }
@@ -6568,8 +7009,9 @@ fn gen_stmt(s: Node, retlabel: int) {
         let lv = slot_addr(ID_LOCAL, s.aux)      // list ptr (hidden, stays in memory: GC root)
         let xv = slot_addr(ID_LOCAL, s.op)       // index (hidden, never promoted)
         let ev = slot_addr(ID_LOCAL, s.slot)     // element var (may be promoted)
+        let eref = is_ref(ty_el[s.kids[0].ty])
         gen_expr(s.kids[0])
-        o("mov " + lv + ", rax")
+        store_ref(ID_LOCAL, s.aux)               // the hidden slot owns the list for the loop
         o("mov qword ptr " + xv + ", 0")
         olabel(top)
         o("mov rcx, " + lv)
@@ -6578,7 +7020,12 @@ fn gen_stmt(s: Node, retlabel: int) {
         o("jge {lbl(end)}")
         o("mov rdx, [rcx + 16]")
         o("mov rax, [rdx + rax*8]")
-        o("mov " + ev + ", rax")
+        if eref {
+            dup_rax()
+            store_ref(ID_LOCAL, s.slot)
+        } else {
+            o("mov " + ev + ", rax")
+        }
         // A float element variable may live in a promoted xmm register, which
         // reads never take from the memory slot -- so publish it there too, or
         // every iteration of `for x in someFloatList` sees 0.
@@ -6611,6 +7058,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         olabel(iend)
         let fr = float_reg(ID_LOCAL, s.slot)   // only floats get xmm-promoted, so
         if fr != "" { o("movq " + fr + ", rax") }   // a promoted result is a float
+        else if is_ref(s.ty) { store_ref(ID_LOCAL, s.slot) }
         else { o("mov " + slot_addr(ID_LOCAL, s.slot) + ", rax") }
         return
     }
@@ -6628,7 +7076,8 @@ fn gen_stmt(s: Node, retlabel: int) {
         return
     }
     if s.k == N_EXPRST {
-        gen_expr(s.kids[0])
+        let t = gen_tmp(s.kids[0], true)  // an owned result nobody keeps
+        if t { drop_rax() }
         return
     }
     die(s.line, "internal: cannot generate statement kind {s.k}")
@@ -6662,7 +7111,7 @@ fn line_uses_r12(s: str) -> bool {
 fn try_index_rmw(t: Node, v: Node) -> bool {
     if v.k != N_BIN { return false }
     if not expr_eq(v.kids[0], t) { return false }
-    if has_call(v.kids[1]) or has_call(t.kids[1]) { return false }
+    if has_call(v.kids[1]) or has_call(t.kids[1]) or has_call(t.kids[0]) { return false }
     let rhs = v.kids[1]
     if ty_kind[t.ty] == K_FLOAT {
         if v.aux != BC_FLOAT { return false }
@@ -6677,6 +7126,7 @@ fn try_index_rmw(t: Node, v: Node) -> bool {
         o("movsd xmm0, [rcx + " + ir + "*8]")
         fop_emit(op, "xmm0", sp)
         o("movsd [rcx + " + ir + "*8], xmm0")
+        index_fin_keep()
         return true
     }
     if v.aux == BC_STR or v.aux == BC_FLOAT { return false }
@@ -6694,6 +7144,7 @@ fn try_index_rmw(t: Node, v: Node) -> bool {
     o("mov " + dr + ", [rcx + " + ir + "*8]")
     o(alu + " " + dr + ", " + sr)
     o("mov [rcx + " + ir + "*8], " + dr)
+    index_fin_keep()
     scratch_free(dr)
     scratch_free(sr)
     return true
@@ -6703,6 +7154,26 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
     g_cur_regcall = starts_rt(label) or g_next_regcall
     g_cur_nslots = nslots
     g_cur_nparams = nparams
+    // Which slots hold references is decided BEFORE promotion, because
+    // compute_promotions has to leave those slots in memory (see store_ref).
+    // The inliner is why this cannot be inferred from the reads alone: a
+    // hoisted result temp is written by an N_INLINE and read through nodes
+    // whose type need not agree with the statement that stores to it.
+    bclear(g_refslot)
+    for i in 0..nslots { g_refslot.push(false) }
+    // The counting primitives themselves get no slot bookkeeping: a release
+    // routine that released its own frame on the way out would call itself
+    // forever. Their only reference slots hold the string literal an inlined
+    // rt_die carries, which never lives on the heap.
+    var rc_core = label == "lm_rx_drop" or label == "lm_rx_dup" or label == "lm_rx_assign" or label == "lm_rx_drop_child"
+    if label == "lm_rx_drop_slots" or label == "lm_rx_release" or label == "lm_rx_drop_children" { rc_core = true }
+    if not rc_core {
+        for s in stmts { mark_ref_slots(s) }
+    }
+    mv_reset(nslots, stmts)
+    if rc_core {
+        for i in 0..nslots { g_movable[i] = false }   // no bookkeeping in the counter itself
+    }
     compute_promotions(stmts, nslots, nparams)
     var base = nslots
     if g_cur_regcall { base += nparams }    // home slots for register params
@@ -6758,6 +7229,18 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
             if g_pxreg[i] != "" { o("movsd {g_pxreg[i]}, [rbp + {16 + 8 * (nparams - 1 - i)}]") }
         }
     }
+    // reference slots start empty: a drop on exit (or on a re-declaration
+    // inside a loop) must never see whatever the frame held before
+    var ndrop = 0
+    for i in 0..nslots {
+        if g_refslot[i] {
+            o("mov qword ptr " + slot_addr(ID_LOCAL, i) + ", 0")
+            ndrop += 1
+        }
+    }
+    // Parameters are NOT dropped: they are borrowed from the caller, which is
+    // keeping them alive for the whole call. Zephyr parameters are immutable,
+    // so a borrowed slot is never written either -- nothing to release.
     let retlabel = newlabel()
     // Register the globals array as a GC root set. This must land *after* the
     // runtime's own top-level initializers, or they would overwrite the
@@ -6780,6 +7263,33 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
         rcall("rt_set_globals")
     }
     olabel(retlabel)
+    if ndrop > 0 {                    // the locals go; the result in rax stays
+        o("push rax")
+        if ndrop > 1 {
+            // one call and a loop over a static offset table, instead of a call
+            // per slot on every return -- see rx_drop_slots
+            var offs = ""
+            for i in 0..nslots {
+                if g_refslot[i] {
+                    if offs != "" { offs = offs + ", " }
+                    offs = offs + "{16 + 8 * i}"
+                }
+            }
+            g_dslots.push(offs)
+            o("mov rcx, rbp")
+            o("lea rdx, [rip + __ds{g_dslots.len() - 1}]")
+            o("mov r8, {ndrop}")
+            rcall(fn_label("rx_drop_slots"))
+        } else {
+            for i in 0..nslots {
+                if g_refslot[i] {
+                    o("mov rcx, " + slot_addr(ID_LOCAL, i))
+                    rcall(fn_label("rx_drop"))
+                }
+            }
+        }
+        o("pop rax")
+    }
     for k in 0..g_npromo { o("mov {PROMO_REGS[k]}, [rbp - {16 + 8 * (base + k)}]") }
     for k in 0..g_nfpromo { o("movsd {FPROMO_REGS[k]}, [rbp - {16 + 8 * (xbase + k)}]") }
     // does the body really use r12? (the out-of-line bounds-failure blocks may,
@@ -6889,6 +7399,7 @@ fn gen_program(prog: Node) {
             if f.tparams.len() > 0 { continue }        // a template emits no code
             g_cur_user = f.body.file == g_main_file
             g_next_regcall = fn_is_regcall(n.refi)
+            g_cur_ptypes = f.ptypes
             gen_fn_body(fn_label(f.label), f.nslots, f.pnames.len(), f.body.kids)
         }
     }
@@ -6896,6 +7407,7 @@ fn gen_program(prog: Node) {
         let f = g_fns[g_insts[i]]
         g_cur_user = f.body.file == g_main_file
         g_next_regcall = fn_is_regcall(g_insts[i])
+        g_cur_ptypes = f.ptypes
         gen_fn_body(fn_label(f.label), f.nslots, f.pnames.len(), f.body.kids)
     }
     var top: [Node] = []
@@ -6904,6 +7416,8 @@ fn gen_program(prog: Node) {
     }
     g_cur_user = true    // main body: per-node file filter keeps only main-file top statements
     g_next_regcall = false
+    var no_ptypes: [int] = []
+    g_cur_ptypes = no_ptypes
     gen_fn_body("zephyr_main", g_top_nslots, 0, top)
 
     raw(".section .rdata")
@@ -6954,6 +7468,16 @@ fn gen_program(prog: Node) {
             o(".quad {k}")
         }
         di += 1
+    }
+    for i in 0..g_dts.len() {          // shape descriptors for the reference counter
+        raw(".balign 8")
+        raw("__dt{i}:")
+        for w in g_dts[i].split(", ") { o(".quad " + w) }
+    }
+    for i in 0..g_dslots.len() {       // frame-offset tables for the exit drop
+        raw(".balign 8")
+        raw("__ds{i}:")
+        for w in g_dslots[i].split(", ") { o(".quad " + w) }
     }
     // interface vtables: one per (struct, interface) pair, method code pointers
     // in interface declaration order.
@@ -7829,17 +8353,24 @@ fn __emb_rt() -> str {
     p.push("// Values are laid out exactly as the C runtime expects:\n")
     p.push("// str = \{i64 len; bytes\}, list = \{i64 len; i64 cap; i64 data\}.\n")
     p.push("\n")
-    p.push("// ---- heap: conservative mark-sweep GC over one reserved region ----\n")
+    p.push("// ---- heap: reference counting, with a mark-sweep collector as backstop ----\n")
     p.push("// The heap is a single contiguous reservation, committed as it grows, so a\n")
     p.push("// candidate pointer maps to a bit index in O(1). Every object is\n")
-    p.push("// [8-byte header][payload]; the header holds the payload size (a multiple of\n")
-    p.push("// 8, so the low 3 bits are free) plus flags. A start bit marks each payload\n")
-    p.push("// address, which is how a conservatively-scanned word is recognised as a real\n")
-    p.push("// object pointer. Roots are the machine stack and the globals array.\n")
+    p.push("// [24-byte header][payload]:\n")
+    p.push("//   [obj-24] reference count\n")
+    p.push("//   [obj-16] shape descriptor address, or 0 for an object with no children\n")
+    p.push("//   [obj-8]  payload size (a multiple of 8, so the low 3 bits are free) | flags\n")
+    p.push("// Objects die when their count reaches zero (rx_drop); the descriptor says\n")
+    p.push("// which payload words are references so their counts fall too. The\n")
+    p.push("// conservative collector below is kept as a backstop for cycles and for\n")
+    p.push("// anything the compiler's dup/drop insertion misses: a start bit marks each\n")
+    p.push("// payload address, which is how a conservatively-scanned word is recognised\n")
+    p.push("// as a real object pointer. Roots are the machine stack and the globals array.\n")
     p.push("let HEAP_RESERVE = 1073741824       // 1 GiB of address space (reserved, not committed)\n")
     p.push("let COMMIT_STEP = 4194304           // commit 4 MiB at a time\n")
     p.push("let F_MARK = 1\n")
     p.push("let F_FREE = 2\n")
+    p.push("let HDR = 24                        // header bytes before every payload\n")
     p.push("\n")
     p.push("var __hbase = 0      // heap base\n")
     p.push("var __hbump = 0      // next never-yet-used address\n")
@@ -7862,6 +8393,7 @@ fn __emb_rt() -> str {
     p.push("var __wlcommit = 0\n")
     p.push("var __wltop = 0\n")
     p.push("var __gc_on = 0      // 1 once the heap is initialised\n")
+    p.push("var __leaked = 0     // objects the backstop collector found that counting missed\n")
     p.push("\n")
     p.push("fn rx_bit_set(base: int, idx: int) \{\n")
     p.push("    let b = base + (idx >> 3)\n")
@@ -7900,6 +8432,7 @@ fn __emb_rt() -> str {
     p.push("fn rx_heap_init() \{\n")
     p.push("    __fl = win(\"VirtualAlloc\", 0, 4096, 12288, 4)     // (NCLASS+1) heads, off-heap\n")
     p.push("    if __fl == 0 \{ rt_die(\"out of memory\") \}\n")
+    p.push("    rx_desc_init()\n")
     p.push("    __hbase = rx_reserve(HEAP_RESERVE)\n")
     p.push("    __hbump = __hbase\n")
     p.push("    __hcommit = __hbase\n")
@@ -8138,20 +8671,208 @@ fn __emb_rt() -> str {
     p.push("    \}\n")
     p.push("    __flbig = 0\n")
     p.push("    __live = 0\n")
-    p.push("    var obj = __hbase + 8\n")
+    p.push("    __leaked = 0\n")
+    p.push("    var obj = __hbase + HDR\n")
     p.push("    while obj < __hbump \{\n")
     p.push("        let h = load64(obj - 8)\n")
     p.push("        let size = h & (0 - 8)\n")
     p.push("        let idx = (obj - __hbase) >> 3\n")
     p.push("        if rx_bit_get(__markb, idx) == 0 \{\n")
+    p.push("            // Unreachable but not yet freed: under reference counting that is\n")
+    p.push("            // either a cycle or a missed drop. Counted so it can be reported.\n")
+    p.push("            if (h & F_FREE) == 0 \{ __leaked += 1 \}\n")
     p.push("            store64(obj - 8, size | F_FREE)          // dead (or already free)\n")
     p.push("            rx_free_push(obj, size)\n")
     p.push("        \} else \{\n")
     p.push("            store64(obj - 8, size)                   // clear mark/free flags\n")
-    p.push("            __live += size + 8\n")
+    p.push("            __live += size + HDR\n")
     p.push("        \}\n")
-    p.push("        obj = obj + 8 + size\n")
+    p.push("        obj = obj + HDR + size\n")
     p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// ---- reference counting ----\n")
+    p.push("// Every reference-typed value the compiler holds carries one count. Locals and\n")
+    p.push("// stored fields own theirs; parameters borrow the caller's. rx_dup and rx_drop\n")
+    p.push("// are what the compiler emits; nothing else touches the count. Both ignore\n")
+    p.push("// addresses outside the heap, because a `str` may point at a literal in the\n")
+    p.push("// data section and a closure's env may be 0.\n")
+    p.push("fn rx_dup(v: int) -> int \{\n")
+    p.push("    if v < __hbase or v >= __hbump \{ return v \}\n")
+    p.push("    store64(v - 24, load64(v - 24) + 1)\n")
+    p.push("    return v\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// `*addr = v` for a reference slot: the old holder's count goes away with it.\n")
+    p.push("// rx_drop's body is inlined rather than called -- this runs 37M times in a\n")
+    p.push("// self-build, and the old value is very often 0 (a slot's first store) or a\n")
+    p.push("// string literal outside the heap, where the whole job is one compare.\n")
+    p.push("fn rx_assign(addr: int, v: int) \{\n")
+    p.push("    let old = load64(addr)\n")
+    p.push("    store64(addr, v)\n")
+    p.push("    if old >= __hbase and old < __hbump \{\n")
+    p.push("        let rc = load64(old - 24)\n")
+    p.push("        if rc > 1 \{\n")
+    p.push("            store64(old - 24, rc - 1)\n")
+    p.push("        \} else \{\n")
+    p.push("            if rc < 1 \{ rt_die(\"reference count underflow\") \}\n")
+    p.push("            store64(old - 24, 0)\n")
+    p.push("            rx_release(old)\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// whether a container's keys / values / elements are references, per its descriptor\n")
+    p.push("fn rx_kref(m: int) -> int \{\n")
+    p.push("    let d = load64(m - 16)\n")
+    p.push("    if d == 0 \{ return 0 \}\n")
+    p.push("    return load64(d + 8)\n")
+    p.push("\}\n")
+    p.push("fn rx_vref(m: int) -> int \{\n")
+    p.push("    let d = load64(m - 16)\n")
+    p.push("    if d == 0 \{ return 0 \}\n")
+    p.push("    return load64(d + 16)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_drop(v: int) \{\n")
+    p.push("    if v < __hbase or v >= __hbump \{ return \}\n")
+    p.push("    let rc = load64(v - 24)\n")
+    p.push("    if rc > 1 \{\n")
+    p.push("        store64(v - 24, rc - 1)\n")
+    p.push("        return\n")
+    p.push("    \}\n")
+    p.push("    if rc < 1 \{ rt_die(\"reference count underflow\") \}\n")
+    p.push("    store64(v - 24, 0)\n")
+    p.push("    rx_release(v)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Releasing a frame's reference slots. A function with several of them used to\n")
+    p.push("// pay a call per slot on every single return, which measured at 403M calls --\n")
+    p.push("// 80% of all counting work -- to free something only 2.5% of the time. The\n")
+    p.push("// compiler emits the slot offsets as a static table instead, so a return costs\n")
+    p.push("// one call and a loop, with rx_drop's body inlined here.\n")
+    p.push("fn rx_drop_slots(fp: int, tbl: int, n: int) \{\n")
+    p.push("    var i = 0\n")
+    p.push("    while i < n \{\n")
+    p.push("        let v = load64(fp - load64(tbl + i * 8))\n")
+    p.push("        if v >= __hbase and v < __hbump \{\n")
+    p.push("            let rc = load64(v - 24)\n")
+    p.push("            if rc > 1 \{\n")
+    p.push("                store64(v - 24, rc - 1)\n")
+    p.push("            \} else \{\n")
+    p.push("                if rc < 1 \{ rt_die(\"reference count underflow\") \}\n")
+    p.push("                store64(v - 24, 0)\n")
+    p.push("                rx_release(v)\n")
+    p.push("            \}\n")
+    p.push("        \}\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// A child reference losing its holder: decrement, and queue it for release\n")
+    p.push("// when that was the last one. Queuing instead of recursing is what keeps a\n")
+    p.push("// million-element linked structure from overflowing the stack.\n")
+    p.push("fn rx_drop_child(c: int) \{\n")
+    p.push("    if c < __hbase or c >= __hbump \{ return \}\n")
+    p.push("    let rc = load64(c - 24)\n")
+    p.push("    if rc > 1 \{\n")
+    p.push("        store64(c - 24, rc - 1)\n")
+    p.push("        return\n")
+    p.push("    \}\n")
+    p.push("    if rc < 1 \{ rt_die(\"reference count underflow\") \}\n")
+    p.push("    store64(c - 24, 0)\n")
+    p.push("    rx_wl_push(c)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Frees `v` and, transitively, everything only it kept alive. Shares the\n")
+    p.push("// collector's worklist; the two never run at once because the collector is only\n")
+    p.push("// ever entered from allocation, which release never performs.\n")
+    p.push("fn rx_release(v: int) \{\n")
+    p.push("    rt_lock()\n")
+    p.push("    rx_wl_push(v)\n")
+    p.push("    while __wltop > 0 \{\n")
+    p.push("        __wltop -= 1\n")
+    p.push("        let obj = load64(__wl + __wltop * 8)\n")
+    p.push("        let desc = load64(obj - 16)\n")
+    p.push("        if desc != 0 \{ rx_drop_children(obj, desc) \}\n")
+    p.push("        let size = load64(obj - 8) & (0 - 8)\n")
+    p.push("        store64(obj - 8, size | F_FREE)\n")
+    p.push("        rx_free_push(obj, size)\n")
+    p.push("    \}\n")
+    p.push("    rt_unlock()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Shape descriptors. The compiler emits one per type into the data section; the\n")
+    p.push("// runtime keeps a few of its own (rx_desc_init) for the objects it builds itself.\n")
+    p.push("//   [0] kind   1 = fixed slots: [8] slot count, [16..] bitmask, bit i = slot i is a reference\n")
+    p.push("//              2 = list cell \{len, cap, data\}: [8] 1 if the elements are references\n")
+    p.push("//              3 = map: [8] 1 if keys are references, [16] 1 if values are\n")
+    p.push("fn rx_drop_children(obj: int, desc: int) \{\n")
+    p.push("    let kind = load64(desc)\n")
+    p.push("    if kind == 1 \{\n")
+    p.push("        let n = load64(desc + 8)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < n \{\n")
+    p.push("            if (load64(desc + 16 + (i >> 6) * 8) >> (i & 63)) & 1 == 1 \{\n")
+    p.push("                rx_drop_child(load64(obj + i * 8))\n")
+    p.push("            \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("    \} else if kind == 2 \{\n")
+    p.push("        let data = load64(obj + 16)\n")
+    p.push("        if load64(desc + 8) == 1 \{\n")
+    p.push("            let n = load64(obj)\n")
+    p.push("            var i = 0\n")
+    p.push("            while i < n \{\n")
+    p.push("                rx_drop_child(load64(data + i * 8))\n")
+    p.push("                i += 1\n")
+    p.push("            \}\n")
+    p.push("        \}\n")
+    p.push("        rx_drop_child(data)\n")
+    p.push("    \} else if kind == 3 \{\n")
+    p.push("        let cap = load64(obj + 8)\n")
+    p.push("        let keys = load64(obj + 16)\n")
+    p.push("        let vals = load64(obj + 24)\n")
+    p.push("        let state = load64(obj + 32)\n")
+    p.push("        let kref = load64(desc + 8)\n")
+    p.push("        let vref = load64(desc + 16)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < cap \{\n")
+    p.push("            if load8(state + i) == 1 \{\n")
+    p.push("                if kref == 1 \{ rx_drop_child(load64(keys + i * 8)) \}\n")
+    p.push("                if vref == 1 \{ rx_drop_child(load64(vals + i * 8)) \}\n")
+    p.push("            \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        rx_drop_child(keys)\n")
+    p.push("        rx_drop_child(vals)\n")
+    p.push("        rx_drop_child(state)\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// The runtime's own descriptors, on one off-heap page.\n")
+    p.push("var __d_list_val = 0\n")
+    p.push("var __d_list_ref = 0\n")
+    p.push("var __d_box_val = 0\n")
+    p.push("var __d_box_ref = 0\n")
+    p.push("var __d_map_val = 0\n")
+    p.push("fn rx_desc_init() \{\n")
+    p.push("    let page = win(\"VirtualAlloc\", 0, 4096, 12288, 4)\n")
+    p.push("    if page == 0 \{ rt_die(\"out of memory\") \}\n")
+    p.push("    __d_map_val = page + 128         // kind 3, plain keys and values\n")
+    p.push("    store64(page + 128, 3)\n")
+    p.push("    __d_list_val = page              // kind 2, elements are values\n")
+    p.push("    store64(page, 2)\n")
+    p.push("    __d_list_ref = page + 32         // kind 2, elements are references\n")
+    p.push("    store64(page + 32, 2)\n")
+    p.push("    store64(page + 40, 1)\n")
+    p.push("    __d_box_val = page + 64          // kind 1, one slot, not a reference\n")
+    p.push("    store64(page + 64, 1)\n")
+    p.push("    store64(page + 72, 1)\n")
+    p.push("    __d_box_ref = page + 96          // kind 1, one slot, a reference\n")
+    p.push("    store64(page + 96, 1)\n")
+    p.push("    store64(page + 104, 1)\n")
+    p.push("    store64(page + 112, 1)\n")
     p.push("\}\n")
     p.push("\n")
     p.push("// a small scratch page for out-params (never freed, not on the GC heap)\n")
@@ -8183,10 +8904,10 @@ fn __emb_rt() -> str {
     p.push("        let nxt = load64(cur)\n")
     p.push("        if sz >= need \{\n")
     p.push("            if prev == 0 \{ __flbig = nxt \} else \{ store64(prev, nxt) \}\n")
-    p.push("            if sz >= need + 16 \{                     // split off the tail\n")
-    p.push("                let rest = sz - need - 8\n")
+    p.push("            if sz >= need + HDR + 8 \{                // split off the tail\n")
+    p.push("                let rest = sz - need - HDR\n")
     p.push("                store64(cur - 8, need)\n")
-    p.push("                let nb = cur + need + 8              // payload of the remainder\n")
+    p.push("                let nb = cur + need + HDR            // payload of the remainder\n")
     p.push("                store64(nb - 8, rest | F_FREE)\n")
     p.push("                rx_bit_set(__startb, (nb - __hbase) >> 3)\n")
     p.push("                rx_free_push(nb, rest)\n")
@@ -8202,9 +8923,20 @@ fn __emb_rt() -> str {
     p.push("    return 0\n")
     p.push("\}\n")
     p.push("\n")
+    p.push("// An object with no children (a string, a list's data buffer). The compiler\n")
+    p.push("// still calls this by name, so the signature must not change.\n")
     p.push("fn rt_alloc(size: int) -> int \{\n")
+    p.push("    return rt_alloc_d(size, 0)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// An object whose payload holds references: `desc` (see rx_drop_children) says\n")
+    p.push("// which words, so dropping it can drop them. Count starts at 1 - the caller\n")
+    p.push("// owns the fresh object.\n")
+    p.push("fn rt_alloc_d(size: int, desc: int) -> int \{\n")
     p.push("    rt_lock()\n")
     p.push("    let r = rx_alloc_body(size)\n")
+    p.push("    store64(r - 24, 1)\n")
+    p.push("    store64(r - 16, desc)\n")
     p.push("    rt_unlock()\n")
     p.push("    return r\n")
     p.push("\}\n")
@@ -8240,10 +8972,10 @@ fn __emb_rt() -> str {
     p.push("        if b != 0 \{ return b \}\n")
     p.push("    \}\n")
     p.push("    // bump\n")
-    p.push("    rx_grow(__hbump + 8 + need)\n")
-    p.push("    let obj = __hbump + 8\n")
-    p.push("    store64(__hbump, need)\n")
-    p.push("    __hbump = __hbump + 8 + need\n")
+    p.push("    rx_grow(__hbump + HDR + need)\n")
+    p.push("    let obj = __hbump + HDR\n")
+    p.push("    store64(obj - 8, need)\n")
+    p.push("    __hbump = obj + need\n")
     p.push("    rx_bit_set(__startb, (obj - __hbase) >> 3)\n")
     p.push("    return obj                                       // committed pages start zeroed\n")
     p.push("\}\n")
@@ -8391,7 +9123,7 @@ fn __emb_rt() -> str {
     p.push("fn rt_str_split(s: int, sep: int) -> int \{\n")
     p.push("    let n = load64(s)\n")
     p.push("    let m = load64(sep)\n")
-    p.push("    let out = rt_list_new(0)\n")
+    p.push("    let out = rt_list_new_d(0, __d_list_ref)\n")
     p.push("    if m == 0 \{\n")
     p.push("        var i = 0\n")
     p.push("        while i < n \{\n")
@@ -8511,8 +9243,16 @@ fn __emb_rt() -> str {
     p.push("// ---- hash map ----\n")
     p.push("// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind\n")
     p.push("// state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.\n")
+    p.push("// Called by name from the compiler; a map whose keys and values it will not drop.\n")
     p.push("fn rt_map_new(keykind: int) -> int \{\n")
-    p.push("    let m = rt_alloc(48)\n")
+    p.push("    return rt_map_new_d(keykind, 0)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// `desc` is a kind-3 descriptor saying whether keys and values are references.\n")
+    p.push("fn rt_map_new_d(keykind: int, desc: int) -> int \{\n")
+    p.push("    var d = desc\n")
+    p.push("    if d == 0 \{ d = __d_map_val \}     // the buffers still have to go when the map does\n")
+    p.push("    let m = rt_alloc_d(48, d)\n")
     p.push("    let cap = 8\n")
     p.push("    store64(m, 0)\n")
     p.push("    store64(m + 8, cap)\n")
@@ -8576,7 +9316,9 @@ fn __emb_rt() -> str {
     p.push("    while probes < cap \{\n")
     p.push("        let st = load8(state + i)\n")
     p.push("        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 \{\n")
-    p.push("            store64(vals + i * 8, v)          // update in place\n")
+    p.push("            if rx_vref(m) == 1 \{ rx_assign(vals + i * 8, v) \}   // update in place\n")
+    p.push("            else \{ store64(vals + i * 8, v) \}\n")
+    p.push("            if rx_kref(m) == 1 \{ rx_drop(k) \}                    // the old key stays\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        if st == 2 and tomb < 0 \{ tomb = i \}\n")
@@ -8614,6 +9356,10 @@ fn __emb_rt() -> str {
     p.push("        \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
+    p.push("    // The entries moved, not their counts: only the old arrays themselves die.\n")
+    p.push("    rx_drop(oldkeys)\n")
+    p.push("    rx_drop(oldvals)\n")
+    p.push("    rx_drop(oldstate)\n")
     p.push("\}\n")
     p.push("// ---- int-key fast paths: hash and == inlined, no call per probe ----\n")
     p.push("fn rx_ilookup(m: int, k: int) -> int \{\n")
@@ -8650,7 +9396,8 @@ fn __emb_rt() -> str {
     p.push("    while probes < cap \{\n")
     p.push("        let st = load8(state + i)\n")
     p.push("        if st == 1 and load64(keys + i * 8) == k \{\n")
-    p.push("            store64(vals + i * 8, v)\n")
+    p.push("            if rx_vref(m) == 1 \{ rx_assign(vals + i * 8, v) \}\n")
+    p.push("            else \{ store64(vals + i * 8, v) \}\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        if st == 2 and tomb < 0 \{ tomb = i \}\n")
@@ -8676,16 +9423,24 @@ fn __emb_rt() -> str {
     p.push("    \}\n")
     p.push("    rx_map_insert(m, k, v)\n")
     p.push("\}\n")
+    p.push("// Lookups hand back a +1 of their own when the values are references: the\n")
+    p.push("// caller owns what it gets, the map keeps what it holds. rt_map_set and\n")
+    p.push("// rt_list_push are the only runtime entry points that take ownership of an\n")
+    p.push("// argument; everything else borrows.\n")
     p.push("fn rt_map_get(m: int, k: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    if i < 0 \{ rt_die(\"map key not found\") \}\n")
-    p.push("    return load64(load64(m + 24) + i * 8)\n")
+    p.push("    let v = load64(load64(m + 24) + i * 8)\n")
+    p.push("    if rx_vref(m) == 1 \{ let d = rx_dup(v) \}\n")
+    p.push("    return v\n")
     p.push("\}\n")
     p.push("// fused m.get(k).or(d): the value or the default, no optional cell allocated\n")
     p.push("fn rt_map_get_or(m: int, k: int, d: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
-    p.push("    if i < 0 \{ return d \}\n")
-    p.push("    return load64(load64(m + 24) + i * 8)\n")
+    p.push("    var v = d\n")
+    p.push("    if i >= 0 \{ v = load64(load64(m + 24) + i * 8) \}\n")
+    p.push("    if rx_vref(m) == 1 \{ let d = rx_dup(v) \}\n")
+    p.push("    return v\n")
     p.push("\}\n")
     p.push("// dispatch: int-keyed maps take the inlined fast path\n")
     p.push("fn rx_lookup(m: int, k: int) -> int \{\n")
@@ -8696,8 +9451,15 @@ fn __emb_rt() -> str {
     p.push("fn rt_map_get_opt(m: int, k: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    if i < 0 \{ return 0 \}\n")
-    p.push("    let cell = rt_alloc(8)\n")
-    p.push("    store64(cell, load64(load64(m + 24) + i * 8))\n")
+    p.push("    let v = load64(load64(m + 24) + i * 8)\n")
+    p.push("    var cell = 0\n")
+    p.push("    if rx_vref(m) == 1 \{\n")
+    p.push("        cell = rt_alloc_d(8, __d_box_ref)\n")
+    p.push("        let d = rx_dup(v)\n")
+    p.push("    \} else \{\n")
+    p.push("        cell = rt_alloc_d(8, __d_box_val)\n")
+    p.push("    \}\n")
+    p.push("    store64(cell, v)\n")
     p.push("    return cell\n")
     p.push("\}\n")
     p.push("fn rt_map_has(m: int, k: int) -> int \{\n")
@@ -8709,15 +9471,19 @@ fn __emb_rt() -> str {
     p.push("    if i < 0 \{ return \}\n")
     p.push("    store8(load64(m + 32) + i, 2)         // tombstone\n")
     p.push("    store64(m, load64(m) - 1)\n")
+    p.push("    if rx_kref(m) == 1 \{ rx_drop(load64(load64(m + 16) + i * 8)) \}\n")
+    p.push("    if rx_vref(m) == 1 \{ rx_drop(load64(load64(m + 24) + i * 8)) \}\n")
     p.push("\}\n")
     p.push("fn rt_map_keys(m: int) -> int \{\n")
     p.push("    let cap = load64(m + 8)\n")
     p.push("    let keys = load64(m + 16)\n")
     p.push("    let state = load64(m + 32)\n")
-    p.push("    let out = rt_list_new(0)\n")
+    p.push("    var ld = __d_list_val\n")
+    p.push("    if rx_kref(m) == 1 \{ ld = __d_list_ref \}\n")
+    p.push("    let out = rt_list_new_d(0, ld)\n")
     p.push("    var i = 0\n")
     p.push("    while i < cap \{\n")
-    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, load64(keys + i * 8)) \}\n")
+    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, rx_dup(load64(keys + i * 8))) \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
     p.push("    return out\n")
@@ -8726,10 +9492,12 @@ fn __emb_rt() -> str {
     p.push("    let cap = load64(m + 8)\n")
     p.push("    let vals = load64(m + 24)\n")
     p.push("    let state = load64(m + 32)\n")
-    p.push("    let out = rt_list_new(0)\n")
+    p.push("    var ld = __d_list_val\n")
+    p.push("    if rx_vref(m) == 1 \{ ld = __d_list_ref \}\n")
+    p.push("    let out = rt_list_new_d(0, ld)\n")
     p.push("    var i = 0\n")
     p.push("    while i < cap \{\n")
-    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, load64(vals + i * 8)) \}\n")
+    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, rx_dup(load64(vals + i * 8))) \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
     p.push("    return out\n")
@@ -9052,8 +9820,15 @@ fn __emb_rt() -> str {
     p.push("    let n = load64(l)\n")
     p.push("    if lo < 0 or hi < lo or hi > n \{ rt_die(\"invalid slice\") \}\n")
     p.push("    let data = load64(l + 16)\n")
-    p.push("    let out = rt_list_new(hi - lo)\n")
+    p.push("    let out = rt_list_new_d(hi - lo, load64(l - 16))\n")
     p.push("    rx_mcopy(load64(out + 16), data + lo * 8, (hi - lo) * 8)\n")
+    p.push("    if rx_kref(l) == 1 \{                  // kind 2: [8] is the element flag\n")
+    p.push("        var i = lo\n")
+    p.push("        while i < hi \{\n")
+    p.push("            let d = rx_dup(load64(data + i * 8))\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
     p.push("    return out\n")
     p.push("\}\n")
     p.push("\n")
@@ -9188,8 +9963,16 @@ fn __emb_rt() -> str {
     p.push("\}\n")
     p.push("\n")
     p.push("// ---- lists ----  (a list value points to \{i64 len; i64 cap; i64 data\})\n")
+    p.push("// Called by name from the compiler; a list whose elements it will not drop.\n")
     p.push("fn rt_list_new(n: int) -> int \{\n")
-    p.push("    let l = rt_alloc(24)\n")
+    p.push("    return rt_list_new_d(n, 0)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// `desc` is a kind-2 descriptor saying whether the elements are references.\n")
+    p.push("fn rt_list_new_d(n: int, desc: int) -> int \{\n")
+    p.push("    var d = desc\n")
+    p.push("    if d == 0 \{ d = __d_list_val \}    // the data buffer still has to go when the list does\n")
+    p.push("    let l = rt_alloc_d(24, d)\n")
     p.push("    var cap = n\n")
     p.push("    if cap < 4 \{ cap = 4 \}\n")
     p.push("    let data = rt_alloc(cap * 8)\n")
@@ -9205,9 +9988,11 @@ fn __emb_rt() -> str {
     p.push("    if n == cap \{\n")
     p.push("        let ncap = cap * 2\n")
     p.push("        let nd = rt_alloc(ncap * 8)\n")
-    p.push("        rx_mcopy(nd, load64(l + 16), n * 8)\n")
+    p.push("        let od = load64(l + 16)\n")
+    p.push("        rx_mcopy(nd, od, n * 8)\n")
     p.push("        store64(l + 8, ncap)\n")
     p.push("        store64(l + 16, nd)\n")
+    p.push("        rx_drop(od)                       // the cell was the buffer's only holder\n")
     p.push("    \}\n")
     p.push("    store64(load64(l + 16) + n * 8, v)\n")
     p.push("    store64(l, n + 1)\n")
@@ -9645,7 +10430,7 @@ fn __emb_rt() -> str {
     p.push("// ---- command-line args ----\n")
     p.push("fn rt_args() -> int \{\n")
     p.push("    let cl = win(\"GetCommandLineA\")       // LPSTR\n")
-    p.push("    let l = rt_list_new(0)\n")
+    p.push("    let l = rt_list_new_d(0, __d_list_ref)\n")
     p.push("    var i = 0\n")
     p.push("    var going = true\n")
     p.push("    while going \{\n")
