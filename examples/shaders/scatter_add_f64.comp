@@ -1,0 +1,64 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+layout(local_size_x = 256) in;
+// Caller must zero the output and issue the appropriate memory barrier first.
+// Caller validates rank, axis and index bounds; oshape/meta.y describe gradient.
+// Requires shaderBufferInt64Atomics. Duplicate sums have nondeterministic order.
+layout(std430, binding = 0) readonly buffer BufA { double data[]; } A;
+layout(std430, binding = 1) readonly buffer BufI { uint idx[]; } I;
+layout(std430, binding = 2) buffer BufO { double data[]; } O;
+layout(std430, binding = 2) buffer BufBits { uint64_t data[]; } Bits;
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = output numel, z = op/axis, w = dtype flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // operand A strides, in elements
+    uvec4 bstr;    // operand B strides, in elements
+    uvec4 ostr;    // output strides, in elements
+    uvec4 offs;    // A offset, B offset, output offset, auxiliary value
+} pc;
+
+// Decode only the active dimensions, in row-major logical order.
+uvec4 output_index(uint linear) {
+    uvec4 index = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        index[d - 1u] = linear % pc.oshape[d - 1u];
+        linear /= pc.oshape[d - 1u];
+    }
+    return index;
+}
+
+// Strides and offsets are in elements; complex elements occupy two doubles.
+uint double_index(uvec4 index, uvec4 strides, uint offset, bool is_complex) {
+    uint position = offset;
+    for (uint d = 0u; d < pc.meta.x; ++d) {
+        position += index[d] * strides[d];
+    }
+    return is_complex ? 2u * position : position;
+}
+
+// Atomic load and bitwise CAS also terminate correctly when the sum is NaN.
+void atomic_add_double(uint index, double value) {
+    uint64_t old = atomicCompSwap(Bits.data[index], uint64_t(0), uint64_t(0));
+    for (;;) {
+        precise double sum = uint64BitsToDouble(old) + value;
+        uint64_t updated = doubleBitsToUint64(sum);
+        uint64_t observed = atomicCompSwap(Bits.data[index], old, updated);
+        if (observed == old) { return; }
+        old = observed;
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+    uvec4 index = output_index(gid);
+    bool ac = (pc.meta.w & 1u) != 0u;
+    bool oc = (pc.meta.w & 4u) != 0u;
+    uint ia = double_index(index, pc.astr, pc.offs.x, ac);
+    index[pc.meta.z] = I.idx[index[pc.meta.z]];
+    uint io = double_index(index, pc.ostr, pc.offs.z, oc);
+    atomic_add_double(io, A.data[ia]);
+    if (oc) { atomic_add_double(io + 1u, ac ? A.data[ia + 1u] : 0.0lf); }
+}

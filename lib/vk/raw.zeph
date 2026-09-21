@@ -93,6 +93,7 @@ extern fn vkCreateFence(device: int, pCreateInfo: int, pAllocator: int, pFence: 
 extern fn vkDestroyFence(device: int, fence: int, pAllocator: int) from "vulkan-1.dll"
 extern fn vkWaitForFences(device: int, fenceCount: int, pFences: int, waitAll: int, timeout: int) -> i32 from "vulkan-1.dll"
 extern fn vkResetFences(device: int, fenceCount: int, pFences: int) -> i32 from "vulkan-1.dll"
+extern fn vkGetFenceStatus(device: int, fence: int) -> i32 from "vulkan-1.dll"
 extern fn vkCreateSemaphore(device: int, pCreateInfo: int, pAllocator: int, pSemaphore: int) -> i32 from "vulkan-1.dll"
 extern fn vkDestroySemaphore(device: int, semaphore: int, pAllocator: int) from "vulkan-1.dll"
 

@@ -396,6 +396,27 @@ if (-not ((Test-Path $spvF64) -and (Test-Path $spvC64))) {
     }
 }
 
+# ---- GPU streams, events and allocator lifetime (A22) ----
+# Same skip policy as ml-gpu: an absent Vulkan device is an environment
+# fact, not a defect.
+if (-not (Test-Path $spvF64)) {
+    Write-Host "SKIP ml-gpu-stream -- compute kernels not built"
+} else {
+    $strExe = Join-Path $tmp "gpu_stream_test.exe"
+    Remove-Item $strExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tests\ml\gpu_stream_test.zeph $strExe 2>&1 | Out-Null
+    if (-not (Test-Path $strExe)) {
+        Check "ml-gpu-stream" $false "gpu_stream_test.zeph did not compile"
+    } else {
+        $sout = (& $strExe 2>&1 | Out-String)
+        if ($sout -match "vkCreateInstance" -or $sout -match "no Vulkan") {
+            Write-Host "SKIP ml-gpu-stream -- no Vulkan device available"
+        } else {
+            Check "ml-gpu-stream" ($sout -match "gpu stream: 23 checks passed") "got tail: $($sout.Trim() -split "`n" | Select-Object -Last 1)"
+        }
+    }
+}
+
 # ---- phase parity against the float64 numpy reference (A13) ----
 # Skipped rather than failed when numpy is absent: it is a reference-side
 # dependency, and its absence is not a defect in the compiler or the port.

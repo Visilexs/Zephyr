@@ -194,6 +194,78 @@ The benchmark is a tool rather than a suite entry: two minutes at the
 specification size is too slow for `run_tests.ps1`, and the correctness it
 depends on is already covered there by `ml-gpu`.
 
+## Streams, events and allocator lifetime (A22)
+
+`lib/ml/gpu_stream.zeph` and `tests/ml/gpu_stream_test.zeph`, 23 checks. The
+suite implements the specification's own reference-test list one for one
+rather than inventing a different set.
+
+Design follows three sentences in the memory-runtime document. "Stream is an
+ordered execution lane, not guaranteed independent hardware" -- so lanes need
+no dedicated hardware queue. "Cross-stream consumers must wait on producer
+events" -- so an event carries a binary semaphore for the device as well as a
+fence for the host. "Releasing a tensor handle cannot immediately recycle
+in-flight storage" -- so release moves an allocation to a retired list, and
+only a completed fence promotes it to the free list. `vkDeviceWaitIdle`
+appears nowhere; completion is polled per fence through `vkGetFenceStatus`,
+the one binding that had to be hand-added.
+
+### Three bugs the tests found, all the same bug
+
+Each was a host-side use-after-free, which is the failure A22 is named for:
+
+1. The pool created an event per allocation and `pool_touch` overwrote it,
+   leaking the first and double-destroying the second.
+2. The test destroyed its own events while the allocator still held those
+   fence handles, so the next `vkGetFenceStatus` read freed memory.
+3. `pool_destroy` destroyed events before waiting on the allocations that
+   referenced them.
+
+The resolution is that the pool takes ownership of any event handed to
+`pool_touch`. The allocator outlives the submitter's interest in a
+submission, so it cannot borrow the handle it polls.
+
+A fourth, milder one: `stream_submit` allocated a command buffer per
+submission and never freed it. The event now owns it and frees it after the
+wait.
+
+### Mutation testing, including one that did not fail
+
+| mutation | result |
+|---|---|
+| recycle in-flight storage immediately | **caught** |
+| ignore the refcount, retire on first release | **caught** |
+| ignore cross-stream waits | **caught, but only after two rewrites** |
+| put both lanes on one queue | passes, correctly |
+
+The third row is the honest part. Deleting the cross-stream wait originally
+left the suite green. Twice. The producer was 64x64 and finished in about
+0.06 ms, while the host spends about 0.3 ms building the consumer's pipeline
+and descriptor set, so the consumer could not have started early even without
+a wait -- the test was measuring nothing. Moving the producer to 1024x1024,
+where it runs for about 17 ms, made the wait load-bearing, and the test now
+asserts that the producer was still running when the consumer was submitted
+so it can never silently go vacuous again.
+
+The fourth row is not a failure. One queue is in-order, so both lanes on one
+queue still produce the right answer; the second queue is what makes the test
+able to tell a real wait from luck, not what makes the code correct.
+
+### One change outside lib/ml
+
+`lib/vk/gfx.zeph` now requests two queues from the chosen family instead of
+one, clamped to what the family exposes, and stores the second as
+`Gfx.queue2`. Queue 0 and every existing caller are untouched. Verified by
+re-running `examples/vulkan/compute.zeph` (6 sampled particles, 0 mismatches)
+and the 277-check `ml-gpu` suite.
+
+### Known portability gap, not yet fixed
+
+`gfx.zeph` passes no `pEnabledFeatures` at device creation, so `shaderFloat64`
+and `shaderBufferInt64Atomics` are used without being enabled. This driver
+permits it and every result here is correct, but it is undefined behaviour by
+the specification and would be the first thing to fail on another vendor.
+
 ## Op-coverage ledger (A23 scope, A41 requirement)
 
 Derived by `tools/op_census.zeph`, which runs one real full step -- forward

@@ -21,7 +21,13 @@ struct Gfx {
     qfam: int,
     cmdpool: int,
     memprops: Bytes,       // cached VkPhysicalDeviceMemoryProperties
-    surface: int           // 0 when headless
+    surface: int,          // 0 when headless
+    queue2: int            // a second queue from the same family, or `queue`
+                           // again when the family only exposes one. Nothing
+                           // in the graphics path uses it; it exists so a
+                           // compute backend can run two lanes that really
+                           // can overlap, which is the only way a test can
+                           // tell a cross-lane wait from luck.
 }
 
 // One frame's worth of reusable per-frame state. Keeping several of these in
@@ -177,12 +183,19 @@ impl Gfx {
         }
         if qfam < 0 { panic("no graphics queue family that can present") }
 
-        var prio = Bytes.new(4)
-        prio.putf32(0, 1.0)
+        // Ask for two queues when the family has them. Queue 0 is what every
+        // existing caller uses and its behaviour is unchanged; queue 1 is
+        // spare capacity for concurrent compute lanes. Families that expose
+        // only one queue still work -- nq_avail clamps the request.
+        var nq_avail = qprops.get32(qfam * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueCount)
+        var nq_want = 2
+        if nq_avail < 2 { nq_want = 1 }
+        var prio = Bytes.new(4 * nq_want)
+        for i in 0..nq_want { prio.putf32(i * 4, 1.0) }
         var qci = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
         qci.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
         qci.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, qfam)
-        qci.put32(VkDeviceQueueCreateInfo_queueCount, 1)
+        qci.put32(VkDeviceQueueCreateInfo_queueCount, nq_want)
         qci.put64(VkDeviceQueueCreateInfo_pQueuePriorities, prio.addr())
 
         var dexts: [str] = []
@@ -207,6 +220,12 @@ impl Gfx {
 
         var pq = Bytes.new(8)
         vkGetDeviceQueue(dev, qfam, 0, pq.addr())
+        var pq2 = Bytes.new(8)
+        if nq_want > 1 {
+            vkGetDeviceQueue(dev, qfam, 1, pq2.addr())
+        } else {
+            pq2.put64(0, pq.get64(0))
+        }
 
         var cpci = Bytes.new(VkCommandPoolCreateInfo_sizeof)
         cpci.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
@@ -219,7 +238,8 @@ impl Gfx {
         vkGetPhysicalDeviceMemoryProperties(phys, mp.addr())
 
         return Gfx{instance: instance, phys: phys, dev: dev, queue: pq.get64(0),
-                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface}
+                   qfam: qfam, cmdpool: pool.get64(0), memprops: mp, surface: surface,
+                   queue2: pq2.get64(0)}
     }
 
     fn shutdown(self) {

@@ -1,0 +1,79 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 256) in;
+// Same-dtype arithmetic over strided views; zero strides broadcast.
+layout(std430, binding = 0) readonly buffer BufA { double data[]; } A;
+layout(std430, binding = 1) readonly buffer BufB { double data[]; } B;
+layout(std430, binding = 2) writeonly buffer BufO { double data[]; } O;
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = output numel, z = op/axis, w = dtype flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // operand A strides, in elements
+    uvec4 bstr;    // operand B strides, in elements
+    uvec4 ostr;    // output strides, in elements
+    uvec4 offs;    // A offset, B offset, output offset, auxiliary value
+} pc;
+
+// Decode only the active dimensions, in row-major logical order.
+uvec4 output_index(uint linear) {
+    uvec4 index = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        index[d - 1u] = linear % pc.oshape[d - 1u];
+        linear /= pc.oshape[d - 1u];
+    }
+    return index;
+}
+
+// Strides and offsets are in elements; complex elements occupy two doubles.
+uint double_index(uvec4 index, uvec4 strides, uint offset, bool is_complex) {
+    uint position = offset;
+    for (uint d = 0u; d < pc.meta.x; ++d) {
+        position += index[d] * strides[d];
+    }
+    return is_complex ? 2u * position : position;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+    uvec4 index = output_index(gid);
+    bool ac = (pc.meta.w & 1u) != 0u;
+    bool bc = (pc.meta.w & 2u) != 0u;
+    bool oc = (pc.meta.w & 4u) != 0u;
+    uint ia = double_index(index, pc.astr, pc.offs.x, ac);
+    uint ib = double_index(index, pc.bstr, pc.offs.y, bc);
+    uint io = double_index(index, pc.ostr, pc.offs.z, oc);
+    double ar = A.data[ia];
+    double br = B.data[ib];
+    double ai = ac ? A.data[ia + 1u] : 0.0lf;
+    double bi = bc ? B.data[ib + 1u] : 0.0lf;
+    precise double re;
+    precise double im = 0.0lf;
+    if (pc.meta.z == 0u) {
+        re = ar + br;
+        im = ai + bi;
+    } else if (pc.meta.z == 1u) {
+        re = ar - br;
+        im = ai - bi;
+    } else if (pc.meta.z == 2u) {
+        re = ac ? ar * br - ai * bi : ar * br;
+        im = ar * bi + ai * br;
+    } else if (!ac) {
+        re = ar / br;
+    } else {
+        // Match cdiv_re/cdiv_im in ops.zeph: Smith division, not |b| squared.
+        if (abs(br) >= abs(bi)) {
+            precise double ratio = bi / br;
+            precise double denominator = br + bi * ratio;
+            re = (ar + ai * ratio) / denominator;
+            im = (ai - ar * ratio) / denominator;
+        } else {
+            precise double ratio = br / bi;
+            precise double denominator = br * ratio + bi;
+            re = (ar * ratio + ai) / denominator;
+            im = (ai * ratio - ar) / denominator;
+        }
+    }
+    O.data[io] = re;
+    if (oc) { O.data[io + 1u] = im; }
+}
