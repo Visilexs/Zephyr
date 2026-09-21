@@ -17,10 +17,11 @@ passed on the strength of an exit code alone.
 | A03 | **passed** | Same suite. Owner/view sharing, writes visible in both directions, a view outliving the owner handle, version bumps through views, stale-save detection, and 50 allocate/release cycles returning to a zero baseline with peak at one buffer rather than fifty. |
 | A04 | **passed** | `tests/ml/ops_test.zeph`, 107 checks, plus 26 rejection cases in their own processes. Independently, `tools/ml_reference/check_ops.py` agrees with numpy on all 33 operators, most bit-exact. Non-contiguous inputs are covered by running the same operators through transposed and sliced views. |
 | A05 | **passed** | Same suites. Complex mul, div, conj, abs2, expi and matmul against analytic values; byte layout compared against numpy's `complex64`/`complex128`, which share PyTorch's memory format. |
-| A10 | **passed** | `tools/ml_reference/test_phase.py` (12 groups, D=4/8/128 and the spec defaults) *and* an independently written `tools/ml_reference/verify_phase.py`, 121 checks, coded from MATHEMATICS.md rather than from the module. Pair bijection and bounds at D=4/8/128, G^H G=I built from the doc's own matrix, inverse by G^H, norm preservation, simultaneity, and 10,000 fixed-angle gates drifting 1.1e-16. No renormalization exists anywhere in the update path. |
+| A10 | **passed** | `tools/ml_reference/test_phase.py` (12 groups, D=4/8/128 and the spec defaults) *and* an independently written `tools/ml_reference/verify_phase.py`, 121 checks, coded from MATHEMATICS.md rather than from the module. Pair bijection and bounds at D=4/8/128, G^H G=I built from the doc's own matrix, inverse by G^H, norm preservation, simultaneity, and 10,000 fixed-angle gates drifting 1.1e-16. No renormalization exists anywhere in the update path. The native port is covered separately by `tests/ml/phase_gates_test.zeph`, 1,981 checks and the only phase suite that runs on all three targets, which pins the pairing `phase_givens` builds in Zephyr at D=4, 8 **and 128** -- the per-step parity harness only reaches D=4 and D=8, and a pairing that was a bijection but paired the wrong coordinates would preserve the norm perfectly and go unnoticed. It also checks inverse by G^H, per-stage norm preservation, the stage-B wrap from the last coordinate to the first, and that the two stages are genuinely different permutations. Its assertions were confirmed load-bearing by mutation: perturbing the expected pairing makes it panic on the first check. |
 | A11 | **passed** | Same two suites. Probabilities invariant and state equivariant under global phase at three angles, controller angles unchanged, features invariant under global phase but sensitive to relative phase and matching the doc formula bit-for-bit. The constructed interference example is internally inconsistent in the specification -- with the normalized row it states, the squared amplitude is (1+cos(delta))/2, not the 1+cos(delta) the prose claims -- so both forms are asserted explicitly and the discrepancy is recorded as DESIGN.md D16 rather than absorbed into a tolerance. The claim the paragraph actually makes, that two orthonormal rows sweep [1,0] to [0,1] while global phase moves neither, holds exactly. |
 | A12 | **passed** | Same two suites. The paired-real port agrees with the complex model on loss, probabilities, state and every one of the eight parameter gradients to 1e-12, and holds no complex array at all. Both are checked against central differences: worst relative error 3.7e-10, real and imaginary parts separately. The mapped optimizer step is the SGD check in test_phase.py; AdamW waits for M4. |
-| A06–A09, A13–A29, A32–A41 | **not_run** | Not started. A06 is partly evidenced already by the finite-difference sweep above, but the native autograd it refers to does not exist yet. |
+| A13 | **passed** | `tools/ml_reference/check_phase.py` compares the Zephyr port against the verified float64 reference on **148 quantities and all 16 steps** at D=4 and D=8: not just the final probabilities but, for every step, the invariant features, the controller hidden layer, the angles, the post-phase state, both Givens stage outputs, the resulting state and the active-row mask. Worst disagreement 2.3e-16. The two sides build their weights independently from a mirrored LCG and all 16 parameter tensors are asserted **bit-identical**, so the agreement cannot be an artifact of a drifting fixture. Masks preserve state exactly (compared as hex, not within a tolerance); K=0/1/4 give exact update counts and are cross-checked by recomposing K THINK steps independently; zero, subnormal and near-overflow readouts all stay finite. |
+| A06–A09, A14–A29, A32–A41 | **not_run** | Not started. A06 is partly evidenced already by the finite-difference sweep above, but the native autograd it refers to does not exist yet. |
 | A30 | **passed** | `tools/ml_reference/test_tasks.py`. Solver agrees with the label on 10,240 examples per task, recomputing from the token sequence alone. Task A query-only baseline sits within 0.125 ± 0.04 of chance on every split. Task B per-example: ≥2 feasible until the final clue, exactly 1 after, and the final clue combined with the original candidate list admits ≥2. |
 | A31 | **passed** | Same suite. Seeded split hashes reproducible and pairwise disjoint, no duplicates within a split, frozen vocabulary covering all test tokens, composition and length bins non-empty, exact class balance, and class mean lengths equal to 1e-12 so length does not leak the target. |
 
@@ -93,6 +94,9 @@ sweep.
 | ops rejection cases | 26 processes | ~8s |
 | `tools/ml_reference/test_phase.py` | 12 groups, D=4/8/128 | ~6s |
 | `tools/ml_reference/verify_phase.py` | 121 | ~5s |
+| `tests/ml/phase_test.zeph` | 205 | ~1s |
+| `tests/ml/phase_gates_test.zeph` | 1,981 | ~1s |
+| `tools/ml_reference/check_phase.py` | 148 quantities, 16 steps | ~2s |
 | `tools/ml_reference/test_tasks.py` | 13 groups, 10,240 examples per task | ~8s |
 
 ### CPU operators against numpy
@@ -122,11 +126,18 @@ The tensor and operator suites were compiled for each backend from the same
 sources and run. Not a milestone requirement -- recorded because portability
 is cheap to lose silently and M5/M8 depend on it.
 
-| Target | tensor | ops |
-|---|---|---|
-| Windows x86-64 PE (kernel32) | 73 passed | 107 passed |
-| Linux x86-64 static ELF (raw syscalls, no libc) | 73 passed | 107 passed |
-| WebAssembly (node) | 73 passed | 107 passed |
+| Target | tensor | ops | phase gates |
+|---|---|---|---|
+| Windows x86-64 PE (kernel32) | 73 passed | 107 passed | 1,981 passed |
+| Linux x86-64 static ELF (raw syscalls, no libc) | 73 passed | 107 passed | 1,981 passed |
+| WebAssembly (node) | 73 passed | 107 passed | 1,981 passed |
+
+`tests/ml/phase_test.zeph` is deliberately absent from this table: it is
+Windows-only by construction, because it runs its rejection cases as child
+processes through `CreateProcessA` (a panic cannot be caught in-process). So
+the forward-pass invariants -- norm preservation, global-phase invariance, PAD
+identity, THINK counts, readout edges -- are currently verified on Windows
+only. The gate-level suite, which needs no subprocess, covers all three.
 
 Identical counts, and identical assertions, so the stride arithmetic, the
 complex component layout and the reference-counted buffers all behave the
@@ -158,6 +169,29 @@ perturbed separately, step 1e-6, two-sided.
 The floor here is the finite difference, not the analytic gradient: the
 complex and paired-real models agree with each other to 1e-12, an order of
 magnitude tighter than either agrees with the stencil.
+
+### Phase forward port against the reference, per step
+
+D=4 and D=8, four sequence tokens then four THINK steps, batch of three
+including a fully padded row.
+
+| Quantity | worst scaled disagreement |
+|---|---|
+| all 16 parameter tensors | 0.0, bit-identical |
+| active-row masks | 0.0 |
+| controller hidden layer | 5.2e-17 |
+| angles | 8.7e-17 |
+| invariant features | 2.1e-16 |
+| post-phase state | 1.9e-16 |
+| Givens stage 0 and stage 1 | 2.0e-16 |
+| state after each step | 2.0e-16 |
+| probabilities | 2.3e-16 |
+
+A couple of ulp, consistent with a different summation order and with this
+repository's own `fsin`/`fcos` standing in for libm. Nothing here is a
+tolerance chosen to make a comparison pass: the weights are bit-identical, and
+a quantity missing from the dump or present but unexpected is a failure rather
+than a silent omission.
 
 ## Interpretation, kept separate
 

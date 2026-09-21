@@ -334,6 +334,49 @@ $opsBuilt = Test-Path "$tmp\ops_test.exe"
 $opsOut = if ($opsBuilt) { (cmd /c "`"$tmp\ops_test.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 107 checks passed") "got: $opsOut"
 
+# ---- phase forward port: acceptance A13, and A10 at the gate level ----
+# phase_test.zeph runs its own rejection cases by relaunching itself, because
+# a panic cannot be caught in-process; no separate entries are needed here.
+$phaseSuites = [ordered]@{
+    "ml-phase"       = @("tests\ml\phase_test.zeph", "phase: 205 checks passed")
+    "ml-phase-gates" = @("tests\ml\phase_gates_test.zeph", "phase gates: 1981 checks passed")
+}
+foreach ($nm in $phaseSuites.Keys) {
+    $src = $phaseSuites[$nm][0]
+    $want = $phaseSuites[$nm][1]
+    $exe = Join-Path $tmp "$nm.exe"
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt $src $exe 2>&1 | Out-Null
+    $built = Test-Path $exe
+    $out = if ($built) { (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+    Check $nm ($built -and $out -eq $want) "got: $out"
+}
+
+# ---- phase parity against the float64 numpy reference (A13) ----
+# Skipped rather than failed when numpy is absent: it is a reference-side
+# dependency, and its absence is not a defect in the compiler or the port.
+$hasNumpy = $false
+try {
+    & python -c "import numpy" 2>&1 | Out-Null
+    $hasNumpy = ($LASTEXITCODE -eq 0)
+} catch { $hasNumpy = $false }
+if (-not $hasNumpy) {
+    Write-Host "SKIP ml-phase-parity -- numpy not available"
+} else {
+    $dumpExe = Join-Path $tmp "phase_dump.exe"
+    $dumpTxt = Join-Path $tmp "phase_dump.txt"
+    Remove-Item $dumpExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tools\ml_reference\phase_dump.zeph $dumpExe 2>&1 | Out-Null
+    if (-not (Test-Path $dumpExe)) {
+        Check "ml-phase-parity" $false "phase_dump.zeph did not compile"
+    } else {
+        cmd /c "`"$dumpExe`" > `"$dumpTxt`" 2>&1" | Out-Null
+        $parity = (& python tools\ml_reference\check_phase.py $dumpTxt | Out-String).Trim()
+        $ok = ($LASTEXITCODE -eq 0) -and ($parity -match "148/148 quantities passed")
+        Check "ml-phase-parity" $ok "got tail: $($parity -split "`n" | Select-Object -Last 1)"
+    }
+}
+
 $opNeg = [ordered]@{
     "dtype-mix"  = 'let x = t_add(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]))'
     "bcast-bad"  = 'let x = t_add(t_zeros(DType.F64, [2, 3]), t_zeros(DType.F64, [4, 3]))'

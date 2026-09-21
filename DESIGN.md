@@ -173,3 +173,41 @@ exactly, and is now asserted directly instead of being inferred from the
 scalar. This is a normalization bookkeeping error in the prose, recorded
 rather than silently corrected, and it needs a versioned fixture update only
 if a later document depends on the literal 0-to-2 range.
+
+## D17 -- parity is checked per step, with bit-identical weights
+
+`check_phase.py` compares every intermediate the forward pass actually
+produced -- features, hidden layer, angles, post-phase state, both stage
+outputs, the state, and the active mask -- rather than the final
+probabilities alone. A wrong sign inside one Givens stage can still land on a
+plausible output distribution, so an end-to-end comparison would be weak
+evidence for the thing M3 is supposed to establish.
+
+Two properties make the comparison mean something. The weights are rebuilt
+independently on each side from a mirrored LCG and then asserted
+**bit-identical**, so the tolerance cannot be quietly absorbing a different
+fixture or fill order. And the harness fails on a quantity that is missing
+from the dump as well as on one that is present but unexpected, so a port
+that computed nothing could not pass vacuously.
+
+The native side reproduces the intermediates from the same function the
+forward pass uses. They are returned by it, never recomputed for the test,
+because a recomputed intermediate checks the test's arithmetic rather than
+the implementation's.
+
+## D18 -- the pairing is pinned natively, not only through parity
+
+The parity harness runs at D=4 and D=8. The specification's own dimension is
+D=128, and `phase_givens` constructs its pairing in Zephyr independently of
+the reference. A pairing that was a valid bijection but paired the wrong
+coordinates would preserve the norm exactly and produce a perfectly plausible
+trajectory, so norm checks cannot catch it.
+
+`tests/ml/phase_gates_test.zeph` therefore pins the pairing directly at D=4, 8
+and 128, using theta=pi/2 and phi=0 to turn a stage into a pure signed swap so
+each coordinate's partner is readable straight off the output. It also asserts
+the pairs are disjoint and cover every coordinate exactly once, that the stage
+inverts under -theta (G^H), that stage B wraps the last coordinate onto the
+first, and that the two stages are not the same permutation. Two of its checks
+exist only to keep the rest non-vacuous: that a stage genuinely changes the
+state, and that stages A and B differ.
