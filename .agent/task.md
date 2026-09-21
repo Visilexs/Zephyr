@@ -88,7 +88,13 @@ Last measured results (or none):
 
 Known failure with exact reproduction:
   None outstanding. Two environment blockers, both pre-existing:
-    powershell -File tests\run_tests.ps1   -> gcc not found, aborts at once
+    powershell -File tests\run_tests.ps1   -> gcc not found, aborts at once.
+      Root cause is structural: the suite drives bootstrap\zephyr.exe, the
+      historical C seed, not the shipped zc.exe. The seed binary is committed
+      but needs zephyr_rt.dll, which only gcc builds. Deliberately not
+      rewritten to target zc.exe: its negative cases match the C compiler's
+      exact error text. The math and ML suites are run directly through
+      zc.exe instead, and the reject cases extracted and run standalone.
     powershell -File scripts\selfbuild.ps1 -> objdump not found at the last
                                               line, after the fixpoint passed
 
