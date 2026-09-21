@@ -58,7 +58,37 @@ fn cdiv_im(a: float, b: float, c: float, d: float) -> float {
     return (b * r - a) / (c * r + d)
 }
 
+// ---------------------------------------------------------------------------
+// Backend hooks.
+//
+// A backend takes over an op family by pushing one function here; empty means
+// the CPU body below, which is what every existing bit-exact comparison in
+// this repository runs against. The unary hook is keyed by the device opcode
+// so that t_map1 and the five complex-specific ops share one slot instead of
+// needing five, and the output dtype is passed because abs2, real, imag and
+// expi all change it.
+//
+// The cost is one length check per call against bodies that are O(n) or
+// worse, so the CPU path is unaffected.
+var BINARY_HOOK: [fn(Tensor, Tensor, int) -> Tensor] = []
+var UNARY_HOOK: [fn(Tensor, int, DType) -> Tensor] = []
+var SUMDIM_HOOK: [fn(Tensor, int) -> Tensor] = []
+var GATHER_HOOK: [fn(Tensor, int, [int]) -> Tensor] = []
+
+fn hook_unary(t: Tensor, op: int, odt: DType) -> Tensor {
+    let f = UNARY_HOOK[0]
+    return f(t, op, odt)
+}
+
 fn t_binary(a: Tensor, b: Tensor, op: int, who: str) -> Tensor {
+    if BINARY_HOOK.len() > 0 {
+        let f = BINARY_HOOK[0]
+        return f(a, b, op)
+    }
+    return t_binary_cpu(a, b, op, who)
+}
+
+fn t_binary_cpu(a: Tensor, b: Tensor, op: int, who: str) -> Tensor {
     let shape = bcast_pair(a, b, who)
     let ea = t_expand(a, shape)
     let eb = t_expand(b, shape)
@@ -121,6 +151,11 @@ fn t_neg(t: Tensor) -> Tensor {
 }
 
 fn t_conj(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 7, t.dt) }
+    return t_conj_cpu(t)
+}
+
+fn t_conj_cpu(t: Tensor) -> Tensor {
     if not dtype_is_complex(t.dt) { panic("conj: not a complex tensor") }
     let out = t_zeros(t.dt, t.shape)
     if t_numel(t) == 0 { return out }
@@ -137,6 +172,11 @@ fn t_conj(t: Tensor) -> Tensor {
 // This is the only real-from-complex path that is not an error, and its VJP
 // is 2z under the real inner product.
 fn t_abs2(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 6, dtype_component(t.dt)) }
+    return t_abs2_cpu(t)
+}
+
+fn t_abs2_cpu(t: Tensor) -> Tensor {
     if not dtype_is_complex(t.dt) { panic("abs2: not a complex tensor") }
     let out = t_zeros(dtype_component(t.dt), t.shape)
     if t_numel(t) == 0 { return out }
@@ -152,6 +192,11 @@ fn t_abs2(t: Tensor) -> Tensor {
 }
 
 fn t_real(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 8, dtype_component(t.dt)) }
+    return t_real_cpu(t)
+}
+
+fn t_real_cpu(t: Tensor) -> Tensor {
     if not dtype_is_complex(t.dt) { panic("real: not a complex tensor") }
     let out = t_zeros(dtype_component(t.dt), t.shape)
     if t_numel(t) == 0 { return out }
@@ -165,6 +210,11 @@ fn t_real(t: Tensor) -> Tensor {
 }
 
 fn t_imag(t: Tensor) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 9, dtype_component(t.dt)) }
+    return t_imag_cpu(t)
+}
+
+fn t_imag_cpu(t: Tensor) -> Tensor {
     if not dtype_is_complex(t.dt) { panic("imag: not a complex tensor") }
     let out = t_zeros(dtype_component(t.dt), t.shape)
     if t_numel(t) == 0 { return out }
@@ -180,6 +230,11 @@ fn t_imag(t: Tensor) -> Tensor {
 // expi(theta) = cos(theta) + i sin(theta), real in, complex out. The phase
 // gate is built on this.
 fn t_expi(t: Tensor, d: DType) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, 10, d) }
+    return t_expi_cpu(t, d)
+}
+
+fn t_expi_cpu(t: Tensor, d: DType) -> Tensor {
     if not dtype_is_float(t.dt) { panic("expi: argument must be a real float tensor") }
     if not dtype_is_complex(d) { panic("expi: output dtype must be complex") }
     let out = t_zeros(d, t.shape)
@@ -264,6 +319,14 @@ fn t_sum_all_im(t: Tensor) -> float {
 // Reduce one axis, keeping the rank so the result broadcasts back over the
 // input without the caller having to reason about which axis vanished.
 fn t_sum_dim(t: Tensor, dim: int) -> Tensor {
+    if SUMDIM_HOOK.len() > 0 {
+        let f = SUMDIM_HOOK[0]
+        return f(t, dim)
+    }
+    return t_sum_dim_cpu(t, dim)
+}
+
+fn t_sum_dim_cpu(t: Tensor, dim: int) -> Tensor {
     let r = t.shape.len()
     if dim < 0 or dim >= r { panic("sum_dim: dim out of range") }
     var osh: [int] = []
@@ -383,6 +446,11 @@ fn map1_real(x: float, op: int) -> float {
 }
 
 fn t_map1(t: Tensor, op: int) -> Tensor {
+    if UNARY_HOOK.len() > 0 { return hook_unary(t, op, t.dt) }
+    return t_map1_cpu(t, op)
+}
+
+fn t_map1_cpu(t: Tensor, op: int) -> Tensor {
     if dtype_is_complex(t.dt) { panic("map1: real tensor required") }
     if not dtype_is_float(t.dt) { panic("map1: float tensor required") }
     let out = t_zeros(t.dt, t.shape)
@@ -408,6 +476,14 @@ fn t_ln(t: Tensor) -> Tensor { return t_map1(t, MAP_LN) }
 // Givens stage's pair coordinates (dim 1), and cyclic roll (below).
 
 fn t_index_select(t: Tensor, dim: int, sel: [int]) -> Tensor {
+    if GATHER_HOOK.len() > 0 {
+        let f = GATHER_HOOK[0]
+        return f(t, dim, sel)
+    }
+    return t_index_select_cpu(t, dim, sel)
+}
+
+fn t_index_select_cpu(t: Tensor, dim: int, sel: [int]) -> Tensor {
     let r = t.shape.len()
     if dim < 0 or dim >= r { panic("index_select: dim out of range") }
     let n = t.shape[dim]

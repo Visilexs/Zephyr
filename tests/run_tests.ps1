@@ -436,6 +436,25 @@ if (-not (Test-Path $spvF64)) {
     }
 }
 
+# ---- GPU gradient and optimizer-update gates (A23) ----
+if (-not (Test-Path $spvF64)) {
+    Write-Host "SKIP ml-gpu-grad -- compute kernels not built"
+} else {
+    $grdExe = Join-Path $tmp "gpu_grad_test.exe"
+    Remove-Item $grdExe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt tests\ml\gpu_grad_test.zeph $grdExe 2>&1 | Out-Null
+    if (-not (Test-Path $grdExe)) {
+        Check "ml-gpu-grad" $false "gpu_grad_test.zeph did not compile"
+    } else {
+        $gdout = (& $grdExe 2>&1 | Out-String)
+        if ($gdout -match "vkCreateInstance" -or $gdout -match "no Vulkan") {
+            Write-Host "SKIP ml-gpu-grad -- no Vulkan device available"
+        } else {
+            Check "ml-gpu-grad" ($gdout -match "gpu grad: 15 checks passed") "got tail: $($gdout.Trim() -split "`n" | Select-Object -Last 1)"
+        }
+    }
+}
+
 # ---- phase parity against the float64 numpy reference (A13) ----
 # Skipped rather than failed when numpy is absent: it is a reference-side
 # dependency, and its absence is not a defect in the compiler or the port.

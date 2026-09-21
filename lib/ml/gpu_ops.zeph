@@ -24,6 +24,7 @@
 // resident layer is what makes these worth calling; this is the correctness
 // floor it will be checked against.
 import "ml/gpu.zeph"
+import "ml/autograd.zeph"
 
 // Opcodes. 0-3 are fixed by t_binary and 0-4 by the MAP_ constants in
 // ops.zeph; the rest continue that numbering and the kernels agree.
@@ -275,4 +276,83 @@ fn gop_scatter_add(m: GpuMM, gr: Tensor, dim: int, n: int, sel: [int]) -> Tensor
     gpu_free(m, bi)
     gpu_free(m, bo)
     return out
+}
+
+// ---------------------------------------------------------------------------
+// Installing the backend.
+//
+// Every hook falls back to the CPU body for anything the kernels do not
+// cover -- non-float dtypes, float32, rank above 4 -- so enabling the backend
+// changes where work happens and never what is computed. That property is
+// what makes the gradient gate meaningful: if enabling the device could
+// silently narrow coverage, a matching gradient would only prove the narrowed
+// paths agreed.
+fn gop_supported(d: DType) -> bool {
+    return d == DType.F64 or d == DType.C64
+}
+
+fn gpu_ops_enable(m: GpuMM) {
+    var bh: [fn(Tensor, Tensor, int) -> Tensor] = []
+    bh.push(fn(a: Tensor, b: Tensor, op: int) -> Tensor {
+        if a.dt != b.dt or not gop_supported(a.dt) { return t_binary_cpu(a, b, op, "binary") }
+        // The CPU path broadcasts inside itself; the device kernel wants both
+        // operands already at the output shape, which t_expand gives for free
+        // as zero strides. Doing it here keeps the kernel simple and keeps the
+        // two paths computing the same thing.
+        let shape = broadcast_shape(a.shape, b.shape)
+        if shape.len() > GOP_MAX_RANK { return t_binary_cpu(a, b, op, "binary") }
+        return gop_binary(m, t_expand(a, shape), t_expand(b, shape), op)
+    })
+    BINARY_HOOK = bh
+
+    var uh: [fn(Tensor, int, DType) -> Tensor] = []
+    uh.push(fn(t: Tensor, op: int, odt: DType) -> Tensor {
+        if not gop_supported(t.dt) or not gop_supported(odt) or t.shape.len() > GOP_MAX_RANK {
+            if op == 6 { return t_abs2_cpu(t) }
+            if op == 7 { return t_conj_cpu(t) }
+            if op == 8 { return t_real_cpu(t) }
+            if op == 9 { return t_imag_cpu(t) }
+            if op == 10 { return t_expi_cpu(t, odt) }
+            return t_map1_cpu(t, op)
+        }
+        return gop_unary(m, t, op, odt)
+    })
+    UNARY_HOOK = uh
+
+    var sh: [fn(Tensor, int) -> Tensor] = []
+    sh.push(fn(t: Tensor, dim: int) -> Tensor {
+        if not gop_supported(t.dt) or t.shape.len() > GOP_MAX_RANK { return t_sum_dim_cpu(t, dim) }
+        return gop_sum_dim(m, t, dim)
+    })
+    SUMDIM_HOOK = sh
+
+    var gh: [fn(Tensor, int, [int]) -> Tensor] = []
+    gh.push(fn(t: Tensor, dim: int, sel: [int]) -> Tensor {
+        if not gop_supported(t.dt) or t.shape.len() > GOP_MAX_RANK { return t_index_select_cpu(t, dim, sel) }
+        return gop_gather(m, t, dim, sel)
+    })
+    GATHER_HOOK = gh
+
+    var ch: [fn(Tensor, int, int, [int]) -> Tensor] = []
+    ch.push(fn(gr: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
+        if not gop_supported(gr.dt) or gr.shape.len() > GOP_MAX_RANK { return scatter_add_cpu(gr, dim, n, sel) }
+        return gop_scatter_add(m, gr, dim, n, sel)
+    })
+    SCATTER_HOOK = ch
+
+    gpu_enable(m)
+}
+
+fn gpu_ops_disable() {
+    let b: [fn(Tensor, Tensor, int) -> Tensor] = []
+    let u: [fn(Tensor, int, DType) -> Tensor] = []
+    let s: [fn(Tensor, int) -> Tensor] = []
+    let g: [fn(Tensor, int, [int]) -> Tensor] = []
+    let c: [fn(Tensor, int, int, [int]) -> Tensor] = []
+    BINARY_HOOK = b
+    UNARY_HOOK = u
+    SUMDIM_HOOK = s
+    GATHER_HOOK = g
+    SCATTER_HOOK = c
+    gpu_disable()
 }

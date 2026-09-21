@@ -350,7 +350,17 @@ fn real_like(t: Tensor) -> DType {
 // Scatter-add rather than scatter-copy: index_select may repeat an index, and
 // each occurrence contributes. t_index_copy deliberately refuses duplicates,
 // so it cannot be reused here.
+var SCATTER_HOOK: [fn(Tensor, int, int, [int]) -> Tensor] = []
+
 fn scatter_add(g: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
+    if SCATTER_HOOK.len() > 0 {
+        let f = SCATTER_HOOK[0]
+        return f(g, dim, n, sel)
+    }
+    return scatter_add_cpu(g, dim, n, sel)
+}
+
+fn scatter_add_cpu(g: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
     var osh: [int] = []
     for i in 0..g.shape.len() { osh.push(g.shape[i]) }
     osh[dim] = n

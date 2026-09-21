@@ -263,6 +263,51 @@ need the CPU changed, not the kernel.
 and `ln` exist only on the device. They are therefore **not** covered by the
 95 checks and nothing here claims them. The phase model does not reach them.
 
+## Device kernels: gradient and update gates (A23, second half)
+
+`tests/ml/gpu_grad_test.zeph`, 15 checks. The same phase training step is run
+twice -- once entirely on the CPU, once with every supported op dispatched to
+the device -- and the loss, the gradients and the parameters after an AdamW
+step are compared.
+
+| gate | scope | result |
+|---|---|---|
+| loss | one scalar | agrees, 1e-12 |
+| gradient | 964 components over 8 parameters, real and complex | agrees, 1e-12 |
+| update | 964 parameter components after AdamW with weight decay 0.01 | agrees, 1e-12 |
+| dispatch | 54 matmuls actually sent to the device | non-zero |
+
+**No VJP is reimplemented for the device, and none should be.** The VJPs in
+`autograd.zeph` are compositions of the primitives in `ops.zeph`, so hooking
+those primitives routes the backward pass along with the forward. That is
+what makes a matching gradient mean "every op is supported with its VJP"
+rather than only "the forward agrees".
+
+The hooks are five slots -- binary, unary, sum_dim, gather, scatter_add --
+mirroring the five kernels, plus the existing matmul slot. The unary slot is
+keyed by device opcode so `t_map1` and the five complex-specific ops share
+it. Every hook falls back to the CPU body for anything the kernels do not
+cover (non-float dtypes, float32, rank above 4), so enabling the device
+changes where work happens and never what is computed.
+
+The fourth gate exists because the first three could all pass for the wrong
+reason: if every hook fell back, the two paths would be the same code and
+would agree perfectly while proving nothing.
+
+Mutation-tested: a scatter-add that stores instead of accumulating breaks the
+`index_select` VJP and fails 2 checks; a binary hook that skips broadcast
+expansion fails before it can produce a number.
+
+Weight decay is deliberately non-zero, so the decoupled-decay term is inside
+the comparison rather than only the gradient.
+
+### What this configuration costs
+
+Every op is an upload, a dispatch and a download, so a step in this mode is
+far slower than on the CPU. That is a fact about per-op dispatch, not about
+the device, and it is what tensor residency is for. A23 gates correctness;
+the performance work is M6's.
+
 ## Streams, events and allocator lifetime (A22)
 
 `lib/ml/gpu_stream.zeph` and `tests/ml/gpu_stream_test.zeph`, 23 checks. The
