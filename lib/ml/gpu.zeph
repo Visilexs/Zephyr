@@ -71,7 +71,7 @@ fn gpu_lanes(d: DType) -> int {
 // Host-visible upload of a 2-D tensor, element by element through t_get, so
 // non-contiguous views (transposes, slices) upload correctly without a repack.
 fn gpu_upload(m: GpuMM, t: Tensor, rows: int, cols: int, lanes: int) -> GpuBuffer {
-    let buf = m.g.buffer(rows * cols * lanes * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    let buf = gpu_buf(m, rows * cols * lanes * 8)
     var pp = Bytes.new(8)
     var cell = Bytes.new(8)
     vkcheck(vkMapMemory(m.g.dev, buf.mem, 0, buf.size, 0, pp.addr()), "gpu_upload: vkMapMemory")
@@ -111,7 +111,7 @@ fn gpu_matmul(m: GpuMM, a: Tensor, b: Tensor) -> Tensor {
 
     let bufA = gpu_upload(m, a, M, K, lanes)
     let bufB = gpu_upload(m, b, K, N, lanes)
-    let bufC = m.g.buffer(M * N * lanes * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    let bufC = gpu_buf(m, M * N * lanes * 8)
 
     var bufs: [GpuBuffer] = []
     bufs.push(bufA)
@@ -169,9 +169,9 @@ fn gpu_matmul(m: GpuMM, a: Tensor, b: Tensor) -> Tensor {
     vkDestroyPipelineLayout(m.g.dev, lay, 0)
     vkDestroyShaderModule(m.g.dev, sh, 0)
     m.g.destroy_desc_set(ds)
-    m.g.destroy_buffer(bufA)
-    m.g.destroy_buffer(bufB)
-    m.g.destroy_buffer(bufC)
+    gpu_free(m, bufA)
+    gpu_free(m, bufB)
+    gpu_free(m, bufC)
     return out
 }
 
@@ -188,4 +188,49 @@ fn gpu_matmul_backward(m: GpuMM, a: Tensor, b: Tensor, gc: Tensor) -> [Tensor] {
     out.push(gpu_matmul(m, gc, bt))
     out.push(gpu_matmul(m, at, gc))
     return out
+}
+
+// ---------------------------------------------------------------------------
+// Device memory accounting and the matmul hook.
+//
+// Peak device memory is tracked here rather than asked of the driver: every
+// allocation in this backend goes through gpu_buf, so the number is exact and
+// does not depend on a driver query that may or may not exist.
+var GPU_LIVE_BYTES = 0
+var GPU_PEAK_BYTES = 0
+
+fn gpu_reset_memory() {
+    GPU_LIVE_BYTES = 0
+    GPU_PEAK_BYTES = 0
+}
+
+fn gpu_buf(m: GpuMM, bytes: int) -> GpuBuffer {
+    let b = m.g.buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    GPU_LIVE_BYTES = GPU_LIVE_BYTES + bytes
+    if GPU_LIVE_BYTES > GPU_PEAK_BYTES { GPU_PEAK_BYTES = GPU_LIVE_BYTES }
+    return b
+}
+
+fn gpu_free(m: GpuMM, b: GpuBuffer) {
+    GPU_LIVE_BYTES = GPU_LIVE_BYTES - b.size
+    m.g.destroy_buffer(b)
+}
+
+// Route t_matmul through the device. Anything the kernels do not cover falls
+// back to t_matmul_cpu rather than failing, so enabling the backend can change
+// speed but never coverage.
+fn gpu_enable(m: GpuMM) {
+    var h: [fn(Tensor, Tensor) -> Tensor] = []
+    h.push(fn(a: Tensor, b: Tensor) -> Tensor {
+        if a.shape.len() != 2 or b.shape.len() != 2 { return t_matmul_cpu(a, b) }
+        if a.dt != b.dt { return t_matmul_cpu(a, b) }
+        if a.dt != DType.F64 and a.dt != DType.C64 { return t_matmul_cpu(a, b) }
+        return gpu_matmul(m, a, b)
+    })
+    MATMUL_HOOK = h
+}
+
+fn gpu_disable() {
+    let empty: [fn(Tensor, Tensor) -> Tensor] = []
+    MATMUL_HOOK = empty
 }

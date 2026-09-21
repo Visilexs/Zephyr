@@ -292,7 +292,24 @@ fn t_sum_dim(t: Tensor, dim: int) -> Tensor {
 // [M,K] @ [K,N] -> [M,N] only. Batch dimensions are deliberately not here: the
 // specification wants the two-dimensional case correct and the vector cases
 // specified separately rather than inherited by accident.
+// A backend may take over matmul by pushing one function here; empty means the
+// CPU path below. A list rather than an optional because it needs no default
+// value and no new type. The cost is one length check per call, against an
+// O(n^3) body, so the CPU path is unaffected and stays the default -- every
+// existing bit-exact comparison in this repository runs with this empty.
+var MATMUL_HOOK: [fn(Tensor, Tensor) -> Tensor] = []
+var MATMUL_CALLS = 0
+
 fn t_matmul(a: Tensor, b: Tensor) -> Tensor {
+    MATMUL_CALLS = MATMUL_CALLS + 1
+    if MATMUL_HOOK.len() > 0 {
+        let f = MATMUL_HOOK[0]
+        return f(a, b)
+    }
+    return t_matmul_cpu(a, b)
+}
+
+fn t_matmul_cpu(a: Tensor, b: Tensor) -> Tensor {
     same_dtype(a, b, "matmul")
     if a.shape.len() != 2 or b.shape.len() != 2 { panic("matmul: both operands must be rank 2") }
     let m = a.shape[0]

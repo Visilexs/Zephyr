@@ -147,6 +147,53 @@ Also worth recording because it distorts any speedup claim: the CPU reference
 `t_matmul` runs at 15 MFLOP/s, which is slow enough that GPU-vs-CPU ratios
 here measure `t_get`/`t_set` overhead rather than the GPU.
 
+## Full training step, CPU against the Vulkan backend
+
+`tools/gpu_step_bench.zeph`. A step is what `overfit_test.zeph` runs every
+iteration -- `pad_loss` over the batch, `av_backward` over the tape, gradient
+clipping, AdamW -- with the only difference being whether `t_matmul`
+dispatches to the device. Timing is reported only after both paths are shown
+to produce the same loss and the same gradients.
+
+| config | matmuls/step | fwd cpu ms | fwd gpu ms | fwd x | step cpu ms | step gpu ms | step x | peak device |
+|---|---|---|---|---|---|---|---|---|
+| small D=8 E=4 H=16 b=32 T=4 K=1 | 33 | 25.0 | 24.7 | 1.01 | 79.1 | 80.6 | **0.98** | 14.8 KB |
+| spec D=128 E=32 H=128 b=32 T=4 K=2 | 39 | 2735.8 | 351.0 | 7.79 | 8395.0 | 1546.3 | **5.43** | 565 KB |
+
+Medians of 12 and 6 timed repetitions; p95 within 1% of the median in every
+row except the small forward pass.
+
+Agreement: loss matches to 3e-15 relative at both sizes, and the gradients
+match across **104,160 components** at the specification size with a worst
+relative disagreement of 4e-14.
+
+**The small configuration is a forward-only winner and therefore not a
+winner.** It is 1.01x ahead on the forward pass and 0.98x behind on the full
+step. A21 asks specifically that this case not be reported as a win, and the
+benchmark prints the verdict rather than leaving it to be noticed: at that
+size 33 dispatches of a tiny matmul cost more in submission and host transfer
+than they save, and the backward pass adds the transposes and the second
+matmul per node that tip it over. The backend is only worth enabling at the
+specification dimension.
+
+Note also that the win **narrows** from 7.79x to 5.43x once the backward pass
+is included, for the same reason. Any speedup quoted from a forward pass alone
+overstates the backend by about 40% here.
+
+Two caveats that keep these numbers honest:
+
+* The CPU side is `t_matmul`, which runs at about 15 MFLOP/s. Both sides are
+  naive, so the comparison is fair as a same-workload measurement, but 5.43x
+  is a statement about this pair of implementations and not about CPUs and
+  GPUs in general.
+* At the specification size a step still spends most of its GPU time in host
+  upload, which the per-byte `store8` path caps at 327 MiB/s. The ceiling on
+  this backend is the transfer API, not the kernel.
+
+The benchmark is a tool rather than a suite entry: two minutes at the
+specification size is too slow for `run_tests.ps1`, and the correctness it
+depends on is already covered there by `ml-gpu`.
+
 ## Existing compute surface in this repository
 
 Surveyed before planning M5, so the milestone starts from what is actually
