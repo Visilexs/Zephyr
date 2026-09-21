@@ -337,6 +337,62 @@ impl Gfx {
         return GpuBuffer{buf: buf, mem: mem, size: size}
     }
 
+    // A device-local storage buffer filled from host memory through a staging
+    // copy. Host-visible memory would work and be simpler, but a brick pool is
+    // read at random by every ray, and leaving it across PCIe would make every
+    // sample a bus transaction.
+    fn storage_upload(self, src: Bytes, n: int) -> GpuBuffer {
+        assert(n > 0 and n <= src.len(), "storage_upload size is outside the source")
+        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        let pp = vk_output(8)
+        vkcheck(vkMapMemory(self.dev, stage.mem, 0, n, 0, pp.addr()), "vkMapMemory (storage_upload)")
+        let dstp = pp.get64(0)
+        vk_free_output(pp)
+        for i in 0..n { store8(dstp + i, src.get8(i)) }
+        vkUnmapMemory(self.dev, stage.mem)
+
+        // TRANSFER_SRC as well, so read_storage can copy it back out; a buffer
+        // nothing can read is a buffer nothing can check.
+        var dst = self.buffer(n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        // VkBufferCopy is three 64-bit fields: srcOffset, dstOffset, size.
+        var region = Bytes.new(24)
+        region.put64(0, 0)
+        region.put64(8, 0)
+        region.put64(16, n)
+        let ra = region.addr()
+        let sb = stage.buf
+        let db = dst.buf
+        self.immediate(fn(cb: int) {
+            vkCmdCopyBuffer(cb, sb, db, 1, ra)
+        })
+        self.destroy_buffer(stage)
+        return dst
+    }
+
+    // Read a DEVICE-LOCAL buffer back, through a staging copy. read_buffer maps
+    // the memory directly and so only works on host-visible buffers.
+    fn read_storage(self, b: GpuBuffer, n: int) -> Bytes {
+        assert(n > 0 and n <= b.size, "read_storage size is outside the buffer")
+        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        var region = Bytes.new(24)
+        region.put64(0, 0)
+        region.put64(8, 0)
+        region.put64(16, n)
+        let ra = region.addr()
+        let sb = b.buf
+        let db = stage.buf
+        self.immediate(fn(cb: int) {
+            vkCmdCopyBuffer(cb, sb, db, 1, ra)
+        })
+        let out = self.read_buffer(stage, n)
+        self.destroy_buffer(stage)
+        return out
+    }
+
     fn destroy_buffer(self, b: GpuBuffer) {
         vkDestroyBuffer(self.dev, b.buf, 0)
         vkFreeMemory(self.dev, b.mem, 0)
