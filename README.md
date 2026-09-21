@@ -22,10 +22,13 @@ print(b.dist(a))                    // same call, method syntax
 
 ## Why
 
-- **Memory safe.** No pointers, no manual memory, no null. A garbage collector
-  reclaims memory, every list access is bounds-checked, and every variable must
-  be initialized. There is no way to write a use-after-free, double-free,
-  buffer overrun, or null dereference.
+- **Memory safe, with no collector pauses.** No pointers, no manual memory, no
+  null. Memory is reclaimed by **reference counting the compiler inserts for
+  you** — every list access is bounds-checked, and every variable must be
+  initialized. There is no way to write a use-after-free, double-free, buffer
+  overrun, or null dereference, and no thread ever stops for a collection: a
+  50 MB live set churning 585 MB over 3,000 frames shows a **29 µs** worst-case
+  pause, where the old tracing collector spiked to ~4 ms.
 - **Statically typed, but concise.** Types are inferred for locals
   (`let x = 3`), required only on function signatures and struct fields.
   `int` widens to `float` implicitly; every other conversion is explicit
@@ -42,7 +45,7 @@ print(b.dist(a))                    // same call, method syntax
   | integer SIMD (matmul) | **42 ms** | 72 | 70 | wins both |
   | rasterization (cube) | **8 ms** | 10 | 11 | wins both |
   | bignum (pi) | **66 ms** | 84 | 91 | wins both |
-  | alloc / GC (strings) | **132 ms** | 172 | 148 | wins both |
+  | allocation churn (strings) | **132 ms** | 172 | 148 | wins both |
   | sorting | **139 ms** | 276 | 43 | 2× faster than C |
   | recursion (fib) | 21 ms | 12 | 21 | ties Rust |
   | hash map | 83 ms | 32 | 69 | ties Rust |
@@ -53,10 +56,23 @@ print(b.dist(a))                    // same call, method syntax
   Rust's per-format heap strings), beats C by 2× on sorting (a
   branchless-partition introsort — the pdqsort technique — against C's
   `qsort`), ties Rust on recursion and hash maps, and is within ~1.2× on
-  float. **Peak memory is the lowest of the three on most rows** (alloc/GC:
-  12 MB vs its own earlier 138 MB, thanks to a Go-style live-proportional GC
-  trigger and the string builder). Every row also *compiles* ~10× faster than
-  gcc or rustc on the same program.
+  float. **Peak memory is the lowest of the three on most rows.** Every row
+  also *compiles* ~10× faster than gcc or rustc on the same program.
+
+  **Caveat: that Zephyr column was measured before reference counting
+  replaced the collector.** The C and Rust columns are unaffected. Re-running
+  every benchmark against both compilers, same machine, same checksums, gives
+  the cost of the change:
+
+  | | fib | matmul | mandel | sort | strings | hashmap | cube | pi | liquid |
+  |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+  | ref-counting vs collector | 0.85× | 1.10× | 0.95× | 1.04× | 1.15× | 1.20× | 1.23× | 1.10× | 1.05× |
+
+  Median ~1.1×, and the allocation row pays the most — so its win over Rust is
+  now inside the noise, while the rest of the table stands. Peak memory on that
+  row **falls from 14 MB to 3 MB**, because nothing waits for a collection to
+  come around. The compiler itself, the heaviest Zephyr program there is, runs
+  at 1.36× its collector-era self.
 
 - **A real optimizer — including things gcc and LLVM don't do.** The
   self-hosted compiler carries: a function **inliner**, **register promotion**
@@ -90,7 +106,8 @@ print(b.dist(a))                    // same call, method syntax
   multi-file programs.
 - **Three targets, one source.** The same program compiles to a Windows PE
   (`.exe`, kernel32 only), a static Linux ELF (`--linux`, raw syscalls, no
-  libc), or a WebAssembly module (`--wasm`, runtime and GC included).
+  libc), or a WebAssembly module (`--wasm`, runtime included — this is the one
+  target that still reclaims with the tracing collector rather than counting).
   `crosscheck` scripts compile both native targets from the same sources and
   require byte-identical output.
 - **Talks to the machine when it needs to.** A native-interop layer —
@@ -209,7 +226,7 @@ powershell -File bootstrap\bootstrap.ps1       # verifies both fixpoints
 ## The runtime, written in Zephyr
 
 Zephyr's runtime exists in two forms. The default is C (`bootstrap/runtime.c`,
-`zephyr_rt.dll`) — it has the optimized GC and full float support. The second is
+`zephyr_rt.dll`) — it has the tracing collector and full float support. The second is
 **written in Zephyr itself** (`runtime.zeph`): allocation, strings, lists,
 struct/list formatting, interpolation, panics, and command-line args, all
 implemented with Zephyr's low-level primitives — bitwise ops, raw memory access
@@ -223,13 +240,34 @@ implemented with Zephyr's low-level primitives — bitwise ops, raw memory acces
 An executable built with `--rt` imports nothing but `kernel32.dll`. The Zephyr
 runtime is now feature-complete: every type (including maps, enums, optionals
 and function values), string/int/float parsing **and float formatting**
-(matching C's `%.15g`), file I/O, command-line args, and a **conservative
-mark-sweep garbage collector** — a contiguous reserved heap with an
-object-start bitmap for O(1) pointer identification, size-segregated free
-lists for O(1) allocation, and roots scanned from the machine stack and the
-globals array. It halves peak memory on an allocation-heavy benchmark (2M
-short-lived strings: 56.9 MB collected vs 114.3 MB uncollected) and costs the
-compiler ~25% on compile time.
+(matching C's `%.15g`), file I/O, command-line args, and **reference counting**.
+
+### Reference counting
+
+Every object carries a 24-byte header: a count, a pointer to a static shape
+descriptor the compiler emits, and its size. The compiler holds an ownership
+contract — an expression leaves an *owned* value in `rax`, every slot that
+stores one owns a count, and a function releases its locals on the way out —
+so `retain`/`release` never appear in source. Nothing is deferred, so freeing
+is spread evenly through the program instead of pooling into a pause:
+
+- **29 µs worst-case frame** over 3,000 frames with a 50 MB live set and
+  585 MB churned (`spikes/gc_pause.zeph`), zero frames over 1 ms. The tracing
+  collector spiked to ~4 ms on the same workload, which drops frames.
+- **Counting does all the reclaiming.** A 300k-iteration churn loop with a
+  four-object live set peaks at 4 MB, and at exactly 4 MB again with the
+  collector stubbed out entirely.
+- Compiling `zc.zeph` — about four million objects — leaves **one**
+  unreachable object unfreed. The collector-era build left 3,996,212.
+
+Counting alone cannot reclaim a **cycle**, so the conservative mark-sweep
+collector stays linked underneath it — a contiguous reserved heap with an
+object-start bitmap for O(1) pointer identification, free lists for O(1)
+allocation, and roots scanned from the machine stack and the globals array.
+It now fires only when the free lists come up empty past a growth target,
+which counting makes rare, so it collects the cycles and otherwise stays out
+of the way. Declaring a back-edge weak, so cycles never form, is planned and
+not implemented.
 
 `examples/ffi_runtime.zeph` is a smaller standalone demonstration — stdout I/O
 and integer formatting in pure Zephyr, calling only kernel32.
@@ -260,7 +298,7 @@ assembly) → peephole → **built-in assembler and PE linker**. The assembler
 encodes exactly the instruction vocabulary the code generator emits, and the
 linker writes a Windows PE64 executable directly — imports, sections, entry
 stub and all — with no external tools. Every Zephyr value is 64 bits; composite
-values live on the GC heap.
+values live on a reference-counted heap.
 
 The self-hosted `zc.exe` links the Zephyr-written runtime (`--rt`) and imports
 only `kernel32.dll`. The historical C seed instead links `zephyr_rt.dll`, a
@@ -275,21 +313,28 @@ and exists only to reconstruct the first `zc.exe` from source.
 powershell -File tests\run_tests.ps1
 ```
 
-Covers the examples, language features, GC stress (200k allocations),
+Covers the examples, language features, allocation stress (200k objects),
 compile-time errors, and runtime panics.
 
 ## Roadmap
 
 Maps, enums, modules, optionals, closures, generics, interfaces, float
-formatting, the garbage collector, the inliner, register promotion (integer
+formatting, reference counting, the inliner, register promotion (integer
 *and* float), runtime-reciprocal division, a **register-based calling
 convention** for user functions, and two further backends — **Linux/ELF**
 (`--linux`) and **WebAssembly** (`--wasm`) — have all landed. Still open,
 roughly in the order that would move the benchmarks:
 
-- **Allocation / GC pressure** — the alloc and hash-map benchmarks are
-  allocation-bound. Escape analysis to stack-allocate non-escaping temporaries,
-  and inlining the map probe fast-path at call sites, are the open levers.
+- **Reference-counting overhead** — counting costs a median ~1.1× across the
+  benchmarks and 1.36× on the compiler itself. The remaining cost is the sheer
+  number of retains executed, not the price of each one, so the levers are
+  fewer owned reads: escape analysis to stack-allocate non-escaping
+  temporaries, reuse analysis to write in place when a count is known to be
+  one, and weak back-edges so the collector is no longer needed for cycles.
+  Counts are also non-atomic, so sharing an object across threads is unsound
+  until they become interlocked.
+- **Counting on WebAssembly** — the `--wasm` backend emits no counting and
+  still relies on the tracing collector.
 - **Feature parity across targets** — WebAssembly still lacks files, closures,
   interfaces and threads; native interop (`extern fn … from`) is Windows-only.
 - **Overloading** — one name, one function. Generics covered the cases that
