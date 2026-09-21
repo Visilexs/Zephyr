@@ -86,6 +86,50 @@ measured step timings, so the tradeoff between an fp64 path that preserves
 the existing parity evidence and an fp32 path that does not must be measured
 rather than assumed.
 
+## Measured matmul throughput, fp32 against fp64
+
+`tools/gpu_probe.zeph`, RTX 5090, hand-written GLSL compiled with `glslc`,
+correctness checked against `lib/ml/ops` before any timing is reported.
+Warm median of 30 submissions (10 at the compute-bound sizes).
+
+| shape | cpu ms | f32 ms | f64 ms | f64/f32 | rel err f32 | rel err f64 |
+|---|---|---|---|---|---|---|
+| controller W1 [32,416]x[416,128] | 216 | 0.113 | 0.122 | 1.08 | 6.6e-6 | 7e-15 |
+| controller W2 [32,128]x[128,384] | 200 | 0.059 | 0.074 | 1.25 | 2.3e-6 | 2e-15 |
+| readout [32,128]x[128,3] | 1.54 | 0.058 | 0.067 | 1.16 | 6.8e-7 | 1e-15 |
+| square [256,256]x[256,256] | 2176 | 0.129 | 0.198 | 1.54 | 5.2e-6 | 5e-15 |
+| n=512 compute-bound | -- | 0.900 (p95 0.979) | 1.143 (p95 1.498) | 1.27 | 2.5e-6 | 4e-15 |
+| n=1024 compute-bound | -- | 11.32 (p95 11.80) | 17.45 (p95 18.08) | **1.54** | 6.6e-6 | 2e-15 |
+
+**The 1.54 is not the FP64 arithmetic penalty and must not be quoted as one.**
+At n=1024 the fp32 kernel achieves 190 GFLOP/s, which is roughly 0.2% of this
+device's fp32 peak. The kernel is naive -- one global load per operand per
+multiply-accumulate, no tiling, no shared memory -- so it is bandwidth-bound,
+not ALU-bound. fp64 moves twice the bytes and lands at 1.54x, close to the 2x
+a purely bandwidth-bound kernel predicts. The ALU ratio on consumer NVIDIA
+parts is about 1/64, and none of it is visible here because the ALUs are idle
+waiting on memory.
+
+The consequence runs the wrong way from the comfortable reading: **the ratio
+is favourable only because the kernel is slow.** Any tiling work that makes
+the fp32 kernel approach its ceiling will widen the gap toward 64x, because
+fp64 has far less headroom -- it is already at about 8% of its own peak. An
+fp64 backend is cheap today and gets relatively more expensive with every
+optimisation.
+
+Two other measurements, both larger than the arithmetic:
+
+* **Host upload runs at 327 MiB/s** (16 MiB in 49 ms). That is the per-byte
+  `store8` loop the current mapped-memory API forces, not the bus. At n=1024
+  upload costs 49 ms against 17 ms of compute, so transfer dominates by 3x. A
+  bulk copy into mapped memory would buy more than any kernel tuning.
+* **Cold pipeline build is 0.21-0.33 ms**, negligible, and the same for both
+  precisions.
+
+Also worth recording because it distorts any speedup claim: the CPU reference
+`t_matmul` runs at 15 MFLOP/s, which is slow enough that GPU-vs-CPU ratios
+here measure `t_get`/`t_set` overhead rather than the GPU.
+
 ## Existing compute surface in this repository
 
 Surveyed before planning M5, so the milestone starts from what is actually
