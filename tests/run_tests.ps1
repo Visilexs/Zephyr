@@ -280,6 +280,15 @@ $stdOut = if ($stdBuilt) { (cmd /c "`"$tmp\stdlib.exe`" 2>&1" | Out-String).Trim
 $stdWant = @("7","3","8","65536","HELLO, WORLD","Hello, Zephyr","true","7","true","3","hi","ababab","true","5","2","[1, 3, 5, 9]","3.14159","1.4142135623731","0.25","Green","true","2","30","2","true","false","2","1","-1","30","0","none","true","[1, 4, 9, 16]","81","[1, 4, 9]","[2, 4]","10","[101, 102]","true","ok") -join "`n"
 Check "stdlib-builtins" ($stdBuilt -and $stdOut -eq $stdWant) "got: $stdOut"
 
+# ---- std/math.zeph function family: trig reciprocals, inverse trig,
+# ---- hyperbolics, gamma/digamma, gudermannian, derivatives, quadrature ----
+Remove-Item "$tmp\math_fns.exe" -ErrorAction SilentlyContinue
+$mathBuild = (& .\zc.exe --rt tests\math_fns.zeph "$tmp\math_fns.exe" 2>&1 | Out-String).Trim()
+$mathBuilt = Test-Path "$tmp\math_fns.exe"
+if (-not $mathBuilt) { Write-Host "  math build output: $mathBuild" -ForegroundColor Yellow }
+$mathOut = if ($mathBuilt) { (cmd /c "`"$tmp\math_fns.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+Check "std-math-fns" ($mathBuilt -and $mathOut -eq "math: 198 checks passed") "got: $mathOut"
+
 # ---- modules: import splices declarations, once, resolved relative to the importer ----
 $moddir = Join-Path $tmp "mod"
 New-Item -ItemType Directory -Force "$moddir\sub" | Out-Null
