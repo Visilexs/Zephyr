@@ -32,6 +32,41 @@ fn ck_ftc(f: fn(float) -> float, d: fn(float) -> float, a: float, b: float, name
     return ck(near(got, f(b) - f(a), 0.0000001), name)
 }
 
+// ---- gamma a second way, from the Euler integral ---------------------------
+// gamma(x) = integral from 0 to infinity of t^(x-1) e^(-t) dt, evaluated with
+// integrate_p. Nothing here shares code with the Lanczos gamma beyond exp and
+// ln, so agreement between the two is real evidence rather than a shared bug.
+
+// log of the integrand's peak, at t = x-1. The integral is divided through by
+// this so it comes out O(sqrt x) rather than O(gamma x): integrate's eps is
+// ABSOLUTE, and asking for 1e-12 on gamma(17)=2.09e13 would demand 26 digits
+// and bisect until it hit the depth cap.
+fn gpeak_log(x: float) -> float {
+    if x <= 2.0 { return 0.0 }
+    let m = x - 1.0
+    return m * fln(m) - m
+}
+
+// one exp, not two: t^(x-1) and e^(-t) computed apart overflow for large t
+// long before the decay cancels them
+fn gintegrand(t: float, x: float) -> float {
+    if t == 0.0 {
+        if x > 1.0 { return 0.0 }
+        return 1.0
+    }
+    return fexp((x - 1.0) * fln(t) - t - gpeak_log(x))
+}
+
+// below 1 the integrand is singular at the origin, so walk x up with
+// gamma(x) = gamma(x+1)/x and integrate something well behaved instead
+fn gamma_quad(x: float) -> float {
+    if x <= 0.0 { return NAN }
+    if x < 1.0 { return gamma_quad(x + 1.0) / x }
+    let hi = 60.0 + 3.0 * x
+    let s = integrate_p(gintegrand, x, 0.0, hi, 0.0000000000001)
+    return s * fexp(gpeak_log(x))
+}
+
 var n = 0
 
 // ---- anchors: exact closed forms
@@ -181,5 +216,16 @@ n += ck(gamma(172.0) == INF, "gamma overflows past 171.62")
 let t = 0.00000001
 n += ck(fabs((tanh(t) - t) / t) < 0.000000000001, "tanh keeps digits near zero")
 n += ck(fabs((sinh(t) - t) / t) < 0.000000000001, "sinh keeps digits near zero")
+
+// ---- Lanczos gamma against the Euler integral, two independent routes.
+// Observed worst disagreement is 2.4e-13, at x=2; 1e-11 leaves headroom for
+// a different rounding order on another target.
+let gq = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.5, 6.0, 9.0, 12.0, 17.0]
+for i in 0..gq.len() {
+    let x = gq[i]
+    n += ck(near(gamma_quad(x), gamma(x), 0.00000000001), "gamma = euler integral")
+}
+n += ck(near(gamma_quad(0.5) * gamma_quad(0.5), PI, 0.0000000001), "quad gamma(1/2)^2 = pi")
+n += ck(near(gamma_quad(6.0), 120.0, 0.0000000001), "quad gamma(6) = 120")
 
 print("math: {n} checks passed")

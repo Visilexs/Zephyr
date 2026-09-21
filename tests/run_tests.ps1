@@ -287,7 +287,7 @@ $mathBuild = (& .\zc.exe --rt tests\math_fns.zeph "$tmp\math_fns.exe" 2>&1 | Out
 $mathBuilt = Test-Path "$tmp\math_fns.exe"
 if (-not $mathBuilt) { Write-Host "  math build output: $mathBuild" -ForegroundColor Yellow }
 $mathOut = if ($mathBuilt) { (cmd /c "`"$tmp\math_fns.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-Check "std-math-fns" ($mathBuilt -and $mathOut -eq "math: 198 checks passed") "got: $mathOut"
+Check "std-math-fns" ($mathBuilt -and $mathOut -eq "math: 211 checks passed") "got: $mathOut"
 
 # ---- modules: import splices declarations, once, resolved relative to the importer ----
 $moddir = Join-Path $tmp "mod"

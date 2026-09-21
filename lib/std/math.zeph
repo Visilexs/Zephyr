@@ -352,3 +352,31 @@ fn integrate(f: fn(float) -> float, a: float, b: float, eps: float) -> float {
     if a > b { return 0.0 - integrate(f, b, a, eps) }
     return adapt(f, a, b, eps, simpson(f, a, b), 50)
 }
+
+// Same again for a one-parameter family f(t; p). Worth the duplication: the
+// alternative is capturing p in a closure, which does not exist on wasm, or a
+// module-level var, which would make the quadrature non-reentrant.
+
+fn simpson_p(f: fn(float, float) -> float, p: float, a: float, b: float) -> float {
+    let c = (a + b) / 2.0
+    return (b - a) / 6.0 * (f(a, p) + 4.0 * f(c, p) + f(b, p))
+}
+
+fn adapt_p(f: fn(float, float) -> float, p: float, a: float, b: float, eps: float, whole: float, depth: int) -> float {
+    let c = (a + b) / 2.0
+    let left = simpson_p(f, p, a, c)
+    let right = simpson_p(f, p, c, b)
+    let delta = left + right - whole
+    if depth <= 0 or fabs(delta) <= 15.0 * eps {
+        return left + right + delta / 15.0
+    }
+    let lo = adapt_p(f, p, a, c, eps / 2.0, left, depth - 1)
+    let hi = adapt_p(f, p, c, b, eps / 2.0, right, depth - 1)
+    return lo + hi
+}
+
+fn integrate_p(f: fn(float, float) -> float, p: float, a: float, b: float, eps: float) -> float {
+    if a == b { return 0.0 }
+    if a > b { return 0.0 - integrate_p(f, p, b, a, eps) }
+    return adapt_p(f, p, a, b, eps, simpson_p(f, p, a, b), 50)
+}
