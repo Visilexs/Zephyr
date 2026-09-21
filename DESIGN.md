@@ -211,3 +211,40 @@ inverts under -theta (G^H), that stage B wraps the last coordinate onto the
 first, and that the two stages are not the same permutation. Two of its checks
 exist only to keep the rest non-vacuous: that a stage genuinely changes the
 state, and that stages A and B differ.
+
+## D19 -- the tape records opcodes and handles, not closures
+
+A closure-based tape is the usual design and is not available here: wasm has
+no closures, and lib/ml has so far compiled and passed identically as a
+Windows PE, a static Linux ELF and wasm. Recording closures would trade that
+away silently, for a milestone that never mentions it.
+
+So a node holds an opcode, up to two input handles, saved tensors, and small
+integer and float argument lists. Inputs are integer handles into a global
+variable table rather than tensors, which means a node cannot alias its
+input, cannot hold a stale descriptor, and the graph is a plain integer DAG.
+
+Because handles are allocated in forward order, a node's inputs always have
+smaller handles than its output. One descending sweep therefore visits every
+node after all of its consumers, and no topological sort is needed.
+
+## D20 -- in-place mutation is an error, not a wrong number
+
+Saved tensors go through the version-checked `Saved` type from M2a, which was
+built for this and had been unused. If a saved tensor's storage is mutated
+between the forward and reverse passes, `saved_get` panics. The alternative
+is a gradient that is quietly computed from the wrong values, which is the
+single worst failure mode an AD system has, because every downstream number
+still looks plausible.
+
+## D21 -- the tape is explicitly reset, and that is asserted
+
+A07 requires the tape not to grow without bound across steps. Rather than
+trimming heuristically, the tape is reset explicitly and `av_nodes()` is
+exported so a test can measure it. The test asserts that one step records
+exactly three nodes and that twenty-five steps leave three -- an exact
+measured count, not a loose upper bound that a leak could hide under.
+
+`no_grad` suppresses recording rather than discarding afterwards, and an
+operation whose inputs all require no gradient records nothing at all, so
+inference costs no tape at all rather than a tape that is thrown away.
