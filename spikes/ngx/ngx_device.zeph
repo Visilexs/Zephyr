@@ -1,0 +1,83 @@
+// Spike 5 - a Vulkan device NGX will accept.
+//
+// NVSDK_NGX_VULKAN_RequiredExtensions names extensions that must be enabled at
+// instance and device creation. Miss one and NGX does not complain here; it
+// fails later, during feature creation, with a result code that does not say
+// which extension was missing. So this asks the shim first and feeds the answer
+// straight into vkCreateInstance/vkCreateDevice.
+//
+// Build into this directory so LoadLibraryA finds vxngx.dll next to the exe.
+import "vk/gfx.zeph"
+
+extern fn vxngx_abi() -> i32 from "vxngx.dll"
+extern fn vxngx_required_extensions(buf: int, buflen: int, pic: int, pdc: int) -> i32 from "vxngx.dll"
+
+let NGX_SUCCESS = 1
+
+fn cstr(p: int, maxn: int) -> str {
+    var s = ""
+    var i = 0
+    var done = false
+    while i < maxn and not done {
+        let b = load8(p + i)
+        if b == 0 { done = true }
+        else { s = "{s}{chr(b)}" }
+        i = i + 1
+    }
+    return s
+}
+
+assert(vxngx_abi() == 1, "vxngx.dll ABI is not 1")
+
+let scratch = win("VirtualAlloc", 0, 16384, 12288, 4)
+assert(scratch != 0, "VirtualAlloc failed")
+let buf = scratch
+let pic = scratch + 8192
+let pdc = scratch + 8320
+
+let r = vxngx_required_extensions(buf, 8192, pic, pdc)
+assert(r == NGX_SUCCESS, "NVSDK_NGX_VULKAN_RequiredExtensions returned {r}")
+
+let n_inst = load64(pic) & 4294967295
+let n_dev = load64(pdc) & 4294967295
+let blob = cstr(buf, 8192)
+
+// The shim packs the two lists into one buffer, newline separated, with a
+// lone "--" between them.
+var inst_exts: [str] = []
+var dev_exts: [str] = []
+var in_dev = false
+for line in blob.split("\n") {
+    let e = line.trim()
+    if e.len() == 0 { continue }
+    if e == "--" {
+        in_dev = true
+        continue
+    }
+    if in_dev { dev_exts.push(e) } else { inst_exts.push(e) }
+}
+assert(inst_exts.len() == n_inst, "parsed {inst_exts.len()} instance extensions, NGX said {n_inst}")
+assert(dev_exts.len() == n_dev, "parsed {dev_exts.len()} device extensions, NGX said {n_dev}")
+print("NGX wants {n_inst} instance and {n_dev} device extensions")
+for e in inst_exts { print("  instance: {e}") }
+for e in dev_exts { print("  device:   {e}") }
+
+var layers: [str] = []
+for arg in args() {
+    if arg == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+
+// Headless: NGX itself needs no surface, and keeping a window out of the spike
+// keeps the failure surface small.
+var g = Gfx.make_ext("zephyr-ngx-device", layers, 0, 0, inst_exts, dev_exts)
+print("gpu: {g.gpu_name()}")
+assert(g.dev != 0, "device handle is null")
+assert(g.phys != 0, "physical device handle is null")
+
+// Prove the device is usable, not merely created: run the smallest possible
+// command through it.
+var ran = false
+g.immediate(fn(cb: int) { ran = true })
+assert(ran, "immediate command buffer did not execute")
+
+print("PASS: created and used a Vulkan device with every NGX-required extension")

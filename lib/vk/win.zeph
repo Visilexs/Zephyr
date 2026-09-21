@@ -6,6 +6,7 @@
 // OS -- Vulkan never calls us, so nothing here needs a thunk.
 
 import "std/bytes.zeph"
+import "vk/raw.zeph"
 
 extern fn GetModuleHandleA(name: int) -> int from "kernel32.dll"
 extern fn RegisterClassA(wc: int) -> int from "user32.dll"
@@ -37,10 +38,17 @@ fn window_open(title: str, w: int, h: int) -> Window {
     // LoadLibraryA, not GetModuleHandleA: every user32 entry point here is
     // resolved lazily through `extern fn`, so user32 may not be mapped yet and
     // GetModuleHandleA would hand back 0.
-    let u32mod = win("LoadLibraryA", cbytes("user32.dll").addr())
+    // Both names are bound to locals first. `cbytes(x).addr()` hands out the
+    // address of a temporary whose last reference dies with the expression, so
+    // reference counting frees the buffer before the call reads it -- it only
+    // appeared to work when nothing else had allocated yet and the freed block
+    // still held its bytes.
+    var u32name = cbytes("user32.dll")
+    let u32mod = win("LoadLibraryA", u32name.addr())
     if u32mod == 0 { panic("could not load user32.dll") }
     // the window procedure is user32's own default handler
-    let defwp = win("GetProcAddress", u32mod, cbytes("DefWindowProcA").addr())
+    var dwpname = cbytes("DefWindowProcA")
+    let defwp = win("GetProcAddress", u32mod, dwpname.addr())
     if defwp == 0 { panic("could not resolve DefWindowProcA") }
 
     var name = cbytes("zephyrVulkanWindow")
@@ -58,8 +66,8 @@ fn window_open(title: str, w: int, h: int) -> Window {
                                120, 90, w, h, 0, 0, hinst, 0)
     if hwnd == 0 { panic("CreateWindowExA failed") }
     let s = ShowWindow(hwnd, 5)
-    return Window{hwnd: hwnd, hinst: hinst, msg: Bytes.new(64),
-                  rect: Bytes.new(16), cls: cls, name: name}
+    return Window{hwnd: hwnd, hinst: hinst, msg: vk_output(64),
+                  rect: vk_output(16), cls: cls, name: name}
 }
 
 impl Window {
@@ -84,5 +92,9 @@ impl Window {
         let r = GetClientRect(self.hwnd, self.rect.addr())
         return self.rect.get32(12)
     }
-    fn close(self) { let r = DestroyWindow(self.hwnd) }
+    fn close(self) {
+        let r = DestroyWindow(self.hwnd)
+        vk_free_output(self.msg)
+        vk_free_output(self.rect)
+    }
 }

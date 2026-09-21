@@ -9,6 +9,22 @@
 // required for extensions (debug messenger, surfaces) -- not needed yet.
 
 import "vk/consts.zeph"
+import "std/bytes.zeph"
+
+// Off-heap scratch for native output only; the caller must free it after its last use.
+fn vk_output(n: int) -> Bytes {
+    assert(n > 0, "vk_output: size must be positive")
+    let p = win("VirtualAlloc", 0, n, 12288, 4)
+    assert(p != 0, "vk_output: VirtualAlloc failed")
+    let mem: [int] = []
+    return Bytes{mem: mem, p: p, n: n}
+}
+
+// Release only scratch obtained from vk_output; no references may be used afterward.
+fn vk_free_output(b: Bytes) {
+    let freed = win("VirtualFree", b.addr(), 0, 32768)
+    assert(freed != 0, "vk_free_output: VirtualFree failed")
+}
 
 fn vkcheck(r: int, what: str) {
     // externs declared `-> i32` already sign-extend, so r is a true VkResult
@@ -33,6 +49,7 @@ extern fn vkDestroyInstance(instance: int, pAllocator: int) from "vulkan-1.dll"
 // ---- physical device ----
 extern fn vkEnumeratePhysicalDevices(instance: int, pCount: int, pDevices: int) -> i32 from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceProperties(physicalDevice: int, pProperties: int) from "vulkan-1.dll"
+extern fn vkGetPhysicalDeviceFormatProperties(physicalDevice: int, format: int, pFormatProperties: int) from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice: int, pCount: int, pProps: int) from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceMemoryProperties(physicalDevice: int, pMemoryProperties: int) from "vulkan-1.dll"
 
@@ -84,6 +101,8 @@ extern fn vkCmdEndRenderPass(commandBuffer: int) from "vulkan-1.dll"
 extern fn vkCmdBindPipeline(commandBuffer: int, pipelineBindPoint: int, pipeline: int) from "vulkan-1.dll"
 extern fn vkCmdDraw(commandBuffer: int, vertexCount: int, instanceCount: int, firstVertex: int, firstInstance: int) from "vulkan-1.dll"
 extern fn vkCmdCopyImageToBuffer(commandBuffer: int, srcImage: int, srcImageLayout: int, dstBuffer: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
+extern fn vkCmdCopyBufferToImage(commandBuffer: int, srcBuffer: int, dstImage: int, dstImageLayout: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
+extern fn vkCmdBlitImage(commandBuffer: int, srcImage: int, srcImageLayout: int, dstImage: int, dstImageLayout: int, regionCount: int, pRegions: int, filter: int) from "vulkan-1.dll"
 extern fn vkCmdPipelineBarrier(commandBuffer: int, srcStageMask: int, dstStageMask: int, dependencyFlags: int, memoryBarrierCount: int, pMemoryBarriers: int, bufferMemoryBarrierCount: int, pBufferMemoryBarriers: int, imageMemoryBarrierCount: int, pImageMemoryBarriers: int) from "vulkan-1.dll"
 
 // ---- submit / sync ----

@@ -1,0 +1,18 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D target;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec2 uv = vec2(p) / vec2(size - 1);
+    ivec2 delta = 2 * p + 1 - size;
+    int radius = min(size.x, size.y) / 4;
+    bool circle = dot(vec2(delta), vec2(delta)) <= float(4 * radius * radius);
+    vec4 colour = circle ? vec4(1.0, 0.25, 0.0625, 1.0)
+                         : vec4(uv, 0.25, 1.0);
+    imageStore(target, p, colour);
+}
