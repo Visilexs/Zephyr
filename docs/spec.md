@@ -182,9 +182,7 @@ is a redeclaration error.
 
 `fn(T, ...) -> R` is the type of a function value (`-> R` is omitted for
 void). A function's name used outside a call position evaluates to its code
-address, so functions can be stored in variables, lists, maps, and struct
-fields, and passed to and returned from other functions. Any expression of
-function type may be called: `ops["up"](10)`.
+address. Any expression of function type may be called: `ops["up"](10)`.
 
 Two function types are equal when their parameter types and return type match.
 A local variable may shadow a function name; a global may not.
@@ -208,39 +206,6 @@ A function value is a `{code, environment}` pair; a plain function name used as
 a value has an empty environment. Calls through a function value are identical
 either way, so `fn(int) -> int` accepts both.
 
-### 3.0.5 Generics
-
-    fn contains[T](xs: [T], x: T) -> bool {
-        for v in xs {
-            if v == x { return true }
-        }
-        return false
-    }
-
-    print(contains([1, 2, 3], 2))       // true
-    print(contains(["a", "b"], "b"))    // true — structural ==
-    print([1, 2].contains(2))           // same call, UFCS
-
-Functions may take type parameters in `[...]`. They are **inferred from the
-arguments** — never written at the call site — and unification looks through
-`[T]`, `[K: V]`, `T?`, and `fn(T) -> U`, so `map[T, U]` can infer `U` from the
-return type of the function you pass it.
-
-Generics are **monomorphised**: each distinct set of type arguments compiles to
-its own copy of the body, which is then type-checked with `T` bound. That
-copy's checking *is* the contract — `contains` compiles `v == x` for the
-concrete `T`, so it works for `int`, `str`, and enums, and is rejected for
-element types with no `==`. There is no trait or interface system, and none is
-needed to express the standard library.
-
-A generic function has no single type, so it cannot be used as a function value.
-
-`std/list.zeph` is written entirely in these terms — `contains`, `index_of`,
-`reverse`, `slice`, `map`, `filter`, `fold`, `any`, `all`, `first`, `last`,
-`sort_by`. They were compiler builtins before generics existed. `import` it:
-
-    import "std/list.zeph"
-
 ### 3.0.4 Optionals
 
     fn find(xs: [int], target: int) -> int? {
@@ -262,6 +227,38 @@ type error. `let x = none` needs an annotation to say which optional it is.
 An optional is a pointer to a one-word cell, so `0`, `false`, and `""` are
 ordinary values, cleanly distinct from `none` — `let z: int? = 0` has
 `z.has() == true`.
+
+### 3.0.5 Generics
+
+    fn contains[T](xs: [T], x: T) -> bool {
+        for v in xs {
+            if v == x { return true }
+        }
+        return false
+    }
+
+    print(contains([1, 2, 3], 2))       // true
+    print(contains(["a", "b"], "b"))    // true — structural ==
+    print([1, 2].contains(2))           // same call, UFCS
+
+Functions may take type parameters in `[...]`. They are **inferred from the
+arguments** — never written at the call site — and unification looks through
+`[T]`, `[K: V]`, `T?`, and `fn(T) -> U`, so `map[T, U]` can infer `U` from the
+return type of the function you pass it.
+
+Generics are monomorphised: each distinct set of type arguments compiles to its
+own copy of the body, type-checked with `T` bound. That checking is the whole
+contract — `contains` compiles `v == x` for the concrete `T`, so it works for
+`int`, `str` and enums, and is rejected for element types with no `==`. There is
+no trait system.
+
+A generic function has no single type, so it cannot be used as a function value.
+
+`std/list.zeph` is written entirely in these terms — `contains`, `index_of`,
+`reverse`, `slice`, `map`, `filter`, `fold`, `any`, `all`, `first`, `last`,
+`sort_by`. They were compiler builtins before generics existed. `import` it:
+
+    import "std/list.zeph"
 
 ### 3.0.6 Methods and interfaces
 
@@ -295,11 +292,9 @@ Any struct whose `impl` provides all of an interface's methods (matching
 parameter and return types) is usable where that interface is expected — the
 conversion is implicit and structural, no `implements` clause. An interface
 value is a fat reference (a `{vtable, data}` cell); calling a method on it
-dispatches dynamically through the struct's vtable. This gives runtime
-polymorphism — a `[Shape]` may hold circles and rects, and `s.area()` runs the
-right one. Interface values cannot be printed directly; call a method instead.
-There is no implementation inheritance: compose structs and share behaviour
-through interfaces.
+dispatches through the struct's vtable, so a `[Shape]` may hold circles and
+rects. Interface values cannot be printed directly; call a method instead. There
+is no implementation inheritance.
 
 ### 3.1 Declarations and inference
 
@@ -455,11 +450,11 @@ runtime does not count or trace them (see the caution below).
 Off-heap memory is obtained by calling the OS directly, e.g.
 `win("VirtualAlloc", 0, n, 12288, 4)` (MEM_RESERVE|COMMIT, PAGE_READWRITE).
 Buffers the OS writes into (a `POINT`, a `RECT`, a swapchain image) **must**
-live off-heap this way: a `zeros()`/list allocation is reclaimed as soon as the
-last reference to it goes away (§4), and the address you handed the OS does not
-count as one; a `VirtualAlloc` region is never reclaimed. The heap itself never
-moves an object, so a raw address stays valid exactly as long as some Zephyr
-variable still holds the value.
+live off-heap this way. A `zeros()`/list allocation is freed as soon as the last
+reference goes away (§4), and the address you handed the OS does not count as
+one; a `VirtualAlloc` region is never reclaimed. The heap does not move objects,
+so a raw address stays valid exactly as long as some Zephyr variable still holds
+the value.
 
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
 to the kernel shim `k32_Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
@@ -481,34 +476,30 @@ values. Memory safety guarantees:
 3. no null and no uninitialized reads — construction requires all values
 4. no manual deallocation — there is nothing to double-free
 
-**Reference counting.** Memory is reclaimed by counting, and the compiler
-writes the counting for you — there is no `retain`, no `release`, and no
-annotation. Every heap object carries a count; each slot holding a reference
-(local, parameter, field, element, global) owns one, storing over a slot
-releases what it held, and a function releases its locals as it returns. An
-object is freed at the instant its last reference goes away, so reclamation is
-spread through the program rather than pooled into a pause, and peak memory
-tracks the live set rather than twice it. This is an implementation guarantee,
-not a language-visible one: a program cannot observe *when* an object is freed.
+Memory is reclaimed by reference counting, inserted by the compiler; there is no
+retain, release or annotation in source. Every heap object carries a count. Each
+slot holding a reference — local, parameter, field, element, global — owns one,
+storing over a slot releases what it held, and a function releases its locals as
+it returns. An object is freed when its last reference goes away, so peak memory
+tracks the live set rather than twice it. A program cannot observe *when* an
+object is freed; the timing is an implementation property, not a language rule.
 
-The heap is **non-moving**. An object stays at the address it was allocated at
-for its whole life, which is what makes `addr()` (§3.6) usable at all.
+The heap is non-moving. An object keeps its address for its whole life, which is
+what makes `addr()` (§3.6) usable.
 
-**Cycles and the backstop.** Counting alone cannot reclaim a cycle — a struct
-reachable from itself keeps its own count above zero. A conservative mark-sweep
-collector therefore stays linked underneath: it scans the machine stack and the
-globals array for anything that looks like a heap pointer, so it can only ever
-over-retain, never over-free. It runs only when allocation cannot be satisfied
-past a growth target, which counting makes rare. A cycle is a leak rather than a
-safety break — none of the four guarantees above depends on the collector — but
-it is a leak the backstop eventually clears, at the cost of a pause. That pause
-is the reason to avoid cyclic structures in latency-sensitive code.
+Counting cannot reclaim a cycle: a struct reachable from itself keeps its own
+count above zero. A conservative mark-sweep collector stays linked underneath,
+scanning the machine stack and the globals array for anything that looks like a
+heap pointer, so it can only over-retain, never over-free. It runs only when
+allocation cannot be satisfied past a growth target, which counting makes rare.
+A cycle is a leak, not a safety break — none of the four guarantees above
+depends on the collector — but clearing it costs a pause, which is why cyclic
+structures are worth avoiding in latency-sensitive code.
 
-Counts are **not atomic**, which is why a heap reference may never cross a
-thread boundary (§8).
+Counts are not atomic. That is why a heap reference may never cross a thread
+boundary (§8).
 
-On the `--wasm` target the compiler emits no counting; that backend reclaims
-with the collector alone.
+The `--wasm` backend emits no counting and reclaims with the collector alone.
 
 ## 5. Formatting
 
@@ -577,16 +568,16 @@ Threads are available on the Windows target through `lib/std/thread.zeph`
 | `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across `cpu_count()` workers, then join. |
 | `cpu_count()` | → int | Logical processor count. |
 
-The worker argument is deliberately an `int` — a worker index or a raw buffer
-address — **never a heap reference**. Two reasons, either sufficient: it
-travels through memory the collector does not scan, and reference counts are
-not atomic (§4), so two threads adjusting the same count would race and free an
-object that is still in use. Share data by passing an off-heap buffer address
-(§3.6) and partitioning it by index.
+The worker argument is an `int` — a worker index or a raw buffer address — and
+never a heap reference. Either reason alone is sufficient: it travels through
+memory the collector does not scan, and counts are not atomic (§4), so two
+threads adjusting the same count would race and free an object still in use.
+Share data by passing an off-heap buffer address (§3.6) and partitioning it by
+index.
 
-There is **no user-facing mutex or atomics API**. None is needed while that
-rule is kept: threads share no counted object. The backstop collector is
-stop-the-world — it suspends every registered thread and scans each one's
-register context and stack — so the rare collection is safe under concurrency
-without any locking in user code. String interpolation is thread-safe (a per-thread
-builder). Threads are not available on `--linux` or `--wasm`.
+There is no user-facing mutex or atomics API, and none is needed while that rule
+holds, because threads then share no counted object. The backstop collector is
+stop-the-world: it suspends every registered thread and scans each one's register
+context and stack, so the rare collection is safe under concurrency without
+locking in user code. String interpolation is thread-safe, using a per-thread
+builder. Threads are not available on `--linux` or `--wasm`.
