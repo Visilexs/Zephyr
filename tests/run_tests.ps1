@@ -338,6 +338,7 @@ Check "ml-ops" ($opsBuilt -and $opsOut -eq "ops: 107 checks passed") "got: $opsO
 $adSuites = [ordered]@{
     "ml-autograd" = @("tests\ml\autograd_test.zeph", "autograd: 674 checks passed")
     "ml-phase-ad" = @("tests\ml\phase_ad_test.zeph", "phase ad: 180 checks passed")
+    "ml-overfit"  = @("tests\ml\overfit_test.zeph", "overfit: 132 checks passed")
 }
 foreach ($nm in $adSuites.Keys) {
     $src = $adSuites[$nm][0]
@@ -347,7 +348,8 @@ foreach ($nm in $adSuites.Keys) {
     & .\zc.exe --rt $src $exe 2>&1 | Out-Null
     $built = Test-Path $exe
     $out = if ($built) { (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-    Check $nm ($built -and $out -eq $want) "got: $out"
+    $tail = ($out -split "`n" | Select-Object -Last 1).Trim()
+    Check $nm ($built -and $tail -eq $want) "got: $tail"
 }
 
 # ---- phase forward port: acceptance A13, and A10 at the gate level ----

@@ -24,7 +24,7 @@ passed on the strength of an exit code alone.
 | A11 | **passed** | Same two suites. Probabilities invariant and state equivariant under global phase at three angles, controller angles unchanged, features invariant under global phase but sensitive to relative phase and matching the doc formula bit-for-bit. The constructed interference example is internally inconsistent in the specification -- with the normalized row it states, the squared amplitude is (1+cos(delta))/2, not the 1+cos(delta) the prose claims -- so both forms are asserted explicitly and the discrepancy is recorded as DESIGN.md D16 rather than absorbed into a tolerance. The claim the paragraph actually makes, that two orthonormal rows sweep [1,0] to [0,1] while global phase moves neither, holds exactly. |
 | A12 | **passed** | Same two suites. The paired-real port agrees with the complex model on loss, probabilities, state and every one of the eight parameter gradients to 1e-12, and holds no complex array at all. Both are checked against central differences: worst relative error 3.7e-10, real and imaginary parts separately. The mapped optimizer step is the SGD check in test_phase.py; AdamW waits for M4. |
 | A13 | **passed** | `tools/ml_reference/check_phase.py` compares the Zephyr port against the verified float64 reference on **148 quantities and all 16 steps** at D=4 and D=8: not just the final probabilities but, for every step, the invariant features, the controller hidden layer, the angles, the post-phase state, both Givens stage outputs, the resulting state and the active-row mask. Worst disagreement 2.3e-16. The two sides build their weights independently from a mirrored LCG and all 16 parameter tensors are asserted **bit-identical**, so the agreement cannot be an artifact of a drifting fixture. Masks preserve state exactly (compared as hex, not within a tolerance); K=0/1/4 give exact update counts and are cross-checked by recomposing K THINK steps independently; zero, subnormal and near-overflow readouts all stay finite. |
-| A14 | **partial** | Native forward and backward are finite and verified. `tools/ml_reference/check_phase_grad.py` agrees with the reference's **analytic** reverse pass on 18/18 quantities at D=4 and D=8 -- the loss and all eight parameter gradients, complex ones on both components -- to between 2.6e-17 and 1.9e-15. That is the sharp form of the test: finite differences inside Zephyr already pass, but the reference's own stencil error is 3.7e-10 while its two model implementations agree to 1e-12, so the analytic comparison removes slack the stencil cannot. `tests/ml/phase_ad_test.zeph` adds 180 checks including forward agreement with the M3-verified `phase.zeph`. **Not yet done:** the bounded 32-example overfit, which needs the optimizer from A08. |
+| A14 | **passed** | Native forward and backward are finite and verified. `tools/ml_reference/check_phase_grad.py` agrees with the reference's **analytic** reverse pass on 18/18 quantities at D=4 and D=8 -- the loss and all eight parameter gradients, complex ones on both components -- to between 2.6e-17 and 1.9e-15. That is the sharp form of the test: finite differences inside Zephyr already pass, but the reference's own stencil error is 3.7e-10 while its two model implementations agree to 1e-12, so the analytic comparison removes slack the stencil cannot. `tests/ml/phase_ad_test.zeph` adds 180 checks including forward agreement with the M3-verified `phase.zeph`. The bounded overfit is `tests/ml/overfit_test.zeph`, 132 checks: 32 examples driven from loss 1.4006 to 0.0460 and accuracy 0.5 to 0.96875 in 120 steps and 10.8s, with **no Python runtime dependency** -- data, model, gradients, AdamW and metrics are all native and the reported numbers come out of the binary. |
 | A30 | **passed** | `tools/ml_reference/test_tasks.py`. Solver agrees with the label on 10,240 examples per task, recomputing from the token sequence alone. Task A query-only baseline sits within 0.125 ± 0.04 of chance on every split. Task B per-example: ≥2 feasible until the final clue, exactly 1 after, and the final clue combined with the original candidate list admits ≥2. |
 | A31 | **passed** | Same suite. Seeded split hashes reproducible and pairwise disjoint, no duplicates within a split, frozen vocabulary covering all test tokens, composition and length bins non-empty, exact class balance, and class mean lengths equal to 1e-12 so length does not leak the target. |
 
@@ -227,6 +227,25 @@ analytic gradients agree with its own central differences only to 3.7e-10,
 while its complex and paired-real models agree with each other to 1e-12.
 Comparing native gradients against the analytic ones therefore tests
 something the stencil cannot resolve.
+
+### Bounded overfit, native (A14)
+
+D=8, E=4, H=16, K=1, 32 examples of length 4, AdamW at lr 0.02, 120 steps.
+
+| | start | end |
+|---|---|---|
+| mean NLL | 1.40064338692914 | 0.04599491937856 |
+| accuracy | 0.5 | 0.96875 (31 of 32) |
+
+Wall clock 10.8s. Gradients are scanned for NaN every step rather than only
+at the end, and divergence is excluded by a separate check from improvement.
+
+**This measures the plumbing, not the architecture.** The labels are
+deliberately pseudo-random and unrelated to the tokens, which makes fitting
+them a capacity and optimization check: it shows the tape, the VJPs and AdamW
+compose into a working training loop. It says nothing about the phase
+architecture, about generalization, or about the hypothesis this project
+exists to test, and it must not be cited as if it did.
 
 ### Mutation testing of the gradient suites
 
