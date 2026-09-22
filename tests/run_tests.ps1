@@ -344,6 +344,29 @@ $canonBuilt = Test-Path "$canonDir\main.exe"
 $canonOut = if ($canonBuilt) { (cmd /c "`"$canonDir\main.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { $canonBuild }
 Check "modules-canonical-paths" ($canonBuilt -and $canonOut -eq "41`n42") "got: $canonOut"
 
+# ---- checker diagnostics retain the defining file through imports/generics ----
+$diagDir = Join-Path $tmp "diagnostics"
+New-Item -ItemType Directory -Force $diagDir | Out-Null
+Set-Content "$diagDir\main.zeph" 'import "sub.zeph"' -Encoding ascii
+Set-Content "$diagDir\sub.zeph" "// first`n// second`nlet x: int = `"boom`"" -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:imported-file" ($diag -match 'sub\.zeph:3:' -and $diag -notmatch 'main\.zeph') "got: $diag"
+
+Set-Content "$diagDir\main.zeph" "import `"sub.zeph`"`nprint(bad(1))" -Encoding ascii
+Set-Content "$diagDir\sub.zeph" @'
+// first
+fn bad[T](x: T) -> int {
+    let y: int = "boom"
+    return 0
+}
+'@ -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:generic-imported-file" ($diag -match 'sub\.zeph:3:' -and $diag -notmatch 'main\.zeph') "got: $diag"
+
+Set-Content "$diagDir\main.zeph" "// first`n// second`nlet x: int = `"boom`"" -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:main-file" ($diag -match 'main\.zeph:3:') "got: $diag"
+
 # ---- OOP: impl methods, associated functions, interface dynamic dispatch ----
 $oopdir = Join-Path $tmp "oop"
 New-Item -ItemType Directory -Force $oopdir | Out-Null

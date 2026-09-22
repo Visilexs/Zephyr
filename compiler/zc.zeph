@@ -2985,6 +2985,7 @@ fn vtable_index(sd: int, ifc: int) -> int {
 fn check(prog: Node) {
     // pass 0: enum names + members (int-backed, resolved at compile time)
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_ENUMDEF {
             if find_enum(n.name) >= 0 { die(n.line, "duplicate enum '{n.name}'") }
             if find_struct(n.name) >= 0 { die(n.line, "'{n.name}' is already a struct") }
@@ -3001,6 +3002,7 @@ fn check(prog: Node) {
     }
     // pass 1a: struct names
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF {
             if find_struct(n.name) >= 0 { die(n.line, "duplicate struct '{n.name}'") }
             if find_enum(n.name) >= 0 { die(n.line, "'{n.name}' is already an enum") }
@@ -3012,6 +3014,7 @@ fn check(prog: Node) {
     }
     // pass 1a.5: interface names + method signatures (self excluded from sigs)
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_INTERFACE {
             if find_iface(n.name) >= 0 { die(n.line, "duplicate interface '{n.name}'") }
             if find_struct(n.name) >= 0 { die(n.line, "'{n.name}' is already a struct") }
@@ -3039,6 +3042,7 @@ fn check(prog: Node) {
     }
     // pass 1b: struct fields
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF {
             let sd = g_structs[n.refi]
             for f in n.kids {
@@ -3054,6 +3058,7 @@ fn check(prog: Node) {
     }
     // pass 1c: function signatures
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_FN {
             if find_fn(n.name) >= 0 { die(n.line, "duplicate function '{n.name}'") }
             if is_builtin_name(n.name) { die(n.line, "'{n.name}' is a builtin and cannot be redefined") }
@@ -3084,6 +3089,7 @@ fn check(prog: Node) {
     g_is_top = true
     g_at_global = true
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF or n.k == N_ENUMDEF or n.k == N_INTERFACE { continue }
         if n.k == N_FN {
             // a generic function is a template: nothing to check until it is
@@ -3099,6 +3105,7 @@ fn check(prog: Node) {
 
 // check one function body with the current type bindings in effect
 fn check_fn_body(f: FDef) {
+    g_file = f.node.file
     env_push()
     for j in 0..f.pnames.len() {
         env_add(f.pnames[j], f.ptypes[j], false, ID_PARAM, j)
@@ -13538,6 +13545,7 @@ if d_in == "" and d_version {
     desugar_extern(prog)
     desugar_oop(prog)
     check(prog)
+    g_file = d_in
     fold_globals(prog)
     inline_pass(prog)
     let is_s = d_out.len() > 2 and d_out.sub(d_out.len() - 2, d_out.len()) == ".s"
