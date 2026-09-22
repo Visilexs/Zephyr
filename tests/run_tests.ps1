@@ -299,6 +299,42 @@ foreach ($name in $panics.Keys) {
     Check "panic:$name" ($r.code -eq 1 -and $r.out -match "panic:") "expected panic, got($($r.code)): $($r.out)"
 }
 
+$locatedPanics = @{
+    "index"       = @{ src = "let xs = [1]`nprint(xs[2])"; line = 2 }
+    "division"    = @{ src = "let z = 0`nprint(4 / z)"; line = 2 }
+    "modulo"      = @{ src = "let z = 0`nprint(4 % z)"; line = 2 }
+    "int-parse"   = @{ src = 'print("bad" as int)'; line = 1 }
+    "float-parse" = @{ src = 'print("bad" as float)'; line = 1 }
+    "pop"         = @{ src = "var xs: [int] = []`nprint(xs.pop())"; line = 2 }
+    "assert"      = @{ src = 'assert(false, "broken")'; line = 1 }
+    "explicit"    = @{ src = 'panic("broken")'; line = 1 }
+    "optional"    = @{ src = "let n: int? = none`nprint(n.get())"; line = 2 }
+    "chr"         = @{ src = 'print(chr(256))'; line = 1 }
+    "substring"   = @{ src = 'print("hi".sub(0, 3))'; line = 1 }
+    "map-key"     = @{ src = "let m = [`"a`": 1]`nprint(m[`"b`"])"; line = 2 }
+    "read-file"   = @{ src = 'print(read_file("zephyr-no-such-file-9274"))'; line = 1 }
+    "write-file"  = @{ src = 'write_file("?:", "x")'; line = 1 }
+    "byte"        = @{ src = 'print("a".byte(2))'; line = 1 }
+    "index-store" = @{ src = "var xs = [1]`nxs[3] = 4"; line = 2 }
+}
+foreach ($name in $locatedPanics.Keys) {
+    $case = $locatedPanics[$name]
+    $r = RunSrc "rtloc_$name" $case.src
+    $prefix = "panic: rtloc_${name}.zeph:$($case.line): "
+    Check "panic-location:$name" ($r.code -eq 1 -and $r.out.StartsWith($prefix)) "expected $prefix; got($($r.code)): $($r.out)"
+}
+$r = RunSrc "rtloc_ok" 'print("still running")'
+Check "panic-location:success" ($r.code -eq 0 -and $r.out -eq "still running") "got($($r.code)): $($r.out)"
+
+$rtlocDir = Join-Path $tmp "rtloc_import"
+New-Item -ItemType Directory -Force "$rtlocDir\lib2" | Out-Null
+Set-Content "$rtlocDir\main.zeph" 'import "lib2/sub.zeph"' -Encoding ascii
+Set-Content "$rtlocDir\lib2\sub.zeph" "// first`nlet xs = [1]`nprint(xs[2])" -Encoding ascii
+Remove-Item "$rtlocDir\main.exe" -ErrorAction SilentlyContinue
+$importBuild = (cmd /c ".\zc.exe --rt `"$rtlocDir\main.zeph`" `"$rtlocDir\main.exe`" 2>&1" | Out-String).Trim()
+$importOut = if (Test-Path "$rtlocDir\main.exe") { (cmd /c "`"$rtlocDir\main.exe`" 2>&1" | Out-String).Trim() } else { $importBuild }
+Check "panic-location:import" ($importOut.StartsWith("panic: lib2/sub.zeph:3: ")) "got: $importOut"
+
 # ---- self-hosted stdlib builtins (compiled by zc.exe --rt) ----
 Remove-Item "$tmp\stdlib.exe" -ErrorAction SilentlyContinue
 $stdBuild = (& .\zc.exe --rt examples\basics\stdlib.zeph "$tmp\stdlib.exe" 2>&1 | Out-String).Trim()

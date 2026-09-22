@@ -380,7 +380,7 @@ fn nnode(k: int, line: int) -> Node {
 }
 
 fn die(line: int, msg: str) {
-    panic("{g_file}:{line}: error: {msg}")
+    rt_panic_str("{g_file}:{line}: error: {msg}")
 }
 
 fn is_digit(c: int) -> bool { return c >= 48 and c <= 57 }
@@ -3187,6 +3187,8 @@ fn add_dstr(s: str) -> int {
     return g_dstrs.len() - 1
 }
 
+fn panic_site(e: Node) -> str { return "{e.file}:{e.line}: " }
+
 // Float literals used to be materialized with `movabs rax, <bits>` + `movq
 // xmm, rax`: two instructions, a GPR clobbered, and no chance for the SSE
 // instruction to read the value in place. Parking them in .rdata makes
@@ -3219,6 +3221,18 @@ fn rcall(f: str) {
     o("sub rsp, 32")
     o("call " + f)
     o("mov rsp, r12")
+}
+
+// The message is already in rcx; concatenate only after a failure.
+fn panic_message(e: Node) {
+    o("mov rdx, rcx")
+    o("lea rcx, [rip + __s{add_dstr(panic_site(e))}]")
+    rcall("rt_panic_at")
+}
+
+fn panic_literal(e: Node, msg: str) {
+    o("lea rcx, [rip + __s{add_dstr(panic_site(e) + msg)}]")
+    rcall("rt_panic_str")
 }
 
 fn slot_addr(kind: int, idx: int) -> str {
@@ -4413,12 +4427,7 @@ fn gen_div_fast(e: Node) {
     let sv = scratch_take()
     if sv == "" {
         gen_int_operands(e.kids[0], e.kids[1])
-        let ok0 = newlabel()
-        o("test rcx, rcx")
-        o("jne {lbl(ok0)}")
-        if e.op == T_SLASH { rcall("rt_div_zero") }
-        else { rcall("rt_mod_zero") }
-        olabel(ok0)
+        gen_zero_check(e)
         o("cqo")
         o("idiv rcx")
         if e.op == T_PCT { o("mov rax, rdx") }
@@ -4447,12 +4456,7 @@ fn gen_div_fast(e: Node) {
     o("jmp {lbl(end)}")
     olabel(slow)
     gen_leaf("rcx", e.kids[1])    // divisor is a leaf by construction
-    let ok = newlabel()
-    o("test rcx, rcx")
-    o("jne {lbl(ok)}")
-    if e.op == T_SLASH { rcall("rt_div_zero") }
-    else { rcall("rt_mod_zero") }
-    olabel(ok)
+    gen_zero_check(e)
     o("cqo")
     o("idiv rcx")
     if e.op == T_PCT { o("mov rax, rdx") }
@@ -4463,43 +4467,42 @@ fn gen_div_fast(e: Node) {
 // that never runs -- but inline it still costs fetch/decode bandwidth in the
 // hot loop it sits in (7 instructions per access). Emit only the branch here
 // and park the panic sequence at the end of the function, where it costs
-// nothing. rt_bounds_fail never returns, so nothing jumps back.
+// nothing. The panic routine never returns, so nothing jumps back.
 var g_cold: [str] = []          // deferred out-of-line blocks for this function
 
-fn gen_bounds_check(listreg: str, idxreg: str) {
+// A failed check branches away; the successful path carries no location work.
+fn cold_panic(e: Node, msg: str) {
+    g_cold.push("  lea rcx, [rip + __s{add_dstr(panic_site(e) + msg)}]\n")
+    g_cold.push("  mov r12, rsp\n")
+    g_cold.push("  and rsp, -16\n")
+    g_cold.push("  sub rsp, 32\n")
+    g_cold.push("  call rt_panic_str\n")
+}
+
+fn gen_zero_check(e: Node) {
+    let ok = newlabel()
+    o("test rcx, rcx")
+    o("jne {lbl(ok)}")
+    if e.op == T_SLASH { panic_literal(e, "division by zero") }
+    else { panic_literal(e, "modulo by zero") }
+    olabel(ok)
+}
+
+fn gen_bounds_check(listreg: str, idxreg: str, e: Node) {
     let fail = newlabel()
     o("cmp {idxreg}, [{listreg}]")
     o("jae {lbl(fail)}")
     g_cold.push(".L{fail}:\n")
-    if idxreg == "rax" {
-        g_cold.push("  mov rdx, [{listreg}]\n")
-        g_cold.push("  mov rcx, rax\n")
-    } else {
-        g_cold.push("  mov r8, [rcx]\n")
-        g_cold.push("  mov rcx, {idxreg}\n")
-        g_cold.push("  mov rdx, r8\n")
-    }
-    // the same rsp-alignment dance rcall() emits, spelled out for the cold block
-    g_cold.push("  mov r12, rsp\n")
-    g_cold.push("  and rsp, -16\n")
-    g_cold.push("  sub rsp, 32\n")
-    g_cold.push("  call rt_bounds_fail\n")
-    g_cold.push("  mov rsp, r12\n")
+    cold_panic(e, "index out of bounds")
 }
 
 // bounds check against a cached length in a frame slot (hoisted list base)
-fn gen_bounds_check_slot(lenslot: str, idxreg: str) {
+fn gen_bounds_check_slot(lenslot: str, idxreg: str, e: Node) {
     let fail = newlabel()
     o("cmp {idxreg}, " + lenslot)
     o("jae {lbl(fail)}")
     g_cold.push(".L{fail}:\n")
-    g_cold.push("  mov rdx, " + lenslot + "\n")
-    g_cold.push("  mov rcx, {idxreg}\n")
-    g_cold.push("  mov r12, rsp\n")
-    g_cold.push("  and rsp, -16\n")
-    g_cold.push("  sub rsp, 32\n")
-    g_cold.push("  call rt_bounds_fail\n")
-    g_cold.push("  mov rsp, r12\n")
+    cold_panic(e, "index out of bounds")
 }
 
 // flush the cold blocks collected while generating one function body
@@ -5001,12 +5004,7 @@ fn gen_binop(e: Node) {
         return
     }
     if op == T_SLASH or op == T_PCT {
-        let ok = newlabel()
-        o("test rcx, rcx")
-        o("jne {lbl(ok)}")
-        if op == T_SLASH { rcall("rt_div_zero") }
-        else { rcall("rt_mod_zero") }
-        olabel(ok)
+        gen_zero_check(e)
         o("cqo")
         o("idiv rcx")
         if op == T_PCT { o("mov rax, rdx") }
@@ -5410,7 +5408,7 @@ fn gen_index_addr(e: Node) -> str {
     if e.op > 0 {                      // base hoisted out of the enclosing loop
         let p = e.op - 1
         if inreg { ir = iop } else { gen_expr(e.kids[1]) }
-        gen_bounds_check_slot(lb_lslot(p), ir)
+        gen_bounds_check_slot(lb_lslot(p), ir, e)
         o("mov rcx, " + lb_dslot(p))
         g_ia_tmp = 0                   // nothing parked: every caller ends with index_fin_keep
         return ir
@@ -5428,7 +5426,7 @@ fn gen_index_addr(e: Node) -> str {
         g_ia_tmp = 1
         if t { g_ia_tmp = 2 }
     }
-    gen_bounds_check("rcx", ir)
+    gen_bounds_check("rcx", ir, e)
     o("mov rcx, [rcx + 16]")
     return ir
 }
@@ -5623,7 +5621,7 @@ fn gen_call(e: Node) {
     if k == CK_PANIC {
         let t = gen_tmp(e.kids[1], true)       // borrowed; the process does not come back
         o("mov rcx, rax")
-        rcall("rt_panic_str")
+        panic_message(e)
         return
     }
     if k == CK_SQRT {
@@ -5654,6 +5652,7 @@ fn gen_call(e: Node) {
         let t = gen_tmp(e.kids[0].kids[0], true)
         tmp_hold(t)
         o("mov rcx, rax")
+        o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_list_pop")             // ownership moves out of the list
         tmp_done_keep(t)
         return
@@ -5683,9 +5682,7 @@ fn gen_call(e: Node) {
         let ok = newlabel()
         o("cmp rax, 0")
         o("jne {lbl(ok)}")
-        let msgi = add_dstr("called .get() on a none value")
-        o("lea rcx, [rip + __s{msgi}]")
-        rcall("rt_panic_str")
+        panic_literal(e, "called .get() on a none value")
         olabel(ok)
         o("mov rax, [rax]")
         if is_ref(e.ty) { dup_rax() }
@@ -5829,11 +5826,10 @@ fn gen_call(e: Node) {
         if e.kids.len() > 2 {
             gen_expr(e.kids[2])
             o("mov rcx, rax")
+            panic_message(e)
         } else {
-            let msgi = add_dstr("assertion failed")
-            o("lea rcx, [rip + __s{msgi}]")
+            panic_literal(e, "assertion failed")
         }
-        rcall("rt_panic_str")
         olabel(ok)
         return
     }
@@ -5847,6 +5843,7 @@ fn gen_call(e: Node) {
         let t = gen_tmp(e.kids[1], true)
         tmp_hold(t)
         o("mov rcx, rax")
+        o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_read_file")
         tmp_done_keep(t)
         return
@@ -5859,12 +5856,18 @@ fn gen_call(e: Node) {
         o("push rax")
         o("mov rdx, [rsp]")
         o("mov rcx, [rsp + 8]")
+        o("lea r8, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_write_file")
         drop_temps(owned)
         return
     }
     if k == CK_CHR {
         gen_expr(e.kids[1])
+        let fail = newlabel()
+        o("cmp rax, 255")
+        o("ja {lbl(fail)}")
+        g_cold.push(".L{fail}:\n")
+        cold_panic(e, "chr out of range")
         o("mov rcx, rax")
         rcall("rt_chr")
         return
@@ -6054,7 +6057,7 @@ fn gen_call(e: Node) {
         o("push rax")
         gen_expr(e.kids[1])
         o("mov rcx, [rsp]")
-        gen_bounds_check("rcx", "rax")
+        gen_bounds_check("rcx", "rax", e)
         o("movzx eax, byte ptr [rcx + rax + 8]")
         tmp_pop_keep(t)
         return
@@ -6068,6 +6071,15 @@ fn gen_call(e: Node) {
         o("mov r8, rax")
         o("pop rdx")
         o("mov rcx, [rsp]")
+        let fail = newlabel()
+        o("test rdx, rdx")
+        o("js {lbl(fail)}")
+        o("cmp r8, rdx")
+        o("jl {lbl(fail)}")
+        o("cmp r8, [rcx]")
+        o("jg {lbl(fail)}")
+        g_cold.push(".L{fail}:\n")
+        cold_panic(e, "invalid substring")
         rcall("rt_str_sub")
         tmp_pop_keep(t)
         return
@@ -6086,6 +6098,13 @@ fn gen_call(e: Node) {
     if e.op == 1 { cargs.push(e.kids[0].kids[0]) }        // UFCS receiver
     for i in 1..e.kids.len() { cargs.push(e.kids[i]) }
     var ncargs = cargs.len()
+    // Runtime-internal failures with fixed text name their own source line.
+    if f.name == "rt_die" and ncargs == 1 and cargs[0].k == N_STRLIT {
+        if cargs[0].kids.len() == 1 and cargs[0].kids[0].k == N_STRTXT {
+            panic_literal(e, cargs[0].kids[0].name)
+            return
+        }
+    }
     // Arguments are BORROWED (see the ownership contract above is_ref): the
     // callee is handed a reference the caller is already keeping alive, so no
     // count changes hands and the callee drops nothing on the way out. That is
@@ -6347,8 +6366,10 @@ fn gen_expr(e: Node) {
                 o("lea rdx, [rip + __td{e.slot}]")
                 rcall("rt_to_str")
             } else if c == C_S2I {
+                o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
                 rcall("rt_str_to_int")
             } else {
+                o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
                 rcall("rt_str_to_float")
             }
             tmp_done_keep(t)
@@ -6367,9 +6388,11 @@ fn gen_expr(e: Node) {
             rcall("rt_to_str")
         } else if c == C_S2I {
             o("mov rcx, rax")
+            o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
             rcall("rt_str_to_int")
         } else if c == C_S2F {
             o("mov rcx, rax")
+            o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
             rcall("rt_str_to_float")
         }
         return
@@ -6383,6 +6406,7 @@ fn gen_expr(e: Node) {
             o("push rax")
             o("mov rdx, [rsp]")        // key
             o("mov rcx, [rsp + 8]")    // map
+            o("lea r8, [rip + __s{add_dstr(panic_site(e))}]")
             rcall(map_getfn(e.kids[0].ty))   // hands back its own +1
             drop_temps(owned)
             return
@@ -6937,10 +6961,10 @@ fn gen_stmt(s: Node, retlabel: int) {
             }
             if t.op > 0 {                       // hoisted base (see lb_promote_loop)
                 let p = t.op - 1
-                gen_bounds_check_slot(lb_lslot(p), ixr)
+                gen_bounds_check_slot(lb_lslot(p), ixr, t)
                 o("mov r8, " + lb_dslot(p))
             } else {
-                gen_bounds_check("rcx", ixr)
+                gen_bounds_check("rcx", ixr, t)
                 o("mov r8, [rcx + 16]")
             }
             if is_ref(t.ty) {
@@ -8338,6 +8362,8 @@ fn dirname(p: str) -> str {
     }
     return ""
 }
+
+fn basename(p: str) -> str { return p.sub(dirname(p).len(), p.len()) }
 
 fn is_abs_path(p: str) -> bool {
     if p.len() == 0 { return false }
@@ -11157,7 +11183,9 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
     for n in prog.kids {
         if n.k == N_IMPORT {
             var path = n.name
+            var display = basename(n.name)
             if not is_abs_path(path) {
+                display = dirname(n.file) + n.name
                 path = basedir + n.name
                 // Fall back to the compiler's own directory, then to lib/
                 // beneath it, so `import "std/list.zeph"` or `import
@@ -11165,8 +11193,10 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
                 if not path_exists(path) and g_exedir != "" {
                     if path_exists(g_exedir + n.name) {
                         path = g_exedir + n.name
+                        display = n.name
                     } else if path_exists(g_exedir + "lib/" + n.name) {
                         path = g_exedir + "lib/" + n.name
+                        display = "lib/" + n.name
                     }
                 }
             }
@@ -11174,7 +11204,10 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
             var ei = 0 - 1
             if not path_exists(path) {
                 ei = embed_match(n.name)
-                if ei >= 0 { path = "embed:" + embedded_name(ei) }
+                if ei >= 0 {
+                    path = "embed:" + embedded_name(ei)
+                    display = "lib/" + embedded_name(ei)
+                }
             }
             var key = path
             if ei < 0 { key = canon_key(path) }
@@ -11186,13 +11219,13 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
                 g_imported.push(key)
                 let prev = g_file
                 if ei >= 0 {
-                    g_file = embedded_name(ei) + " (embedded)"
+                    g_file = display
                     let inner = parse(lex_src(embedded_src(ei), 1))
                     let expanded = expand_imports(inner, "")
                     g_file = prev
                     for i in 0..expanded.kids.len() { out.push(expanded.kids[i]) }
                 } else {
-                    g_file = path
+                    g_file = display
                     let inner = parse(lex_src(read_file(path), 1))
                     let expanded = expand_imports(inner, dirname(path))
                     g_file = prev
@@ -13536,22 +13569,22 @@ if d_in == "" and d_version {
     if d_in == "" or d_out == "" {
         panic("usage: zc [--rt] [--version] <input.zeph> <output.exe|output.s>")
     }
-    g_file = d_in
+    g_file = basename(d_in)
     g_exedir = exe_dir()
     var prog = parse(lex_src(read_file(d_in), 1))
     prog = expand_imports(prog, dirname(d_in))
-    g_file = d_in
+    g_file = basename(d_in)
     if d_rt {
         // prepend the Zephyr runtime so rt_* resolve locally (kernel32-only
         // output). A runtime.zeph next to the compiler, then one in the current
         // directory, overrides the copy embedded in the binary.
         var rtsrc = ""
         if g_exedir != "" and path_exists(g_exedir + "compiler/runtime.zeph") {
-            g_file = g_exedir + "compiler/runtime.zeph"
-            rtsrc = read_file(g_file)
+            g_file = "compiler/runtime.zeph"
+            rtsrc = read_file(g_exedir + "compiler/runtime.zeph")
         } else if g_exedir != "" and path_exists(g_exedir + "runtime.zeph") {
-            g_file = g_exedir + "runtime.zeph"
-            rtsrc = read_file(g_file)
+            g_file = "runtime.zeph"
+            rtsrc = read_file(g_exedir + "runtime.zeph")
         } else if path_exists("runtime.zeph") {
             g_file = "runtime.zeph"
             rtsrc = read_file("runtime.zeph")
@@ -13569,8 +13602,25 @@ if d_in == "" and d_version {
             var ospath = g_exedir + osname
             if not path_exists(ospath) { ospath = osname }
             if not path_exists(ospath) { panic("this target needs " + osname + " next to zc.exe") }
-            g_file = ospath
+            g_file = osname
             rtsrc = read_file(ospath) + rtsrc
+        }
+        if not g_wasm {
+            // The runtime source stays untouched on disk; only failure branches
+            // of helpers reached from native code receive the caller's site.
+            rtsrc = rtsrc.replace("fn rt_str_to_int(s: int) -> int \{", "fn rt_str_to_int(s: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_str_to_float(s: int) -> int \{", "fn rt_str_to_float(s: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_list_pop(l: int) -> int \{", "fn rt_list_pop(l: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_map_get(m: int, k: int) -> int \{", "fn rt_map_get(m: int, k: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_read_file(path: int) -> int \{", "fn rt_read_file(path: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_write_file(path: int, data: int) \{", "fn rt_write_file(path: int, data: int, site: str) \{")
+            rtsrc = rtsrc.replace("rt_die(\"cannot convert to int\")", "rt_die(site + \"cannot convert to int\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot convert to float\")", "rt_die(site + \"cannot convert to float\")")
+            rtsrc = rtsrc.replace("rt_die(\"pop from empty list\")", "rt_die(site + \"pop from empty list\")")
+            rtsrc = rtsrc.replace("rt_die(\"map key not found\")", "rt_die(site + \"map key not found\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot read file\")", "rt_die(site + \"cannot read file\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot write file\")", "rt_die(site + \"cannot write file\")")
+            rtsrc += "\nfn rt_panic_at(site: str, msg: str) \{ rt_die(site + msg) \}\n"
         }
         let rtprog = parse(lex_src(rtsrc, 1))
         var merged: [Node] = []
@@ -13581,12 +13631,12 @@ if d_in == "" and d_version {
         }
         for i in 0..prog.kids.len() { merged.push(prog.kids[i]) }
         prog.kids = merged
-        g_file = d_in
+        g_file = basename(d_in)
     }
     desugar_extern(prog)
     desugar_oop(prog)
     check(prog)
-    g_file = d_in
+    g_file = basename(d_in)
     fold_globals(prog)
     inline_pass(prog)
     let is_s = d_out.len() > 2 and d_out.sub(d_out.len() - 2, d_out.len()) == ".s"
