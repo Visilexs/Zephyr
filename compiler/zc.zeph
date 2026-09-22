@@ -11101,6 +11101,20 @@ fn path_exists(path: str) -> bool {
     return (attr & 4294967295) != 4294967295
 }
 
+// Compare disk imports by absolute Windows path, regardless of spelling.
+fn canon_key(path: str) -> str {
+    let buf = zeros(path.len() / 8 + 2)
+    let data = load64(addr(buf) + 16)
+    for i in 0..path.len() { store8(data + i, path.byte(i)) }
+    store8(data + path.len(), 0)
+    let out = zeros(33)                        // 264 bytes for a 260-byte path
+    let dest = load64(addr(out) + 16)
+    let n = win("GetFullPathNameA", data, 260, dest, 0)
+    var key = ""
+    for i in 0..n { key = key + chr(load8(dest + i)) }
+    return key.lower()
+}
+
 // splice each `import "path"` in place with that file's declarations.
 // Each path is included once, so diamonds and cycles terminate.
 fn expand_imports(prog: Node, basedir: str) -> Node {
@@ -11127,12 +11141,14 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
                 ei = embed_match(n.name)
                 if ei >= 0 { path = "embed:" + embedded_name(ei) }
             }
+            var key = path
+            if ei < 0 { key = canon_key(path) }
             var seen = false
             for i in 0..g_imported.len() {
-                if g_imported[i] == path { seen = true }
+                if g_imported[i] == key { seen = true }
             }
             if not seen {
-                g_imported.push(path)
+                g_imported.push(key)
                 let prev = g_file
                 if ei >= 0 {
                     g_file = embedded_name(ei) + " (embedded)"

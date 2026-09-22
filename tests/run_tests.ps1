@@ -322,6 +322,28 @@ $modOut = if ($modBuilt) { (cmd /c "`"$moddir\main.exe`" 2>&1" | Out-String).Tri
 $modWant = @("hello, world","49","2","High","3") -join "`n"
 Check "modules-import" ($modBuilt -and $modOut -eq $modWant) "got: $modOut"
 
+# ---- imports reached through different spellings are included once ----
+$canonDir = Join-Path $tmp "canon"
+New-Item -ItemType Directory -Force "$canonDir\engine", "$canonDir\game" | Out-Null
+Set-Content "$canonDir\engine\core.zeph" "fn core_one() -> int { return 41 }" -Encoding ascii
+Set-Content "$canonDir\game\combat.zeph" @'
+import "../engine/core.zeph"
+fn combat_two() -> int { return core_one() + 1 }
+'@ -Encoding ascii
+Set-Content "$canonDir\main.zeph" @'
+import "engine/core.zeph"
+import "./engine/core.zeph"
+import "ENGINE/Core.zeph"
+import "game/combat.zeph"
+print(core_one())
+print(combat_two())
+'@ -Encoding ascii
+Remove-Item "$canonDir\main.exe" -ErrorAction SilentlyContinue
+$canonBuild = (cmd /c ".\zc.exe --rt `"$canonDir\main.zeph`" `"$canonDir\main.exe`" 2>&1" | Out-String).Trim()
+$canonBuilt = Test-Path "$canonDir\main.exe"
+$canonOut = if ($canonBuilt) { (cmd /c "`"$canonDir\main.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { $canonBuild }
+Check "modules-canonical-paths" ($canonBuilt -and $canonOut -eq "41`n42") "got: $canonOut"
+
 # ---- OOP: impl methods, associated functions, interface dynamic dispatch ----
 $oopdir = Join-Path $tmp "oop"
 New-Item -ItemType Directory -Force $oopdir | Out-Null
