@@ -1,9 +1,8 @@
-# Zephyr test suite. Builds the compiler, then runs positive, negative, and panic tests.
+# Zephyr test suite. Runs positive, negative, and panic tests with zc.exe.
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot
 Set-Location $root
-& .\bootstrap\build.ps1
-if ($LASTEXITCODE -ne 0) { exit 1 }
+if (-not (Test-Path .\zc.exe)) { Write-Host "zc.exe missing" -ForegroundColor Red; exit 1 }
 
 $pass = 0; $fail = 0
 $tmp = Join-Path $env:TEMP "zephyr_tests"
@@ -16,9 +15,16 @@ function Check($name, $ok, $detail) {
 
 function RunSrc($name, $src) {
     $f = Join-Path $tmp "$name.zeph"
+    $exe = Join-Path $tmp "$name.exe"
     Set-Content -Path $f -Value $src -Encoding ascii
-    $out = cmd /c ".\bootstrap\zephyr.exe run `"$f`" 2>&1"
-    return @{ code = $LASTEXITCODE; out = ($out | Out-String).Trim() }
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $out = cmd /c ".\zc.exe --rt `"$f`" `"$exe`" 2>&1"
+    $code = $LASTEXITCODE
+    if (Test-Path $exe) {
+        $out = cmd /c "`"$exe`" 2>&1"
+        $code = $LASTEXITCODE
+    }
+    return @{ code = $code; out = ($out | Out-String).Trim() }
 }
 
 # ---- positive: examples with expected output ----
@@ -28,7 +34,10 @@ $expected = @{
     "shapes"  = "5`n5`nPoint{x: 6, y: 8}`n3`n(0, 0)`n(3, 4)`n(6, 8)"
 }
 foreach ($name in $expected.Keys) {
-    $out = (& .\bootstrap\zephyr.exe run "examples\basics\$name.zeph" | Out-String).Trim() -replace "`r", ""
+    $exe = Join-Path $tmp "$name.exe"
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt "examples\basics\$name.zeph" $exe 2>&1 | Out-Null
+    $out = if (Test-Path $exe) { (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
     $want = $expected[$name] -replace "`r", ""
     Check "example:$name" ($out -eq $want) "got: $out"
 }
@@ -38,7 +47,10 @@ $fb = for ($i = 1; $i -le 100; $i++) {
     if ($i % 15 -eq 0) { "FizzBuzz" } elseif ($i % 3 -eq 0) { "Fizz" }
     elseif ($i % 5 -eq 0) { "Buzz" } else { "$i" }
 }
-$out = (& .\bootstrap\zephyr.exe run "examples\basics\fizzbuzz.zeph" | Out-String).Trim() -replace "`r", ""
+$fbExe = Join-Path $tmp "fizzbuzz.exe"
+Remove-Item $fbExe -ErrorAction SilentlyContinue
+& .\zc.exe --rt examples\basics\fizzbuzz.zeph $fbExe 2>&1 | Out-Null
+$out = if (Test-Path $fbExe) { (cmd /c "`"$fbExe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "example:fizzbuzz" ($out -eq (($fb -join "`n"))) "fizzbuzz mismatch"
 
 # ---- language features ----
@@ -120,11 +132,12 @@ for i in 1..101 { sum += i }
 print("sum={sum}")
 '@
 Set-Content -Path "$tmp\rtprog.zeph" -Value $rtsrc -Encoding ascii
-& .\bootstrap\zephyr.exe build "$tmp\rtprog.zeph" -o "$rtdir\rtprog.exe" --rt 2>&1 | Out-Null
+Remove-Item "$rtdir\rtprog.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt "$tmp\rtprog.zeph" "$rtdir\rtprog.exe" 2>&1 | Out-Null
 $rtBuilt = Test-Path "$rtdir\rtprog.exe"
 # run in an isolated dir with NO zephyr_rt.dll present
 $rtOut = if ($rtBuilt) { (cmd /c "`"$rtdir\rtprog.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-$rtWant = (& .\bootstrap\zephyr.exe run "$tmp\rtprog.zeph" | Out-String).Trim() -replace "`r", ""
+$rtWant = @("runtime in 0? no, in Zephyr", "[1, 4, 9, 16, 25]", "5", "P{x: 7, y: 8}", "15", "50", "8", "1073741824", "sum=5050") -join "`n"
 $noDll = -not (Test-Path "$rtdir\zephyr_rt.dll")
 Check "rt:zephyr-runtime" ($rtBuilt -and $noDll -and $rtOut -eq $rtWant) "built=$rtBuilt noDll=$noDll out=$rtOut"
 
@@ -151,8 +164,8 @@ $exp = @("ABCD","65","68","99","99") -join [Environment]::NewLine
 Check "intrinsics" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 # ---- ffi_runtime example: I/O + int formatting in pure Zephyr via kernel32 ----
-& .\bootstrap\zephyr.exe build examples\basics\ffi_runtime.zeph -o "$tmp\ffir.exe" | Out-Null
-Copy-Item bootstrap\zephyr_rt.dll "$tmp\zephyr_rt.dll" -Force
+Remove-Item "$tmp\ffir.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt examples\basics\ffi_runtime.zeph "$tmp\ffir.exe" 2>&1 | Out-Null
 $out = (& "$tmp\ffir.exe" | Out-String).Trim() -replace "`r", ""
 $want = "integers formatted and printed by a Zephyr-written runtime:`n0`n42`n-1234567`n1000000000`nsum 1..100 = 5050" -replace "`r", ""
 Check "ffi-runtime" ($out -eq $want) "got: $out"
