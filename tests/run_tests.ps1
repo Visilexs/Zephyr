@@ -163,6 +163,21 @@ print(load64(d))
 $exp = @("ABCD","65","68","99","99") -join [Environment]::NewLine
 Check "intrinsics" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
+$r = RunSrc "narrow_loads" @'
+let a = win("VirtualAlloc", 0, 4096, 12288, 4)
+assert(a != 0)
+store64(a, -1)
+assert(load32(a) == 4294967295)
+assert(load16(a) == 65535)
+store32(a + 8, 305419896)
+assert(load32(a + 8) == 305419896)
+assert(load16(a + 8) == 22136)
+store8(a + 16, 200)
+assert(load16(a + 16) == 200)
+print("ok")
+'@
+Check "intrinsics:narrow-loads" ($r.code -eq 0 -and $r.out -eq "ok") "got($($r.code)): $($r.out)"
+
 # ---- ffi_runtime example: I/O + int formatting in pure Zephyr via kernel32 ----
 Remove-Item "$tmp\ffir.exe" -ErrorAction SilentlyContinue
 & .\zc.exe --rt examples\basics\ffi_runtime.zeph "$tmp\ffir.exe" 2>&1 | Out-Null

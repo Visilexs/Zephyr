@@ -441,7 +441,7 @@ runtime does not count or trace them (see the caution below).
 
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
-| `load64(a)` / `load8(a)` | int → int | Read 8 / 1 bytes at address `a`. |
+| `load64(a)` / `load32(a)` / `load16(a)` / `load8(a)` | int → int | Read 8 / 4 / 2 / 1 bytes at address `a`; narrower reads zero-extend. |
 | `store64(a, v)` / `store32(a, v)` / `store8(a, v)` | int, int → void | Write 8 / 4 / 1 bytes. |
 | `addr(x)` | any → int | Address of a `str`, list, struct, or **function** value. A function yields its `{code, env}` closure cell — the handle a native callback thunk needs. |
 | `stackptr()` | → int | Current stack pointer (`rsp`). |

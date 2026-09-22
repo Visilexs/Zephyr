@@ -212,6 +212,8 @@ let CK_SYSCALL = 36    // Linux: `syscall` instruction, System V argument regist
 let CK_WGROW = 37      // wasm: memory.grow
 let CK_WWRITE = 38     // wasm: host import that takes (fd, ptr, len)
 let CK_WEXIT = 39      // wasm: host import that ends the program
+let CK_LOAD32 = 40
+let CK_LOAD16 = 41
 // cast kinds
 let C_NOP = 0
 let C_TRUNC = 1
@@ -1479,7 +1481,7 @@ fn is_builtin_name(n: str) -> bool {
     if n == "chr" or n == "byte" or n == "sub" or n == "join" or n == "bits" { return true }
     if n == "emit" or n == "frombits" or n == "zeros" or n == "assert" { return true }
     if n == "abs" or n == "min" or n == "max" or n == "pow" { return true }
-    if n == "load64" or n == "load8" or n == "store64" or n == "store32" or n == "store8" { return true }
+    if n == "load64" or n == "load32" or n == "load16" or n == "load8" or n == "store64" or n == "store32" or n == "store8" { return true }
     if n == "stackptr" or n == "win" or n == "addr" { return true }
     return false
 }
@@ -2313,10 +2315,13 @@ fn check_call(e: Node) -> int {
         return TI_VOID
     }
     // unsafe low-level intrinsics (for the Zephyr runtime)
-    if c.name == "load64" or c.name == "load8" {
+    if c.name == "load64" or c.name == "load32" or c.name == "load16" or c.name == "load8" {
         if nargs != 1 { die(e.line, "{c.name}(addr) takes one int argument") }
         if ty_kind[ce(e.kids[1])] != K_INT { die(e.line, "{c.name} argument must be int") }
-        if c.name == "load64" { e.aux = CK_LOAD64 } else { e.aux = CK_LOAD8 }
+        if c.name == "load64" { e.aux = CK_LOAD64 }
+        else if c.name == "load32" { e.aux = CK_LOAD32 }
+        else if c.name == "load16" { e.aux = CK_LOAD16 }
+        else { e.aux = CK_LOAD8 }
         return TI_INT
     }
     if c.name == "store64" or c.name == "store32" or c.name == "store8" {
@@ -4284,7 +4289,7 @@ fn lb_lslot(p: int) -> str { return "[rbp - {16 + 8 * (g_lb_base + 2 * p + 1)}]"
 
 fn inline_ck(a: int) -> bool {
     if a == CK_SQRT or a == CK_LEN or a == CK_BITS { return true }
-    if a == CK_LOAD64 or a == CK_LOAD8 { return true }
+    if a == CK_LOAD64 or a == CK_LOAD32 or a == CK_LOAD16 or a == CK_LOAD8 { return true }
     if a == CK_STORE64 or a == CK_STORE32 or a == CK_STORE8 { return true }
     if a == CK_STACKPTR or a == CK_ABS or a == CK_MIN or a == CK_MAX { return true }
     return false
@@ -5062,7 +5067,7 @@ fn tmp_safe(e: Node) -> bool {
     if e.k == N_INT or e.k == N_FLOAT or e.k == N_BOOL { return true }
     if e.k == N_ID { return e.aux != ID_FUNC and not is_ref(e.ty) }
     if e.k == N_CALL {
-        if e.aux != CK_LOAD64 and e.aux != CK_LOAD8 { return false }
+        if e.aux != CK_LOAD64 and e.aux != CK_LOAD32 and e.aux != CK_LOAD16 and e.aux != CK_LOAD8 { return false }
     } else if e.k == N_BIN {
         if e.aux == BC_STR { return false }
     } else if e.k != N_NEG and e.k != N_NOT {
@@ -5511,7 +5516,7 @@ fn mem_operand(e: Node) -> str {
 fn addr_safe_value(e: Node) -> bool {
     if e.k == N_CALL {
         let a = e.aux
-        if a != CK_LOAD64 and a != CK_LOAD8 { return false }
+        if a != CK_LOAD64 and a != CK_LOAD32 and a != CK_LOAD16 and a != CK_LOAD8 { return false }
     }
     for i in 0..e.kids.len() {
         if not addr_safe_value(e.kids[i]) { return false }
@@ -5890,6 +5895,16 @@ fn gen_call(e: Node) {
         }
         gen_expr(e.kids[1])
         o("movzx eax, byte ptr [rax]")
+        return
+    }
+    if k == CK_LOAD32 or k == CK_LOAD16 {
+        var m = mem_operand(e.kids[1])
+        if m == "" {
+            gen_expr(e.kids[1])
+            m = "[rax]"
+        }
+        if k == CK_LOAD32 { o("mov eax, dword ptr " + m) }
+        else { o("movzx eax, word ptr " + m) }
         return
     }
     if k == CK_STORE64 {
@@ -7661,6 +7676,14 @@ fn parse_operand(text0: str) -> Op {
     var text = text0
     while text.len() > 0 and text.byte(0) == 32 { text = text.sub(1, text.len()) }
     if starts_with(text, "qword ptr ") { text = text.sub(10, text.len()) }
+    else if starts_with(text, "dword ptr ") {
+        op.size = 32
+        text = text.sub(10, text.len())
+    }
+    else if starts_with(text, "word ptr ") {
+        op.size = 16
+        text = text.sub(9, text.len())
+    }
     else if starts_with(text, "byte ptr ") {
         op.size = 8
         text = text.sub(9, text.len())
@@ -7903,7 +7926,9 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
             return
         }
         if a.kind == OPK_REG and b.kind == OPK_MEM {
-            enc_rm(1, 139, -1, a.reg, b, false, false)
+            var w = 1
+            if a.size == 32 { w = 0 }
+            enc_rm(w, 139, -1, a.reg, b, false, false)
             return
         }
         if a.kind == OPK_MEM and b.kind == OPK_REG {   // store; honor source width
@@ -8004,7 +8029,9 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         return
     }
     if mn == "movzx" {
-        enc_rm(0, 15, 182, ops[0].reg, ops[1], false, false)
+        var opc = 182
+        if ops[1].size == 16 { opc = 183 }
+        enc_rm(0, 15, opc, ops[0].reg, ops[1], false, false)
         return
     }
     if mn == "lea" {
@@ -12742,6 +12769,19 @@ fn wcall(e: Node) {
         wtruth()
         wc.push(49)                          // i64.load8_u
         wu(wc, 0)
+        wu(wc, 0)
+        return
+    }
+    if k == CK_LOAD32 or k == CK_LOAD16 {
+        wexpr(e.kids[1])
+        wtruth()
+        if k == CK_LOAD32 {
+            wc.push(53)                      // i64.load32_u
+            wu(wc, 2)
+        } else {
+            wc.push(51)                      // i64.load16_u
+            wu(wc, 1)
+        }
         wu(wc, 0)
         return
     }
