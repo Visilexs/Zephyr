@@ -11144,6 +11144,7 @@ fn canon_key(path: str) -> str {
     let out = zeros(33)                        // 264 bytes for a 260-byte path
     let dest = load64(addr(out) + 16)
     let n = win("GetFullPathNameA", data, 260, dest, 0)
+    if n == 0 or n >= 260 { return path.lower() }   // too long: n is the size it needed
     var key = ""
     for i in 0..n { key = key + chr(load8(dest + i)) }
     return key.lower()
