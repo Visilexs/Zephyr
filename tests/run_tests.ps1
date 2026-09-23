@@ -522,12 +522,13 @@ print(bits(-0.0))
 let z = 0.0
 print(bits(-z))
 print(-7)
+print(bits("-0" as float))
 '@ -Encoding ascii
 Remove-Item "$fldir\n.exe" -ErrorAction SilentlyContinue
 & .\zc.exe --rt "$fldir\n.zeph" "$fldir\n.exe" 2>&1 | Out-Null
 $ngBuilt = Test-Path "$fldir\n.exe"
 $ngOut = if ($ngBuilt) { (cmd /c "`"$fldir\n.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-$ngWant = @("-1.5","-3","-1.5","-2.5","-3","-3","-9223372036854775808","-9223372036854775808","-7") -join "`n"
+$ngWant = @("-1.5","-3","-1.5","-2.5","-3","-3","-9223372036854775808","-9223372036854775808","-7","-9223372036854775808") -join "`n"
 Check "float-unary-minus" ($ngBuilt -and $ngOut -eq $ngWant) "got: $ngOut"
 
 # ---- threads: allocation and GC across several stacks ----

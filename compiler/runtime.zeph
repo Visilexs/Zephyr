@@ -1610,7 +1610,7 @@ fn rt_str_to_float(s: int) -> int {
     }
     while i < n and load8(s + 8 + i) == 32 { i += 1 }
     if not any or i != n { rt_die("cannot convert to float") }
-    if neg { val = 0.0 - val }
+    if neg { val = -val }                  // not 0.0 - val: "-0" must parse as -0.0
     return bits(val)
 }
 

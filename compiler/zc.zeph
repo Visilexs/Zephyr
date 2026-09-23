@@ -10022,7 +10022,7 @@ fn __emb_rt() -> str {
     p.push("    \}\n")
     p.push("    while i < n and load8(s + 8 + i) == 32 \{ i += 1 \}\n")
     p.push("    if not any or i != n \{ rt_die(\"cannot convert to float\") \}\n")
-    p.push("    if neg \{ val = 0.0 - val \}\n")
+    p.push("    if neg \{ val = -val \}                  // not 0.0 - val: \"-0\" must parse as -0.0\n")
     p.push("    return bits(val)\n")
     p.push("\}\n")
     p.push("\n")
@@ -12089,11 +12089,10 @@ fn wexpr(e: Node) {
     }
     if k == N_NEG {
         if e.ty == TI_FLOAT {
-            wconst(0)
-            wc.push(191)                     // f64.reinterpret_i64
+            // f64.neg flips the sign bit; 0.0 - x would turn -0.0 into +0.0
             wexpr(e.kids[0])
-            wc.push(191)
-            wc.push(161)                     // f64.sub
+            wc.push(191)                     // f64.reinterpret_i64
+            wc.push(154)                     // f64.neg
             wc.push(189)                     // i64.reinterpret_f64
             return
         }

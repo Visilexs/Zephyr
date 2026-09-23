@@ -20,6 +20,8 @@ extern fn IsWindow(hwnd: int) -> i32 from "user32.dll"
 extern fn GetClientRect(hwnd: int, rect: int) -> i32 from "user32.dll"
 extern fn LoadCursorA(inst: int, name: int) -> int from "user32.dll"
 extern fn GetAsyncKeyState(key: int) -> i32 from "user32.dll"
+// No arguments; the FFI needs one, and a spare register argument is harmless on Win64.
+extern fn GetForegroundWindow(unused: int) -> int from "user32.dll"
 
 struct Window {
     hwnd: int,
@@ -71,7 +73,8 @@ fn window_open(title: str, w: int, h: int) -> Window {
 }
 
 impl Window {
-    // Drain the queue; false once the window is gone or Esc is pressed.
+    // Drain the queue; false once the window is gone or Esc is pressed while
+    // it has focus (GetAsyncKeyState is global: Esc in another app must not quit).
     fn poll(self) -> bool {
         while PeekMessageA(self.msg.addr(), 0, 0, 0, 1) != 0 {
             let m = self.msg.get32(8)
@@ -80,7 +83,7 @@ impl Window {
             let d = DispatchMessageA(self.msg.addr())
         }
         if IsWindow(self.hwnd) == 0 { return false }
-        if (GetAsyncKeyState(27) & 32768) != 0 { return false }   // VK_ESCAPE
+        if GetForegroundWindow(0) == self.hwnd and (GetAsyncKeyState(27) & 32768) != 0 { return false }   // VK_ESCAPE
         return true
     }
 
