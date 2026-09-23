@@ -248,6 +248,27 @@ for w in [100, 7] {
 $want = @("33","14","0","1","0","2","1","0","1","3") -join [Environment]::NewLine
 Check "div-loop-var" ($r.code -eq 0 -and $r.out -eq $want) "got: $($r.out)"
 
+# ---- maps under insert/remove churn at a steady size ----
+# Removes leave tombstones, and growth used to count live entries only, so a
+# sliding window of keys filled every empty slot and died with "map overflow".
+$r = RunSrc "mapchurn" @'
+var m: [int: int] = [:]
+var s: [str: int] = [:]
+for i in 0..60000 {
+    m[i] = i
+    s["k{i}"] = i
+    if i >= 2300 {
+        m.remove(i - 2300)
+        s.remove("k{i - 2300}")
+    }
+}
+var ok = m.len() == 2300 and s.len() == 2300
+for i in 57700..60000 { ok = ok and m[i] == i and s["k{i}"] == i }
+for i in 0..57700 { ok = ok and not m.has(i) }
+print(ok)
+'@
+Check "map-churn" ($r.code -eq 0 -and $r.out -eq "true") "got($($r.code)): $($r.out)"
+
 # ---- globals + new builtins (io, str utils, args) ----
 $tmpFwd = $tmp -replace "\\", "/"
 $r = RunSrc "globals_io" @"

@@ -893,8 +893,11 @@ fn rt_list_contains_str(l: int, v: int) -> int {
     return 0
 }
 // ---- hash map ----
-// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind
+// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind [48]tombstones
 // state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.
+// Tombstones count toward the load factor: a probe only stops at an empty slot,
+// so a map with insert/remove churn at a steady size used to fill every empty
+// slot with tombstones and die with "map overflow" without ever growing.
 // Called by name from the compiler; a map whose keys and values it will not drop.
 fn rt_map_new(keykind: int) -> int {
     return rt_map_new_d(keykind, 0)
@@ -904,7 +907,7 @@ fn rt_map_new(keykind: int) -> int {
 fn rt_map_new_d(keykind: int, desc: int) -> int {
     var d = desc
     if d == 0 { d = __d_map_val }     // the buffers still have to go when the map does
-    let m = rt_alloc_d(48, d)
+    let m = rt_alloc_d(56, d)
     let cap = 8
     store64(m, 0)
     store64(m + 8, cap)
@@ -912,6 +915,7 @@ fn rt_map_new_d(keykind: int, desc: int) -> int {
     store64(m + 24, rt_alloc(cap * 8))
     store64(m + 32, rt_alloc(cap))
     store64(m + 40, keykind)
+    store64(m + 48, 0)
     return m
 }
 fn rx_hash_int(k: int) -> int {
@@ -976,7 +980,10 @@ fn rx_map_insert(m: int, k: int, v: int) {
         if st == 2 and tomb < 0 { tomb = i }
         if st == 0 {
             var slot = i
-            if tomb >= 0 { slot = tomb }
+            if tomb >= 0 {
+                slot = tomb
+                store64(m + 48, load64(m + 48) - 1)
+            }
             store64(keys + slot * 8, k)
             store64(vals + slot * 8, v)
             store8(state + slot, 1)
@@ -986,19 +993,26 @@ fn rx_map_insert(m: int, k: int, v: int) {
         i = (i + 1) & (cap - 1)
         probes += 1
     }
-    rt_die("map overflow")
+    // no empty slot anywhere: the key is absent, so a tombstone is free to take
+    if tomb < 0 { rt_die("map overflow") }
+    store64(keys + tomb * 8, k)
+    store64(vals + tomb * 8, v)
+    store8(state + tomb, 1)
+    store64(m, load64(m) + 1)
+    store64(m + 48, load64(m + 48) - 1)
 }
-fn rx_map_grow(m: int) {
+// Move every live entry into fresh arrays of ncap slots, dropping tombstones.
+fn rx_map_rehash(m: int, ncap: int) {
     let oldcap = load64(m + 8)
     let oldkeys = load64(m + 16)
     let oldvals = load64(m + 24)
     let oldstate = load64(m + 32)
-    let ncap = oldcap * 2
     store64(m + 8, ncap)
     store64(m + 16, rt_alloc(ncap * 8))
     store64(m + 24, rt_alloc(ncap * 8))
     store64(m + 32, rt_alloc(ncap))       // fresh pages are zero = all empty
     store64(m, 0)
+    store64(m + 48, 0)
     let isint = load64(m + 40) == 0
     var i = 0
     while i < oldcap {
@@ -1055,7 +1069,10 @@ fn rx_iinsert(m: int, k: int, v: int) {
         if st == 2 and tomb < 0 { tomb = i }
         if st == 0 {
             var slot = i
-            if tomb >= 0 { slot = tomb }
+            if tomb >= 0 {
+                slot = tomb
+                store64(m + 48, load64(m + 48) - 1)
+            }
             store64(keys + slot * 8, k)
             store64(vals + slot * 8, v)
             store8(state + slot, 1)
@@ -1065,10 +1082,23 @@ fn rx_iinsert(m: int, k: int, v: int) {
         i = (i + 1) & (cap - 1)
         probes += 1
     }
-    rt_die("map overflow")
+    // no empty slot anywhere: the key is absent, so a tombstone is free to take
+    if tomb < 0 { rt_die("map overflow") }
+    store64(keys + tomb * 8, k)
+    store64(vals + tomb * 8, v)
+    store8(state + tomb, 1)
+    store64(m, load64(m) + 1)
+    store64(m + 48, load64(m + 48) - 1)
 }
 fn rt_map_set(m: int, k: int, v: int) {
-    if (load64(m) + 1) * 10 >= load64(m + 8) * 7 { rx_map_grow(m) }   // grow at 70%
+    // Rehash at 70% of slots in use, tombstones included. Double when the live
+    // entries alone would fill over 35%; otherwise it is mostly tombstones, and
+    // rebuilding at the same size clears them.
+    let cap = load64(m + 8)
+    if (load64(m) + load64(m + 48) + 1) * 10 >= cap * 7 {
+        if (load64(m) + 1) * 20 >= cap * 7 { rx_map_rehash(m, cap * 2) }
+        else { rx_map_rehash(m, cap) }
+    }
     if load64(m + 40) == 0 {
         rx_iinsert(m, k, v)
         return
@@ -1123,6 +1153,7 @@ fn rt_map_remove(m: int, k: int) {
     if i < 0 { return }
     store8(load64(m + 32) + i, 2)         // tombstone
     store64(m, load64(m) - 1)
+    store64(m + 48, load64(m + 48) + 1)
     if rx_kref(m) == 1 { rx_drop(load64(load64(m + 16) + i * 8)) }
     if rx_vref(m) == 1 { rx_drop(load64(load64(m + 24) + i * 8)) }
 }
