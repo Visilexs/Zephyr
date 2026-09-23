@@ -4027,7 +4027,8 @@ fn cf_eval(e: Node) -> Node {
         }
         if a.k == N_FLOAT {
             var c = nnode(N_FLOAT, e.line)
-            c.fval = 0.0 - a.fval
+            // negation is a sign flip, not 0.0 - x: that gives +0.0 for -0.0
+            c.fval = frombits(bits(a.fval) ^ (1 << 63))
             c.ty = TI_FLOAT
             return c
         }
@@ -6335,7 +6336,10 @@ fn gen_expr(e: Node) {
     if e.k == N_NEG {
         gen_expr(e.kids[0])
         if ty_kind[e.ty] == K_FLOAT {
-            o("movabs rcx, {bits(-0.0)}")
+            // Flip the sign bit. The mask is spelled as an int: `bits(-0.0)`
+            // folded -0.0 as 0.0 - 0.0 = +0.0, so the mask was 0 and every
+            // float negation compiled to a no-op.
+            o("movabs rcx, {1 << 63}")
             o("xor rax, rcx")
         } else {
             o("neg rax")

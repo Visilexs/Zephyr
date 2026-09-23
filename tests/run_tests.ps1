@@ -504,6 +504,32 @@ $flOut = if ($flBuilt) { (cmd /c "`"$fldir\f.exe`" 2>&1" | Out-String).Trim() -r
 $flWant = @("3.6","1","2.5","0.1","4352464011485697175","4547007122018943789") -join "`n"
 Check "float-forin-and-literals" ($flBuilt -and $flOut -eq $flWant) "got: $flOut"
 
+# ---- unary minus on floats: runtime values, not just literals ----
+# The sign mask was folded from -0.0 as 0.0 - 0.0 = +0.0, so -x compiled to x
+# for every non-literal float while int negation and literals looked fine.
+Set-Content "$fldir\n.zeph" @'
+fn one() -> float { return 1.5 }
+let xs = [2.5]
+let t = one()
+print(-one())
+print(-one() * 2.0)
+print(-t)
+print(-xs[0])
+print(-(t * 2.0))
+let l = [-t, -one()]
+print(l[0] + l[1])
+print(bits(-0.0))
+let z = 0.0
+print(bits(-z))
+print(-7)
+'@ -Encoding ascii
+Remove-Item "$fldir\n.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt "$fldir\n.zeph" "$fldir\n.exe" 2>&1 | Out-Null
+$ngBuilt = Test-Path "$fldir\n.exe"
+$ngOut = if ($ngBuilt) { (cmd /c "`"$fldir\n.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+$ngWant = @("-1.5","-3","-1.5","-2.5","-3","-3","-9223372036854775808","-9223372036854775808","-7") -join "`n"
+Check "float-unary-minus" ($ngBuilt -and $ngOut -eq $ngWant) "got: $ngOut"
+
 # ---- threads: allocation and GC across several stacks ----
 # Run more than once: a collector that misses another thread's roots fails
 # intermittently, not deterministically.
