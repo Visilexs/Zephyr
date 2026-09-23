@@ -209,6 +209,22 @@ impl VkPhysicalDeviceProperties {
     }
     fn deviceName_at(self) -> int { return self.b.addr() + 20 }
     fn limits_at(self) -> int { return self.b.addr() + 296 }
+    fn limits_maxImageDimension2D(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(300, v)
+        return self
+    }
+    fn limits_maxImageDimension3D(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(304, v)
+        return self
+    }
+    fn limits_maxComputeWorkGroupInvocations(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(528, v)
+        return self
+    }
+    fn limits_maxPushConstantsSize(self, v: int) -> VkPhysicalDeviceProperties {
+        self.b.put32(328, v)
+        return self
+    }
 }
 
 struct VkQueueFamilyProperties { b: Bytes }
@@ -225,6 +241,28 @@ impl VkQueueFamilyProperties {
     }
     fn queueCount(self, v: int) -> VkQueueFamilyProperties {
         self.b.put32(4, v)
+        return self
+    }
+}
+
+struct VkFormatProperties { b: Bytes }
+impl VkFormatProperties {
+    fn new() -> VkFormatProperties {
+        var b = Bytes.new(12)
+        return VkFormatProperties{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn linearTilingFeatures(self, v: int) -> VkFormatProperties {
+        self.b.put32(0, v)
+        return self
+    }
+    fn optimalTilingFeatures(self, v: int) -> VkFormatProperties {
+        self.b.put32(4, v)
+        return self
+    }
+    fn bufferFeatures(self, v: int) -> VkFormatProperties {
+        self.b.put32(8, v)
         return self
     }
 }
@@ -1720,6 +1758,100 @@ impl VkBufferImageCopy {
         self.b.put32(52, v)
         return self
     }
+}
+
+struct VkImageBlit { b: Bytes }
+impl VkImageBlit {
+    fn new() -> VkImageBlit {
+        var b = Bytes.new(80)
+        return VkImageBlit{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn srcSubresource_at(self) -> int { return self.b.addr() + 0 }
+    fn srcSubresource_aspectMask(self, v: int) -> VkImageBlit {
+        self.b.put32(0, v)
+        return self
+    }
+    fn srcSubresource_mipLevel(self, v: int) -> VkImageBlit {
+        self.b.put32(4, v)
+        return self
+    }
+    fn srcSubresource_baseArrayLayer(self, v: int) -> VkImageBlit {
+        self.b.put32(8, v)
+        return self
+    }
+    fn srcSubresource_layerCount(self, v: int) -> VkImageBlit {
+        self.b.put32(12, v)
+        return self
+    }
+    fn srcOffsets_at(self) -> int { return self.b.addr() + 16 }
+    fn srcOffsets_0_x(self, v: int) -> VkImageBlit {
+        self.b.put32(16, v)
+        return self
+    }
+    fn srcOffsets_0_y(self, v: int) -> VkImageBlit {
+        self.b.put32(20, v)
+        return self
+    }
+    fn srcOffsets_0_z(self, v: int) -> VkImageBlit {
+        self.b.put32(24, v)
+        return self
+    }
+    fn srcOffsets_1_x(self, v: int) -> VkImageBlit {
+        self.b.put32(28, v)
+        return self
+    }
+    fn srcOffsets_1_y(self, v: int) -> VkImageBlit {
+        self.b.put32(32, v)
+        return self
+    }
+    fn srcOffsets_1_z(self, v: int) -> VkImageBlit {
+        self.b.put32(36, v)
+        return self
+    }
+    fn dstSubresource_at(self) -> int { return self.b.addr() + 40 }
+    fn dstSubresource_aspectMask(self, v: int) -> VkImageBlit {
+        self.b.put32(40, v)
+        return self
+    }
+    fn dstSubresource_mipLevel(self, v: int) -> VkImageBlit {
+        self.b.put32(44, v)
+        return self
+    }
+    fn dstSubresource_baseArrayLayer(self, v: int) -> VkImageBlit {
+        self.b.put32(48, v)
+        return self
+    }
+    fn dstSubresource_layerCount(self, v: int) -> VkImageBlit {
+        self.b.put32(52, v)
+        return self
+    }
+    fn dstOffsets_at(self) -> int { return self.b.addr() + 56 }
+    fn dstOffsets_0_x(self, v: int) -> VkImageBlit {
+        self.b.put32(56, v)
+        return self
+    }
+    fn dstOffsets_0_y(self, v: int) -> VkImageBlit {
+        self.b.put32(60, v)
+        return self
+    }
+    fn dstOffsets_0_z(self, v: int) -> VkImageBlit {
+        self.b.put32(64, v)
+        return self
+    }
+    fn dstOffsets_1_x(self, v: int) -> VkImageBlit {
+        self.b.put32(68, v)
+        return self
+    }
+    fn dstOffsets_1_y(self, v: int) -> VkImageBlit {
+        self.b.put32(72, v)
+        return self
+    }
+    fn dstOffsets_1_z(self, v: int) -> VkImageBlit {
+        self.b.put32(76, v)
+        return self
+    }
 
 // ---- WSI: surface, swapchain, present ----
 }
@@ -2303,6 +2435,55 @@ impl VkPushConstantRange {
     }
 }
 
+struct VkDescriptorImageInfo { b: Bytes }
+impl VkDescriptorImageInfo {
+    fn new() -> VkDescriptorImageInfo {
+        var b = Bytes.new(24)
+        return VkDescriptorImageInfo{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn sampler(self, v: int) -> VkDescriptorImageInfo {
+        self.b.put64(0, v)
+        return self
+    }
+    fn imageView(self, v: int) -> VkDescriptorImageInfo {
+        self.b.put64(8, v)
+        return self
+    }
+    fn imageLayout(self, v: int) -> VkDescriptorImageInfo {
+        self.b.put32(16, v)
+        return self
+    }
+}
+
+struct VkMemoryBarrier { b: Bytes }
+impl VkMemoryBarrier {
+    fn new() -> VkMemoryBarrier {
+        var b = Bytes.new(24)
+        b.put32(0, VK_STRUCTURE_TYPE_MEMORY_BARRIER)
+        return VkMemoryBarrier{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn sType(self, v: int) -> VkMemoryBarrier {
+        self.b.put32(0, v)
+        return self
+    }
+    fn pNext(self, v: int) -> VkMemoryBarrier {
+        self.b.put64(8, v)
+        return self
+    }
+    fn srcAccessMask(self, v: int) -> VkMemoryBarrier {
+        self.b.put32(16, v)
+        return self
+    }
+    fn dstAccessMask(self, v: int) -> VkMemoryBarrier {
+        self.b.put32(20, v)
+        return self
+    }
+}
+
 struct VkImageMemoryBarrier { b: Bytes }
 impl VkImageMemoryBarrier {
     fn new() -> VkImageMemoryBarrier {
@@ -2349,126 +2530,186 @@ impl VkImageMemoryBarrier {
         return self
     }
     fn subresourceRange_at(self) -> int { return self.b.addr() + 48 }
+    fn subresourceRange_aspectMask(self, v: int) -> VkImageMemoryBarrier {
+        self.b.put32(48, v)
+        return self
+    }
+    fn subresourceRange_baseMipLevel(self, v: int) -> VkImageMemoryBarrier {
+        self.b.put32(52, v)
+        return self
+    }
+    fn subresourceRange_levelCount(self, v: int) -> VkImageMemoryBarrier {
+        self.b.put32(56, v)
+        return self
+    }
+    fn subresourceRange_baseArrayLayer(self, v: int) -> VkImageMemoryBarrier {
+        self.b.put32(60, v)
+        return self
+    }
+    fn subresourceRange_layerCount(self, v: int) -> VkImageMemoryBarrier {
+        self.b.put32(64, v)
+        return self
+    }
 }
 
 fn create_buffer(dev: int, ci: VkBufferCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateBuffer(dev, ci.addr(), 0, p.addr()), "vkCreateBuffer")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_image(dev: int, ci: VkImageCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateImage(dev, ci.addr(), 0, p.addr()), "vkCreateImage")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_image_view(dev: int, ci: VkImageViewCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateImageView(dev, ci.addr(), 0, p.addr()), "vkCreateImageView")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_shader_module(dev: int, ci: VkShaderModuleCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateShaderModule(dev, ci.addr(), 0, p.addr()), "vkCreateShaderModule")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_pipeline_layout(dev: int, ci: VkPipelineLayoutCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreatePipelineLayout(dev, ci.addr(), 0, p.addr()), "vkCreatePipelineLayout")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_render_pass(dev: int, ci: VkRenderPassCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateRenderPass(dev, ci.addr(), 0, p.addr()), "vkCreateRenderPass")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_framebuffer(dev: int, ci: VkFramebufferCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateFramebuffer(dev, ci.addr(), 0, p.addr()), "vkCreateFramebuffer")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_command_pool(dev: int, ci: VkCommandPoolCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateCommandPool(dev, ci.addr(), 0, p.addr()), "vkCreateCommandPool")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_fence(dev: int, ci: VkFenceCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateFence(dev, ci.addr(), 0, p.addr()), "vkCreateFence")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_semaphore(dev: int, ci: VkSemaphoreCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateSemaphore(dev, ci.addr(), 0, p.addr()), "vkCreateSemaphore")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_swapchain(dev: int, ci: VkSwapchainCreateInfoKHR) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateSwapchainKHR(dev, ci.addr(), 0, p.addr()), "vkCreateSwapchainKHR")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn allocate_memory(dev: int, ci: VkMemoryAllocateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkAllocateMemory(dev, ci.addr(), 0, p.addr()), "vkAllocateMemory")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_descriptor_set_layout(dev: int, ci: VkDescriptorSetLayoutCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateDescriptorSetLayout(dev, ci.addr(), 0, p.addr()), "vkCreateDescriptorSetLayout")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_descriptor_pool(dev: int, ci: VkDescriptorPoolCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateDescriptorPool(dev, ci.addr(), 0, p.addr()), "vkCreateDescriptorPool")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_instance(ci: VkInstanceCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateInstance(ci.addr(), 0, p.addr()), "vkCreateInstance")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_device(phys: int, ci: VkDeviceCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateDevice(phys, ci.addr(), 0, p.addr()), "vkCreateDevice")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_surface(inst: int, ci: VkWin32SurfaceCreateInfoKHR) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateWin32SurfaceKHR(inst, ci.addr(), 0, p.addr()), "vkCreateWin32SurfaceKHR")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_graphics_pipeline(dev: int, ci: VkGraphicsPipelineCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateGraphicsPipelines(dev, 0, 1, ci.addr(), 0, p.addr()), "vkCreateGraphicsPipelines")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn create_compute_pipeline(dev: int, ci: VkComputePipelineCreateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkCreateComputePipelines(dev, 0, 1, ci.addr(), 0, p.addr()), "vkCreateComputePipelines")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 fn allocate_descriptor_set(dev: int, ci: VkDescriptorSetAllocateInfo) -> int {
-    var p = Bytes.new(8)
+    var p = vk_output(8)
     vkcheck(vkAllocateDescriptorSets(dev, ci.addr(), p.addr()), "vkAllocateDescriptorSets")
-    return p.get64(0)
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
 }
 
 // a VkClearValue is a bare union of four floats
