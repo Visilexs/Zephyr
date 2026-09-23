@@ -136,6 +136,16 @@ extern fn vkUpdateDescriptorSets(device: int, descriptorWriteCount: int, pDescri
 extern fn vkCmdBindDescriptorSets(commandBuffer: int, pipelineBindPoint: int, layout: int, firstSet: int, descriptorSetCount: int, pDescriptorSets: int, dynamicOffsetCount: int, pDynamicOffsets: int) from "vulkan-1.dll"
 extern fn vkCmdCopyBuffer(commandBuffer: int, srcBuffer: int, dstBuffer: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
 
+// ---- raster: samplers, indexed + indirect draws ----
+// (no vkCmdSetDepthBias: its float arguments travel in XMM registers, which the
+// int-only FFI can't fill -- set depth bias statically in the rasterization state)
+extern fn vkCreateSampler(device: int, pCreateInfo: int, pAllocator: int, pSampler: int) -> i32 from "vulkan-1.dll"
+extern fn vkDestroySampler(device: int, sampler: int, pAllocator: int) from "vulkan-1.dll"
+extern fn vkCmdBindIndexBuffer(commandBuffer: int, buffer: int, offset: int, indexType: int) from "vulkan-1.dll"
+extern fn vkCmdDrawIndexed(commandBuffer: int, indexCount: int, instanceCount: int, firstIndex: int, vertexOffset: int, firstInstance: int) from "vulkan-1.dll"
+extern fn vkCmdDrawIndirect(commandBuffer: int, buffer: int, offset: int, drawCount: int, stride: int) from "vulkan-1.dll"
+extern fn vkCmdFillBuffer(commandBuffer: int, dstBuffer: int, dstOffset: int, size: int, data: int) from "vulkan-1.dll"
+
 // ---- WSI: surface + swapchain ----
 // The Windows loader exports these directly, so GetProcAddress resolves them
 // without going through vkGetInstanceProcAddr.

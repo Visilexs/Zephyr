@@ -986,6 +986,18 @@ impl VkPipelineRasterizationStateCreateInfo {
         self.b.put32(40, v)
         return self
     }
+    fn depthBiasConstantFactor(self, v: float) -> VkPipelineRasterizationStateCreateInfo {
+        self.b.putf32(44, v)
+        return self
+    }
+    fn depthBiasClamp(self, v: float) -> VkPipelineRasterizationStateCreateInfo {
+        self.b.putf32(48, v)
+        return self
+    }
+    fn depthBiasSlopeFactor(self, v: float) -> VkPipelineRasterizationStateCreateInfo {
+        self.b.putf32(52, v)
+        return self
+    }
     fn lineWidth(self, v: float) -> VkPipelineRasterizationStateCreateInfo {
         self.b.putf32(56, v)
         return self
@@ -2552,6 +2564,175 @@ impl VkImageMemoryBarrier {
     }
 }
 
+struct VkSamplerCreateInfo { b: Bytes }
+impl VkSamplerCreateInfo {
+    fn new() -> VkSamplerCreateInfo {
+        var b = Bytes.new(80)
+        b.put32(0, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+        return VkSamplerCreateInfo{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn sType(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(0, v)
+        return self
+    }
+    fn pNext(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put64(8, v)
+        return self
+    }
+    fn flags(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(16, v)
+        return self
+    }
+    fn magFilter(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(20, v)
+        return self
+    }
+    fn minFilter(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(24, v)
+        return self
+    }
+    fn mipmapMode(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(28, v)
+        return self
+    }
+    fn addressModeU(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(32, v)
+        return self
+    }
+    fn addressModeV(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(36, v)
+        return self
+    }
+    fn addressModeW(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(40, v)
+        return self
+    }
+    fn mipLodBias(self, v: float) -> VkSamplerCreateInfo {
+        self.b.putf32(44, v)
+        return self
+    }
+    fn anisotropyEnable(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(48, v)
+        return self
+    }
+    fn maxAnisotropy(self, v: float) -> VkSamplerCreateInfo {
+        self.b.putf32(52, v)
+        return self
+    }
+    fn compareEnable(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(56, v)
+        return self
+    }
+    fn compareOp(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(60, v)
+        return self
+    }
+    fn minLod(self, v: float) -> VkSamplerCreateInfo {
+        self.b.putf32(64, v)
+        return self
+    }
+    fn maxLod(self, v: float) -> VkSamplerCreateInfo {
+        self.b.putf32(68, v)
+        return self
+    }
+    fn borderColor(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(72, v)
+        return self
+    }
+    fn unnormalizedCoordinates(self, v: int) -> VkSamplerCreateInfo {
+        self.b.put32(76, v)
+        return self
+    }
+}
+
+struct VkSubpassDependency { b: Bytes }
+impl VkSubpassDependency {
+    fn new() -> VkSubpassDependency {
+        var b = Bytes.new(28)
+        return VkSubpassDependency{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn srcSubpass(self, v: int) -> VkSubpassDependency {
+        self.b.put32(0, v)
+        return self
+    }
+    fn dstSubpass(self, v: int) -> VkSubpassDependency {
+        self.b.put32(4, v)
+        return self
+    }
+    fn srcStageMask(self, v: int) -> VkSubpassDependency {
+        self.b.put32(8, v)
+        return self
+    }
+    fn dstStageMask(self, v: int) -> VkSubpassDependency {
+        self.b.put32(12, v)
+        return self
+    }
+    fn srcAccessMask(self, v: int) -> VkSubpassDependency {
+        self.b.put32(16, v)
+        return self
+    }
+    fn dstAccessMask(self, v: int) -> VkSubpassDependency {
+        self.b.put32(20, v)
+        return self
+    }
+    fn dependencyFlags(self, v: int) -> VkSubpassDependency {
+        self.b.put32(24, v)
+        return self
+    }
+}
+
+struct VkBufferCopy { b: Bytes }
+impl VkBufferCopy {
+    fn new() -> VkBufferCopy {
+        var b = Bytes.new(24)
+        return VkBufferCopy{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn srcOffset(self, v: int) -> VkBufferCopy {
+        self.b.put64(0, v)
+        return self
+    }
+    fn dstOffset(self, v: int) -> VkBufferCopy {
+        self.b.put64(8, v)
+        return self
+    }
+    fn size(self, v: int) -> VkBufferCopy {
+        self.b.put64(16, v)
+        return self
+    }
+}
+
+struct VkDrawIndirectCommand { b: Bytes }
+impl VkDrawIndirectCommand {
+    fn new() -> VkDrawIndirectCommand {
+        var b = Bytes.new(16)
+        return VkDrawIndirectCommand{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn vertexCount(self, v: int) -> VkDrawIndirectCommand {
+        self.b.put32(0, v)
+        return self
+    }
+    fn instanceCount(self, v: int) -> VkDrawIndirectCommand {
+        self.b.put32(4, v)
+        return self
+    }
+    fn firstVertex(self, v: int) -> VkDrawIndirectCommand {
+        self.b.put32(8, v)
+        return self
+    }
+    fn firstInstance(self, v: int) -> VkDrawIndirectCommand {
+        self.b.put32(12, v)
+        return self
+    }
+}
+
 fn create_buffer(dev: int, ci: VkBufferCreateInfo) -> int {
     var p = vk_output(8)
     vkcheck(vkCreateBuffer(dev, ci.addr(), 0, p.addr()), "vkCreateBuffer")
@@ -2659,6 +2840,14 @@ fn create_descriptor_set_layout(dev: int, ci: VkDescriptorSetLayoutCreateInfo) -
 fn create_descriptor_pool(dev: int, ci: VkDescriptorPoolCreateInfo) -> int {
     var p = vk_output(8)
     vkcheck(vkCreateDescriptorPool(dev, ci.addr(), 0, p.addr()), "vkCreateDescriptorPool")
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
+}
+
+fn create_sampler(dev: int, ci: VkSamplerCreateInfo) -> int {
+    var p = vk_output(8)
+    vkcheck(vkCreateSampler(dev, ci.addr(), 0, p.addr()), "vkCreateSampler")
     let handle = p.get64(0)
     vk_free_output(p)
     return handle

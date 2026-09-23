@@ -390,6 +390,9 @@ int main(int argc, char **argv) {
     OF(VkPipelineRasterizationStateCreateInfo, cullMode);
     OF(VkPipelineRasterizationStateCreateInfo, frontFace);
     OF(VkPipelineRasterizationStateCreateInfo, depthBiasEnable);
+    OF(VkPipelineRasterizationStateCreateInfo, depthBiasConstantFactor);
+    OF(VkPipelineRasterizationStateCreateInfo, depthBiasClamp);
+    OF(VkPipelineRasterizationStateCreateInfo, depthBiasSlopeFactor);
     OF(VkPipelineRasterizationStateCreateInfo, lineWidth);
 
     SZS(VkPipelineMultisampleStateCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
@@ -648,6 +651,33 @@ int main(int argc, char **argv) {
     CO(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     CO(VK_ACCESS_SHADER_READ_BIT); CO(VK_ACCESS_SHADER_WRITE_BIT);
     CO(VK_ACCESS_TRANSFER_WRITE_BIT); CO(VK_ACCESS_HOST_READ_BIT);
+
+    /* ---- raster: sampled images, depth reads, subpass dependencies, indirect draws ---- */
+    CO(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+    CO(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); CO(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+    CO(VK_DESCRIPTOR_TYPE_SAMPLER);
+    CO(VK_IMAGE_USAGE_SAMPLED_BIT);
+    CO(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    CO(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    CO(VK_ATTACHMENT_LOAD_OP_LOAD);
+    CO(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    CO(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
+    CO(VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+    CO(VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+    CO(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+    CO(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    CO(VK_ACCESS_INDIRECT_COMMAND_READ_BIT); CO(VK_ACCESS_HOST_WRITE_BIT);
+    CO(VK_ACCESS_MEMORY_READ_BIT); CO(VK_ACCESS_MEMORY_WRITE_BIT);
+    CO(VK_DEPENDENCY_BY_REGION_BIT);
+    CO(VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT); CO(VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    CO(VK_INDEX_TYPE_UINT16); CO(VK_INDEX_TYPE_UINT32);
+    CO(VK_SAMPLER_MIPMAP_MODE_NEAREST); CO(VK_SAMPLER_MIPMAP_MODE_LINEAR);
+    CO(VK_SAMPLER_ADDRESS_MODE_REPEAT); CO(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    CO(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
+    CO(VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK); CO(VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE);
+    CO(VK_FORMAT_R16G16_SFLOAT); CO(VK_FORMAT_R16_SFLOAT); CO(VK_FORMAT_R8G8_UNORM);
+    CO(VK_FORMAT_R32G32B32A32_SFLOAT); CO(VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    CO(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     CO(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT);
 
     SZ(VkDescriptorSetLayoutBinding);
@@ -724,6 +754,30 @@ int main(int argc, char **argv) {
     OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, baseArrayLayer);
     OFN(VkImageMemoryBarrier, subresourceRange, VkImageSubresourceRange, layerCount);
 
+    SZS(VkSamplerCreateInfo, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+    OF(VkSamplerCreateInfo, sType); OF(VkSamplerCreateInfo, pNext);
+    OF(VkSamplerCreateInfo, flags); OF(VkSamplerCreateInfo, magFilter);
+    OF(VkSamplerCreateInfo, minFilter); OF(VkSamplerCreateInfo, mipmapMode);
+    OF(VkSamplerCreateInfo, addressModeU); OF(VkSamplerCreateInfo, addressModeV);
+    OF(VkSamplerCreateInfo, addressModeW); OF(VkSamplerCreateInfo, mipLodBias);
+    OF(VkSamplerCreateInfo, anisotropyEnable); OF(VkSamplerCreateInfo, maxAnisotropy);
+    OF(VkSamplerCreateInfo, compareEnable); OF(VkSamplerCreateInfo, compareOp);
+    OF(VkSamplerCreateInfo, minLod); OF(VkSamplerCreateInfo, maxLod);
+    OF(VkSamplerCreateInfo, borderColor); OF(VkSamplerCreateInfo, unnormalizedCoordinates);
+
+    SZ(VkSubpassDependency);
+    OF(VkSubpassDependency, srcSubpass); OF(VkSubpassDependency, dstSubpass);
+    OF(VkSubpassDependency, srcStageMask); OF(VkSubpassDependency, dstStageMask);
+    OF(VkSubpassDependency, srcAccessMask); OF(VkSubpassDependency, dstAccessMask);
+    OF(VkSubpassDependency, dependencyFlags);
+
+    SZ(VkBufferCopy);
+    OF(VkBufferCopy, srcOffset); OF(VkBufferCopy, dstOffset); OF(VkBufferCopy, size);
+
+    SZ(VkDrawIndirectCommand);
+    OF(VkDrawIndirectCommand, vertexCount); OF(VkDrawIndirectCommand, instanceCount);
+    OF(VkDrawIndirectCommand, firstVertex); OF(VkDrawIndirectCommand, firstInstance);
+
     sclose();
 
     /* handle-returning constructors */
@@ -741,6 +795,7 @@ int main(int argc, char **argv) {
     CREATE(vkAllocateMemory,      VkMemoryAllocateInfo,        "allocate_memory");
     CREATE(vkCreateDescriptorSetLayout, VkDescriptorSetLayoutCreateInfo, "create_descriptor_set_layout");
     CREATE(vkCreateDescriptorPool,      VkDescriptorPoolCreateInfo,      "create_descriptor_pool");
+    CREATE(vkCreateSampler,       VkSamplerCreateInfo,         "create_sampler");
 
     /* the few constructors whose first argument is not a device */
     if (g_mode == 1) {
