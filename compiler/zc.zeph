@@ -4390,8 +4390,11 @@ fn has_index(e: Node) -> bool {
 }
 
 // promote up to (2 - g_div_next) invariant divisors for a loop body; returns
-// how many pairs were claimed (caller releases them after the loop)
-fn div_promote_loop(body: Node) -> int {
+// how many pairs were claimed (caller releases them after the loop). Invariance
+// is checked over the whole loop statement: a for loop's own variable is
+// written by its header, not its body, and hoisting it read the previous
+// run's last value (every nested `for d in ...` divided by a stale d).
+fn div_promote_loop(body: Node, whole: Node) -> int {
     if g_div_next >= 2 { return 0 }
     sclear(g_dc_keys)
     nclear(g_dc_nodes)
@@ -4401,7 +4404,7 @@ fn div_promote_loop(body: Node) -> int {
     while ci < g_dc_keys.len() and g_div_next < 2 {
         let d = g_dc_nodes[ci]
         var ok = true
-        if d.k == N_ID { ok = not div_assigned_in(body, d.aux, d.slot) }
+        if d.k == N_ID { ok = not div_assigned_in(whole, d.aux, d.slot) }
         if ok {
             div_mark(body, g_dc_keys[ci], g_div_next)
             emit_div_setup(g_div_next, d)
@@ -6998,7 +7001,7 @@ fn gen_stmt(s: Node, retlabel: int) {
     if s.k == N_WHILE {
         let top = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[1])
+        let ndp = div_promote_loop(s.kids[1], s)
         let nlb = lb_promote_loop(s.kids[1])
         olabel(top)
         gen_cond(s.kids[0], end, true)
@@ -7020,7 +7023,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         let top = newlabel()
         let cont = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[2])
+        let ndp = div_promote_loop(s.kids[2], s)
         let nlb = lb_promote_loop(s.kids[2])
         let iv = slot_addr(ID_LOCAL, s.slot)     // loop var (may be promoted)
         let hv = slot_addr(ID_LOCAL, s.aux)      // limit (hidden, never promoted)
@@ -7055,7 +7058,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         let top = newlabel()
         let cont = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[1])
+        let ndp = div_promote_loop(s.kids[1], s)
         let lv = slot_addr(ID_LOCAL, s.aux)      // list ptr (hidden, stays in memory: GC root)
         let xv = slot_addr(ID_LOCAL, s.op)       // index (hidden, never promoted)
         let ev = slot_addr(ID_LOCAL, s.slot)     // element var (may be promoted)

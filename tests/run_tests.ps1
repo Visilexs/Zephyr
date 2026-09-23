@@ -236,6 +236,18 @@ foreach ($n in @([long]-7, 7, -100, 100, 0, 9223372036854775807)) {
 $exp += "-3"; $exp += "-1"; $exp += "-3"; $exp += "1"; $exp += "0"
 Check "div-semantics" ($r.code -eq 0 -and $r.out -eq (($exp -join [Environment]::NewLine))) "mismatch"
 
+# ---- a for loop's own variable is not a loop-invariant divisor ----
+# The reciprocal was computed at loop entry from the variable's previous value,
+# so the second run of an inner loop divided by the first run's last divisor.
+$r = RunSrc "divloopvar" @'
+for w in [100, 7] {
+    for d in [3, 7, 4096] { print(w / d) }
+    for d in 3..5 { print(w % d) }
+}
+'@
+$want = @("33","14","0","1","0","2","1","0","1","3") -join [Environment]::NewLine
+Check "div-loop-var" ($r.code -eq 0 -and $r.out -eq $want) "got: $($r.out)"
+
 # ---- globals + new builtins (io, str utils, args) ----
 $tmpFwd = $tmp -replace "\\", "/"
 $r = RunSrc "globals_io" @"
