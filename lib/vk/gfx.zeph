@@ -45,6 +45,8 @@ struct Swapchain {
     fbs: [int],
     frames: [Frame],
     img_fence: [int],      // fence of the frame last using each image (0 = none)
+    img_serial: [int],     // serial of the frame last using each image
+    serial: int,           // frames presented so far
     // Render-finished semaphores are per IMAGE, not per frame. A present
     // operation keeps waiting on its semaphore after the submit fence has
     // signalled, so reusing a frame's semaphore two frames later can signal one
@@ -860,15 +862,18 @@ impl Gfx {
             vk_free_output(pcb)
         }
         var img_fence: [int] = []
+        var img_serial: [int] = []
         var img_sem: [int] = []
         for i in 0..n {
             img_fence.push(0)
+            img_serial.push(0)
             img_sem.push(self.semaphore())
         }
 
         return Swapchain{handle: handle, usage: usage, format: format, w: w, h: h,
                          images: images, views: views, fbs: fbs,
-                         frames: frames, img_fence: img_fence, img_sem: img_sem, cur: 0,
+                         frames: frames, img_fence: img_fence, img_serial: img_serial, serial: 0,
+                         img_sem: img_sem, cur: 0,
                          depth_format: depth_format, depth_imgs: depth_imgs,
                          depth_mems: depth_mems, depth_views: depth_views}
     }
@@ -964,13 +969,19 @@ impl Gfx {
         let idx = pidx.get32(0)
         vk_free_output(pidx)
 
-        // another in-flight frame may still be drawing into this image
-        if s.img_fence[idx] != 0 and s.img_fence[idx] != f.fence {
+        // another in-flight frame may still be drawing into this image. Only
+        // one of the last frames.len() - 1 frames can be: the wait on this
+        // frame's own fence above retired everything older. An older entry's
+        // fence has been reused by a newer frame since, and waiting on it
+        // stalled every third frame for the whole previous frame (3 images,
+        // 2 frames in flight).
+        if s.img_fence[idx] != 0 and s.img_fence[idx] != f.fence and s.img_serial[idx] > s.serial - s.frames.len() {
             var pother = Bytes.new(8)
             pother.put64(0, s.img_fence[idx])
             vkcheck(vkWaitForFences(self.dev, 1, pother.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
         }
         s.img_fence[idx] = f.fence
+        s.img_serial[idx] = s.serial
 
         // reset only now -- everything that could still be pending has retired
         vkcheck(vkResetFences(self.dev, 1, pfence.addr()), "vkResetFences")
@@ -1017,6 +1028,7 @@ impl Gfx {
         let pres = vkQueuePresentKHR(self.queue, pi.addr())
 
         s.cur = (s.cur + 1) % s.frames.len()
+        s.serial += 1
 
         if pres == VK_ERROR_OUT_OF_DATE_KHR or pres == VK_SUBOPTIMAL_KHR { return false }
         if pres != VK_SUCCESS { panic("vkQueuePresentKHR: VkResult {pres}") }
