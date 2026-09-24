@@ -7582,8 +7582,9 @@ var r_bytes: [int] = []
 var a_bss = 0
 var a_sect = 0
 var a_syms: [ASym] = []
+var a_symcap = 65536              // slots in a_symhash: a power of two, doubled past half full
 var a_symhash: [int] = []
-for i in 0..65536 { a_symhash.push(0) }
+for i in 0..a_symcap { a_symhash.push(0) }
 var a_fixes: [AFix] = []
 var a_imports: [str] = []
 var a_import_dll: [int] = []      // 0 = zephyr_rt.dll, 1 = kernel32.dll
@@ -7635,29 +7636,45 @@ fn rb64(v: int) {
 
 fn strhash(s: str) -> int {
     var h = 0
-    for i in 0..s.len() { h = (h * 31 + s.byte(i)) % 65536 }
+    for i in 0..s.len() { h = (h * 31 + s.byte(i)) % 1073741824 }
     return h
 }
 
 fn sym_intern(name: str) -> int {
-    var h = strhash(name)
+    var h = strhash(name) % a_symcap
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return idx }
-        h = (h + 1) % 65536
+        h = (h + 1) % a_symcap
     }
     a_syms.push(ASym{name: name, sect: 0, off: 0, defined: false, predef: false})
     a_symhash[h] = a_syms.len()
+    if a_syms.len() * 2 > a_symcap { sym_grow() }
     return a_syms.len() - 1
+}
+
+// Double the symbol table and re-slot every symbol. It used to be a fixed
+// 65536 slots, and a program with more labels than that (atoll at M5, 65677)
+// made sym_intern probe a full table forever: the link hung.
+fn sym_grow() {
+    a_symcap = a_symcap * 2
+    var nh: [int] = []
+    for i in 0..a_symcap { nh.push(0) }
+    for k in 0..a_syms.len() {
+        var h = strhash(a_syms[k].name) % a_symcap
+        while nh[h] != 0 { h = (h + 1) % a_symcap }
+        nh[h] = k + 1
+    }
+    a_symhash = nh
 }
 
 // read-only: is `name` a locally defined/pre-scanned label?
 fn sym_is_local(name: str) -> bool {
-    var h = strhash(name)
+    var h = strhash(name) % a_symcap
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return a_syms[idx].predef or a_syms[idx].defined }
-        h = (h + 1) % 65536
+        h = (h + 1) % a_symcap
     }
     return false
 }
