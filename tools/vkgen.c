@@ -152,6 +152,7 @@ int main(int argc, char **argv) {
     CO(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO);
     CO(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO);
     CO(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
+    CO(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
     CO(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
     CO(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     CO(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
@@ -218,6 +219,8 @@ int main(int argc, char **argv) {
     CO(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT); CO(VK_PIPELINE_STAGE_TRANSFER_BIT);
     CO(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     CO(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    CO(VK_QUERY_TYPE_TIMESTAMP);
+    CO(VK_QUERY_RESULT_64_BIT); CO(VK_QUERY_RESULT_WAIT_BIT);
     CO(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT); CO(VK_ACCESS_TRANSFER_READ_BIT);
     CO(VK_QUEUE_FAMILY_IGNORED);
     CO(VK_SUBPASS_EXTERNAL);
@@ -272,9 +275,11 @@ int main(int argc, char **argv) {
     OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxImageDimension3D);
     OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxComputeWorkGroupInvocations);
     OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, maxPushConstantsSize);
+    OFN(VkPhysicalDeviceProperties, limits, VkPhysicalDeviceLimits, timestampPeriod);
 
     SZ(VkQueueFamilyProperties);
     OF(VkQueueFamilyProperties, queueFlags); OF(VkQueueFamilyProperties, queueCount);
+    OF(VkQueueFamilyProperties, timestampValidBits);
 
     SZ(VkFormatProperties);
     OF(VkFormatProperties, linearTilingFeatures); OF(VkFormatProperties, optimalTilingFeatures);
@@ -497,6 +502,11 @@ int main(int argc, char **argv) {
     SZS(VkCommandPoolCreateInfo, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
     OF(VkCommandPoolCreateInfo, sType); OF(VkCommandPoolCreateInfo, pNext);
     OF(VkCommandPoolCreateInfo, flags); OF(VkCommandPoolCreateInfo, queueFamilyIndex);
+
+    SZS(VkQueryPoolCreateInfo, VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
+    OF(VkQueryPoolCreateInfo, sType); OF(VkQueryPoolCreateInfo, pNext);
+    OF(VkQueryPoolCreateInfo, flags); OF(VkQueryPoolCreateInfo, queryType);
+    OF(VkQueryPoolCreateInfo, queryCount); OF(VkQueryPoolCreateInfo, pipelineStatistics);
 
     SZS(VkCommandBufferAllocateInfo, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
     OF(VkCommandBufferAllocateInfo, sType); OF(VkCommandBufferAllocateInfo, pNext);
@@ -789,6 +799,7 @@ int main(int argc, char **argv) {
     CREATE(vkCreateRenderPass,    VkRenderPassCreateInfo,      "create_render_pass");
     CREATE(vkCreateFramebuffer,   VkFramebufferCreateInfo,     "create_framebuffer");
     CREATE(vkCreateCommandPool,   VkCommandPoolCreateInfo,     "create_command_pool");
+    CREATE(vkCreateQueryPool,     VkQueryPoolCreateInfo,       "create_query_pool");
     CREATE(vkCreateFence,         VkFenceCreateInfo,           "create_fence");
     CREATE(vkCreateSemaphore,     VkSemaphoreCreateInfo,       "create_semaphore");
     CREATE(vkCreateSwapchainKHR,  VkSwapchainCreateInfoKHR,    "create_swapchain");

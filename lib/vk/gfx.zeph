@@ -75,6 +75,61 @@ struct GpuBuffer { buf: int, mem: int, size: int }
 // VK_FORMAT_* it was created with, which readback needs to size a texel.
 struct GpuImage { image: int, mem: int, view: int, w: int, h: int, d: int, fmt: int }
 
+// Timestamp queries on Gfx's graphics queue. Read only after the stamped
+// submission has completed; WAIT also covers a still-pending submission.
+struct QueryPool { dev: int, handle: int, count: int, period: float, valid_bits: int }
+
+impl QueryPool {
+    fn new(g: Gfx, count: int) -> QueryPool {
+        assert(count > 0, "query pool needs at least one slot")
+        let props = vk_output(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(g.phys, props.addr())
+        let period = props.getf32(VkPhysicalDeviceProperties_limits_timestampPeriod)
+        vk_free_output(props)
+
+        var qcount = vk_output(4)
+        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, qcount.addr(), 0)
+        let families = vk_output(VkQueueFamilyProperties_sizeof * qcount.get32(0))
+        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, qcount.addr(), families.addr())
+        let valid_bits = families.get32(g.qfam * VkQueueFamilyProperties_sizeof
+                                        + VkQueueFamilyProperties_timestampValidBits)
+        vk_free_output(families)
+        vk_free_output(qcount)
+        assert(valid_bits > 0, "graphics queue does not support timestamps")
+
+        let ci = VkQueryPoolCreateInfo.new().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(count)
+        return QueryPool{dev: g.dev, handle: create_query_pool(g.dev, ci),
+                         count: count, period: period, valid_bits: valid_bits}
+    }
+
+    fn reset(self, cmd: int) { vkCmdResetQueryPool(cmd, self.handle, 0, self.count) }
+
+    fn stamp(self, cmd: int, stage: int, i: int) {
+        assert(i >= 0 and i < self.count, "timestamp slot out of range")
+        vkCmdWriteTimestamp(cmd, stage, self.handle, i)
+    }
+
+    // Return elapsed nanoseconds, accounting for queues with fewer than 64 valid bits.
+    fn read_ns(self, i0: int, i1: int) -> int {
+        assert(i0 >= 0 and i0 < self.count and i1 >= 0 and i1 < self.count,
+               "timestamp slot out of range")
+        let data = vk_output(16)
+        let flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+        vkcheck(vkGetQueryPoolResults(self.dev, self.handle, i0, 1, 8,
+                                     data.addr(), 8, flags),
+                "vkGetQueryPoolResults")
+        vkcheck(vkGetQueryPoolResults(self.dev, self.handle, i1, 1, 8,
+                                     data.addr() + 8, 8, flags),
+                "vkGetQueryPoolResults")
+        var ticks = data.get64(8) - data.get64(0)
+        vk_free_output(data)
+        if self.valid_bits < 64 { ticks = ticks & ((1 << self.valid_bits) - 1) }
+        return ((ticks as float) * self.period) as int
+    }
+
+    fn destroy(self) { vkDestroyQueryPool(self.dev, self.handle, 0) }
+}
+
 // Transition one colour mip/layer on the same queue, with an explicit dependency.
 fn image_barrier(cb: int, image: int, old_layout: int, new_layout: int,
                  src_stage: int, dst_stage: int, src_access: int, dst_access: int) {

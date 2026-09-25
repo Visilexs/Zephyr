@@ -225,6 +225,10 @@ impl VkPhysicalDeviceProperties {
         self.b.put32(328, v)
         return self
     }
+    fn limits_timestampPeriod(self, v: float) -> VkPhysicalDeviceProperties {
+        self.b.putf32(720, v)
+        return self
+    }
 }
 
 struct VkQueueFamilyProperties { b: Bytes }
@@ -241,6 +245,10 @@ impl VkQueueFamilyProperties {
     }
     fn queueCount(self, v: int) -> VkQueueFamilyProperties {
         self.b.put32(4, v)
+        return self
+    }
+    fn timestampValidBits(self, v: int) -> VkQueueFamilyProperties {
+        self.b.put32(8, v)
         return self
     }
 }
@@ -1533,6 +1541,41 @@ impl VkCommandPoolCreateInfo {
     }
 }
 
+struct VkQueryPoolCreateInfo { b: Bytes }
+impl VkQueryPoolCreateInfo {
+    fn new() -> VkQueryPoolCreateInfo {
+        var b = Bytes.new(32)
+        b.put32(0, VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO)
+        return VkQueryPoolCreateInfo{b: b}
+    }
+    fn addr(self) -> int { return self.b.addr() }
+    fn raw(self) -> Bytes { return self.b }
+    fn sType(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put32(0, v)
+        return self
+    }
+    fn pNext(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put64(8, v)
+        return self
+    }
+    fn flags(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put32(16, v)
+        return self
+    }
+    fn queryType(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put32(20, v)
+        return self
+    }
+    fn queryCount(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put32(24, v)
+        return self
+    }
+    fn pipelineStatistics(self, v: int) -> VkQueryPoolCreateInfo {
+        self.b.put32(28, v)
+        return self
+    }
+}
+
 struct VkCommandBufferAllocateInfo { b: Bytes }
 impl VkCommandBufferAllocateInfo {
     fn new() -> VkCommandBufferAllocateInfo {
@@ -2792,6 +2835,14 @@ fn create_framebuffer(dev: int, ci: VkFramebufferCreateInfo) -> int {
 fn create_command_pool(dev: int, ci: VkCommandPoolCreateInfo) -> int {
     var p = vk_output(8)
     vkcheck(vkCreateCommandPool(dev, ci.addr(), 0, p.addr()), "vkCreateCommandPool")
+    let handle = p.get64(0)
+    vk_free_output(p)
+    return handle
+}
+
+fn create_query_pool(dev: int, ci: VkQueryPoolCreateInfo) -> int {
+    var p = vk_output(8)
+    vkcheck(vkCreateQueryPool(dev, ci.addr(), 0, p.addr()), "vkCreateQueryPool")
     let handle = p.get64(0)
     vk_free_output(p)
     return handle
