@@ -18,7 +18,7 @@
 // anything the compiler's dup/drop insertion misses: a start bit marks each
 // payload address, which is how a conservatively-scanned word is recognised
 // as a real object pointer. Roots are the machine stack and the globals array.
-let HEAP_RESERVE = 1073741824       // 1 GiB of address space (reserved, not committed)
+let HEAP_RESERVE = 4294967296       // 4 GiB of address space (reserved, not committed)
 let COMMIT_STEP = 4194304           // commit 4 MiB at a time
 let F_MARK = 1
 let F_FREE = 2
