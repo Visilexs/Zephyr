@@ -3357,6 +3357,24 @@ fn inl_borrow_decl(s: Node) -> bool {
     return borrow_ok(s.kids[0], false)
 }
 
+// gen_tmp for an operand consumed only by runtime code that runs no user code
+// (map/list primitives): a global can be borrowed too when nothing before
+// the call can run a store or a call, since then nothing can reassign it
+// while the runtime holds it.
+fn gen_tmp_rt(x: Node, safe: bool) -> bool {
+    if safe and x.k == N_ID and x.aux == ID_GLOBAL {
+        g_borrow = true
+        gen_expr(x)
+        return false
+    }
+    return gen_tmp(x, safe)
+}
+
+fn has_fn_arg(e: Node) -> bool {
+    for c in e.kids { if ty_kind[c.ty] == K_FN { return true } }
+    return false
+}
+
 // value -> rax; true when it is an owned temporary the caller must drop
 fn gen_tmp(x: Node, safe: bool) -> bool {
     if borrow_ok(x, safe) {
@@ -6118,7 +6136,8 @@ fn gen_call(e: Node) {
             if i == 0 { a = a.kids[0] }
             var safe = true
             for j in (i + 1)..e.kids.len() { if has_call(e.kids[j]) { safe = false } }
-            owned.push(gen_tmp(a, safe))
+            if has_fn_arg(e) { owned.push(gen_tmp(a, safe)) }   // might call back into user code
+            else { owned.push(gen_tmp_rt(a, safe)) }
             o("push rax")
             n += 1
         }
@@ -7229,7 +7248,7 @@ fn gen_stmt(s: Node, retlabel: int) {
             }
             tmp_pop(bt)
         } else if ty_kind[t.kids[0].ty] == K_MAP {
-            let mt = gen_tmp(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
+            let mt = gen_tmp_rt(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
             o("push rax")                    // map
             gen_expr(t.kids[1])              // key (owned: the map takes it)
             o("push rax")
