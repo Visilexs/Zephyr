@@ -2822,6 +2822,8 @@ fn always_returns(stmts: [Node]) -> bool {
 var g_top_nslots = 0
 var g_rt_top = 0     // top-level statements contributed by runtime.zeph (--rt)
 
+let XRESOLVE_PREFIX = "fn __xresolve"     // generated extern resolvers: never inlined
+
 // Desugar `extern fn` declarations into ordinary Zephyr functions that resolve
 // their target lazily and cache it: one LoadLibraryA per DLL, one
 // GetProcAddress per symbol, then callptr (which already does the full Win64
@@ -2892,13 +2894,16 @@ fn desugar_extern(prog: Node) {
         var arglist = ""
         if params.kids.len() > 0 { arglist = ", " + call.join() }
         src.push("var __xf{j} = 0\n")
+        // first-call resolution, kept out of line (see XRESOLVE_PREFIX): the
+        // wrapper itself inlines to a compare, a rarely-taken call and callptr
+        src.push(XRESOLVE_PREFIX + "{j}() -> int \{\n")
+        src.push("    let f = win(\"GetProcAddress\", __xd{d}(), __xcstr(\"{x.name}\"))\n")
+        src.push("    if f == 0 \{ panic(\"extern: {dllname} has no symbol {x.name}\") \}\n")
+        src.push("    return f\n\}\n")
         src.push("fn {x.name}(" + sig.join() + ")")
         if ret.k != N_NONE { src.push(" -> int") }
         src.push(" \{\n")
-        src.push("    if __xf{j} == 0 \{\n")
-        src.push("        __xf{j} = win(\"GetProcAddress\", __xd{d}(), __xcstr(\"{x.name}\"))\n")
-        src.push("        if __xf{j} == 0 \{ panic(\"extern: {dllname} has no symbol {x.name}\") \}\n")
-        src.push("    \}\n")
+        src.push("    if __xf{j} == 0 \{ __xf{j} = __xresolve{j}() \}\n")
         if ret.k == N_NONE { src.push("    let __r = callptr(__xf{j}" + arglist + ")\n") }
         else if sext { src.push("    return __xsext32(callptr(__xf{j}" + arglist + "))\n") }
         else { src.push("    return callptr(__xf{j}" + arglist + ")\n") }
@@ -4273,7 +4278,7 @@ fn inline_pass(prog: Node) {
     // instantiations are ordinary FDefs and do participate).
     for i in 0..g_fns.len() {
         let f = g_fns[i]
-        if not f.has_env and f.tparams.len() == 0 and node_count(f.body) <= 128 {
+        if not f.has_env and f.tparams.len() == 0 and node_count(f.body) <= 128 and not starts_with(f.name, "__xresolve") {
             f.pristine = clone_node(f.body)
             f.prist_ok = true
             f.prist_nslots = f.nslots
@@ -4460,6 +4465,7 @@ fn lb_root_ok(e: Node) -> bool {
 fn lb_root_call(s: Node) -> bool {
     if s.k == N_EXPRST or s.k == N_DECL { return s.kids.len() > 0 and lb_has_call(s.kids[0]) }
     if s.k == N_ASSIGN { return lb_has_call(s.kids[1]) }
+    if s.k == N_INLINE { return lb_has_call(s) }
     return false
 }
 
@@ -4489,6 +4495,10 @@ fn lb_unsafe_stmt(s: Node) -> bool {
     if k == N_FORIN { return lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) }
     if k == N_INLINE { return lb_unsafe(s) }
     if k == N_RET { return false }            // leaves the loop: nothing reads a base after it
+    if k == N_IRET {                          // jumps to its N_INLINE's end: refreshed there
+        if s.kids[0].k == N_NONE { return false }
+        return not lb_root_ok(s.kids[0])
+    }
     return lb_has_call(s)
 }
 
@@ -5797,6 +5807,55 @@ fn mem_operand(e: Node) -> str {
     return "[" + br + " + " + ir + "*{sc}]"
 }
 
+// callptr whose operands are call-free: nothing can run between evaluating
+// one argument and the next, so leaves (literals, variables) need no staging
+// and load straight into their argument register or stack slot at the call.
+fn callptr_direct_ok(e: Node) -> bool {
+    for i in 1..e.kids.len() {
+        if has_call(e.kids[i]) or ty_kind[e.kids[i].ty] == K_FLOAT { return false }
+    }
+    return true
+}
+
+fn gen_callptr_direct(e: Node) {
+    let nargs = e.kids.len() - 2              // kids[0]=callee, kids[1]=target, then args
+    var at: [int] = []                         // per operand: push index, or -1 for a leaf
+    var npushed = 0
+    for i in 1..e.kids.len() {
+        let a = e.kids[i]
+        if is_leaf(a) { at.push(0 - 1) }
+        else {
+            gen_expr(a)
+            o("push rax")
+            at.push(npushed)
+            npushed += 1
+        }
+    }
+    o("mov r12, rsp")
+    o("and rsp, -16")
+    var nstack = 0
+    if nargs > 4 { nstack = nargs - 4 }
+    let pframe = (32 + 8 * nstack + 15) & (0 - 16)
+    o("sub rsp, {pframe}")
+    // operand i (0 = target) as a source, loaded into reg
+    for k in 0..nstack {
+        let i = 5 + k
+        if at[i] < 0 { gen_leaf("rax", e.kids[i + 1]) }
+        else { o("mov rax, [r12 + {8 * (npushed - 1 - at[i])}]") }
+        o("mov [rsp + {32 + 8 * k}], rax")
+    }
+    let ar = ["r10", "rcx", "rdx", "r8", "r9"]
+    var i = 0
+    while i < 5 and i <= nargs {
+        if at[i] < 0 { gen_leaf(ar[i], e.kids[i + 1]) }
+        else { o("mov " + ar[i] + ", [r12 + {8 * (npushed - 1 - at[i])}]") }
+        i += 1
+    }
+    o("call r10")
+    o("mov rsp, r12")
+    if npushed > 0 { o("add rsp, {8 * npushed}") }
+}
+
 // `base + K` / `K + base` / `base - K` with a literal K: the literal folds
 // into the memory operand's displacement. Returns the displacement (0: no
 // split) and leaves the base in g_ad_base.
@@ -6279,6 +6338,10 @@ fn gen_call(e: Node) {
     }
     if k == CK_STACKPTR {
         o("mov rax, rsp")
+        return
+    }
+    if k == CK_CALLPTR and callptr_direct_ok(e) {
+        gen_callptr_direct(e)
         return
     }
     if k == CK_CALLPTR {
