@@ -5456,7 +5456,7 @@ fn gen_into_try(e: Node, dst: str) -> bool {
         return true
     }
     if e.k == N_CALL and e.aux == CK_LOAD64 {
-        let m = mem_operand(e.kids[1])
+        let m = addr_operand_free(e.kids[1])
         if m == "" { return false }
         o("mov " + dst + ", " + m)
         return true
@@ -5777,6 +5777,88 @@ fn mem_operand(e: Node) -> str {
     let ir = leaf_reg(idxn.kids[0])
     if ir == "" { return "" }
     return "[" + br + " + " + ir + "*{sc}]"
+}
+
+// `base + K` / `K + base` / `base - K` with a literal K: the literal folds
+// into the memory operand's displacement. Returns the displacement (0: no
+// split) and leaves the base in g_ad_base.
+var g_ad_base = nnode(N_NONE, 0)
+
+fn addr_disp(e: Node) -> int {
+    if e.k != N_BIN or e.aux == BC_FLOAT or e.aux == BC_STR { return 0 }
+    if e.op == T_PLUS and e.kids[1].k == N_INT and e.kids[1].ival > 0 - 2147483648 and e.kids[1].ival < 2147483647 {
+        g_ad_base = e.kids[0]
+        return e.kids[1].ival
+    }
+    if e.op == T_PLUS and e.kids[0].k == N_INT and e.kids[0].ival > 0 - 2147483648 and e.kids[0].ival < 2147483647 {
+        g_ad_base = e.kids[1]
+        return e.kids[0].ival
+    }
+    if e.op == T_MINUS and e.kids[1].k == N_INT and e.kids[1].ival > 0 - 2147483647 and e.kids[1].ival < 2147483647 {
+        g_ad_base = e.kids[0]
+        return 0 - e.kids[1].ival
+    }
+    return 0
+}
+
+fn disp_str(d: int) -> str {
+    if d < 0 { return " - {0 - d}" }
+    return " + {d}"
+}
+
+// memory operand for an address expression that needs no code at all
+// (register-resident parts plus a literal displacement), or ""
+fn addr_operand_free(e: Node) -> str {
+    let m = mem_operand(e)
+    if m != "" { return m }
+    let d = addr_disp(e)
+    if d == 0 { return "" }
+    let b = g_ad_base
+    let bm = mem_operand(b)
+    if bm != "" { return bm.sub(0, bm.len() - 1) + disp_str(d) + "]" }
+    let br = leaf_reg(b)
+    if br != "" { return "[" + br + disp_str(d) + "]" }
+    return ""
+}
+
+// memory operand for an address expression; may emit code into rax
+fn gen_load_addr(e: Node) -> str {
+    let m = addr_operand_free(e)
+    if m != "" { return m }
+    let d = addr_disp(e)
+    if d != 0 {
+        let b = g_ad_base
+        gen_expr(b)
+        return "[rax" + disp_str(d) + "]"
+    }
+    gen_expr(e)
+    return "[rax]"
+}
+
+// store64/32/8: address then value, value register named by width
+fn gen_store_raw(e: Node, vreg: str) {
+    let m = addr_operand_free(e.kids[1])
+    if m != "" and addr_safe_value(e.kids[2]) {
+        if vreg == "rax" {
+            let vr = leaf_reg(e.kids[2])
+            if vr != "" {                        // register source: no staging at all
+                o("mov " + m + ", " + vr)
+                return
+            }
+        }
+        gen_expr(e.kids[2])
+        o("mov " + m + ", " + vreg)
+        return
+    }
+    var d = addr_disp(e.kids[1])
+    var b = e.kids[1]
+    if d != 0 { b = g_ad_base }
+    gen_expr(b)
+    o("push rax")
+    gen_expr(e.kids[2])
+    o("pop rcx")
+    if d != 0 { o("mov [rcx" + disp_str(d) + "], " + vreg) }
+    else { o("mov [rcx], " + vreg) }
 }
 
 // A folded store computes its address at the point of the store rather than
@@ -6151,68 +6233,29 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_LOAD64 {
-        let m = mem_operand(e.kids[1])
-        if m != "" {
-            o("mov rax, " + m)
-            return
-        }
-        gen_expr(e.kids[1])
-        o("mov rax, [rax]")
+        o("mov rax, " + gen_load_addr(e.kids[1]))
         return
     }
     if k == CK_LOAD8 {
-        let m = mem_operand(e.kids[1])
-        if m != "" {
-            o("movzx eax, byte ptr " + m)
-            return
-        }
-        gen_expr(e.kids[1])
-        o("movzx eax, byte ptr [rax]")
+        o("movzx eax, byte ptr " + gen_load_addr(e.kids[1]))
         return
     }
     if k == CK_LOAD32 or k == CK_LOAD16 {
-        var m = mem_operand(e.kids[1])
-        if m == "" {
-            gen_expr(e.kids[1])
-            m = "[rax]"
-        }
+        let m = gen_load_addr(e.kids[1])
         if k == CK_LOAD32 { o("mov eax, dword ptr " + m) }
         else { o("movzx eax, word ptr " + m) }
         return
     }
     if k == CK_STORE64 {
-        let m = mem_operand(e.kids[1])
-        if m != "" and addr_safe_value(e.kids[2]) {
-            let vr = leaf_reg(e.kids[2])
-            if vr != "" {                        // register source: no staging at all
-                o("mov " + m + ", " + vr)
-                return
-            }
-            gen_expr(e.kids[2])
-            o("mov " + m + ", rax")
-            return
-        }
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], rax")
+        gen_store_raw(e, "rax")
         return
     }
     if k == CK_STORE32 {
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], eax")
+        gen_store_raw(e, "eax")
         return
     }
     if k == CK_STORE8 {
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], al")
+        gen_store_raw(e, "al")
         return
     }
     if k == CK_STACKPTR {
