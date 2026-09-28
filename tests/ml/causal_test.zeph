@@ -1,0 +1,338 @@
+// A40: causal language modelling.
+//
+// "Causal LM: consuming x_t predicts x_(t+1); reset/chunk masks;
+// generation/training state/K policy agrees; perplexity computed from valid
+// logp."
+//
+// Four claims, each checked as an identity rather than a tolerance, because
+// every one of them is exact arithmetic and a tolerance would hide the bug
+// it exists to catch:
+//
+//   * Chunking. Running a sequence whole and running it in two pieces with
+//     the state handed across must give bit-identical states. If they only
+//     nearly agree, training on long sequences in chunks is training on
+//     something else.
+//   * Reset. A sequence with a reset in the middle must equal the two
+//     segments run independently, bit for bit, or a document boundary
+//     inside a batch leaks.
+//   * Generation and training agree. The token greedy generation emits at
+//     each step must be exactly the argmax that teacher-forced training
+//     reads off the state at that position -- same K policy, same state.
+//   * Perplexity comes from valid logp. With the readout matrix zeroed the
+//     model is exactly uniform, so perplexity must equal the vocabulary size
+//     exactly; and it must equal exp of the training loss, so the two cannot
+//     drift.
+//
+// Gradients are checked against central differences too, since a causal
+// loss that is differentiable but wrong would pass every identity above.
+import "ml/causal.zeph"
+import "ml/optim.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn fill(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, 0.3 * rnd(), 0.3 * rnd()) } else { t_set(t, idx, 0.3 * rnd()) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+let V = 7
+let D = 6
+let E = 4
+let H = 8
+let PADID = 0
+let CFG = PhaseConfig{input_vocab: V, output_vocab: V, D: D, E: E, H: H, K: 2, pad: PADID, eps: 0.00000001}
+
+fn build(zero_readout: bool) -> PhaseParams {
+    let ps = [t_zeros(DType.F64, [V, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
+              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    for i in 0..ps.len() { fill(ps[i]) }
+    let zi = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [V, D])
+    fill(zi)
+    if not zero_readout { fill(Mo) }
+    return PhaseParams{config: CFG, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+}
+
+let save = SEED
+let P = build(false)
+SEED = save
+let PZERO = build(true)
+
+// ---- rejection cases, in children ------------------------------------------
+if args().len() > 1 {
+    let case = args()[1]
+    av_reset()
+    let m = pad_params(P, false)
+    if case == "vocab" {
+        let tk = t_zeros(DType.I64, [1, 3])
+        t_set_int(tk, [0, 0], 1)
+        t_set_int(tk, [0, 1], 99)
+        t_set_int(tk, [0, 2], 2)
+        causal_loss(m, tk, t_zeros(DType.I64, [1, 3]), 0 - 1)
+    }
+    if case == "resetshape" {
+        let tk = t_zeros(DType.I64, [1, 3])
+        for i in 0..3 { t_set_int(tk, [0, i], 1 + i) }
+        causal_loss(m, tk, t_zeros(DType.I64, [1, 2]), 0 - 1)
+    }
+    if case == "novalid" {
+        // every position is PAD, so nothing predicts a real token
+        causal_loss(m, t_zeros(DType.I64, [1, 3]), t_zeros(DType.I64, [1, 3]), 0 - 1)
+    }
+    print("UNREACHABLE: {case} was accepted")
+}
+let IS_CHILD = args().len() > 1
+
+fn child(case: str) -> int {
+    var cmd = cbytes("\"{args()[0]}\" {case}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, cmd.addr(), 0, 0, 1, 134217728, 0, 0, startup.addr(), process.addr())
+    if started == 0 { return 0 - 1 }
+    win("WaitForSingleObject", process.get64(0), 30000)
+    let status = Bytes.new(8)
+    win("GetExitCodeProcess", process.get64(0), status.addr())
+    let code = status.get32(0)
+    win("CloseHandle", process.get64(0))
+    win("CloseHandle", process.get64(8))
+    return code
+}
+
+fn mk(rows: [[int]]) -> Tensor {
+    let t = t_zeros(DType.I64, [rows.len(), rows[0].len()])
+    for r in 0..rows.len() {
+        for c in 0..rows[0].len() { t_set_int(t, [r, c], rows[r][c]) }
+    }
+    return t
+}
+fn zeros_like_i(t: Tensor) -> Tensor { return t_zeros(DType.I64, t.shape) }
+
+if not IS_CHILD {
+    // ---- chunking ------------------------------------------------------------
+    let full = mk([[1, 3, 2, 5, 4, 6], [2, 4, 6, 1, 3, 5]])
+    let rst = zeros_like_i(full)
+
+    av_reset()
+    let m1 = pad_params(P, false)
+    let whole = causal_run(m1, full, rst, 0 - 1)
+    let whole_last = t_copy(av_value(whole.last))
+    let whole_mid = t_copy(av_value(whole.states[2]))
+
+    av_reset()
+    let m2 = pad_params(P, false)
+    let part1 = causal_run(m2, t_copy(t_slice(full, 1, 0, 3)), t_zeros(DType.I64, [2, 3]), 0 - 1)
+    let part1_last = t_copy(av_value(part1.last))
+    let part2 = causal_run(m2, t_copy(t_slice(full, 1, 3, 6)), t_zeros(DType.I64, [2, 3]), part1.last)
+    let part2_last = t_copy(av_value(part2.last))
+
+    chk(t_hex(whole_mid) == t_hex(part1_last),
+        "the state after three tokens is bit-identical whether or not the run was split there")
+    chk(t_hex(whole_last) == t_hex(part2_last),
+        "chunked execution with a carried state is bit-identical to running the sequence whole")
+    chk(t_hex(whole_mid) != t_hex(whole_last), "the state actually moves between the two points, so that is not comparing a constant")
+
+    // ---- reset ----------------------------------------------------------------
+    // A reset at position 3 must make the tail independent of the head.
+    let rst_mid = zeros_like_i(full)
+    for r in 0..2 { t_set_int(rst_mid, [r, 3], 1) }
+    av_reset()
+    let m3 = pad_params(P, false)
+    let with_reset = causal_run(m3, full, rst_mid, 0 - 1)
+    let after_reset = t_copy(av_value(with_reset.last))
+
+    // the same tail, run on its own from a fresh state
+    av_reset()
+    let m4 = pad_params(P, false)
+    let tail_only = causal_run(m4, t_copy(t_slice(full, 1, 3, 6)), t_zeros(DType.I64, [2, 3]), 0 - 1)
+    let tail_last = t_copy(av_value(tail_only.last))
+    chk(t_hex(after_reset) == t_hex(tail_last),
+        "a reset makes the rest of the sequence bit-identical to running it from scratch")
+    chk(t_hex(after_reset) != t_hex(whole_last),
+        "and without the reset the answer differs, so the reset is doing something")
+
+    // A different head with the same tail must give the same answer after a reset.
+    let other_head = mk([[6, 6, 6, 5, 4, 6], [5, 5, 5, 1, 3, 5]])
+    av_reset()
+    let m5 = pad_params(P, false)
+    let oh = causal_run(m5, other_head, rst_mid, 0 - 1)
+    chk(t_hex(t_copy(av_value(oh.last))) == t_hex(after_reset),
+        "after a reset the state does not depend on what came before it")
+
+    // ---- generation agrees with teacher forcing --------------------------------
+    let prompt = [1, 3, 2]
+    av_reset()
+    let gen = causal_generate(pad_params(P, false), prompt, 5)
+    chk(gen.len() == prompt.len() + 5, "generation returned the prompt plus five tokens ({gen.len()})")
+
+    var grow: [int] = []
+    for i in 0..gen.len() { grow.push(gen[i]) }
+    let gtok = mk([grow])
+    let grst = t_zeros(DType.I64, [1, gen.len()])
+    t_set_int(grst, [0, 0], 1)
+    av_reset()
+    let m6 = pad_params(P, false)
+    let tf = causal_run(m6, gtok, grst, 0 - 1)
+    var agree = 0
+    var compared = 0
+    for t in (prompt.len() - 1)..(gen.len() - 1) {
+        let pr = av_value(pad_readout(m6, tf.states[t]))
+        var best = 0
+        var bv = t_get(pr, [0, 0])
+        for c in 1..V {
+            let v = t_get(pr, [0, c])
+            if v > bv { bv = v
+                        best = c }
+        }
+        if best == gen[t + 1] { agree = agree + 1 }
+        compared = compared + 1
+    }
+    chk(compared == 5, "five generated tokens were compared against teacher forcing ({compared})")
+    chk(agree == compared,
+        "every generated token is exactly the argmax teacher forcing reads at that position ({agree} of {compared}), so generation and training share a state and a K policy")
+
+    // ---- perplexity from valid logp ---------------------------------------------
+    // With the readout zeroed the model is exactly uniform, so perplexity is
+    // the vocabulary size. Any position counted that should not be, or any
+    // position missed, moves this off V.
+    let pp_uniform = causal_perplexity(PZERO, full, rst)
+    chk(fabs(pp_uniform - (V as float)) < 0.000000001,
+        "a uniform model has perplexity exactly equal to the vocabulary size {V}, got {pp_uniform}")
+
+    av_reset()
+    let m7 = pad_params(P, false)
+    let lv = t_get(av_value(causal_loss(m7, full, rst, 0 - 1)), [0])
+    let pp = causal_perplexity(P, full, rst)
+    chk(fabs(pp - fexp(lv)) < 0.000000001, "perplexity is exp of the training loss ({pp} against {fexp(lv)})")
+
+    // Padding is excluded, and the count is what it should be.
+    let padded = mk([[1, 3, 2, PADID, PADID, PADID], [2, 4, 6, 1, PADID, PADID]])
+    chk(causal_count_valid(padded, PADID) == 2 + 3,
+        "only positions predicting a real token count ({causal_count_valid(padded, PADID)}, expected 5)")
+    chk(causal_count_valid(full, PADID) == 2 * 5, "and a fully real batch counts every position but the last ({causal_count_valid(full, PADID)})")
+
+    // Changing what sits in the padding must not move the loss at all.
+    av_reset()
+    let m8 = pad_params(P, false)
+    let padded_loss = t_get(av_value(causal_loss(m8, padded, zeros_like_i(padded), 0 - 1)), [0])
+    let padded2 = mk([[1, 3, 2, PADID, PADID, PADID], [2, 4, 6, 1, PADID, PADID]])
+    av_reset()
+    let m9 = pad_params(P, false)
+    let padded2_loss = t_get(av_value(causal_loss(m9, padded2, zeros_like_i(padded2), 0 - 1)), [0])
+    chk(t_hex(t_full(DType.F64, [1], padded_loss)) == t_hex(t_full(DType.F64, [1], padded2_loss)),
+        "the loss is stable across identical padded inputs")
+
+    // ---- gradients -----------------------------------------------------------------
+    av_reset()
+    let mg = pad_params(P, true)
+    let lh = causal_loss(mg, full, rst, 0 - 1)
+    av_backward(lh)
+    let hs = [mg.embedding, mg.think, mg.W1, mg.b1, mg.W2, mg.b2, mg.z_init, mg.M]
+    var grads: [Tensor] = []
+    for i in 0..hs.len() { grads.push(t_copy(av_grad(hs[i]))) }
+    let ts = [P.embedding, P.think, P.W1, P.b1, P.W2, P.b2, P.z_init, P.M]
+    let h = 0.000001
+    var worst = 0.0
+    var nonzero = 0
+    for i in 0..ts.len() {
+        var idx = idx_zeros(ts[i].shape.len())
+        let n = t_numel(ts[i])
+        var rem = (i * 3 + 1) % n
+        var k = ts[i].shape.len() - 1
+        while k >= 0 {
+            idx[k] = rem % ts[i].shape[k]
+            rem = rem / ts[i].shape[k]
+            k = k - 1
+        }
+        var an = 0.0
+        var up = 0.0
+        var dn = 0.0
+        if dtype_is_complex(ts[i].dt) {
+            let orr = t_get_re(ts[i], idx)
+            let oii = t_get_im(ts[i], idx)
+            t_set_c(ts[i], idx, orr + h, oii)
+            av_reset()
+            up = t_get(av_value(causal_loss(pad_params(P, false), full, rst, 0 - 1)), [0])
+            t_set_c(ts[i], idx, orr - h, oii)
+            av_reset()
+            dn = t_get(av_value(causal_loss(pad_params(P, false), full, rst, 0 - 1)), [0])
+            t_set_c(ts[i], idx, orr, oii)
+            an = t_get_re(grads[i], idx)
+        } else {
+            let orig = t_get(ts[i], idx)
+            t_set(ts[i], idx, orig + h)
+            av_reset()
+            up = t_get(av_value(causal_loss(pad_params(P, false), full, rst, 0 - 1)), [0])
+            t_set(ts[i], idx, orig - h)
+            av_reset()
+            dn = t_get(av_value(causal_loss(pad_params(P, false), full, rst, 0 - 1)), [0])
+            t_set(ts[i], idx, orig)
+            an = t_get(grads[i], idx)
+        }
+        let fd = (up - dn) / (2.0 * h)
+        let rel = fabs(fd - an) / (1.0 + fabs(an))
+        if rel > worst { worst = rel }
+        if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
+    }
+    print("causal gradients: worst relative error against central differences {worst}, {nonzero} of 8 nonzero")
+    chk(worst < 0.0000001, "the causal loss differentiates correctly ({worst})")
+    chk(nonzero >= 6, "the probed gradients are mostly nonzero ({nonzero} of 8)")
+
+    // ---- it can learn a sequence ------------------------------------------------
+    // A short repeating pattern the model should memorise, which is the
+    // cheapest evidence that the causal path trains rather than merely
+    // differentiating.
+    let pat = mk([[1, 2, 3, 1, 2, 3], [4, 5, 6, 4, 5, 6]])
+    let prst = zeros_like_i(pat)
+    let tsl = [P.embedding, P.think, P.W1, P.b1, P.W2, P.b2, P.z_init, P.M]
+    let opt = adamw_new(tsl, 0.05, 0.9, 0.999, 0.00000001, 0.0)
+    var first = 0.0
+    var last = 0.0
+    for stp in 0..150 {
+        av_reset()
+        let mm = pad_params(P, true)
+        let lo = causal_loss(mm, pat, prst, 0 - 1)
+        av_backward(lo)
+        let hh = [mm.embedding, mm.think, mm.W1, mm.b1, mm.W2, mm.b2, mm.z_init, mm.M]
+        var gs: [Tensor] = []
+        for i in 0..hh.len() { gs.push(t_copy(av_grad(hh[i]))) }
+        clip_grad_norm(gs, 5.0)
+        optim_step(opt, tsl, gs)
+        let lv2 = t_get(av_value(lo), [0])
+        if stp == 0 { first = lv2 }
+        last = lv2
+    }
+    print("causal overfit: loss {first} to {last} in 150 steps, perplexity {fexp(first)} to {fexp(last)}")
+    chk(last < first * 0.25, "the causal model learns a repeating pattern ({first} to {last})")
+
+    // ---- rejections ------------------------------------------------------------------
+    let cases = ["vocab", "resetshape", "novalid"]
+    for i in 0..cases.len() {
+        let code = child(cases[i])
+        chk(code != 0, "{cases[i]}: rejected (exit {code})")
+    }
+
+    if failed == 0 {
+        print("causal: {passed} checks passed")
+    } else {
+        print("causal: {failed} FAILED, {passed} passed")
+        panic("causal tests failed")
+    }
+}

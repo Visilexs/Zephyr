@@ -1,0 +1,216 @@
+// Causal language modelling on the phase state: consuming x_t predicts
+// x_(t+1).
+//
+// The classification path in phase_ad runs its K THINK steps once, after the
+// whole sequence. That policy cannot work here. A causal model has to have a
+// well-defined state after every token, because generation produces tokens
+// one at a time and must arrive at exactly the state that teacher-forced
+// training would have reached on the same prefix. So:
+//
+//   THE K POLICY FOR CAUSAL MODE: consume the token, then run K THINK steps,
+//   per position. The state after position t is the state used to predict
+//   x_(t+1).
+//
+// It is written down here because it is the thing that makes generation and
+// training agree, and tests/ml/causal_test.zeph asserts the agreement
+// bit-for-bit rather than to a tolerance. If the policy ever changes on one
+// side only, that test fails, which is the whole point of having it.
+//
+// Three other decisions, all of which are visible in the tests:
+//
+//   * A reset mask resets the state to the initial state BEFORE consuming
+//     that position's token. Running a sequence with a reset in the middle
+//     therefore equals running the two halves independently, which is what
+//     makes document boundaries inside a batch meaningful.
+//   * Chunking carries the state across calls. Running [0,T) in one call and
+//     running [0,k) then [k,T) with the state handed over must agree
+//     bit-for-bit, or training on long sequences in chunks is not training
+//     on the sequence.
+//   * A position contributes to the loss only if both its own token and the
+//     token it predicts are real. Perplexity is exp of the mean negative log
+//     likelihood over exactly those positions -- "computed from valid logp",
+//     not from a sum that quietly includes padding.
+import "ml/phase_ad.zeph"
+
+struct CausalRun {
+    states: [int],   // one handle per position: the state after consuming it
+    last: int,       // the state after the final position, for the next chunk
+}
+
+// A 0/1 column selector for one step, as a constant leaf. The same
+// arithmetic-masking approach phase_ad uses: a branch would be control flow
+// the tape cannot see.
+fn causal_col(vals: Tensor, step: int, batch: int, want: int) -> Tensor {
+    let mask = t_zeros(DType.F64, [batch, 1])
+    for row in 0..batch {
+        if t_get_int(vals, [row, step]) == want { t_set(mask, [row, 0], 1.0) }
+    }
+    return mask
+}
+
+fn causal_blend(take: int, a: int, b: int, batch: int) -> int {
+    // take is a [batch,1] real 0/1 mask: result = take*a + (1-take)*b
+    let one = av_leaf(t_ones(DType.F64, [batch, 1]), false)
+    let ac = av_cast(take, DType.C64)
+    let bc = av_cast(av_sub(one, take), DType.C64)
+    return av_add(av_mul(a, ac), av_mul(b, bc))
+}
+
+// tokens [batch, T] int, reset [batch, T] int with 1 meaning "reset before
+// this position". z_in is the incoming state handle, or -1 to start fresh.
+fn causal_run(m: PhaseAD, tokens: Tensor, reset: Tensor, z_in: int) -> CausalRun {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    if reset.shape[0] != batch or reset.shape[1] != length {
+        panic("causal: reset mask is {reset.shape[0]}x{reset.shape[1]}, tokens are {batch}x{length}")
+    }
+    let init = pad_initial(m, batch)
+    var z = init
+    if z_in >= 0 { z = z_in }
+    var states: [int] = []
+    for t in 0..length {
+        let rst = av_leaf(causal_col(reset, t, batch, 1), false)
+        z = causal_blend(rst, init, z, batch)
+
+        var ids: [int] = []
+        for row in 0..batch {
+            let id = t_get_int(tokens, [row, t])
+            if id < 0 or id >= m.cfg.input_vocab { panic("causal: token {id} outside the vocabulary of {m.cfg.input_vocab}") }
+            ids.push(id)
+        }
+        var zz = pad_update(m, z, av_index_select(m.embedding, 0, ids))
+        // The K policy: THINK steps per position, not once at the end.
+        for k in 0..m.cfg.K {
+            zz = pad_update(m, zz, av_expand(av_reshape(m.think, [1, m.cfg.E]), [batch, m.cfg.E]))
+        }
+        // A PAD position leaves the state exactly as it was.
+        let real = av_leaf(t_sub(t_ones(DType.F64, [batch, 1]), causal_col(tokens, t, batch, m.cfg.pad)), false)
+        z = causal_blend(real, zz, z, batch)
+        states.push(z)
+    }
+    return CausalRun{states: states, last: z}
+}
+
+// Which positions predict something real: this token is real and the next
+// token exists and is real.
+fn causal_valid(tokens: Tensor, pad: int) -> Tensor {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    let v = t_zeros(DType.F64, [batch, length])
+    for row in 0..batch {
+        for t in 0..(length - 1) {
+            if t_get_int(tokens, [row, t]) != pad and t_get_int(tokens, [row, t + 1]) != pad {
+                t_set(v, [row, t], 1.0)
+            }
+        }
+    }
+    return v
+}
+
+fn causal_count_valid(tokens: Tensor, pad: int) -> int {
+    let v = causal_valid(tokens, pad)
+    var n = 0
+    for row in 0..v.shape[0] {
+        for t in 0..v.shape[1] {
+            if t_get(v, [row, t]) > 0.5 { n = n + 1 }
+        }
+    }
+    return n
+}
+
+// Total negative log likelihood over valid positions, and the count, as a
+// handle and an integer. Summed rather than averaged so chunks can be
+// combined: a mean per chunk cannot be recombined without its weight.
+fn causal_nll_sum(m: PhaseAD, tokens: Tensor, reset: Tensor, z_in: int, run: CausalRun) -> int {
+    let batch = tokens.shape[0]
+    let length = tokens.shape[1]
+    let valid = causal_valid(tokens, m.cfg.pad)
+    var total = 0
+    var started = false
+    for t in 0..(length - 1) {
+        let probs = pad_readout(m, run.states[t])
+        let hot = t_zeros(DType.F64, [batch, m.cfg.output_vocab])
+        var any = false
+        for row in 0..batch {
+            if t_get(valid, [row, t]) > 0.5 {
+                let nxt = t_get_int(tokens, [row, t + 1])
+                if nxt < 0 or nxt >= m.cfg.output_vocab { panic("causal: next token {nxt} outside the readout vocabulary of {m.cfg.output_vocab}") }
+                t_set(hot, [row, nxt], 1.0)
+                any = true
+            }
+        }
+        if any {
+            // Positions that do not contribute select nothing, so their row
+            // of the one-hot is all zeros; adding eps keeps the log finite
+            // and the zero row contributes ln(1) = 0 after the mask.
+            let picked = av_sum_dim(av_mul(probs, av_leaf(hot, false)), 1)
+            let keep = av_leaf(t_reshape(t_copy(t_slice(valid, 1, t, t + 1)), [batch, 1]), false)
+            let safe = av_add(picked, av_mul(av_sub(av_leaf(t_ones(DType.F64, [batch, 1]), false), keep),
+                                             pad_scalar(1.0)))
+            let contrib = av_sum_all(av_mul(av_neg(av_ln(safe)), keep))
+            if not started { total = contrib
+                             started = true } else { total = av_add(total, contrib) }
+        }
+    }
+    if not started { panic("causal: no position in this batch predicts a real token") }
+    return total
+}
+
+// Mean negative log likelihood per valid position. This is the training loss
+// and it is also exactly what perplexity exponentiates, so the two cannot
+// drift apart.
+fn causal_loss(m: PhaseAD, tokens: Tensor, reset: Tensor, z_in: int) -> int {
+    let run = causal_run(m, tokens, reset, z_in)
+    let n = causal_count_valid(tokens, m.cfg.pad)
+    if n == 0 { panic("causal: this batch has no valid next-token position") }
+    return av_div(causal_nll_sum(m, tokens, reset, z_in, run), pad_scalar(n as float))
+}
+
+// Takes the parameters rather than a tape view, because it resets the tape
+// itself: perplexity is an evaluation, and an evaluation that inherited a
+// half-built tape would be measuring whatever was on it.
+fn causal_perplexity(p: PhaseParams, tokens: Tensor, reset: Tensor) -> float {
+    av_reset()
+    let mm = pad_params(p, false)
+    return fexp(t_get(av_value(causal_loss(mm, tokens, reset, 0 - 1)), [0]))
+}
+
+// Greedy generation, one token at a time, carrying the state forward. The
+// state after each generated token is the state teacher-forced training
+// would have reached on the same prefix -- that is the property
+// tests/ml/causal_test.zeph checks, and it is the reason this walks the same
+// causal_run rather than a second, separately written loop.
+fn causal_generate(m: PhaseAD, prompt: [int], n_new: int) -> [int] {
+    if prompt.len() == 0 { panic("causal: generation needs a non-empty prompt") }
+    var out: [int] = []
+    for i in 0..prompt.len() { out.push(prompt[i]) }
+    var z = 0 - 1
+    var first = true
+    for step in 0..n_new {
+        // Feed only what is new since the last call: the prompt on the first
+        // pass, then one token at a time.
+        var feed: [int] = []
+        if first {
+            for i in 0..prompt.len() { feed.push(prompt[i]) }
+        } else {
+            feed.push(out[out.len() - 1])
+        }
+        let tk = t_zeros(DType.I64, [1, feed.len()])
+        let rs = t_zeros(DType.I64, [1, feed.len()])
+        for i in 0..feed.len() { t_set_int(tk, [0, i], feed[i]) }
+        if first { t_set_int(rs, [0, 0], 1) }
+        let run = causal_run(m, tk, rs, z)
+        z = run.last
+        first = false
+        let probs = av_value(pad_readout(m, run.last))
+        var best = 0
+        var bv = t_get(probs, [0, 0])
+        for c in 1..m.cfg.output_vocab {
+            let v = t_get(probs, [0, c])
+            if v > bv { bv = v
+                        best = c }
+        }
+        out.push(best)
+    }
+    return out
+}

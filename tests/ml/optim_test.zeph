@@ -1,0 +1,270 @@
+import "ml/checkpoint.zeph"
+import "ml/autograd.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+fn near(a: float, b: float) -> bool { return fabs(a - b) <= 0.000000000001 * (1.0 + fabs(b)) }
+
+// Capture the child's panic too: a generic crash must not pass a rejection test.
+var CHILD_PIDS: [int] = []
+
+fn rejects(mode: int, message: str) -> bool {
+    let logname = cbytes("optim-child.log")
+    let security = Bytes.new(24)
+    security.put32(0, 24)
+    security.put32(16, 1)
+    let log = win("CreateFileA", logname.p, 1073741824, 3, security.p, 2, 128, 0)
+    assert(log != 0 - 1, "open child log")
+    let command = cbytes("\"{args()[0]}\" {mode}")
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    startup.put32(60, 256)
+    startup.put64(80, win("GetStdHandle", 0 - 10))
+    startup.put64(88, log)
+    startup.put64(96, log)
+    let process = Bytes.new(24)
+    let started = win("CreateProcessA", 0, command.p, 0, 0, 1, 134217728, 0, 0, startup.p, process.p)
+    assert(started != 0, "start rejection child")
+    // PROCESS_INFORMATION.dwProcessId, so the cleanup at the end can name the
+    // temporary file a deliberately interrupted child leaves behind.
+    CHILD_PIDS.push(process.get32(16))
+    let waited = win("WaitForSingleObject", process.get64(0), 30000)
+    assert(waited == 0, "wait rejection child")
+    let status = Bytes.new(4)
+    assert(win("GetExitCodeProcess", process.get64(0), status.p) != 0, "read child exit")
+    win("CloseHandle", process.get64(0))
+    win("CloseHandle", process.get64(8))
+    win("CloseHandle", log)
+    let output = read_file("optim-child.log")
+    return status.get32(0) == 1 and output.contains(message)
+}
+
+// Nonconstant gradients make missing moments or a reset step observable on resume.
+fn training_step(o: Optim, params: [Tensor], step: int) {
+    var grads: [Tensor] = []
+    for p in params {
+        let g = t_zeros(p.dt, p.shape)
+        var idx = idx_zeros(p.shape.len())
+        for j in 0..t_numel(p) {
+            for c in 0..optim_components(p) {
+                optim_put(g, idx, c, optim_get(p, idx, c) * 0.3 + ((step + c + j) as float) * 0.07)
+            }
+            idx_next(idx, p.shape)
+        }
+        grads.push(g)
+    }
+    optim_step(o, params, grads)
+}
+
+// Child modes share a valid file, then corrupt exactly one field at a time.
+if args().len() > 1 {
+    let mode = args()[1] as int
+    let b = checkpoint_read("optim-good.ckpt")
+    if mode <= 7 or mode >= 11 {
+        var bad = b
+        if mode == 1 { bad.put64(0, 0) }
+        if mode == 2 { bad.put64(8, 99) }
+        if mode == 3 { bad = Bytes.new(12) }
+        if mode == 4 { bad.put64(16, b.n) }
+        if mode == 5 { bad.put64(128, 2) }
+        if mode == 6 { bad.put8(136, bad.get8(136) ^ 1) }
+        if mode == 7 { bad.put64(16, 9223372036854775807) }
+        if mode == 11 { bad.put64(112, 9223372036854775807) }
+        if mode == 12 { bad.put64(128, 9223372036854775807) }
+        if mode == 13 {
+            bad = Bytes.new(112)
+            for i in 0..112 { bad.put8(i, b.get8(i)) }
+            bad.put64(16, 80)
+        }
+        if mode == 14 { bad.put64(120, 9223372036854775807) }
+        let writer = checkpoint_begin("optim-bad.ckpt")
+        checkpoint_write(writer, bad, 0, bad.n)
+        checkpoint_commit(writer)
+        let ignored = checkpoint_load("optim-bad.ckpt")
+    }
+    if mode == 8 or mode == 9 {
+        let writer = checkpoint_begin("optim-good.ckpt")
+        checkpoint_write(writer, b, 0, 32)
+        if mode == 9 {
+            print("interrupted after header")
+            win("ExitProcess", 1)
+        }
+        // An actual OS write failure after the header, through the save writer.
+        win("CloseHandle", writer.handle)
+        writer.handle = 0 - 1
+        checkpoint_write(writer, b, 32, b.n - 32)
+    }
+    if mode == 10 {
+        let restored = checkpoint_decode(b)
+        t_set(restored.params[0], [0], 123.0)
+        checkpoint_save("optim-good.ckpt", restored.params, restored.optim)
+    }
+    win("ExitProcess", 0)
+}
+
+var n = 0
+let p = t_full(DType.F64, [1], 2.0)
+let g = t_full(DType.F64, [1], 3.0)
+let sgd = sgd_new([p], 0.1, 0.0, 0.2)
+optim_step(sgd, [p], [g])
+n += ck(near(t_get(p, [0]), 1.66), "SGD hand value including L2")
+n += ck(sgd.step == 1, "SGD step")
+let mp = t_full(DType.F64, [1], 2.0)
+let mg = t_full(DType.F64, [1], 1.0)
+let momentum = sgd_new([mp], 0.1, 0.5, 0.0)
+for i in 0..3 { optim_step(momentum, [mp], [mg]) }
+n += ck(near(t_get(mp, [0]), 1.575), "momentum three hand steps")
+n += ck(near(t_get(momentum.m[0], [0]), 1.75) and momentum.step == 3, "momentum state and count")
+
+let ap = t_full(DType.F64, [2], 2.0)
+let ag = t_full(DType.F64, [2], 1000.0)
+t_set(ag, [1], 0.001)
+let adam = adamw_new([ap], 0.1, 0.9, 0.999, 0.00000001, 0.0)
+optim_step(adam, [ap], [ag])
+n += ck(near(t_get(ap, [0]), 2.0 - 0.1 * 1000.0 / (1000.0 + 0.00000001)), "Adam first bias correction large")
+n += ck(near(t_get(ap, [1]), 2.0 - 0.1 * 0.001 / (0.001 + 0.00000001)), "Adam first bias correction small")
+let dp = t_full(DType.F64, [1], 2.0)
+let decay = adamw_new([dp], 0.1, 0.9, 0.999, 0.00000001, 0.2)
+optim_step(decay, [dp], [t_zeros(DType.F64, [1])])
+n += ck(bits(t_get(dp, [0])) == bits(2.0 - 0.1 * 0.2 * 2.0), "zero gradient decays exactly lr wd p")
+n += ck(t_get(decay.m[0], [0]) == 0.0 and t_get(decay.v[0], [0]) == 0.0, "decay excluded from moments")
+
+// Paired-real equivalence spans six orders of gradient scale and two steps.
+for complex_dtype in [DType.C32, DType.C64] {
+    let cp = t_full(complex_dtype, [1], 2.0)
+    t_set_c(cp, [0], 2.0, 2.0)
+    let cg = t_zeros(complex_dtype, [1])
+    let rp = t_full(dtype_component(complex_dtype), [2], 2.0)
+    let rg = t_zeros(dtype_component(complex_dtype), [2])
+    let co = adamw_new([cp], 0.1, 0.8, 0.95, 0.00000001, 0.03)
+    let ro = adamw_new([rp], 0.1, 0.8, 0.95, 0.00000001, 0.03)
+    for step in 1..3 {
+        let re = 0.001 * (step as float)
+        let im = 1000.0 / (step as float)
+        t_set_c(cg, [0], re, im)
+        t_set(rg, [0], re)
+        t_set(rg, [1], im)
+        optim_step(co, [cp], [cg])
+        optim_step(ro, [rp], [rg])
+        n += ck(t_hex(cp) == t_hex(rp), "complex matches paired-real parameters")
+        n += ck(t_hex(co.m[0]) == t_hex(ro.m[0]), "independent first moments")
+        n += ck(t_hex(co.v[0]) == t_hex(ro.v[0]), "independent second moments")
+    }
+    n += ck(co.step == 2, "Adam step count")
+}
+
+let cga = t_full(DType.F64, [1], 3.0)
+let cgb = t_zeros(DType.C64, [1])
+t_set_c(cgb, [0], 0.0, 4.0)
+n += ck(clip_grad_norm([cga, cgb], 2.5) == 5.0, "preclip global norm")
+n += ck(t_get(cga, [0]) == 1.5 and t_get_im(cgb, [0]) == 2.0, "joint common scaling")
+let before_a = t_hex(cga)
+let before_b = t_hex(cgb)
+n += ck(clip_grad_norm([cga, cgb], 3.0) == 2.5, "under threshold norm")
+n += ck(t_hex(cga) == before_a and t_hex(cgb) == before_b, "under threshold bit unchanged")
+n += ck(clip_grad_norm([t_zeros(DType.F64, [0])], 0.0) == 0.0, "empty clipping")
+
+// Real + complex, single + double, scalar + empty, signed zero and NaN payload.
+let scalar_shape: [int] = []
+let round_params = [t_full(DType.F64, [1], 0.25), t_full(DType.C64, [2], 0.5), t_full(DType.F32, scalar_shape, 0.3), t_full(DType.C32, [2, 1], 0.7), t_zeros(DType.F64, [0])]
+round_params[1].st.buf.put64(0, 0 - 9223372036854775807 - 1)
+round_params[1].st.buf.put64(8, 9221120237041090602)
+round_params[3].st.buf.put32(4, 2143289386)
+let round_o = adamw_new(round_params, 0.02, 0.8, 0.95, 0.000001, 0.03)
+round_o.step = 17
+checkpoint_save("optim-good.ckpt", round_params, round_o)
+let loaded = checkpoint_load("optim-good.ckpt")
+n += ck(loaded.optim.step == 17 and loaded.optim.kind == 1, "checkpoint optimizer identity and count")
+for i in 0..round_params.len() {
+    n += ck(t_hex(round_params[i]) == t_hex(loaded.params[i]), "bit-exact tensor payload")
+    n += ck(round_params[i].dt == loaded.params[i].dt and shapes_equal(round_params[i].shape, loaded.params[i].shape), "tensor descriptors")
+    n += ck(t_hex(round_o.m[i]) == t_hex(loaded.optim.m[i]) and t_hex(round_o.v[i]) == t_hex(loaded.optim.v[i]), "bit-exact moments")
+}
+let initial_bytes = checkpoint_read("optim-good.ckpt")
+let initial_file = initial_bytes.get_str(0, initial_bytes.n)
+
+// Both optimizer families must continue bit-identically, including nonzero state.
+for kind in 0..2 {
+    let full = [t_full(DType.F64, [2], 0.4), t_full(DType.C64, [2], 0.6)]
+    let split = [t_copy(full[0]), t_copy(full[1])]
+    let fo = optim_new(full, kind, 0.02, 0.03, 0.6, 0.8, 0.95, 0.000001)
+    let so = optim_new(split, kind, 0.02, 0.03, 0.6, 0.8, 0.95, 0.000001)
+    for step in 0..6 { training_step(fo, full, step) }
+    for step in 0..3 { training_step(so, split, step) }
+    checkpoint_save("optim-resume.ckpt", split, so)
+    let resumed = checkpoint_load("optim-resume.ckpt")
+    n += ck(resumed.optim.step == 3, "resume preserves step")
+    let encoded_before = checkpoint_encode(split, so)
+    let encoded_after = checkpoint_encode(resumed.params, resumed.optim)
+    n += ck(encoded_before.get_str(0, encoded_before.n) == encoded_after.get_str(0, encoded_after.n), "all serialized optimizer settings exact")
+    for step in 3..6 { training_step(resumed.optim, resumed.params, step) }
+    for i in 0..2 {
+        n += ck(t_hex(full[i]) == t_hex(resumed.params[i]), "resume parameters exact")
+        n += ck(t_hex(fo.m[i]) == t_hex(resumed.optim.m[i]) and t_hex(fo.v[i]) == t_hex(resumed.optim.v[i]), "resume moments exact")
+    }
+    n += ck(resumed.optim.step == 6, "resume advances count")
+}
+
+// Descriptor-based updates and serialization also honor noncontiguous views.
+let base = t_full(DType.F64, [2, 3], 1.0)
+let view = t_transpose(base, 0, 1)
+let vo = sgd_new([view], 0.1, 0.0, 0.0)
+optim_step(vo, [view], [t_full(DType.F64, [3, 2], 2.0)])
+n += ck(t_get(base, [1, 2]) == 0.8, "optimizer updates view storage")
+checkpoint_save("optim-view.ckpt", [view], vo)
+n += ck(t_hex(checkpoint_load("optim-view.ckpt").params[0]) == t_hex(t_copy(view)), "checkpoint logical view bytes")
+
+// Direct integration: tape gradients are ordinary tensors, no tape ownership.
+av_reset()
+let tp = t_full(DType.F64, [1], 2.0)
+let tv = av_leaf(tp, true)
+av_backward(av_sum_all(av_mul(tv, tv)))
+let to = sgd_new([tp], 0.1, 0.0, 0.0)
+optim_step(to, [tp], [av_grad(tv)])
+n += ck(near(t_get(tp, [0]), 1.6), "tape gradient integration")
+av_reset()
+
+let messages = ["bad magic", "unknown version", "truncated file", "declared length exceeds file", "shape payload mismatch", "bad checksum", "implausibly large allocation"]
+for i in 0..messages.len() { n += ck(rejects(i + 1, "checkpoint: {messages[i]}"), "distinct malformed checkpoint rejection") }
+for mode in [11, 12, 14] { n += ck(rejects(mode, "checkpoint: implausibly large allocation"), "oversized metadata rejected before allocation") }
+n += ck(rejects(13, "checkpoint: truncated file"), "truncated tensor descriptor")
+n += ck(rejects(8, "checkpoint: write failed"), "partial write fails")
+n += ck(read_file("optim-good.ckpt") == initial_file, "failed write preserves original bytes")
+n += ck(t_hex(checkpoint_load("optim-good.ckpt").params[1]) == t_hex(round_params[1]), "original loads after failed write")
+n += ck(rejects(9, "interrupted after header"), "interrupted partial write")
+n += ck(read_file("optim-good.ckpt") == initial_file, "interrupted write preserves original bytes")
+n += ck(checkpoint_load("optim-good.ckpt").optim.step == 17, "original loads after interruption")
+let locked_name = cbytes("optim-good.ckpt")
+let locked = win("CreateFileA", locked_name.p, 2147483648, 1, 0, 3, 128, 0)
+n += ck(locked != 0 - 1, "lock target against rename")
+n += ck(rejects(10, "checkpoint: atomic rename failed"), "failed atomic publication")
+win("CloseHandle", locked)
+n += ck(read_file("optim-good.ckpt") == initial_file, "failed rename preserves original bytes")
+n += ck(checkpoint_load("optim-good.ckpt").optim.step == 17, "original loads after rename failure")
+// Successful replacement must work too, not merely the failure paths.
+round_o.step = 18
+checkpoint_save("optim-good.ckpt", round_params, round_o)
+n += ck(checkpoint_load("optim-good.ckpt").optim.step == 18, "atomic replacement succeeds")
+// Leave nothing behind. The interrupted-write cases abandon their temporary
+// file on purpose -- that is the library behaving correctly under a crash --
+// so the test must remove it, or one file accumulates in the working
+// directory per run, forever.
+fn unlink(name: str) {
+    let b = cbytes(name)
+    win("DeleteFileA", b.p)
+}
+
+for leftover in ["optim-good.ckpt", "optim-bad.ckpt", "optim-resume.ckpt", "optim-view.ckpt", "optim-child.log"] {
+    unlink(leftover)
+}
+for pid in CHILD_PIDS {
+    unlink("optim-good.ckpt.tmp.{pid}.1")
+    unlink("optim-bad.ckpt.tmp.{pid}.1")
+}
+
+print("optim: {n} checks passed")
+
+

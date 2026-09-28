@@ -1,0 +1,254 @@
+// A21: the same full training step, CPU against the Vulkan backend.
+//
+// Not a kernel microbenchmark. A step here is what tests/ml/overfit_test.zeph
+// does every iteration -- pad_loss over the whole batch, av_backward over the
+// whole tape, gradient clipping, and an AdamW update -- with the only
+// difference being whether t_matmul dispatches to the device.
+//
+// Two requirements of A21 shape the output. Correctness is checked before any
+// timing is reported: the two paths must produce the same loss and the same
+// gradients, or the timing is meaningless. And forward-only and full-step are
+// timed separately, because a backend that wins on the forward pass and loses
+// once the backward's two extra matmuls per node are included is not a
+// winner, and reporting only one number would hide that.
+//
+// The CUDA arm A21 also asks for cannot be run on this machine: NVRTC, cuBLAS
+// and the CUDA toolkit are all absent. That arm is blocked, not dropped, and
+// is recorded as such in RESULTS.md.
+import "ml/gpu.zeph"
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+fn sorted_of(xs: [float]) -> [float] {
+    var s: [float] = []
+    for x in xs { s.push(x) }
+    for i in 0..s.len() {
+        for j in 0..(s.len() - 1 - i) {
+            if s[j] > s[j + 1] {
+                let t = s[j]
+                s[j] = s[j + 1]
+                s[j + 1] = t
+            }
+        }
+    }
+    return s
+}
+fn med_of(xs: [float]) -> float {
+    let s = sorted_of(xs)
+    return s[s.len() / 2]
+}
+fn p95_of(xs: [float]) -> float {
+    let s = sorted_of(xs)
+    var k = (s.len() * 95) / 100
+    if k >= s.len() { k = s.len() - 1 }
+    return s[k]
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// Two configurations, because the answer is not the same at both sizes and a
+// single row would let the reader pick whichever conclusion they wanted. The
+// small one is the overfit test's; the large one is the specification's model
+// dimension, where the controller matmuls are the ones the probe measured.
+let NAME = ["small D=8 E=4 H=16 batch 32 T=4 K=1", "spec D=128 E=32 H=128 batch 32 T=4 K=2"]
+let CFG_D = [8, 128]
+let CFG_E = [4, 32]
+let CFG_H = [16, 128]
+let CFG_K = [1, 2]
+let CFG_N = [32, 32]
+let CFG_T = [4, 4]
+let REPS = [12, 6]
+
+fn build(d: int, e: int, h: int, k: int, iv: int, ov: int) -> PhaseParams {
+    let config = PhaseConfig{input_vocab: iv, output_vocab: ov, D: d, E: e, H: h, K: k, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [iv, e])
+    let think = t_zeros(DType.F64, [e])
+    let W1 = t_zeros(DType.F64, [h, e + 3 * d])
+    let b1 = t_zeros(DType.F64, [h])
+    let W2 = t_zeros(DType.F64, [3 * d, h])
+    let b2 = t_zeros(DType.F64, [3 * d])
+    let z_init = t_zeros(DType.C64, [d])
+    let Mo = t_zeros(DType.C64, [ov, d])
+    let ps = [embedding, think, W1, b1, W2, b2, z_init, Mo]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    return PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: Mo}
+}
+
+fn params_of(p: PhaseParams) -> [Tensor] {
+    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+}
+
+// One full step, exactly as overfit_test runs it. Returns the loss value; the
+// gradients are left in `out` so the two paths can be compared element by
+// element without re-running anything.
+fn full_step(p: PhaseParams, tokens: Tensor, targets: [int], opt: Optim, out: [Tensor]) -> float {
+    av_reset()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
+    clip_grad_norm(grads, 5.0)
+    optim_step(opt, params_of(p), grads)
+    for i in 0..grads.len() { out.push(grads[i]) }
+    return t_get(av_value(loss), [0])
+}
+
+fn forward_only(p: PhaseParams, tokens: Tensor, targets: [int]) -> float {
+    av_reset()
+    let m = pad_params(p, false)
+    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+}
+
+let gm = gpu_init()
+print("device: {gpu_device_name(gm)}")
+print("cuda arm: BLOCKED -- NVRTC, cuBLAS and the CUDA toolkit are absent on this machine")
+print("")
+
+for c in 0..NAME.len() {
+    let d = CFG_D[c]
+    let e = CFG_E[c]
+    let h = CFG_H[c]
+    let k = CFG_K[c]
+    let nb = CFG_N[c]
+    let tt = CFG_T[c]
+    let iv = 6
+    let ov = 3
+    let reps = REPS[c]
+    print("=== {NAME[c]} ===")
+
+    let tokens = t_zeros(DType.I64, [nb, tt])
+    var targets: [int] = []
+    for row in 0..nb {
+        for st in 0..tt { t_set_int(tokens, [row, st], 1 + rndi(iv - 1)) }
+        targets.push(rndi(ov))
+    }
+
+    // ---- correctness first: same loss, same gradients, from the same start --
+    let save = SEED
+    let p_cpu = build(d, e, h, k, iv, ov)
+    SEED = save
+    let p_gpu = build(d, e, h, k, iv, ov)
+
+    gpu_disable()
+    MATMUL_CALLS = 0
+    var g_cpu: [Tensor] = []
+    let loss_cpu = full_step(p_cpu, tokens, targets, adamw_new(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_cpu)
+    let mm_per_step = MATMUL_CALLS
+
+    gpu_enable(gm)
+    gpu_reset_memory()
+    var g_gpu: [Tensor] = []
+    let loss_gpu = full_step(p_gpu, tokens, targets, adamw_new(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_gpu)
+    let peak = GPU_PEAK_BYTES
+    gpu_disable()
+
+    let dl = fabs(loss_gpu - loss_cpu) / (1.0 + fabs(loss_cpu))
+    assert(dl < 0.000000001, "loss disagrees between CPU and GPU: {loss_cpu} against {loss_gpu}")
+    assert(g_cpu.len() == g_gpu.len(), "gradient count differs")
+    var worst = 0.0
+    var compared = 0
+    for i in 0..g_cpu.len() {
+        var idx = idx_zeros(g_cpu[i].shape.len())
+        var more = t_numel(g_cpu[i]) > 0
+        while more {
+            if dtype_is_complex(g_cpu[i].dt) {
+                let a1 = fabs(t_get_re(g_gpu[i], idx) - t_get_re(g_cpu[i], idx)) / (1.0 + fabs(t_get_re(g_cpu[i], idx)))
+                let a2 = fabs(t_get_im(g_gpu[i], idx) - t_get_im(g_cpu[i], idx)) / (1.0 + fabs(t_get_im(g_cpu[i], idx)))
+                if a1 > worst { worst = a1 }
+                if a2 > worst { worst = a2 }
+                compared = compared + 2
+            } else {
+                let a1 = fabs(t_get(g_gpu[i], idx) - t_get(g_cpu[i], idx)) / (1.0 + fabs(t_get(g_cpu[i], idx)))
+                if a1 > worst { worst = a1 }
+                compared = compared + 1
+            }
+            more = idx_next(idx, g_cpu[i].shape)
+        }
+    }
+    assert(worst < 0.000000001, "gradients disagree between CPU and GPU, worst {worst}")
+    print("  agreement: loss rel {dl}, {compared} gradient components, worst rel {worst}")
+    print("  matmuls per full step: {mm_per_step}")
+
+    // ---- timing, only now that the two paths are known to agree ------------
+    var cf: [float] = []
+    var cs: [float] = []
+    var gf: [float] = []
+    var gs: [float] = []
+    let o1 = adamw_new(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
+    let o2 = adamw_new(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
+
+    gpu_disable()
+    forward_only(p_cpu, tokens, targets)
+    for r in 0..reps {
+        let a0 = now_ms()
+        forward_only(p_cpu, tokens, targets)
+        cf.push(now_ms() - a0)
+        var sink: [Tensor] = []
+        let b0 = now_ms()
+        full_step(p_cpu, tokens, targets, o1, sink)
+        cs.push(now_ms() - b0)
+    }
+
+    gpu_enable(gm)
+    forward_only(p_gpu, tokens, targets)
+    for r in 0..reps {
+        let a0 = now_ms()
+        forward_only(p_gpu, tokens, targets)
+        gf.push(now_ms() - a0)
+        var sink: [Tensor] = []
+        let b0 = now_ms()
+        full_step(p_gpu, tokens, targets, o2, sink)
+        gs.push(now_ms() - b0)
+    }
+    gpu_disable()
+
+    print("  forward only  cpu med {med_of(cf)} p95 {p95_of(cf)} | gpu med {med_of(gf)} p95 {p95_of(gf)} | speedup {med_of(cf) / med_of(gf)}")
+    print("  full step     cpu med {med_of(cs)} p95 {p95_of(cs)} | gpu med {med_of(gs)} p95 {p95_of(gs)} | speedup {med_of(cs) / med_of(gs)}")
+    print("  peak device memory for one step: {peak} bytes")
+    // A21 asks that a forward-only winner not be reported as a winner. Say so
+    // in the output rather than leaving it for the reader to notice.
+    if med_of(cf) / med_of(gf) > 1.0 and med_of(cs) / med_of(gs) <= 1.0 {
+        print("  VERDICT: forward-only winner, loses on the full step -- NOT a usable backend at this size")
+    } else {
+        if med_of(cs) / med_of(gs) > 1.0 {
+            print("  VERDICT: wins on the full step, not only on the forward pass")
+        } else {
+            print("  VERDICT: loses at this size")
+        }
+    }
+    print("")
+}
+
+gpu_done(gm)
+print("bench complete")

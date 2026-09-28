@@ -1,0 +1,358 @@
+// Device dispatch for the elementwise, reduction and gather kernels.
+//
+// The contract these five kernels share is in .agent/briefs/gpu_kernels.md: a
+// 96-byte push-constant block carrying rank, element count, opcode, a
+// complex-ness bitfield, the output shape, three stride vectors and three
+// offsets. Strides and offsets are in elements, which is exactly what
+// lib/ml/tensor.zeph already stores, so a Tensor's metadata passes straight
+// through with no translation and no repacking.
+//
+// That is the whole reason the contract is shaped this way. Because the
+// kernels index through strides, a transposed, sliced, broadcast or otherwise
+// non-contiguous view needs no materialisation: the view's own strides are
+// the kernel's strides, and a zero stride broadcasts. Four of the twenty-five
+// ops the model uses -- transpose, slice, reshape, expand -- therefore cost
+// nothing on the device at all, because they are metadata and never reach a
+// kernel.
+//
+// Uploads here send a tensor's entire storage verbatim rather than gathering
+// the view. That is deliberate: gathering on the host would defeat the point
+// of passing strides, and it keeps the upload a straight byte copy whose
+// correctness is obvious.
+//
+// ponytail: upload-dispatch-download per call, which is the slow shape. The
+// resident layer is what makes these worth calling; this is the correctness
+// floor it will be checked against.
+import "ml/gpu.zeph"
+import "ml/autograd.zeph"
+
+// Opcodes. 0-3 are fixed by t_binary and 0-4 by the MAP_ constants in
+// ops.zeph; the rest continue that numbering and the kernels agree.
+let GOP_ADD = 0
+let GOP_SUB = 1
+let GOP_MUL = 2
+let GOP_DIV = 3
+
+let GOP_TANH = 0
+let GOP_COS = 1
+let GOP_SIN = 2
+let GOP_EXP = 3
+let GOP_LN = 4
+let GOP_NEG = 5
+let GOP_ABS2 = 6
+let GOP_CONJ = 7
+let GOP_REAL = 8
+let GOP_IMAG = 9
+let GOP_EXPI = 10
+let GOP_CAST = 11
+let GOP_COPY = 12
+
+let GOP_MAX_RANK = 4
+
+fn gop_cbit(d: DType) -> int {
+    if dtype_is_complex(d) { return 1 }
+    return 0
+}
+
+// Copy a Bytes into a device buffer.
+fn gop_send(m: GpuMM, b: GpuBuffer, src: Bytes, n: int) {
+    var pp = Bytes.new(8)
+    vkcheck(vkMapMemory(m.g.dev, b.mem, 0, b.size, 0, pp.addr()), "gop_send: map")
+    let base = pp.get64(0)
+    for i in 0..n { store8(base + i, src.get8(i)) }
+    vkUnmapMemory(m.g.dev, b.mem)
+}
+
+fn gop_recv(m: GpuMM, b: GpuBuffer, dst: Bytes, n: int) {
+    var pp = Bytes.new(8)
+    vkcheck(vkMapMemory(m.g.dev, b.mem, 0, b.size, 0, pp.addr()), "gop_recv: map")
+    let base = pp.get64(0)
+    for i in 0..n { dst.put8(i, load8(base + i)) }
+    vkUnmapMemory(m.g.dev, b.mem)
+}
+
+fn gop_upload(m: GpuMM, t: Tensor) -> GpuBuffer {
+    let n = t.st.nbytes
+    let b = gpu_buf(m, n)
+    gop_send(m, b, t.st.buf, n)
+    return b
+}
+
+// Build the shared 96-byte push block. Shape and stride vectors are padded to
+// rank 4 with shape 1 and stride 0, which the kernels are specified to ignore.
+fn gop_push(rank: int, numel: int, op: int, flags: int, oshape: [int], astr: [int], bstr: [int], ostr: [int], aoff: int, boff: int, ooff: int) -> Bytes {
+    if rank > GOP_MAX_RANK { panic("gpu ops: rank {rank} exceeds the device kernels' maximum of {GOP_MAX_RANK}. Reshape to rank 4 or fewer, or run this op on the CPU.") }
+    var p = Bytes.new(96)
+    p.put32(0, rank)
+    p.put32(4, numel)
+    p.put32(8, op)
+    p.put32(12, flags)
+    for i in 0..GOP_MAX_RANK {
+        var sh = 1
+        var sa = 0
+        var sb = 0
+        var so = 0
+        if i < oshape.len() { sh = oshape[i] }
+        if i < astr.len() { sa = astr[i] }
+        if i < bstr.len() { sb = bstr[i] }
+        if i < ostr.len() { so = ostr[i] }
+        p.put32(16 + i * 4, sh)
+        p.put32(32 + i * 4, sa)
+        p.put32(48 + i * 4, sb)
+        p.put32(64 + i * 4, so)
+    }
+    p.put32(80, aoff)
+    p.put32(84, boff)
+    p.put32(88, ooff)
+    return p
+}
+
+// One-dimensional dispatch over `numel` output elements, 256 per workgroup.
+fn gop_run(m: GpuMM, spv: str, bufs: [GpuBuffer], pcon: Bytes, numel: int) {
+    let ds = m.g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT)
+    let sh = m.g.shader(spv)
+    var sl: [int] = []
+    sl.push(ds.layout)
+    let lay = m.g.pipeline_layout(sl, 96, VK_SHADER_STAGE_COMPUTE_BIT)
+    let pipe = m.g.compute_pipeline(sh, lay, cbytes("main"))
+    var sets = u64s([ds.set])
+    let groups = (numel + 255) / 256
+    let pl = lay
+    let pi = pipe
+    let sa = sets.addr()
+    let pa = pcon.addr()
+    m.g.immediate(fn(cb: int) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pi)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, sa, 0, 0)
+        vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 96, pa)
+        vkCmdDispatch(cb, groups, 1, 1)
+    })
+    vkDestroyPipeline(m.g.dev, pipe, 0)
+    vkDestroyPipelineLayout(m.g.dev, lay, 0)
+    vkDestroyShaderModule(m.g.dev, sh, 0)
+    m.g.destroy_desc_set(ds)
+}
+
+// a and b must already have the same shape. Broadcasting is expressed by
+// passing an expanded view, whose zero strides the kernel reads directly --
+// which is the point of the stride contract, so inferring a broadcast shape
+// here would just duplicate what t_expand already did.
+fn gop_binary(m: GpuMM, a: Tensor, b: Tensor, op: int) -> Tensor {
+    if a.dt != b.dt { panic("gop_binary: dtype mismatch") }
+    if a.shape.len() != b.shape.len() { panic("gop_binary: rank mismatch; expand first") }
+    for i in 0..a.shape.len() {
+        if a.shape[i] != b.shape[i] { panic("gop_binary: shape mismatch at {i}; expand first") }
+    }
+    let out = t_zeros(a.dt, a.shape)
+    let n = t_numel(out)
+    if n == 0 { return out }
+    let ba = gop_upload(m, a)
+    let bb = gop_upload(m, b)
+    let bo = gpu_buf(m, out.st.nbytes)
+    let c = gop_cbit(a.dt)
+    let flags = c + c * 2 + c * 4
+    var bufs: [GpuBuffer] = []
+    bufs.push(ba)
+    bufs.push(bb)
+    bufs.push(bo)
+    gop_run(m, "examples/shaders/elem_binary_f64.comp.spv", bufs,
+            gop_push(out.shape.len(), n, op, flags, out.shape, a.stride, b.stride, out.stride, a.off, b.off, out.off), n)
+    gop_recv(m, bo, out.st.buf, out.st.nbytes)
+    gpu_free(m, ba)
+    gpu_free(m, bb)
+    gpu_free(m, bo)
+    return out
+}
+
+fn gop_unary(m: GpuMM, t: Tensor, op: int, odt: DType) -> Tensor {
+    let out = t_zeros(odt, t.shape)
+    let n = t_numel(out)
+    if n == 0 { return out }
+    let ba = gop_upload(m, t)
+    let bo = gpu_buf(m, out.st.nbytes)
+    let flags = gop_cbit(t.dt) + gop_cbit(odt) * 4
+    var bufs: [GpuBuffer] = []
+    bufs.push(ba)
+    bufs.push(bo)
+    var empty: [int] = []
+    gop_run(m, "examples/shaders/elem_unary_f64.comp.spv", bufs,
+            gop_push(out.shape.len(), n, op, flags, out.shape, t.stride, empty, out.stride, t.off, 0, out.off), n)
+    gop_recv(m, bo, out.st.buf, out.st.nbytes)
+    gpu_free(m, ba)
+    gpu_free(m, bo)
+    return out
+}
+
+// Sum along one axis. The output keeps that axis at extent 1, matching
+// t_sum_dim -- the kernel author read the Zephyr source and corrected the
+// brief on this point, so host and device agree by construction rather than
+// by coincidence.
+fn gop_sum_dim(m: GpuMM, t: Tensor, dim: int) -> Tensor {
+    if dim < 0 or dim >= t.shape.len() { panic("gop_sum_dim: dim {dim} out of range") }
+    var osh: [int] = []
+    for i in 0..t.shape.len() { osh.push(t.shape[i]) }
+    osh[dim] = 1
+    let out = t_zeros(t.dt, osh)
+    let n = t_numel(out)
+    if n == 0 { return out }
+    let ba = gop_upload(m, t)
+    let bo = gpu_buf(m, out.st.nbytes)
+    let c = gop_cbit(t.dt)
+    var bufs: [GpuBuffer] = []
+    bufs.push(ba)
+    bufs.push(bo)
+    // bstr.x carries the stride along the reduced axis and offs.w its length.
+    var red: [int] = []
+    red.push(t.stride[dim])
+    var pcon = gop_push(out.shape.len(), n, dim, c + c * 4, out.shape, t.stride, red, out.stride, t.off, 0, out.off)
+    pcon.put32(92, t.shape[dim])
+    gop_run(m, "examples/shaders/reduce_f64.comp.spv", bufs, pcon, n)
+    gop_recv(m, bo, out.st.buf, out.st.nbytes)
+    gpu_free(m, ba)
+    gpu_free(m, bo)
+    return out
+}
+
+fn gop_sel_buffer(m: GpuMM, sel: [int]) -> GpuBuffer {
+    var s = Bytes.new(4 * sel.len())
+    for i in 0..sel.len() { s.put32(i * 4, sel[i]) }
+    let b = gpu_buf(m, 4 * sel.len())
+    gop_send(m, b, s, 4 * sel.len())
+    return b
+}
+
+// index_select, and with the right index list also roll and concat.
+fn gop_gather(m: GpuMM, t: Tensor, dim: int, sel: [int]) -> Tensor {
+    if dim < 0 or dim >= t.shape.len() { panic("gop_gather: dim {dim} out of range") }
+    var osh: [int] = []
+    for i in 0..t.shape.len() { osh.push(t.shape[i]) }
+    osh[dim] = sel.len()
+    let out = t_zeros(t.dt, osh)
+    let n = t_numel(out)
+    if n == 0 { return out }
+    let ba = gop_upload(m, t)
+    let bi = gop_sel_buffer(m, sel)
+    let bo = gpu_buf(m, out.st.nbytes)
+    let c = gop_cbit(t.dt)
+    var bufs: [GpuBuffer] = []
+    bufs.push(ba)
+    bufs.push(bi)
+    bufs.push(bo)
+    gop_run(m, "examples/shaders/gather_f64.comp.spv", bufs,
+            gop_push(out.shape.len(), n, dim, c + c * 4, out.shape, t.stride, [], out.stride, t.off, 0, out.off), n)
+    gop_recv(m, bo, out.st.buf, out.st.nbytes)
+    gpu_free(m, ba)
+    gpu_free(m, bi)
+    gpu_free(m, bo)
+    return out
+}
+
+// The VJP of a gather: scatter `gr` back into an output of extent `n` along
+// `dim`, accumulating where sel repeats. The output must start zeroed, which
+// t_zeros guarantees and the kernel's header comment requires.
+fn gop_scatter_add(m: GpuMM, gr: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
+    if dim < 0 or dim >= gr.shape.len() { panic("gop_scatter_add: dim {dim} out of range") }
+    var osh: [int] = []
+    for i in 0..gr.shape.len() { osh.push(gr.shape[i]) }
+    osh[dim] = n
+    let out = t_zeros(gr.dt, osh)
+    let cnt = t_numel(gr)
+    if cnt == 0 { return out }
+    let bg = gop_upload(m, gr)
+    let bi = gop_sel_buffer(m, sel)
+    let bo = gpu_buf(m, out.st.nbytes)
+    gop_send(m, bo, out.st.buf, out.st.nbytes)      // the required zero fill
+    let c = gop_cbit(gr.dt)
+    var bufs: [GpuBuffer] = []
+    bufs.push(bg)
+    bufs.push(bi)
+    bufs.push(bo)
+    // Iteration is over the GRADIENT's elements, so the shape driving the
+    // dispatch is the gradient's, not the output's.
+    gop_run(m, "examples/shaders/scatter_add_f64.comp.spv", bufs,
+            gop_push(gr.shape.len(), cnt, dim, c + c * 4, gr.shape, gr.stride, [], out.stride, gr.off, 0, out.off), cnt)
+    gop_recv(m, bo, out.st.buf, out.st.nbytes)
+    gpu_free(m, bg)
+    gpu_free(m, bi)
+    gpu_free(m, bo)
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// Installing the backend.
+//
+// Every hook falls back to the CPU body for anything the kernels do not
+// cover -- non-float dtypes, float32, rank above 4 -- so enabling the backend
+// changes where work happens and never what is computed. That property is
+// what makes the gradient gate meaningful: if enabling the device could
+// silently narrow coverage, a matching gradient would only prove the narrowed
+// paths agreed.
+fn gop_supported(d: DType) -> bool {
+    return d == DType.F64 or d == DType.C64
+}
+
+fn gpu_ops_enable(m: GpuMM) {
+    var bh: [fn(Tensor, Tensor, int) -> Tensor] = []
+    bh.push(fn(a: Tensor, b: Tensor, op: int) -> Tensor {
+        if a.dt != b.dt or not gop_supported(a.dt) { return t_binary_cpu(a, b, op, "binary") }
+        // The CPU path broadcasts inside itself; the device kernel wants both
+        // operands already at the output shape, which t_expand gives for free
+        // as zero strides. Doing it here keeps the kernel simple and keeps the
+        // two paths computing the same thing.
+        let shape = broadcast_shape(a.shape, b.shape)
+        if shape.len() > GOP_MAX_RANK { return t_binary_cpu(a, b, op, "binary") }
+        return gop_binary(m, t_expand(a, shape), t_expand(b, shape), op)
+    })
+    BINARY_HOOK = bh
+
+    var uh: [fn(Tensor, int, DType) -> Tensor] = []
+    uh.push(fn(t: Tensor, op: int, odt: DType) -> Tensor {
+        if not gop_supported(t.dt) or not gop_supported(odt) or t.shape.len() > GOP_MAX_RANK {
+            if op == 6 { return t_abs2_cpu(t) }
+            if op == 7 { return t_conj_cpu(t) }
+            if op == 8 { return t_real_cpu(t) }
+            if op == 9 { return t_imag_cpu(t) }
+            if op == 10 { return t_expi_cpu(t, odt) }
+            return t_map1_cpu(t, op)
+        }
+        return gop_unary(m, t, op, odt)
+    })
+    UNARY_HOOK = uh
+
+    var sh: [fn(Tensor, int) -> Tensor] = []
+    sh.push(fn(t: Tensor, dim: int) -> Tensor {
+        if not gop_supported(t.dt) or t.shape.len() > GOP_MAX_RANK { return t_sum_dim_cpu(t, dim) }
+        return gop_sum_dim(m, t, dim)
+    })
+    SUMDIM_HOOK = sh
+
+    var gh: [fn(Tensor, int, [int]) -> Tensor] = []
+    gh.push(fn(t: Tensor, dim: int, sel: [int]) -> Tensor {
+        if not gop_supported(t.dt) or t.shape.len() > GOP_MAX_RANK { return t_index_select_cpu(t, dim, sel) }
+        return gop_gather(m, t, dim, sel)
+    })
+    GATHER_HOOK = gh
+
+    var ch: [fn(Tensor, int, int, [int]) -> Tensor] = []
+    ch.push(fn(gr: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
+        if not gop_supported(gr.dt) or gr.shape.len() > GOP_MAX_RANK { return scatter_add_cpu(gr, dim, n, sel) }
+        return gop_scatter_add(m, gr, dim, n, sel)
+    })
+    SCATTER_HOOK = ch
+
+    gpu_enable(m)
+}
+
+fn gpu_ops_disable() {
+    let b: [fn(Tensor, Tensor, int) -> Tensor] = []
+    let u: [fn(Tensor, int, DType) -> Tensor] = []
+    let s: [fn(Tensor, int) -> Tensor] = []
+    let g: [fn(Tensor, int, [int]) -> Tensor] = []
+    let c: [fn(Tensor, int, int, [int]) -> Tensor] = []
+    BINARY_HOOK = b
+    UNARY_HOOK = u
+    SUMDIM_HOOK = s
+    GATHER_HOOK = g
+    SCATTER_HOOK = c
+    gpu_disable()
+}

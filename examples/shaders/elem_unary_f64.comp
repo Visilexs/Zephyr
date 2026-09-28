@@ -1,0 +1,417 @@
+#version 450
+// Elementwise unary map on strided float64 tensors.
+//
+// Bindings 0 = in, 1 = out. Operand strides come from pc.astr / pc.offs.x,
+// output strides from pc.ostr / pc.offs.z. pc.meta.z is the op; codes 0..4
+// are the MAP_ constants in lib/ml/ops.zeph and must not be renumbered.
+//
+//   0 tanh   1 cos    2 sin    3 exp    4 ln    5 neg    6 abs2   7 conj
+//   8 real   9 imag  10 expi  11 cast  12 copy
+//
+// The complex bits in pc.meta.w are independent on purpose: ops 6, 8 and 9
+// take a complex input and produce a REAL output, op 10 takes a real input
+// and produces a COMPLEX one, and op 11 converts either way. Bit 0 is read
+// as "the input buffer is interleaved", bit 2 as "the output buffer is
+// interleaved", and neither is inferred from the other. (Bit 1 is operand B
+// and is unused in this kernel.)
+//
+// Strides and offsets are in ELEMENTS, not doubles: a complex element is an
+// interleaved re,im pair, so its double index is twice the element index --
+// the same layout as examples/shaders/matmul_c64.comp. A zero stride is a
+// broadcast axis and is not special-cased: it simply makes every index along
+// that axis land on the same element.
+//
+// The tanh/cos/sin/exp/log/atan built-ins in GLSL are float32 only, so the
+// block below implements them for double. Computing in float and widening
+// would lose ten significant digits; nothing here touches the float type.
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer BufA { double a[]; };
+layout(std430, binding = 1) writeonly buffer BufO { double o[]; };
+layout(push_constant) uniform Push {
+    uvec4 meta;    // x = rank, y = numel (output elements), z = op, w = flags
+    uvec4 oshape;  // output shape, unused trailing entries are 1
+    uvec4 astr;    // strides of the operand, in elements
+    uvec4 bstr;    // unused in this kernel
+    uvec4 ostr;    // strides of the output, in elements
+    uvec4 offs;    // x = operand offset, z = output offset, y/w unused
+} pc;
+
+// ---- shared index helpers --------------------------------------------------
+
+// Linear output index -> 4-component index vector, row-major (last axis
+// fastest). Entries at or beyond pc.meta.x stay 0; the caller sets those
+// shapes to 1 and their strides to 0, so they never contribute.
+uvec4 out_index(uint lin) {
+    uvec4 idx = uvec4(0u);
+    for (uint d = pc.meta.x; d > 0u; --d) {
+        uint s = pc.oshape[d - 1u];
+        idx[d - 1u] = lin % s;
+        lin /= s;
+    }
+    return idx;
+}
+
+// Index vector + strides + offset -> index into the double[] buffer. Doubles
+// the element index for complex tensors, which is where the interleaving is
+// accounted for exactly once.
+uint buf_index(uvec4 idx, uvec4 str, uint off, bool cplx) {
+    uint e = off;
+    for (uint d = 0u; d < pc.meta.x; ++d) { e += idx[d] * str[d]; }
+    return cplx ? 2u * e : e;
+}
+
+// ---- double-precision transcendentals --------------------------------------
+//
+// Each accuracy figure below is the series truncation bound over the reduced
+// range (taken from the first omitted term) plus the few ulp of rounding a
+// Horner evaluation costs, and each was then checked by evaluating the same
+// constants and the same Horner chains in IEEE double outside the shader and
+// comparing against libm over tens of thousands of random arguments.
+
+double d_nan() { return packDouble2x32(uvec2(0u, 0x7FF80000u)); }
+double d_inf() { return packDouble2x32(uvec2(0u, 0x7FF00000u)); }
+
+// Two-part ln2, NOT the split the brief gives. The brief's ln2_hi is just the
+// nearest double to ln2, so k*ln2_hi rounds and the reduced argument inherits
+// about ten lost bits -- measured as 256 ulp of error in e^x near x = -542
+// when the product is formed with a plain multiply. LN2_HI here has its low
+// 24 mantissa bits clear (29 significant bits), so k*LN2_HI is exact for
+// every |k| < 2^24, and the pair still carries 89 bits of ln2. This is the
+// trick LN2_HI/LN2_LO in lib/std/math.zeph use, and the brief says the
+// Zephyr code wins wherever the two disagree.
+const double LN2_HI      = 0.6931471806019545lf;
+const double LN2_LO      = -4.2009150726810846e-11lf;
+const double INV_LN2     = 1.4426950408889634lf;
+const double TWO_OVER_PI = 0.6366197723675814lf;
+// Three-part pi/2 on the same principle: 27, 28 and 50 significant bits, so
+// n*PIO2_1 and n*PIO2_2 are exact for every |n| < 2^25 and the three parts
+// together carry 115 bits of pi/2. |n| < 2^25 means |x| < 5.3e7.
+const double PIO2_1      = 1.570796325802803lf;
+const double PIO2_2      = 9.920935808982456e-10lf;
+const double PIO2_3      = -1.2177051777973966e-18lf;
+const double PI          = 3.141592653589793lf;
+const double HALF_PI     = 1.5707963267948966lf;
+const double PI_6        = 0.5235987755982988lf;
+const double INV_SQRT3   = 0.5773502691896258lf;
+const double TAN_PI_12   = 0.2679491924311227lf;
+
+// e^r - 1 for |r| <= 0.36, by the Taylor series r * sum_{n>=0} r^n/(n+1)!.
+// Kept as a factor of r so nothing cancels as r -> 0, which is the whole
+// reason expm1 exists. The first omitted term is r^17/17!, under 4e-19
+// relative at |r| = 0.36 -- below one ulp.
+double expm1_poly(double r) {
+    double p = 4.779477332387385e-14lf;          // 1/16!
+    p = 7.647163731819816e-13lf + r * p;         // 1/15!
+    p = 1.1470745597729725e-11lf + r * p;
+    p = 1.6059043836821613e-10lf + r * p;
+    p = 2.08767569878681e-09lf + r * p;
+    p = 2.505210838544172e-08lf + r * p;
+    p = 2.755731922398589e-07lf + r * p;
+    p = 2.7557319223985893e-06lf + r * p;
+    p = 2.48015873015873e-05lf + r * p;
+    p = 0.0001984126984126984lf + r * p;
+    p = 0.001388888888888889lf + r * p;
+    p = 0.008333333333333333lf + r * p;
+    p = 0.041666666666666664lf + r * p;
+    p = 0.16666666666666666lf + r * p;           // 1/3!
+    p = 0.5lf + r * p;                           // 1/2!
+    p = 1.0lf + r * p;                           // 1/1!
+    return r * p;
+}
+
+// e^x. Range-reduce k = round(x/ln2), r = x - k*ln2 with the two-part ln2
+// above so the reduction stays exact, then the series, then scale by 2^k with
+// ldexp. Measured worst relative error 2.2e-16 (1 ulp) over 60000 arguments
+// spread across [-700, 700]. Same structure as fexp in lib/std/math.zeph.
+double exp_f64(double x) {
+    if (x > 709.782712893384lf) { return d_inf(); }
+    if (x < -745.2lf) { return 0.0lf; }
+    double k = round(x * INV_LN2);
+    double r = (x - k * LN2_HI) - k * LN2_LO;
+    return ldexp(1.0lf + expm1_poly(r), int(k));
+}
+
+// e^x - 1, accurate near zero. Below 0.36 the series is used directly (no
+// cancellation); above it e^x is far enough from 1 that subtracting is safe.
+// Measured worst relative error 2.2e-16.
+double expm1_f64(double x) {
+    if (abs(x) < 0.36lf) { return expm1_poly(x); }
+    return exp_f64(x) - 1.0lf;
+}
+
+// ln(x). Decompose x = m * 2^e with m in [sqrt(1/2), sqrt(2)), then the atanh
+// series ln(m) = 2*(s + s^3/3 + ... + s^25/25) in s = (m-1)/(m+1), where
+// |s| <= 0.1716. The first omitted term is 2*s^27/27, under 1e-22 relative,
+// so the series is exact to double; recombining with e*ln2 through the
+// two-part ln2 leaves only the rounding. Measured worst relative error
+// 3.4e-16 over 60000 log-uniform arguments. Domain errors follow
+// lib/std/math.zeph: NaN below zero, -inf at zero.
+double log_f64(double x) {
+    if (x < 0.0lf) { return d_nan(); }
+    if (x == 0.0lf) { return -d_inf(); }
+    int e;
+    double m = frexp(x, e);            // m in [0.5, 1)
+    if (m < 0.7071067811865476lf) { m = m * 2.0lf; e = e - 1; }
+    double s = (m - 1.0lf) / (m + 1.0lf);
+    double w = s * s;
+    double p = 0.04lf;                           // 1/25
+    p = 0.043478260869565216lf + w * p;
+    p = 0.047619047619047616lf + w * p;
+    p = 0.05263157894736842lf + w * p;
+    p = 0.058823529411764705lf + w * p;
+    p = 0.06666666666666667lf + w * p;
+    p = 0.07692307692307693lf + w * p;
+    p = 0.09090909090909091lf + w * p;
+    p = 0.1111111111111111lf + w * p;
+    p = 0.14285714285714285lf + w * p;
+    p = 0.2lf + w * p;
+    p = 0.3333333333333333lf + w * p;            // 1/3
+    p = 1.0lf + w * p;                           // 1/1
+    double lm = 2.0lf * s * p;
+    double ef = double(e);
+    return ef * LN2_HI + (lm + ef * LN2_LO);
+}
+
+// sin and cos together: one range reduction serves both, and the complex
+// forms need both halves anyway. Reduce n = round(x/(pi/2)),
+// r = x - n*pi/2 with the three-part pi/2, then Taylor for sine (through
+// r^19) and cosine (through r^20) on |r| <= pi/4. The first omitted terms are
+// r^21/21! and r^22/22!, both under 1e-21, so the polynomials are exact to
+// double. Measured worst absolute error 3.9e-16 for |x| < 1e7. Accuracy holds
+// to |x| = 5.3e7, where n*PIO2_k stops being exact; past that the error grows
+// like |x|*2^-53, exactly as fsin/fcos in lib/std/math.zeph do -- those lose
+// exactness from |x| = 6.6e6, so this kernel stays ahead of the reference
+// across the whole range.
+void sincos_f64(double x, out double sn, out double cs) {
+    double n = round(x * TWO_OVER_PI);
+    double r = ((x - n * PIO2_1) - n * PIO2_2) - n * PIO2_3;
+    double w = r * r;
+
+    double qs = -8.22063524662433e-18lf;         // -1/19!
+    qs = 2.8114572543455206e-15lf + w * qs;      //  1/17!
+    qs = -7.647163731819816e-13lf + w * qs;
+    qs = 1.6059043836821613e-10lf + w * qs;
+    qs = -2.505210838544172e-08lf + w * qs;
+    qs = 2.7557319223985893e-06lf + w * qs;
+    qs = -0.0001984126984126984lf + w * qs;
+    qs = 0.008333333333333333lf + w * qs;        //  1/5!
+    qs = -0.16666666666666666lf + w * qs;        // -1/3!
+    qs = 1.0lf + w * qs;
+    double sp = r * qs;
+
+    double qc = 4.110317623312165e-19lf;         //  1/20!
+    qc = -1.5619206968586225e-16lf + w * qc;     // -1/18!
+    qc = 4.779477332387385e-14lf + w * qc;
+    qc = -1.1470745597729725e-11lf + w * qc;
+    qc = 2.08767569878681e-09lf + w * qc;
+    qc = -2.755731922398589e-07lf + w * qc;
+    qc = 2.48015873015873e-05lf + w * qc;
+    qc = -0.001388888888888889lf + w * qc;
+    qc = 0.041666666666666664lf + w * qc;        //  1/4!
+    qc = -0.5lf + w * qc;                        // -1/2!
+    double cp = 1.0lf + w * qc;
+
+    // Quadrant taken in double, so a huge |x| cannot overflow an int.
+    int q = int(n - 4.0lf * floor(n * 0.25lf));
+    if (q == 0)      { sn =  sp; cs =  cp; }
+    else if (q == 1) { sn =  cp; cs = -sp; }
+    else if (q == 2) { sn = -sp; cs = -cp; }
+    else             { sn = -cp; cs =  sp; }
+}
+
+double sin_f64(double x) { double s; double c; sincos_f64(x, s, c); return s; }
+double cos_f64(double x) { double s; double c; sincos_f64(x, s, c); return c; }
+
+// atan(x). Fold by sign, then by reciprocal for |x| > 1, then shift by pi/6
+// so the residual |t| <= tan(pi/12) = 0.268, where the alternating series
+// through t^33 truncates below 1e-19 relative. The pi/6 and pi/2 constants
+// are each correct to half an ulp. Measured worst relative error 4.4e-16
+// (2 ulp). Same reduction as fatan in lib/std/math.zeph.
+double atan_f64(double x) {
+    double ax = abs(x);
+    bool inv = ax > 1.0lf;
+    if (inv) { ax = 1.0lf / ax; }
+    bool shift = ax > TAN_PI_12;
+    double t = ax;
+    if (shift) { t = (ax - INV_SQRT3) / (1.0lf + ax * INV_SQRT3); }
+    double w = t * t;
+    double p = 0.030303030303030304lf;           //  1/33
+    p = -0.03225806451612903lf + w * p;
+    p = 0.034482758620689655lf + w * p;
+    p = -0.037037037037037035lf + w * p;
+    p = 0.04lf + w * p;
+    p = -0.043478260869565216lf + w * p;
+    p = 0.047619047619047616lf + w * p;
+    p = -0.05263157894736842lf + w * p;
+    p = 0.058823529411764705lf + w * p;
+    p = -0.06666666666666667lf + w * p;
+    p = 0.07692307692307693lf + w * p;
+    p = -0.09090909090909091lf + w * p;
+    p = 0.1111111111111111lf + w * p;
+    p = -0.14285714285714285lf + w * p;
+    p = 0.2lf + w * p;
+    p = -0.3333333333333333lf + w * p;           // -1/3
+    p = 1.0lf + w * p;
+    double r = t * p;
+    if (shift) { r = r + PI_6; }
+    if (inv)   { r = HALF_PI - r; }
+    return x < 0.0lf ? -r : r;
+}
+
+// atan2(y, x), the usual quadrant handling with the axis cases pinned to
+// exact multiples of pi/2. Measured worst absolute error 4.4e-16.
+double atan2_f64(double y, double x) {
+    if (x == 0.0lf && y == 0.0lf) { return 0.0lf; }
+    if (x == 0.0lf) { return y > 0.0lf ? HALF_PI : -HALF_PI; }
+    double r = atan_f64(y / x);
+    if (x > 0.0lf) { return r; }
+    return y >= 0.0lf ? r + PI : r - PI;
+}
+
+// tanh(x) = t/(t+2) with t = e^{2x}-1 from expm1_f64, so the cancellation
+// that wrecks the naive (e^{2x}-1)/(e^{2x}+1) near zero never happens.
+// Saturates past |x| = 20, where tanh is within 5e-18 of +-1, under an ulp.
+// Measured worst relative error 4.4e-16.
+double tanh_f64(double x) {
+    if (x > 20.0lf) { return 1.0lf; }
+    if (x < -20.0lf) { return -1.0lf; }
+    if (abs(x) < 1.0e-8lf) { return x; }
+    double t = expm1_f64(2.0lf * x);
+    return t / (t + 2.0lf);
+}
+
+// sinh(x). Near zero (e^x - e^-x)/2 cancels, so use t*(t+2)/(2*(t+1)) with
+// t = e^x-1, which is the same value with nothing to cancel. That form is
+// only usable while t+1 stays away from zero: once |x| passes ~37, e^x
+// underflows to the point where expm1 returns exactly -1 and the denominator
+// is 0. Past |x| = 1 the direct form has nothing to cancel anyway, which is
+// the same split sinh in lib/std/math.zeph makes. Measured worst relative
+// error 4.4e-16.
+double sinh_f64(double x) {
+    if (abs(x) < 1.0lf) {
+        double t = expm1_f64(x);
+        return 0.5lf * t * (t + 2.0lf) / (t + 1.0lf);
+    }
+    double u = exp_f64(x);
+    return 0.5lf * (u - 1.0lf / u);
+}
+
+// cosh(x) = (e^x + 1/e^x)/2. Both terms are positive, so nothing cancels.
+// Measured worst relative error 2.2e-16.
+double cosh_f64(double x) {
+    double u = exp_f64(x);
+    return 0.5lf * (u + 1.0lf / u);
+}
+
+// ---- kernel ----------------------------------------------------------------
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.meta.y) { return; }
+
+    bool ac = (pc.meta.w & 1u) != 0u;   // input is complex
+    bool oc = (pc.meta.w & 4u) != 0u;   // output is complex
+
+    uvec4 idx = out_index(gid);
+    uint ia = buf_index(idx, pc.astr, pc.offs.x, ac);
+    uint io = buf_index(idx, pc.ostr, pc.offs.z, oc);
+
+    double xr = a[ia];
+    double xi = 0.0lf;
+    if (ac) { xi = a[ia + 1u]; }
+
+    double rr = 0.0lf;
+    double ri = 0.0lf;
+    uint op = pc.meta.z;
+
+    if (op == 0u) {                                 // tanh
+        if (ac) {
+            // tanh(z) = (sinh(2re), sin(2im)) / (cosh(2re) + cos(2im)),
+            // written with the half-angle identities
+            // sinh(2re) = 2*sinh(re)*cosh(re), sin(2im) = 2*sin(im)*cos(im)
+            // and cosh(2re) + cos(2im) = 2*(sinh(re)^2 + cos(im)^2). Same
+            // value, but the denominator is now a sum of two squares instead
+            // of a difference: near the poles at im = (k+1/2)*pi the literal
+            // form cancels to 72 ulp, this one holds 2 ulp. Saturate past
+            // |re| = 20, where sinh(re)^2 starts to grow without bound and
+            // tanh(z) is within an ulp of +-1 whatever im is.
+            if (abs(xr) > 20.0lf) {
+                rr = xr > 0.0lf ? 1.0lf : -1.0lf;
+                ri = 0.0lf;
+            } else {
+                double si; double ci;
+                sincos_f64(xi, si, ci);
+                double sh = sinh_f64(xr);
+                double den = sh * sh + ci * ci;
+                rr = sh * cosh_f64(xr) / den;
+                ri = si * ci / den;
+            }
+        } else {
+            rr = tanh_f64(xr);
+        }
+    } else if (op == 1u) {                          // cos
+        if (ac) {
+            // cos(z) = (cos(re)*cosh(im), -sin(re)*sinh(im))
+            double s; double c;
+            sincos_f64(xr, s, c);
+            rr = c * cosh_f64(xi);
+            ri = -s * sinh_f64(xi);
+        } else {
+            rr = cos_f64(xr);
+        }
+    } else if (op == 2u) {                          // sin
+        if (ac) {
+            // sin(z) = (sin(re)*cosh(im), cos(re)*sinh(im))
+            double s; double c;
+            sincos_f64(xr, s, c);
+            rr = s * cosh_f64(xi);
+            ri = c * sinh_f64(xi);
+        } else {
+            rr = sin_f64(xr);
+        }
+    } else if (op == 3u) {                          // exp
+        if (ac) {
+            // exp(z) = e^re * (cos(im), sin(im))
+            double e = exp_f64(xr);
+            double s; double c;
+            sincos_f64(xi, s, c);
+            rr = e * c;
+            ri = e * s;
+        } else {
+            rr = exp_f64(xr);
+        }
+    } else if (op == 4u) {                          // ln
+        if (ac) {
+            // ln(z) = (0.5*ln(re^2 + im^2), atan2(im, re))
+            rr = 0.5lf * log_f64(xr * xr + xi * xi);
+            ri = atan2_f64(xi, xr);
+        } else {
+            rr = log_f64(xr);
+        }
+    } else if (op == 5u) {                          // neg
+        rr = -xr;
+        ri = -xi;
+    } else if (op == 6u) {                          // abs2: complex -> real
+        rr = xr * xr + xi * xi;
+    } else if (op == 7u) {                          // conj
+        rr = xr;
+        ri = -xi;
+    } else if (op == 8u) {                          // real: complex -> real
+        rr = xr;
+    } else if (op == 9u) {                          // imag: complex -> real
+        rr = xi;
+    } else if (op == 10u) {                         // expi: real -> complex
+        sincos_f64(xr, ri, rr);                     // (cos(theta), sin(theta))
+    } else {
+        // 11 cast, 12 copy. Both are a straight carry-through: xi is already
+        // 0 when the input is real, and ri is simply not stored when the
+        // output is real. So real->complex zero-fills and complex->real drops
+        // the imaginary part without either needing a branch of its own.
+        rr = xr;
+        ri = xi;
+    }
+
+    o[io] = rr;
+    if (oc) { o[io + 1u] = ri; }
+}

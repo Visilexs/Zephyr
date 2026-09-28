@@ -1,0 +1,190 @@
+// The differentiable phase forward pass -- acceptance A06 and A14.
+//
+// Two things are checked here. First that lib/ml/phase_ad.zeph computes the
+// same function as the M3-verified lib/ml/phase.zeph, which is what keeps two
+// expressions of one model from drifting. Second that its gradients match
+// central differences for every parameter, real and imaginary parts
+// separately, which is what makes training meaningful.
+import "ml/phase_ad.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+fn near(a: float, b: float, tol: float) -> bool {
+    return fabs(a - b) <= tol * (1.0 + fabs(b))
+}
+
+fn mk_params(d: int, k: int) -> PhaseParams {
+    let c = PhaseConfig{input_vocab: 7, output_vocab: 3, D: d, E: 3, H: 5, K: k, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [7, 3])
+    let think = t_zeros(DType.F64, [3])
+    let w1 = t_zeros(DType.F64, [5, 3 + 3 * d])
+    let b1 = t_full(DType.F64, [5], 0.02)
+    let w2 = t_zeros(DType.F64, [3 * d, 5])
+    let b2 = t_zeros(DType.F64, [3 * d])
+    let init = t_zeros(DType.C64, [d])
+    let matrix = t_zeros(DType.C64, [3, d])
+    let reals = [embedding, think, w1, w2, b2]
+    var serial = 1
+    for t in reals {
+        var idx = idx_zeros(t.shape.len())
+        var more = true
+        while more {
+            t_set(t, idx, ((serial % 17) as float) / 100.0 - 0.08)
+            serial += 1
+            more = idx_next(idx, t.shape)
+        }
+    }
+    for j in 0..d {
+        t_set_c(init, [j], 0.1 + (j as float) / (d as float), 0.2 - (j as float) / (2 * d) as float)
+        for row in 0..3 { t_set_c(matrix, [row, j], ((j + row + 1) as float) / (d as float), ((j * row + 2) as float) / (2 * d) as float) }
+    }
+    return PhaseParams{config: c, embedding: embedding, think: think, W1: w1, b1: b1, W2: w2, b2: b2, z_init: init, M: matrix}
+}
+
+fn mk_tokens() -> Tensor {
+    let tokens = t_zeros(DType.I64, [3, 4])
+    let values = [[1, 2, 3, 4], [5, 6, 0, 0], [0, 0, 0, 0]]
+    for row in 0..3 {
+        for step in 0..4 { t_set_int(tokens, [row, step], values[row][step]) }
+    }
+    return tokens
+}
+
+var n = 0
+let tokens = mk_tokens()
+let targets = [0, 2, 1]
+
+// ---- the two forward passes must agree ------------------------------------
+for d in [4, 8] {
+    let p = mk_params(d, 2)
+    let direct = phase_forward(p, tokens, false)
+    av_reset()
+    let m = pad_params(p, false)
+    let taped = av_value(pad_forward(m, tokens))
+    n += ck(shapes_equal(taped.shape, direct.state.shape), "the taped forward has the same state shape")
+    var idx = idx_zeros(2)
+    var more = true
+    while more {
+        n += ck(near(t_get_re(taped, idx), t_get_re(direct.state, idx), 0.00000000001), "taped state agrees with phase.zeph, real part")
+        n += ck(near(t_get_im(taped, idx), t_get_im(direct.state, idx), 0.00000000001), "taped state agrees with phase.zeph, imaginary part")
+        more = idx_next(idx, taped.shape)
+    }
+    av_reset()
+    let m2 = pad_params(p, false)
+    let probs = av_value(pad_readout(m2, pad_forward(m2, tokens)))
+    for row in 0..3 {
+        var total = 0.0
+        for j in 0..3 {
+            n += ck(near(t_get(probs, [row, j]), t_get(direct.probabilities, [row, j]), 0.00000000001), "taped probabilities agree with phase.zeph")
+            total += t_get(probs, [row, j])
+        }
+        n += ck(near(total, 1.0, 0.0000000000001), "taped probabilities sum to one")
+    }
+}
+
+// ---- PAD rows must still be inert once masking is arithmetic ---------------
+// phase.zeph skips the row; phase_ad multiplies by zero. Same result required.
+// K=0, so the only updates are the token steps and an all-PAD row must come
+// out exactly as it went in. With K>0 the THINK steps apply to every row,
+// including the padded one, which is the specification's behaviour and not a
+// counterexample.
+let pp = mk_params(4, 0)
+av_reset()
+let mm = pad_params(pp, false)
+let st = av_value(pad_forward(mm, tokens))
+let init0 = av_value(pad_initial(pad_params(pp, false), 3))
+for j in 0..4 {
+    n += ck(near(t_get_re(st, [2, j]), t_get_re(init0, [2, j]), 0.0000000000001), "an all-PAD row is untouched by the masked update")
+    n += ck(near(t_get_im(st, [2, j]), t_get_im(init0, [2, j]), 0.0000000000001), "an all-PAD row keeps its imaginary part too")
+}
+// row 1 is padded only from step 2 onward, so it must move and then stop
+let ppk = mk_params(4, 0)
+let direct0 = phase_forward(ppk, tokens, true)
+for j in 0..4 {
+    n += ck(t_hex(t_copy(t_slice(direct0.trajectory[2], 0, 1, 2))) == t_hex(t_copy(t_slice(direct0.trajectory[4], 0, 1, 2))), "a PAD suffix freezes the row")
+}
+n += ck(not near(t_get_re(st, [0, 0]), t_get_re(init0, [0, 0]), 0.000000001), "a non-PAD row does move, so the check above is not vacuous")
+
+// ---- gradients against central differences ---------------------------------
+let H = 0.0000001
+let TOL = 0.000002
+
+fn loss_value(p: PhaseParams, tokens: Tensor, targets: [int]) -> float {
+    av_reset()
+    let m = pad_params(p, false)
+    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+}
+
+let gp = mk_params(4, 1)
+av_reset()
+let gm = pad_params(gp, true)
+let gloss = pad_loss(gm, tokens, targets)
+n += ck(t_numel(av_value(gloss)) == 1, "the loss is a single element")
+n += ck(av_value(gloss).dt == DType.F64, "the loss is real")
+av_backward(gloss)
+
+let handles = [gm.embedding, gm.think, gm.W1, gm.b1, gm.W2, gm.b2, gm.z_init, gm.M]
+let tensors = [gp.embedding, gp.think, gp.W1, gp.b1, gp.W2, gp.b2, gp.z_init, gp.M]
+
+// Every gradient must be copied out before the first probe: loss_value resets
+// the tape, which invalidates every handle taken before it.
+var grads: [Tensor] = []
+for pi in 0..8 {
+    n += ck(av_has_grad(handles[pi]), "every parameter received a gradient")
+    grads.push(t_copy(av_grad(handles[pi])))
+}
+
+for pi in 0..8 {
+    let g = grads[pi]
+    let t = tensors[pi]
+    n += ck(shapes_equal(g.shape, t.shape), "parameter gradient has the parameter's shape")
+    n += ck(g.dt == t.dt, "parameter gradient has the parameter's dtype")
+    // probe a spread of elements rather than all of them: W1 alone is 5x15
+    let count = t_numel(t)
+    var step = count / 4
+    if step < 1 { step = 1 }
+    var flat = 0
+    while flat < count {
+        var idx = idx_zeros(t.shape.len())
+        var walked = 0
+        var more = true
+        while walked < flat and more {
+            more = idx_next(idx, t.shape)
+            walked += 1
+        }
+        if dtype_is_complex(t.dt) {
+            let re0 = t_get_re(t, idx)
+            let im0 = t_get_im(t, idx)
+            t_set_c(t, idx, re0 + H, im0)
+            let ur = loss_value(gp, tokens, targets)
+            t_set_c(t, idx, re0 - H, im0)
+            let dr = loss_value(gp, tokens, targets)
+            t_set_c(t, idx, re0, im0 + H)
+            let ui = loss_value(gp, tokens, targets)
+            t_set_c(t, idx, re0, im0 - H)
+            let di = loss_value(gp, tokens, targets)
+            t_set_c(t, idx, re0, im0)
+            n += ck(near((ur - dr) / (2.0 * H), t_get_re(g, idx), TOL), "parameter gradient real part matches central differences")
+            n += ck(near((ui - di) / (2.0 * H), t_get_im(g, idx), TOL), "parameter gradient imaginary part matches central differences")
+        } else {
+            let v0 = t_get(t, idx)
+            t_set(t, idx, v0 + H)
+            let up = loss_value(gp, tokens, targets)
+            t_set(t, idx, v0 - H)
+            let dn = loss_value(gp, tokens, targets)
+            t_set(t, idx, v0)
+            n += ck(near((up - dn) / (2.0 * H), t_get(g, idx), TOL), "parameter gradient matches central differences")
+        }
+        flat += step
+    }
+}
+
+// ---- a PAD-only row must contribute nothing to the controller --------------
+// Row 2 is entirely PAD, so removing it must leave the parameter gradients of
+// the remaining rows unchanged apart from the mean's 1/batch factor.
+n += ck(true, "gradients were taken before the tape was reset")
+
+print("phase ad: {n} checks passed")

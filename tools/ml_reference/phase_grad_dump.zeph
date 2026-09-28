@@ -1,0 +1,94 @@
+// Native gradients of the phase model, for comparison against the float64
+// reference's analytic reverse pass -- acceptance A06 and A14.
+//
+// Finite differences already cover these gradients in
+// tests/ml/phase_ad_test.zeph, but a stencil is the weakest oracle available:
+// the reference's analytic reverse pass agrees with its own finite
+// differences two orders tighter than the stencil's own error floor, so
+// comparing against it is a strictly sharper test.
+//
+// The weights come from the same LCG and the same fill order as
+// phase_dump.zeph, so check_phase_grad.py can rebuild them independently and
+// assert they are bit-identical before comparing any gradient. No reference
+// value ever reaches this program.
+import "ml/phase_ad.zeph"
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 20001) as float) / 100000.0 - 0.1
+}
+
+fn dumpR(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+
+fn dumpC(tag: str, t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        print("{tag} {bits(t_get_re(t, idx))} {bits(t_get_im(t, idx))}")
+        more = idx_next(idx, t.shape)
+    }
+}
+
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) {
+            let im = rnd()
+            t_set_c(t, idx, re, im)
+        } else {
+            t_set(t, idx, re)
+        }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+fn dump_grads(d: int, tag: str) {
+    SEED = 20260921
+    let config = PhaseConfig{input_vocab: 7, output_vocab: 3, D: d, E: 3, H: 5, K: 4, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [7, 3])
+    let think = t_zeros(DType.F64, [3])
+    let W1 = t_zeros(DType.F64, [5, 3 + 3 * d])
+    let b1 = t_zeros(DType.F64, [5])
+    let W2 = t_zeros(DType.F64, [3 * d, 5])
+    let b2 = t_zeros(DType.F64, [3 * d])
+    let z_init = t_zeros(DType.C64, [d])
+    let M = t_zeros(DType.C64, [3, d])
+    let tensors = [embedding, think, W1, b1, W2, b2, z_init, M]
+    for i in 0..tensors.len() { fill_random(tensors[i]) }
+    let p = PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: M}
+
+    let tokens = t_zeros(DType.I64, [3, 4])
+    let values = [[1, 2, 3, 4], [5, 6, 0, 0], [0, 0, 0, 0]]
+    for row in 0..3 {
+        for step in 0..4 { t_set_int(tokens, [row, step], values[row][step]) }
+    }
+    let targets = [0, 2, 1]
+
+    av_reset()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+
+    dumpR("{tag}.loss", av_value(loss))
+    dumpR("{tag}.grad.embedding", av_grad(m.embedding))
+    dumpR("{tag}.grad.think", av_grad(m.think))
+    dumpR("{tag}.grad.W1", av_grad(m.W1))
+    dumpR("{tag}.grad.b1", av_grad(m.b1))
+    dumpR("{tag}.grad.W2", av_grad(m.W2))
+    dumpR("{tag}.grad.b2", av_grad(m.b2))
+    dumpC("{tag}.grad.z_init", av_grad(m.z_init))
+    dumpC("{tag}.grad.M", av_grad(m.M))
+}
+
+dump_grads(4, "D4")
+dump_grads(8, "D8")

@@ -1,0 +1,174 @@
+// Tensor-only optimizers. Complex storage is treated as independent real
+// coordinates, including BOTH moment buffers (never a magnitude estimate).
+import "ml/tensor.zeph"
+
+struct Optim {
+    kind: int,
+    step: int,
+    lr: float,
+    wd: float,
+    momentum: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    m: [Tensor],
+    v: [Tensor],
+}
+
+fn optim_finite(x: float) -> bool { return ((bits(x) >> 52) & 2047) != 2047 }
+
+// Validate public configuration, including state restored from a checkpoint.
+fn optim_config(o: Optim) {
+    assert(o.kind == 0 or o.kind == 1, "optim: unknown optimizer")
+    assert(o.step >= 0 and o.step < 9223372036854775807, "optim: invalid step")
+    assert(optim_finite(o.lr) and o.lr >= 0.0, "optim: invalid learning rate")
+    assert(optim_finite(o.wd) and o.wd >= 0.0, "optim: invalid weight decay")
+    assert(o.momentum >= 0.0 and o.momentum < 1.0, "optim: invalid momentum")
+    assert(o.beta1 >= 0.0 and o.beta1 < 1.0 and o.beta2 >= 0.0 and o.beta2 < 1.0, "optim: invalid beta")
+    assert(optim_finite(o.eps) and o.eps > 0.0, "optim: invalid epsilon")
+}
+
+// Allocate moments in the parameter dtype; complex components round separately.
+fn optim_new(params: [Tensor], kind: int, lr: float, wd: float, momentum: float, beta1: float, beta2: float, eps: float) -> Optim {
+    var m: [Tensor] = []
+    var v: [Tensor] = []
+    for i in 0..params.len() {
+        let p = params[i]
+        assert(dtype_is_float(p.dt) or dtype_is_complex(p.dt), "optim: floating parameters required")
+        assert(not p.ro, "optim: read-only parameter")
+        m.push(t_zeros(p.dt, p.shape))
+        v.push(t_zeros(p.dt, p.shape))
+    }
+    let o = Optim{kind: kind, step: 0, lr: lr, wd: wd, momentum: momentum, beta1: beta1, beta2: beta2, eps: eps, m: m, v: v}
+    optim_config(o)
+    return o
+}
+
+fn sgd_new(params: [Tensor], lr: float, momentum: float, wd: float) -> Optim {
+    return optim_new(params, 0, lr, wd, momentum, 0.9, 0.999, 0.00000001)
+}
+
+fn adamw_new(params: [Tensor], lr: float, beta1: float, beta2: float, eps: float, wd: float) -> Optim {
+    return optim_new(params, 1, lr, wd, 0.0, beta1, beta2, eps)
+}
+
+fn optim_components(t: Tensor) -> int {
+    if dtype_is_complex(t.dt) { return 2 }
+    return 1
+}
+
+// Index through the tensor descriptor so slices and transposes also work.
+fn optim_get(t: Tensor, idx: [int], component: int) -> float {
+    let width = dtype_size(dtype_component(t.dt))
+    let off = t_byte_offset(t, idx) + component * width
+    if width == 4 { return t.st.buf.getf32(off) }
+    return t.st.buf.getf64(off)
+}
+
+fn optim_put(t: Tensor, idx: [int], component: int, x: float) {
+    assert(not t.ro, "optim: read-only tensor")
+    let width = dtype_size(dtype_component(t.dt))
+    let off = t_byte_offset(t, idx) + component * width
+    if width == 4 { t.st.buf.putf32(off, x) } else { t.st.buf.putf64(off, x) }
+    storage_bump(t.st)
+}
+
+// Integer exponentiation avoids a logarithm and is deterministic after resume.
+fn optim_power(x: float, n: int) -> float {
+    var base = x
+    var exponent = n
+    var result = 1.0
+    while exponent > 0 {
+        if exponent % 2 == 1 { result = result * base }
+        base = base * base
+        exponent = exponent / 2
+    }
+    return result
+}
+
+// Check all descriptors before mutating any parameter or advancing the step.
+fn optim_state(o: Optim, params: [Tensor]) {
+    optim_config(o)
+    assert(o.m.len() == params.len() and o.v.len() == params.len(), "optim: state count mismatch")
+    for i in 0..params.len() {
+        let p = params[i]
+        assert(dtype_is_float(p.dt) or dtype_is_complex(p.dt), "optim: floating parameters required")
+        assert(not p.ro and not o.m[i].ro and not o.v[i].ro, "optim: read-only state")
+        assert(p.dt == o.m[i].dt and p.dt == o.v[i].dt, "optim: state dtype mismatch")
+        assert(shapes_equal(p.shape, o.m[i].shape) and shapes_equal(p.shape, o.v[i].shape), "optim: state shape mismatch")
+    }
+}
+
+// In-place SGD (coupled L2 decay) or AdamW (decay outside the moments).
+// Call after backward; writes bump storage versions just like tensor setters.
+fn optim_step(o: Optim, params: [Tensor], grads: [Tensor]) {
+    optim_state(o, params)
+    assert(params.len() == grads.len(), "optim: gradient count mismatch")
+    for i in 0..params.len() {
+        assert(params[i].dt == grads[i].dt and shapes_equal(params[i].shape, grads[i].shape), "optim: gradient descriptor mismatch")
+    }
+    o.step += 1
+    let bc1 = 1.0 - optim_power(o.beta1, o.step)
+    let bc2 = 1.0 - optim_power(o.beta2, o.step)
+    for i in 0..params.len() {
+        let p = params[i]
+        var idx = idx_zeros(p.shape.len())
+        for j in 0..t_numel(p) {
+            for c in 0..optim_components(p) {
+                let old = optim_get(p, idx, c)
+                let g = optim_get(grads[i], idx, c)
+                if o.kind == 0 {
+                    let velocity = o.momentum * optim_get(o.m[i], idx, c) + (g + o.wd * old)
+                    optim_put(o.m[i], idx, c, velocity)
+                    optim_put(p, idx, c, old - o.lr * optim_get(o.m[i], idx, c))
+                } else {
+                    optim_put(o.m[i], idx, c, o.beta1 * optim_get(o.m[i], idx, c) + (1.0 - o.beta1) * g)
+                    optim_put(o.v[i], idx, c, o.beta2 * optim_get(o.v[i], idx, c) + (1.0 - o.beta2) * g * g)
+                    let mh = optim_get(o.m[i], idx, c) / bc1
+                    let vh = optim_get(o.v[i], idx, c) / bc2
+                    optim_put(p, idx, c, old - o.lr * o.wd * old - o.lr * mh / (sqrt(vh) + o.eps))
+                }
+            }
+            idx_next(idx, p.shape)
+        }
+    }
+}
+
+// Joint Euclidean norm over every real and imaginary gradient coordinate.
+// Scale the sum of squares to avoid overflow for otherwise finite gradients.
+fn clip_grad_norm(grads: [Tensor], limit: float) -> float {
+    assert(optim_finite(limit) and limit >= 0.0, "optim: invalid clipping limit")
+    var scale = 0.0
+    var ss = 0.0
+    for i in 0..grads.len() {
+        let g = grads[i]
+        assert((dtype_is_float(g.dt) or dtype_is_complex(g.dt)) and not g.ro, "optim: invalid clipping tensor")
+        var idx = idx_zeros(g.shape.len())
+        for j in 0..t_numel(g) {
+            for c in 0..optim_components(g) {
+                var x = optim_get(g, idx, c)
+                assert(optim_finite(x), "optim: nonfinite gradient norm")
+                if x < 0.0 { x = 0.0 - x }
+                if x > 0.0 {
+                    if x > scale {
+                        ss = 1.0 + ss * (scale / x) * (scale / x)
+                        scale = x
+                    } else { ss += (x / scale) * (x / scale) }
+                }
+            }
+            idx_next(idx, g.shape)
+        }
+    }
+    let norm = scale * sqrt(ss)
+    if norm <= limit { return norm }
+    let factor = (limit / scale) / sqrt(ss)
+    for i in 0..grads.len() {
+        let g = grads[i]
+        var idx = idx_zeros(g.shape.len())
+        for j in 0..t_numel(g) {
+            for c in 0..optim_components(g) { optim_put(g, idx, c, optim_get(g, idx, c) * factor) }
+            idx_next(idx, g.shape)
+        }
+    }
+    return norm
+}

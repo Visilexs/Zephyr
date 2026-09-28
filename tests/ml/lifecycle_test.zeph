@@ -1,0 +1,214 @@
+// A41: the whole model lifecycle, natively, with no Python anywhere.
+//
+// "Native training/eval/checkpoint/resume/generation with PyTorch absent;
+// optional oracle still works; project op-coverage ledger complete."
+//
+// This binary trains a causal model, evaluates it, checkpoints it, resumes
+// from the checkpoint and generates from it, in one process, linked against
+// kernel32 only. The claim "PyTorch absent" is not something a test can
+// assert about the world, so it is arranged to be true by construction and
+// checked the only way that means anything: the executable that produces
+// these numbers imports nothing but kernel32, and nothing in this file or
+// anything it imports shells out.
+//
+// The load-bearing check is resume equivalence, and it is exact. Twenty
+// steps, checkpoint, twenty more gives bit-identical parameters to twenty
+// steps, checkpoint, RESTORE, twenty more -- including both AdamW moment
+// buffers and the step counter, because a resume that drops the moments
+// still trains and still looks fine, just differently. Generation after the
+// resume must also emit the identical token sequence, since a model that is
+// numerically restored but generates differently has a broken generation
+// path rather than a broken checkpoint.
+import "ml/causal.zeph"
+import "ml/optim.zeph"
+import "ml/checkpoint.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn fill(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, 0.3 * rnd(), 0.3 * rnd()) } else { t_set(t, idx, 0.3 * rnd()) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+let V = 7
+let D = 6
+let E = 4
+let H = 8
+let CFG = PhaseConfig{input_vocab: V, output_vocab: V, D: D, E: E, H: H, K: 1, pad: 0, eps: 0.00000001}
+
+fn build() -> PhaseParams {
+    SEED = 424242
+    let ps = [t_zeros(DType.F64, [V, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
+              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    for i in 0..ps.len() { fill(ps[i]) }
+    let zi = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [V, D])
+    fill(zi)
+    fill(Mo)
+    return PhaseParams{config: CFG, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
+                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+}
+fn plist(p: PhaseParams) -> [Tensor] {
+    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+}
+
+let DATA = t_zeros(DType.I64, [2, 6])
+for r in 0..2 {
+    for c in 0..6 { t_set_int(DATA, [r, c], 1 + (r * 3 + c) % 6) }
+}
+let RST = t_zeros(DType.I64, [2, 6])
+
+fn train_steps(p: PhaseParams, o: Optim, n: int) -> float {
+    let ts = plist(p)
+    var last = 0.0
+    for stp in 0..n {
+        av_reset()
+        let m = pad_params(p, true)
+        let lo = causal_loss(m, DATA, RST, 0 - 1)
+        av_backward(lo)
+        let hs = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+        var gs: [Tensor] = []
+        for i in 0..hs.len() { gs.push(t_copy(av_grad(hs[i]))) }
+        clip_grad_norm(gs, 5.0)
+        optim_step(o, ts, gs)
+        last = t_get(av_value(lo), [0])
+    }
+    return last
+}
+
+fn copy_into(dst: [Tensor], src: [Tensor]) {
+    for i in 0..dst.len() {
+        var idx = idx_zeros(dst[i].shape.len())
+        var more = t_numel(dst[i]) > 0
+        while more {
+            if dtype_is_complex(dst[i].dt) {
+                t_set_c(dst[i], idx, t_get_re(src[i], idx), t_get_im(src[i], idx))
+            } else {
+                t_set(dst[i], idx, t_get(src[i], idx))
+            }
+            more = idx_next(idx, dst[i].shape)
+        }
+    }
+}
+
+// Relative, matching the convention in optim_test.zeph: the suites run
+// from the repository root.
+let CKPT = "lifecycle.ckpt"
+
+// ---- train, evaluate, checkpoint ---------------------------------------------
+let A = build()
+let optA = adamw_new(plist(A), 0.03, 0.9, 0.999, 0.00000001, 0.01)
+let l0 = train_steps(A, optA, 20)
+let ppl_before = causal_perplexity(A, DATA, RST)
+print("after 20 steps: loss {l0}, perplexity {ppl_before}")
+chk(l0 == l0 and l0 > 0.0, "training produced a finite loss ({l0})")
+chk(ppl_before > 1.0, "perplexity is above one ({ppl_before})")
+
+checkpoint_save(CKPT, plist(A), optA)
+
+// The generation the checkpointed model produces, for comparison after the
+// resume.
+av_reset()
+let gen_before = causal_generate(pad_params(A, false), [1, 2, 3], 6)
+
+// ---- continue without restoring ------------------------------------------------
+let l1 = train_steps(A, optA, 20)
+var contin: [Tensor] = []
+for i in 0..plist(A).len() { contin.push(t_copy(plist(A)[i])) }
+let steps_continued = optA.step
+av_reset()
+let gen_continued = causal_generate(pad_params(A, false), [1, 2, 3], 6)
+
+// ---- restore and redo the same twenty steps ---------------------------------------
+let ck = checkpoint_load(CKPT)
+chk(ck.params.len() == 8, "the checkpoint holds eight parameter tensors ({ck.params.len()})")
+chk(ck.optim.step == 20, "the checkpoint remembers the optimizer step count ({ck.optim.step})")
+
+let B = build()
+copy_into(plist(B), ck.params)
+// Restoring the parameters is not enough and the test has to prove it: the
+// optimizer state comes back too, from the same file.
+let optB = ck.optim
+let l2 = train_steps(B, optB, 20)
+
+var same = 0
+for i in 0..contin.len() {
+    if t_hex(contin[i]) == t_hex(plist(B)[i]) { same = same + 1 }
+}
+chk(same == 8, "resume is bit-exact: all eight parameters match the uninterrupted run ({same} of 8)")
+chk(t_hex(t_full(DType.F64, [1], l1)) == t_hex(t_full(DType.F64, [1], l2)),
+    "and the loss at the same step is bit-identical ({l1} against {l2})")
+chk(optB.step == steps_continued, "the step counter matches ({optB.step} against {steps_continued})")
+
+// Evaluation after the resume agrees, and generation emits the same tokens.
+let ppl_after = causal_perplexity(B, DATA, RST)
+av_reset()
+let gen_after = causal_generate(pad_params(B, false), [1, 2, 3], 6)
+var gsame = true
+if gen_after.len() != gen_continued.len() { gsame = false } else {
+    for i in 0..gen_after.len() {
+        if gen_after[i] != gen_continued[i] { gsame = false }
+    }
+}
+chk(gsame, "generation after the resume emits the identical token sequence")
+var gstr = ""
+for i in 0..gen_after.len() { gstr = gstr + " {gen_after[i]}" }
+print("generation after resume:{gstr}")
+
+// A model that had NOT been trained on must generate something else, or the
+// comparison above is vacuous.
+var moved = false
+if gen_before.len() == gen_continued.len() {
+    for i in 0..gen_before.len() {
+        if gen_before[i] != gen_continued[i] { moved = true }
+    }
+} else { moved = true }
+chk(moved or ppl_after != ppl_before,
+    "twenty more steps changed the model, so the resume comparison is not comparing two identical things")
+
+// ---- the checkpoint file itself -------------------------------------------------
+let raw1 = checkpoint_read(CKPT)
+checkpoint_save(CKPT, plist(B), optB)
+let raw2 = checkpoint_read(CKPT)
+// The second save holds different parameters, so the payload must differ.
+// Written as a real comparison: the first version of this check ended in
+// "or true", which cannot fail and was therefore worth nothing.
+var payload_differs = raw1.n != raw2.n
+if not payload_differs {
+    for i in 32..raw1.n {
+        if raw1.get8(i) != raw2.get8(i) { payload_differs = true }
+    }
+}
+chk(payload_differs, "re-saving a trained-on model writes different bytes, so the file tracks the model")
+let ck2 = checkpoint_load(CKPT)
+var rt = 0
+for i in 0..ck2.params.len() {
+    if t_hex(ck2.params[i]) == t_hex(plist(B)[i]) { rt = rt + 1 }
+}
+chk(rt == 8, "a second save/load round trip is bit-exact ({rt} of 8)")
+
+print("lifecycle: train, evaluate, checkpoint, resume and generate all completed natively")
+print("perplexity {ppl_before} before the checkpoint, {ppl_after} after resuming and training on")
+
+if failed == 0 {
+    print("lifecycle: {passed} checks passed")
+} else {
+    print("lifecycle: {failed} FAILED, {passed} passed")
+    panic("lifecycle tests failed")
+}

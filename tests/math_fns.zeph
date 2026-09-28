@@ -1,0 +1,233 @@
+// Regression for the lib/std/math.zeph function family.
+// Three kinds of check, none of which need a table of magic constants:
+//   1. identities that must hold exactly (pythagorean, inverse round-trips)
+//   2. every derivative against a central difference
+//   3. every derivative integrated back, which is the fundamental theorem
+//      and so exercises function, derivative and quadrature at once
+// Anchor values are the handful of places where an exact closed form exists.
+import "std/math.zeph"
+
+fn near(a: float, b: float, tol: float) -> bool {
+    return fabs(a - b) <= tol * (1.0 + fabs(b))
+}
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+// central difference; good to about 1e-10 at h=1e-6
+fn fd(f: fn(float) -> float, x: float) -> float {
+    let h = 0.000001
+    return (f(x + h) - f(x - h)) / (2.0 * h)
+}
+
+fn ck_d(f: fn(float) -> float, d: fn(float) -> float, x: float, name: str) -> int {
+    return ck(near(d(x), fd(f, x), 0.0000001), name)
+}
+
+// fundamental theorem: integral of f' over [a,b] must recover f(b) - f(a)
+fn ck_ftc(f: fn(float) -> float, d: fn(float) -> float, a: float, b: float, name: str) -> int {
+    let got = integrate(d, a, b, 0.000000000001)
+    return ck(near(got, f(b) - f(a), 0.0000001), name)
+}
+
+// ---- gamma a second way, from the Euler integral ---------------------------
+// gamma(x) = integral from 0 to infinity of t^(x-1) e^(-t) dt, evaluated with
+// integrate_p. Nothing here shares code with the Lanczos gamma beyond exp and
+// ln, so agreement between the two is real evidence rather than a shared bug.
+
+// log of the integrand's peak, at t = x-1. The integral is divided through by
+// this so it comes out O(sqrt x) rather than O(gamma x): integrate's eps is
+// ABSOLUTE, and asking for 1e-12 on gamma(17)=2.09e13 would demand 26 digits
+// and bisect until it hit the depth cap.
+fn gpeak_log(x: float) -> float {
+    if x <= 2.0 { return 0.0 }
+    let m = x - 1.0
+    return m * fln(m) - m
+}
+
+// one exp, not two: t^(x-1) and e^(-t) computed apart overflow for large t
+// long before the decay cancels them
+fn gintegrand(t: float, x: float) -> float {
+    if t == 0.0 {
+        if x > 1.0 { return 0.0 }
+        return 1.0
+    }
+    return fexp((x - 1.0) * fln(t) - t - gpeak_log(x))
+}
+
+// below 1 the integrand is singular at the origin, so walk x up with
+// gamma(x) = gamma(x+1)/x and integrate something well behaved instead
+fn gamma_quad(x: float) -> float {
+    if x <= 0.0 { return NAN }
+    if x < 1.0 { return gamma_quad(x + 1.0) / x }
+    let hi = 60.0 + 3.0 * x
+    let s = integrate_p(gintegrand, x, 0.0, hi, 0.0000000000001)
+    return s * fexp(gpeak_log(x))
+}
+
+var n = 0
+
+// ---- anchors: exact closed forms
+n += ck(near(fatan(1.0), PI / 4.0, 0.0000000000001), "atan(1)=pi/4")
+n += ck(near(fasin(0.5), PI / 6.0, 0.0000000000001), "asin(1/2)=pi/6")
+n += ck(near(facos(0.5), PI / 3.0, 0.0000000000001), "acos(1/2)=pi/3")
+n += ck(near(facot(1.0), PI / 4.0, 0.0000000000001), "acot(1)=pi/4")
+n += ck(near(fasec(2.0), PI / 3.0, 0.0000000000001), "asec(2)=pi/3")
+n += ck(near(facsc(2.0), PI / 6.0, 0.0000000000001), "acsc(2)=pi/6")
+n += ck(near(gamma(5.0), 24.0, 0.0000000001), "gamma(5)=24")
+n += ck(near(gamma(0.5), sqrt(PI), 0.0000000001), "gamma(1/2)=sqrt(pi)")
+n += ck(near(gamma(1.5), sqrt(PI) / 2.0, 0.0000000001), "gamma(3/2)=sqrt(pi)/2")
+n += ck(near(lgamma(1.0), 0.0, 0.0000000001), "lgamma(1)=0")
+n += ck(near(digamma(1.0), 0.0 - 0.5772156649015329, 0.0000000001), "digamma(1)=-euler")
+n += ck(near(gd(0.0), 0.0, 0.0000000000001), "gd(0)=0")
+n += ck(near(sinh(0.0), 0.0, 0.0000000000001), "sinh(0)=0")
+n += ck(near(cosh(0.0), 1.0, 0.0000000000001), "cosh(0)=1")
+
+// acot is the continuous (0,pi) branch, so it must not jump at the origin
+n += ck(near(facot(0.0000001), HALF_PI, 0.00001), "acot continuous from above")
+n += ck(near(facot(0.0 - 0.0000001), HALF_PI, 0.00001), "acot continuous from below")
+n += ck(facot(0.0 - 1.0) > HALF_PI, "acot(-1) in upper half")
+n += ck(near(facot(0.0 - 1.0), 3.0 * PI / 4.0, 0.0000000000001), "acot(-1)=3pi/4")
+
+// ---- identities
+let xs = [0.13, 0.4, 0.77, 1.3, 2.2, 3.9]
+for i in 0..xs.len() {
+    let x = xs[i]
+    let s = fsin(x)
+    let c = fcos(x)
+    n += ck(near(s * s + c * c, 1.0, 0.0000000000001), "sin^2+cos^2=1")
+    n += ck(near(fcsc(x), 1.0 / s, 0.0000000000001), "csc=1/sin")
+    n += ck(near(fsec(x), 1.0 / c, 0.0000000000001), "sec=1/cos")
+    n += ck(near(fcot(x) * ftan(x), 1.0, 0.0000000000001), "cot*tan=1")
+    n += ck(near(cosh(x) * cosh(x) - sinh(x) * sinh(x), 1.0, 0.0000000001), "cosh^2-sinh^2=1")
+    n += ck(near(tanh(x), sinh(x) / cosh(x), 0.0000000000001), "tanh=sinh/cosh")
+    n += ck(near(fln(fexp(x)), x, 0.0000000000001), "ln(exp(x))=x")
+    n += ck(near(gamma(x + 1.0), x * gamma(x), 0.0000000001), "gamma(x+1)=x*gamma(x)")
+    n += ck(near(digamma(x + 1.0), digamma(x) + 1.0 / x, 0.0000000001), "digamma recurrence")
+    n += ck(near(lgamma(x), fln(fabs(gamma(x))), 0.0000000001), "lgamma=ln|gamma|")
+}
+
+// inverse round-trips
+let us = [-0.93, -0.5, -0.11, 0.0, 0.27, 0.6, 0.995]
+for i in 0..us.len() {
+    let u = us[i]
+    n += ck(near(fsin(fasin(u)), u, 0.0000000001), "sin(asin(u))=u")
+    n += ck(near(fcos(facos(u)), u, 0.0000000001), "cos(acos(u))=u")
+    n += ck(near(ftan(fatan(u)), u, 0.0000000001), "tan(atan(u))=u")
+    n += ck(near(gd_inv(gd(u)), u, 0.0000000001), "gd_inv(gd(u))=u")
+    n += ck(near(tanh(u), gd(u) * 0.0 + tanh(u), 0.0000000001), "tanh stable")
+}
+
+// gudermannian ties the circular and hyperbolic families: tan(gd x) = sinh x
+let gs = [-2.5, -0.8, 0.0, 0.4, 1.7, 4.0]
+for i in 0..gs.len() {
+    let x = gs[i]
+    n += ck(near(ftan(gd(x)), sinh(x), 0.0000000001), "tan(gd x)=sinh x")
+    n += ck(near(fsin(gd(x)), tanh(x), 0.0000000001), "sin(gd x)=tanh x")
+}
+
+// reciprocal inverses
+let rs = [1.4, 2.6, 9.0, -1.9, -40.0]
+for i in 0..rs.len() {
+    let x = rs[i]
+    n += ck(near(fsec(fasec(x)), x, 0.0000000001), "sec(asec(x))=x")
+    n += ck(near(fcsc(facsc(x)), x, 0.0000000001), "csc(acsc(x))=x")
+}
+
+// ---- derivatives against central differences
+n += ck_d(fsin, d_fsin, 0.7, "d sin")
+n += ck_d(fcos, d_fcos, 0.7, "d cos")
+n += ck_d(ftan, d_ftan, 0.7, "d tan")
+n += ck_d(fcsc, d_fcsc, 0.7, "d csc")
+n += ck_d(fsec, d_fsec, 0.7, "d sec")
+n += ck_d(fcot, d_fcot, 0.7, "d cot")
+n += ck_d(fasin, d_fasin, 0.4, "d asin")
+n += ck_d(facos, d_facos, 0.4, "d acos")
+n += ck_d(fatan, d_fatan, 0.4, "d atan")
+n += ck_d(facot, d_facot, 0.4, "d acot")
+n += ck_d(facot, d_facot, 0.0 - 2.0, "d acot negative")
+n += ck_d(fasec, d_fasec, 3.0, "d asec")
+n += ck_d(fasec, d_fasec, 0.0 - 3.0, "d asec negative")
+n += ck_d(facsc, d_facsc, 3.0, "d acsc")
+n += ck_d(facsc, d_facsc, 0.0 - 3.0, "d acsc negative")
+n += ck_d(fln, d_fln, 2.3, "d ln")
+n += ck_d(fexp, d_fexp, 1.1, "d exp")
+n += ck_d(sinh, d_sinh, 1.1, "d sinh")
+n += ck_d(cosh, d_cosh, 1.1, "d cosh")
+n += ck_d(tanh, d_tanh, 1.1, "d tanh")
+n += ck_d(tanh, d_tanh, 0.001, "d tanh near zero")
+n += ck_d(gd, d_gd, 1.1, "d gd")
+n += ck_d(gd_inv, d_gd_inv, 0.6, "d gd_inv")
+n += ck_d(lgamma, d_lgamma, 2.7, "d lgamma")
+n += ck_d(gamma, d_gamma, 2.7, "d gamma")
+n += ck_d(gamma, d_gamma, 0.6, "d gamma below one")
+
+// the sign of d_asec/d_acsc for x < -1 is the classic error; pin it
+n += ck(d_fasec(0.0 - 3.0) > 0.0, "d asec positive for x<-1")
+n += ck(d_facsc(0.0 - 3.0) < 0.0, "d acsc negative for x<-1")
+
+// ---- quadrature via the fundamental theorem
+n += ck_ftc(fsin, d_fsin, 0.2, 1.4, "ftc sin")
+n += ck_ftc(fatan, d_fatan, 0.0 - 0.8, 1.9, "ftc atan")
+n += ck_ftc(fasin, d_fasin, 0.0 - 0.5, 0.5, "ftc asin")
+n += ck_ftc(sinh, d_sinh, 0.0, 2.0, "ftc sinh")
+n += ck_ftc(tanh, d_tanh, 0.0 - 1.0, 1.5, "ftc tanh")
+n += ck_ftc(fexp, d_fexp, 0.0, 3.0, "ftc exp")
+n += ck_ftc(fln, d_fln, 0.5, 4.0, "ftc ln")
+n += ck_ftc(gd, d_gd, 0.0 - 2.0, 2.0, "ftc gd")
+n += ck_ftc(lgamma, d_lgamma, 1.2, 4.0, "ftc lgamma")
+
+// integral of sec is the inverse gudermannian, the one identity that links
+// the quadrature, the trig family and the special functions together
+n += ck(near(integrate(fsec, 0.0, 1.0, 0.000000000001), gd_inv(1.0), 0.0000000001), "int sec = gd_inv")
+
+// ---- domain handling: NAN out, no silent garbage
+n += ck(is_nan(fasin(1.5)), "asin out of domain")
+n += ck(is_nan(facos(0.0 - 1.5)), "acos out of domain")
+n += ck(is_nan(fasec(0.5)), "asec out of domain")
+n += ck(is_nan(facsc(0.0 - 0.5)), "acsc out of domain")
+n += ck(is_nan(gd_inv(HALF_PI)), "gd_inv out of domain")
+n += ck(is_nan(fln(0.0 - 1.0)), "ln of a negative is NAN")
+n += ck(fln(0.0) == 0.0 - INF, "ln of zero is -INF")
+n += ck(is_nan(gamma(0.0)), "gamma pole at 0")
+n += ck(is_nan(gamma(0.0 - 3.0)), "gamma pole at -3")
+n += ck(is_nan(digamma(0.0 - 2.0)), "digamma pole at -2")
+n += ck(lgamma(0.0) == INF, "lgamma pole is +inf")
+n += ck(not is_nan(gamma(0.0 - 2.5)), "gamma finite between poles")
+// gamma alternates sign between poles: +ve on (-2,-1), -ve on (-3,-2)
+n += ck(gamma(0.0 - 1.5) > 0.0, "gamma(-1.5) positive")
+n += ck(gamma(0.0 - 2.5) < 0.0, "gamma(-2.5) negative")
+n += ck(gamma(0.0 - 0.5) < 0.0, "gamma(-0.5) negative")
+
+// ---- range: the old float32 bounds silently truncated all of these.
+// Stated as round-trips because Zephyr has no exponent-form float literals.
+n += ck(near(fln(fexp(100.0)), 100.0, 0.0000000000001), "exp(100) not clamped")
+n += ck(near(fln(fexp(700.0)), 700.0, 0.0000000000001), "exp(700) not clamped")
+n += ck(near(fexp(100.0), fexp(50.0) * fexp(50.0), 0.0000000000001), "exp(100) consistent")
+n += ck(near(fexp(0.0 - 100.0) * fexp(100.0), 1.0, 0.0000000001), "exp(-100) not flushed")
+n += ck(near(fexp(0.0 - 300.0) * fexp(300.0), 1.0, 0.0000000001), "exp(-300) not flushed")
+n += ck(fexp(0.0 - 745.5) == 0.0, "exp underflows to zero")
+n += ck(fexp(710.0) == INF, "exp overflows to inf")
+n += ck(near(cosh(100.0), fexp(100.0) / 2.0, 0.0000000001), "cosh(100) not clamped")
+n += ck(near(fln(gamma(100.0)), lgamma(100.0), 0.0000000001), "gamma(100) not clamped")
+n += ck(gamma(172.0) == INF, "gamma overflows past 171.62")
+
+// tanh must not lose digits near zero: tanh(x) - x is about -x^3/3
+let t = 0.00000001
+n += ck(fabs((tanh(t) - t) / t) < 0.000000000001, "tanh keeps digits near zero")
+n += ck(fabs((sinh(t) - t) / t) < 0.000000000001, "sinh keeps digits near zero")
+
+// ---- Lanczos gamma against the Euler integral, two independent routes.
+// Observed worst disagreement is 2.4e-13, at x=2; 1e-11 leaves headroom for
+// a different rounding order on another target.
+let gq = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.5, 6.0, 9.0, 12.0, 17.0]
+for i in 0..gq.len() {
+    let x = gq[i]
+    n += ck(near(gamma_quad(x), gamma(x), 0.00000000001), "gamma = euler integral")
+}
+n += ck(near(gamma_quad(0.5) * gamma_quad(0.5), PI, 0.0000000001), "quad gamma(1/2)^2 = pi")
+n += ck(near(gamma_quad(6.0), 120.0, 0.0000000001), "quad gamma(6) = 120")
+
+print("math: {n} checks passed")

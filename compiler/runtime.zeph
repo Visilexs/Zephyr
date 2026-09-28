@@ -324,7 +324,29 @@ fn rx_collect() {
     __flbig = 0
     __live = 0
     __leaked = 0
+    // The sweep coalesces. It already walks the heap in address order, so a
+    // run of consecutive dead objects can be merged into one free block
+    // instead of being pushed as many small ones.
+    //
+    // Without this the allocator fragments without bound on a workload that
+    // repeatedly allocates the same set of shapes -- a training step being
+    // exactly that. rx_take_free splits a large block and pushes the
+    // remainder back, nothing ever merges two neighbours again, and the free
+    // pool degrades into slivers that no longer fit the sizes still being
+    // asked for. Measured on a reverse-pass loop before this change: at the
+    // point of death the free list held 965 MB across 263,568 blocks -- 98%
+    // of the heap free and unusable -- while __live sat flat at ~10 MB and
+    // __leaked was 0. Nothing was leaking; the heap had been shredded.
+    //
+    // Merging absorbs the interior objects' headers into the payload, so
+    // their start bits must be cleared: after the merge those addresses are
+    // no longer object starts, and rx_try_mark uses __startb to decide
+    // whether a conservatively scanned word points at one. rx_take_free's
+    // split path already re-sets the bit for any remainder it carves off, so
+    // the two stay consistent.
     var obj = __hbase + HDR
+    var run = 0                                      // payload of the open run, 0 if none
+    var runsz = 0
     while obj < __hbump {
         let h = load64(obj - 8)
         let size = h & (0 - 8)
@@ -333,13 +355,28 @@ fn rx_collect() {
             // Unreachable but not yet freed: under reference counting that is
             // either a cycle or a missed drop. Counted so it can be reported.
             if (h & F_FREE) == 0 { __leaked += 1 }
-            store64(obj - 8, size | F_FREE)          // dead (or already free)
-            rx_free_push(obj, size)
+            if run == 0 {
+                run = obj
+                runsz = size
+            } else {
+                rx_bit_clr(__startb, idx)            // no longer an object start
+                runsz = runsz + HDR + size
+            }
         } else {
+            if run != 0 {
+                store64(run - 8, runsz | F_FREE)
+                rx_free_push(run, runsz)
+                run = 0
+                runsz = 0
+            }
             store64(obj - 8, size)                   // clear mark/free flags
             __live += size + HDR
         }
         obj = obj + HDR + size
+    }
+    if run != 0 {
+        store64(run - 8, runsz | F_FREE)
+        rx_free_push(run, runsz)
     }
 }
 

@@ -1,0 +1,390 @@
+// One M7 training run: one family, one task, one seed, one learning rate.
+//
+// Deliberately one run per process. The sweep is a driver script that calls
+// this many times and skips runs whose record already exists, so a sweep
+// that dies at hour nine resumes at hour nine instead of at zero, and a
+// single run can be reproduced on its own from its record.
+//
+// Everything the protocol fixes is a constant in the BUDGET block below and
+// every one of those constants is copied into the run record. A budget that
+// lives only in a shell script is a budget that can be quietly changed after
+// the results are in.
+//
+// Usage:
+//   m7_run.exe <family> <task> <seed> <lr_index> <out.json>
+//     family    phase | incoherent | realrot | k0 | k1 | k4 | k8
+//               | gru_state | gru_param | gru_quad | transformer
+//     task      a | b
+//     seed      integer
+//     lr_index  0, 1 or 2, selecting from the predeclared grid
+import "ml/dataset.zeph"
+import "ml/phase_ad.zeph"
+import "ml/gru.zeph"
+import "ml/transformer.zeph"
+import "ml/optim.zeph"
+
+// ===========================================================================
+// The predeclared budget. Frozen before any test metric was looked at.
+// ===========================================================================
+let BUDGET_STEPS = 1000        // optimizer steps per run
+let BUDGET_BATCH = 32
+let EVAL_EVERY = 100           // validation checks, for selection only
+let SELECT_ROWS = 512          // validation rows used for selection
+let TEST_ROWS = 512            // rows of each frozen split used at the end
+let LR_GRID = [0.0003, 0.001, 0.003]
+let WD = 0.01
+let CLIP = 5.0
+let PRESET_D = 32              // phase model width
+let PRESET_E = 32              // embedding width, shared by every family
+let PRESET_H = 64              // controller hidden width
+let PRESET_K = 2               // THINK steps, except for the k* families
+let TF_D = 32
+let TF_FF = 64
+let TF_LAYERS = 2
+let PRESET_NAME = "m7-reduced"
+
+extern fn QueryPerformanceCounter(p: int) -> i32 from "kernel32.dll"
+extern fn QueryPerformanceFrequency(p: int) -> i32 from "kernel32.dll"
+var qpf = Bytes.new(8)
+QueryPerformanceFrequency(qpf.addr())
+let FREQ = (qpf.get64(0)) as float
+var qtmp = Bytes.new(8)
+fn now_ms() -> float {
+    QueryPerformanceCounter(qtmp.addr())
+    return ((qtmp.get64(0)) as float) * 1000.0 / FREQ
+}
+
+fn write_text(path: str, body: str) {
+    let name = cbytes(path)
+    let h = win("CreateFileA", name.addr(), 1073741824, 0, 0, 2, 128, 0)
+    if h == 0 - 1 { panic("m7_run: cannot open {path} for writing") }
+    let b = cbytes(body)
+    let wrote = Bytes.new(8)
+    let ok = win("WriteFile", h, b.addr(), body.len(), wrote.addr(), 0)
+    win("CloseHandle", h)
+    if ok == 0 { panic("m7_run: write to {path} failed") }
+}
+
+// A seeded generator, so a run is reproducible from (family, task, seed).
+var SEED = 1
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 1000001) as float) / 500000.0 - 1.0
+}
+fn fill_scaled(t: Tensor, sc: float) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, sc * rnd(), sc * rnd()) } else { t_set(t, idx, sc * rnd()) }
+        more = idx_next(idx, t.shape)
+    }
+}
+// Fan-in scaling, the same rule for every family so initialisation is not
+// one of the things that differs between them.
+fn init_like(t: Tensor) {
+    var fan = 1
+    if t.shape.len() >= 2 { fan = t.shape[t.shape.len() - 1] }
+    if t.shape.len() == 1 { fan = t.shape[0] }
+    fill_scaled(t, 1.0 / fexp(0.5 * fln(fan as float)))
+}
+
+fn count_real(ts: [Tensor]) -> int {
+    var n = 0
+    for i in 0..ts.len() {
+        var c = t_numel(ts[i])
+        if dtype_is_complex(ts[i].dt) { c = c * 2 }
+        n = n + c
+    }
+    return n
+}
+
+// ---------------------------------------------------------------------------
+if args().len() < 6 {
+    print("usage: m7_run <family> <task> <seed> <lr_index> <out.json>")
+    panic("m7_run: wrong number of arguments")
+}
+let FAMILY = args()[1]
+let TASK = args()[2]
+let RUN_SEED = args()[3] as int
+let LR_IDX = args()[4] as int
+let OUT = args()[5]
+// A sixth argument "smoke" evaluates validation only and never touches the
+// frozen splits. A pipeline check is not an experiment, and the protocol
+// says the frozen tests are read once, after selection -- a run whose
+// purpose is "does the harness work" must not spend them. The first such
+// check, before this flag existed, did spend them for one configuration;
+// that is recorded in the ledger rather than quietly forgotten.
+var SMOKE = false
+if args().len() > 6 { SMOKE = args()[6] == "smoke" }
+if LR_IDX < 0 or LR_IDX >= LR_GRID.len() { panic("m7_run: lr index {LR_IDX} outside the predeclared grid of {LR_GRID.len()}") }
+if TASK != "a" and TASK != "b" { panic("m7_run: task must be a or b, got {TASK}") }
+let LR = LR_GRID[LR_IDX]
+
+let train = dataset_load("data/m7/{TASK}_train.bin")
+let valid = dataset_load("data/m7/{TASK}_validation.bin")
+let comp = dataset_load("data/m7/{TASK}_composition.bin")
+let leng = dataset_load("data/m7/{TASK}_length.bin")
+let IV = train.vocab
+let OV = train.n_class
+let PAD = train.pad_id
+
+SEED = RUN_SEED * 7919 + 13
+
+// ---- the families ----------------------------------------------------------
+// Each branch sets up the parameter list and leaves the model reachable
+// through the family code; Zephyr has no closures, so the forward pass is an
+// if-chain in loss_of rather than a function value.
+var K_STEPS = PRESET_K
+if FAMILY == "k0" { K_STEPS = 0 }
+if FAMILY == "k1" { K_STEPS = 1 }
+if FAMILY == "k4" { K_STEPS = 4 }
+if FAMILY == "k8" { K_STEPS = 8 }
+
+let is_phase = FAMILY == "phase" or FAMILY == "incoherent" or FAMILY == "realrot" or FAMILY == "k0" or FAMILY == "k1" or FAMILY == "k4" or FAMILY == "k8"
+let is_gru = FAMILY == "gru_state" or FAMILY == "gru_param" or FAMILY == "gru_quad"
+let is_tf = FAMILY == "transformer"
+if not is_phase and not is_gru and not is_tf { panic("m7_run: unknown family {FAMILY}") }
+
+// The phase model is built in every case, because the parameter-matched GRU
+// needs its real parameter count as the target.
+let pcfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: PRESET_D, E: PRESET_E, H: PRESET_H,
+                       K: K_STEPS, pad: PAD, eps: 0.00000001}
+let pps = [t_zeros(DType.F64, [IV, PRESET_E]), t_zeros(DType.F64, [PRESET_E]),
+           t_zeros(DType.F64, [PRESET_H, PRESET_E + 3 * PRESET_D]), t_zeros(DType.F64, [PRESET_H]),
+           t_zeros(DType.F64, [3 * PRESET_D, PRESET_H]), t_zeros(DType.F64, [3 * PRESET_D])]
+let pzi = t_zeros(DType.C64, [PRESET_D])
+let pM = t_zeros(DType.C64, [OV, PRESET_D])
+let PH = PhaseParams{config: pcfg, embedding: pps[0], think: pps[1], W1: pps[2], b1: pps[3],
+                     W2: pps[4], b2: pps[5], z_init: pzi, M: pM}
+let phase_list = [PH.embedding, PH.think, PH.W1, PH.b1, PH.W2, PH.b2, PH.z_init, PH.M]
+let PHASE_PARAMS = count_real(phase_list)
+
+fn gru_count(hn: int, ov: int, iv: int) -> int {
+    // embedding + 3*(W,b) + Wo + bo + h0
+    return iv * PRESET_E + 3 * (hn * (PRESET_E + hn) + hn) + ov * hn + ov + hn
+}
+
+var GRU_HIDDEN = 2 * PRESET_D
+var MATCH_NOTE = "state-size match: hidden = 2D"
+if FAMILY == "gru_param" {
+    // Nearest integer hidden width by total real parameter count, which is
+    // what the baselines document asks for, and the achieved difference is
+    // reported rather than assumed to be small.
+    var best = 1
+    var bestd = 0 - 1
+    for hn in 1..400 {
+        var diff = gru_count(hn, OV, IV) - PHASE_PARAMS
+        if diff < 0 { diff = 0 - diff }
+        if bestd < 0 or diff < bestd { bestd = diff
+                                       best = hn }
+    }
+    GRU_HIDDEN = best
+    MATCH_NOTE = "parameter match: hidden = {best}, {gru_count(best, OV, IV)} against the phase model's {PHASE_PARAMS}"
+}
+var GRU_HEAD = 0
+if FAMILY == "gru_quad" { GRU_HEAD = 1 }
+
+let gcfg = GruConfig{input_vocab: IV, output_vocab: OV, E: PRESET_E, Hn: GRU_HIDDEN,
+                     head: GRU_HEAD, pad: PAD, eps: 0.00000001}
+let GR = GruParams{config: gcfg,
+                   embedding: t_zeros(DType.F64, [IV, PRESET_E]),
+                   Wz: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), bz: t_zeros(DType.F64, [GRU_HIDDEN]),
+                   Wr: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), br: t_zeros(DType.F64, [GRU_HIDDEN]),
+                   Wn: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), bn: t_zeros(DType.F64, [GRU_HIDDEN]),
+                   Wo: t_zeros(DType.F64, [OV, GRU_HIDDEN]), bo: t_zeros(DType.F64, [OV]),
+                   h0: t_zeros(DType.F64, [GRU_HIDDEN])}
+let tcfg = TfConfig{input_vocab: IV, output_vocab: OV, d: TF_D, ff: TF_FF, layers: TF_LAYERS,
+                    max_len: leng.seq_len, pad: PAD, eps: 0.00001}
+let TF = tf_new(tcfg)
+
+var PARAMS: [Tensor] = []
+if is_phase { PARAMS = phase_list }
+if is_gru { PARAMS = gru_param_list(GR) }
+if is_tf { PARAMS = tf_param_list(TF) }
+for i in 0..PARAMS.len() { init_like(PARAMS[i]) }
+let N_PARAMS = count_real(PARAMS)
+
+READOUT_INCOHERENT = FAMILY == "incoherent"
+PHASE_REAL_ROTATIONS = FAMILY == "realrot"
+
+// ---- forward -----------------------------------------------------------------
+// The tape handles of this run's parameters, in the same order as PARAMS.
+// Zephyr has no closures and no tuples, so the forward pass publishes them
+// here rather than returning them alongside the loss.
+var HANDLES: [int] = []
+
+fn loss_handle(tokens: Tensor, targets: [int], req: bool) -> int {
+    if is_phase {
+        let m = pad_params(PH, req)
+        HANDLES = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+        return pad_loss(m, tokens, targets)
+    }
+    if is_gru {
+        let m = gru_params(GR, req)
+        HANDLES = [m.embedding, m.Wz, m.bz, m.Wr, m.br, m.Wn, m.bn, m.Wo, m.bo, m.h0]
+        return gru_loss(m, tokens, targets)
+    }
+    let m = tf_params(TF, req)
+    HANDLES = m.hs
+    return tf_loss(m, tokens, targets)
+}
+fn probs_of(tokens: Tensor) -> Tensor {
+    if is_phase {
+        let m = pad_params(PH, false)
+        return av_value(pad_readout(m, pad_forward(m, tokens)))
+    }
+    if is_gru {
+        let m = gru_params(GR, false)
+        return av_value(gru_readout(m, gru_forward(m, tokens)))
+    }
+    let m = tf_params(TF, false)
+    return av_value(tf_readout(m, tf_forward(m, tokens)))
+}
+
+// Mean NLL and accuracy over the first `rows` rows of a split.
+fn evaluate(d: Dataset, rows: int) -> [float] {
+    var n = rows
+    if n > d.tokens.shape[0] { n = d.tokens.shape[0] }
+    var nll = 0.0
+    var right = 0
+    var seen = 0
+    var start = 0
+    while start < n {
+        var cnt = BUDGET_BATCH
+        if start + cnt > n { cnt = n - start }
+        let b = dataset_batch(d, start, cnt)
+        av_reset()
+        let pr = probs_of(b.tokens)
+        for r in 0..cnt {
+            let t = b.targets[r]
+            var p = t_get(pr, [r, t])
+            if p < 0.000000000000001 { p = 0.000000000000001 }
+            nll = nll - fln(p)
+            var best = 0
+            var bv = t_get(pr, [r, 0])
+            for c in 1..d.n_class {
+                let v = t_get(pr, [r, c])
+                if v > bv { bv = v
+                            best = c }
+            }
+            if best == t { right = right + 1 }
+            seen = seen + 1
+        }
+        start = start + cnt
+    }
+    return [nll / (seen as float), (right as float) / (seen as float), seen as float]
+}
+
+fn snapshot() -> [Tensor] {
+    var s: [Tensor] = []
+    for i in 0..PARAMS.len() { s.push(t_copy(PARAMS[i])) }
+    return s
+}
+fn restore(s: [Tensor]) {
+    for i in 0..PARAMS.len() {
+        var idx = idx_zeros(PARAMS[i].shape.len())
+        var more = t_numel(PARAMS[i]) > 0
+        while more {
+            if dtype_is_complex(PARAMS[i].dt) {
+                t_set_c(PARAMS[i], idx, t_get_re(s[i], idx), t_get_im(s[i], idx))
+            } else {
+                t_set(PARAMS[i], idx, t_get(s[i], idx))
+            }
+            more = idx_next(idx, PARAMS[i].shape)
+        }
+    }
+}
+
+// ---- train ---------------------------------------------------------------------
+let opt = adamw_new(PARAMS, LR, 0.9, 0.999, 0.00000001, WD)
+let ntrain = train.tokens.shape[0]
+var best_nll = 0.0 - 1.0
+var best_step = 0
+var best = snapshot()
+var examples = 0
+var status = "completed"
+var errmsg = ""
+let t_start = now_ms()
+var cursor = 0
+
+for step in 0..BUDGET_STEPS {
+    if cursor + BUDGET_BATCH > ntrain { cursor = 0 }
+    let b = dataset_batch(train, cursor, BUDGET_BATCH)
+    cursor = cursor + BUDGET_BATCH
+    av_reset()
+    let lh = loss_handle(b.tokens, b.targets, true)
+    av_backward(lh)
+    // Read the loss now. evaluate() below resets the tape, and reading the
+    // handle afterwards is a dead handle, not a number.
+    let train_loss = t_get(av_value(lh), [0])
+    var gs: [Tensor] = []
+    for i in 0..HANDLES.len() { gs.push(t_copy(av_grad(HANDLES[i]))) }
+    clip_grad_norm(gs, CLIP)
+    optim_step(opt, PARAMS, gs)
+    examples = examples + BUDGET_BATCH
+    if (step + 1) % EVAL_EVERY == 0 {
+        let v = evaluate(valid, SELECT_ROWS)
+        print("  step {step + 1}: train loss {train_loss}, validation nll {v[0]} acc {v[1]}, {(now_ms() - t_start) / 1000.0}s")
+        if best_nll < 0.0 or v[0] < best_nll {
+            best_nll = v[0]
+            best_step = step + 1
+            best = snapshot()
+        }
+    }
+}
+let elapsed = (now_ms() - t_start) / 1000.0
+
+// Selection is validation-only, and the frozen splits are touched exactly
+// once, here, after selection has already happened.
+restore(best)
+let vfinal = evaluate(valid, TEST_ROWS)
+var ccomp = [0.0 - 1.0, 0.0 - 1.0, 0.0]
+var clen = [0.0 - 1.0, 0.0 - 1.0, 0.0]
+if not SMOKE {
+    ccomp = evaluate(comp, TEST_ROWS)
+    clen = evaluate(leng, TEST_ROWS)
+}
+
+fn jnum(v: float) -> str { return "{v}" }
+var rec = "\{\n"
+rec = rec + "  \"run_id\": \"{FAMILY}-{TASK}-s{RUN_SEED}-lr{LR_IDX}\",\n"
+rec = rec + "  \"family\": \"{FAMILY}\",\n"
+rec = rec + "  \"task\": \"{TASK}\",\n"
+rec = rec + "  \"preset\": \"{PRESET_NAME}\",\n"
+rec = rec + "  \"seed\": {RUN_SEED},\n"
+rec = rec + "  \"learning_rate\": {jnum(LR)},\n"
+rec = rec + "  \"lr_index\": {LR_IDX},\n"
+rec = rec + "  \"weight_decay\": {jnum(WD)},\n"
+rec = rec + "  \"grad_clip\": {jnum(CLIP)},\n"
+rec = rec + "  \"optimizer_steps\": {BUDGET_STEPS},\n"
+rec = rec + "  \"batch\": {BUDGET_BATCH},\n"
+rec = rec + "  \"eval_every\": {EVAL_EVERY},\n"
+rec = rec + "  \"selection_rows\": {SELECT_ROWS},\n"
+rec = rec + "  \"test_rows\": {TEST_ROWS},\n"
+rec = rec + "  \"K\": {K_STEPS},\n"
+rec = rec + "  \"match_note\": \"{MATCH_NOTE}\",\n"
+rec = rec + "  \"parameters_real\": {N_PARAMS},\n"
+rec = rec + "  \"phase_parameters_real\": {PHASE_PARAMS},\n"
+rec = rec + "  \"state_real_dimensions\": {2 * PRESET_D},\n"
+rec = rec + "  \"dtype\": \"f64\",\n"
+rec = rec + "  \"backend\": \"cpu\",\n"
+rec = rec + "  \"examples_seen\": {examples},\n"
+rec = rec + "  \"elapsed_seconds\": {jnum(elapsed)},\n"
+rec = rec + "  \"throughput_examples_per_second\": {jnum((examples as float) / elapsed)},\n"
+rec = rec + "  \"selected_step\": {best_step},\n"
+rec = rec + "  \"selection_nll\": {jnum(best_nll)},\n"
+rec = rec + "  \"validation_nll\": {jnum(vfinal[0])},\n"
+rec = rec + "  \"validation_accuracy\": {jnum(vfinal[1])},\n"
+rec = rec + "  \"composition_nll\": {jnum(ccomp[0])},\n"
+rec = rec + "  \"composition_accuracy\": {jnum(ccomp[1])},\n"
+rec = rec + "  \"length_nll\": {jnum(clen[0])},\n"
+rec = rec + "  \"length_accuracy\": {jnum(clen[1])},\n"
+rec = rec + "  \"chance_accuracy\": {jnum(1.0 / (OV as float))},\n"
+rec = rec + "  \"peak_live_bytes\": null,\n"
+rec = rec + "  \"peak_reserved_bytes\": null,\n"
+rec = rec + "  \"smoke\": {SMOKE},\n"
+rec = rec + "  \"status\": \"{status}\",\n"
+rec = rec + "  \"error\": null\n"
+rec = rec + "\}\n"
+write_text(OUT, rec)
+print("{FAMILY} {TASK} seed {RUN_SEED} lr {LR}: val nll {vfinal[0]} acc {vfinal[1]}, comp acc {ccomp[1]}, len acc {clen[1]}, {elapsed}s")

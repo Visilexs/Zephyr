@@ -1,0 +1,115 @@
+// Gate-level checks for lib/ml/phase.zeph -- acceptance A10.
+//
+// Written separately from tests/ml/phase_test.zeph and from the numpy parity
+// harness, and deliberately aimed at what neither of those reaches. The
+// per-step parity in tools/ml_reference/check_phase.py runs at D=4 and D=8
+// only, so the pairing that phase_givens constructs is unverified at the
+// specification's own D=128 except indirectly through a norm. A pairing that
+// was a bijection but paired the wrong coordinates would preserve the norm
+// perfectly and go unnoticed. These checks pin the pairing itself.
+import "ml/phase.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+fn near(a: float, b: float) -> bool { return fabs(a - b) <= 0.0000000001 * (1.0 + fabs(b)) }
+
+// A reproducible nonzero state whose coordinates are all distinguishable, so a
+// mispairing shows up as a value landing in the wrong slot.
+fn mkstate(d: int) -> Tensor {
+    let z = t_zeros(DType.C64, [1, d])
+    for j in 0..d {
+        t_set_c(z, [0, j], 1.0 + (j as float), 0.5 - (j as float) / 4.0)
+    }
+    return z
+}
+
+fn angles_of(d: int, theta: float, phi: float) -> [Tensor] {
+    let th = t_full(DType.F64, [1, d / 2], theta)
+    let ph = t_full(DType.F64, [1, d / 2], phi)
+    return [th, ph]
+}
+
+var n = 0
+
+for d in [4, 8, 128] {
+    for stage in [0, 1] {
+        let z = mkstate(d)
+
+        // --- the pairing, pinned exactly -----------------------------------
+        // theta = pi/2, phi = 0 makes the stage a pure signed swap:
+        //   a' = b   and   b' = -a
+        // so every coordinate's partner is readable straight off the output.
+        let sw = angles_of(d, HALF_PI, 0.0)
+        let swapped = phase_givens(z, sw[0], sw[1], stage)
+        for j in 0..(d / 2) {
+            let left = 2 * j + stage
+            let right = (2 * j + stage + 1) % d
+            n += ck(near(t_get_re(swapped, [0, left]), t_get_re(z, [0, right])), "stage moves the partner into the left slot")
+            n += ck(near(t_get_im(swapped, [0, left]), t_get_im(z, [0, right])), "left slot carries the partner imaginary part")
+            n += ck(near(t_get_re(swapped, [0, right]), 0.0 - t_get_re(z, [0, left])), "right slot is the negated left value")
+            n += ck(near(t_get_im(swapped, [0, right]), 0.0 - t_get_im(z, [0, left])), "right slot negates the imaginary part too")
+        }
+
+        // --- bijection and range, independent of any arithmetic ------------
+        // Every coordinate must be touched exactly once by the stage's pairs.
+        var seen: [int] = []
+        for j in 0..d { seen.push(0) }
+        for j in 0..(d / 2) {
+            let left = 2 * j + stage
+            let right = (2 * j + stage + 1) % d
+            n += ck(left >= 0 and left < d, "left index in range")
+            n += ck(right >= 0 and right < d, "right index in range")
+            n += ck(left != right, "a pair never pairs a coordinate with itself")
+            seen[left] += 1
+            seen[right] += 1
+        }
+        for j in 0..d { n += ck(seen[j] == 1, "each coordinate belongs to exactly one pair") }
+
+        // --- inverse by G^H, which is the stage at -theta -------------------
+        let th = 0.6
+        let ph = 1.3
+        let fwd = angles_of(d, th, ph)
+        let moved = phase_givens(z, fwd[0], fwd[1], stage)
+        let back = angles_of(d, 0.0 - th, ph)
+        let restored = phase_givens(moved, back[0], back[1], stage)
+        for j in 0..d {
+            n += ck(near(t_get_re(restored, [0, j]), t_get_re(z, [0, j])), "G^H G = I recovers the real part")
+            n += ck(near(t_get_im(restored, [0, j]), t_get_im(z, [0, j])), "G^H G = I recovers the imaginary part")
+        }
+
+        // --- norm preservation at the level of one stage --------------------
+        let before = t_sum_all(t_abs2(z))
+        let after = t_sum_all(t_abs2(moved))
+        n += ck(near(after, before), "one stage preserves the norm")
+
+        // a stage must actually mix, or the checks above would be vacuous
+        n += ck(not near(t_get_re(moved, [0, stage]), t_get_re(z, [0, stage])), "the stage genuinely changes the state")
+    }
+
+    // --- stage B must wrap, which is the part that is easy to get wrong -----
+    let z2 = mkstate(d)
+    let sw2 = angles_of(d, HALF_PI, 0.0)
+    let odd = phase_givens(z2, sw2[0], sw2[1], 1)
+    n += ck(near(t_get_re(odd, [0, d - 1]), t_get_re(z2, [0, 0])), "stage B pairs the last coordinate with the first")
+    n += ck(near(t_get_re(odd, [0, 0]), 0.0 - t_get_re(z2, [0, d - 1])), "the wrapped partner receives the negated value")
+
+    // --- the two stages must differ, or alternating them would not mix ------
+    let za = phase_givens(z2, sw2[0], sw2[1], 0)
+    n += ck(not near(t_get_re(za, [0, 1]), t_get_re(odd, [0, 1])), "stage A and stage B are not the same permutation")
+
+    // --- the elementwise phase gate leaves every magnitude alone ------------
+    let zp = mkstate(d)
+    let ang = t_zeros(DType.F64, [1, d])
+    for j in 0..d { t_set(ang, [0, j], 0.3 + (j as float) / 7.0) }
+    let phased = t_mul(zp, t_expi(ang, DType.C64))
+    for j in 0..d {
+        let m0 = t_get_re(zp, [0, j]) * t_get_re(zp, [0, j]) + t_get_im(zp, [0, j]) * t_get_im(zp, [0, j])
+        let m1 = t_get_re(phased, [0, j]) * t_get_re(phased, [0, j]) + t_get_im(phased, [0, j]) * t_get_im(phased, [0, j])
+        n += ck(near(m1, m0), "the phase gate preserves each magnitude")
+    }
+}
+
+print("phase gates: {n} checks passed")

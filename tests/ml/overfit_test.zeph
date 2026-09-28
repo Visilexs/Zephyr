@@ -1,0 +1,163 @@
+// A bounded overfit of 32 examples, entirely in Zephyr -- acceptance A14.
+//
+// A14 requires no Python runtime dependency for this run, so everything here
+// -- data, model, gradients, optimizer, metrics -- is native, and the numbers
+// printed at the end come out of this binary.
+//
+// WHAT THIS MEASURES, AND WHAT IT DOES NOT. It measures that the tape, the
+// VJPs and AdamW compose into a training loop that can drive a loss down and
+// fit a small fixed set. The labels are deliberately pseudo-random and
+// unrelated to the tokens, which makes this a capacity and optimization
+// check, not a learning one: a model that fits random labels has demonstrated
+// nothing whatever about the phase architecture, generalization, or the
+// hypothesis this project exists to test. Treat a pass here as evidence the
+// plumbing works.
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+fn ck(cond: bool, name: str) -> int {
+    assert(cond, name)
+    return 1
+}
+
+let N = 32
+let T = 4
+let D = 8
+let E = 4
+let H = 16
+let IV = 6
+let OV = 3
+let K = 1
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 20001) as float) / 100000.0 - 0.1
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) {
+            let im = rnd()
+            t_set_c(t, idx, re, im)
+        } else {
+            t_set(t, idx, re)
+        }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+let config = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+let embedding = t_zeros(DType.F64, [IV, E])
+let think = t_zeros(DType.F64, [E])
+let W1 = t_zeros(DType.F64, [H, E + 3 * D])
+let b1 = t_zeros(DType.F64, [H])
+let W2 = t_zeros(DType.F64, [3 * D, H])
+let b2 = t_zeros(DType.F64, [3 * D])
+let z_init = t_zeros(DType.C64, [D])
+let M = t_zeros(DType.C64, [OV, D])
+let params = [embedding, think, W1, b1, W2, b2, z_init, M]
+for i in 0..params.len() { fill_random(params[i]) }
+let p = PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: M}
+
+// 32 examples, no PAD, with labels independent of the tokens on purpose.
+let tokens = t_zeros(DType.I64, [N, T])
+var targets: [int] = []
+for row in 0..N {
+    for step in 0..T { t_set_int(tokens, [row, step], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+
+var seen: [int] = []
+for j in 0..OV { seen.push(0) }
+for row in 0..N { seen[targets[row]] += 1 }
+var n = 0
+for j in 0..OV { n += ck(seen[j] > 0, "every class appears in the 32 examples") }
+
+fn accuracy(p: PhaseParams, tokens: Tensor, targets: [int]) -> float {
+    av_reset()
+    let m = pad_params(p, false)
+    let probs = av_value(pad_readout(m, pad_forward(m, tokens)))
+    var right = 0
+    for row in 0..probs.shape[0] {
+        var best = 0
+        for j in 1..probs.shape[1] {
+            if t_get(probs, [row, j]) > t_get(probs, [row, best]) { best = j }
+        }
+        if best == targets[row] { right += 1 }
+    }
+    return (right as float) / (probs.shape[0] as float)
+}
+
+fn loss_now(p: PhaseParams, tokens: Tensor, targets: [int]) -> float {
+    av_reset()
+    let m = pad_params(p, false)
+    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+}
+
+let start_loss = loss_now(p, tokens, targets)
+let start_acc = accuracy(p, tokens, targets)
+n += ck(start_loss == start_loss, "the initial loss is finite, not NaN")
+n += ck(start_loss > 0.0, "the initial loss is positive")
+
+let opt = adamw_new(params, 0.02, 0.9, 0.999, 0.00000001, 0.0)
+let STEPS = 120
+var prev = start_loss
+var worse = 0
+var last = start_loss
+
+for step in 0..STEPS {
+    av_reset()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
+    for i in 0..grads.len() {
+        var idx = idx_zeros(grads[i].shape.len())
+        var more = t_numel(grads[i]) > 0
+        while more {
+            if dtype_is_complex(grads[i].dt) {
+                let gr = t_get_re(grads[i], idx)
+                let gi = t_get_im(grads[i], idx)
+                if not (gr == gr and gi == gi) { panic("overfit: nonfinite gradient") }
+            } else {
+                let gv = t_get(grads[i], idx)
+                if not (gv == gv) { panic("overfit: nonfinite gradient") }
+            }
+            more = idx_next(idx, grads[i].shape)
+        }
+    }
+    let gnorm = clip_grad_norm(grads, 5.0)
+    n += ck(gnorm == gnorm and gnorm >= 0.0, "the gradient norm is finite and nonnegative")
+    optim_step(opt, params, grads)
+    let now = t_get(av_value(loss), [0])
+    if now > prev { worse += 1 }
+    prev = now
+    last = now
+}
+
+let end_loss = loss_now(p, tokens, targets)
+let end_acc = accuracy(p, tokens, targets)
+
+n += ck(opt.step == STEPS, "the optimizer counted every step")
+n += ck(end_loss == end_loss, "the final loss is finite")
+n += ck(end_loss < start_loss, "the loss fell over training")
+n += ck(end_loss < start_loss * 0.5, "the loss at least halved")
+n += ck(end_acc > start_acc or start_acc == 1.0, "accuracy did not go backwards")
+n += ck(end_acc >= 0.9375, "the model fits at least 30 of the 32 examples")
+// A loss that never once rose would suggest a step size too small to be a
+// real test; a loss that rose constantly would mean divergence.
+n += ck(worse < STEPS / 2, "training did not diverge")
+
+print("overfit start: loss {start_loss} acc {start_acc}")
+print("overfit end:   loss {end_loss} acc {end_acc}")
+print("overfit: {n} checks passed")

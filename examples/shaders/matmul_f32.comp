@@ -1,0 +1,18 @@
+#version 450
+// C = A * B, row-major, float32. One invocation per output element.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; };
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.M || col >= pc.N) { return; }
+    float sum = 0.0;
+    for (uint i = 0u; i < pc.K; ++i) {
+        sum += a[row * pc.K + i] * b[i * pc.N + col];
+    }
+    c[row * pc.N + col] = sum;
+}

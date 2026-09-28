@@ -1,0 +1,213 @@
+// A23, gradient and update halves: the same training step computed entirely
+// on the CPU and again with every supported op dispatched to the device, and
+// the two compared.
+//
+// This is a stronger statement than the output gates in gpu_ops_test.zeph.
+// There, each kernel was checked against its CPU counterpart in isolation.
+// Here the whole tape runs through them -- 400-odd nodes of forward and
+// backward over a real phase model -- so an error in any single VJP, in the
+// stride metadata threaded through them, or in the interaction between two
+// ops shows up in the gradients.
+//
+// The VJPs themselves are not reimplemented for the device and must not be.
+// They are compositions of the primitives in ops.zeph, so routing those
+// primitives routes the backward pass with them. That is why a matching
+// gradient here means "every op is supported with its VJP" rather than only
+// "the forward agrees".
+//
+// The hooks fall back to the CPU for anything the kernels do not cover, so a
+// third check counts how many ops actually reached the device. Without it,
+// gradients could agree perfectly because nothing was dispatched at all.
+import "ml/gpu_ops.zeph"
+import "ml/phase_ad.zeph"
+import "ml/optim.zeph"
+
+var passed = 0
+var failed = 0
+fn chk(c: bool, what: str) {
+    if c { passed = passed + 1 } else {
+        failed = failed + 1
+        print("FAIL: {what}")
+    }
+}
+
+var SEED = 20260921
+fn rnd() -> float {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return ((SEED % 2001) as float) / 1000.0 - 1.0
+}
+fn rndi(n: int) -> int {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED % n
+}
+fn fill_random(t: Tensor) {
+    var idx = idx_zeros(t.shape.len())
+    var more = t_numel(t) > 0
+    while more {
+        let re = rnd()
+        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
+        more = idx_next(idx, t.shape)
+    }
+}
+
+// Small on purpose. Every op becomes an upload, a dispatch and a download in
+// this configuration, so a step costs far more than it does on the CPU --
+// which is a statement about per-op dispatch, not about the device, and is
+// the thing tensor residency will fix. Correctness is what is being gated
+// here, and correctness does not need a big model.
+let D = 8
+let E = 4
+let H = 16
+let K = 1
+let IV = 6
+let OV = 3
+let NB = 4
+let T = 3
+
+fn build() -> PhaseParams {
+    let config = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
+    let embedding = t_zeros(DType.F64, [IV, E])
+    let think = t_zeros(DType.F64, [E])
+    let W1 = t_zeros(DType.F64, [H, E + 3 * D])
+    let b1 = t_zeros(DType.F64, [H])
+    let W2 = t_zeros(DType.F64, [3 * D, H])
+    let b2 = t_zeros(DType.F64, [3 * D])
+    let z_init = t_zeros(DType.C64, [D])
+    let Mo = t_zeros(DType.C64, [OV, D])
+    let ps = [embedding, think, W1, b1, W2, b2, z_init, Mo]
+    for i in 0..ps.len() { fill_random(ps[i]) }
+    return PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: Mo}
+}
+fn params_of(p: PhaseParams) -> [Tensor] {
+    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+}
+
+// Two models from the same seed, so any disagreement is the backend and not
+// the initialisation.
+let save = SEED
+let p_cpu = build()
+SEED = save
+let p_gpu = build()
+
+let tokens = t_zeros(DType.I64, [NB, T])
+var targets: [int] = []
+for row in 0..NB {
+    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    targets.push(rndi(OV))
+}
+
+fn step(p: PhaseParams, opt: Optim, out: [Tensor]) -> float {
+    av_reset()
+    let m = pad_params(p, true)
+    let loss = pad_loss(m, tokens, targets)
+    av_backward(loss)
+    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    var grads: [Tensor] = []
+    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
+    clip_grad_norm(grads, 5.0)
+    optim_step(opt, params_of(p), grads)
+    for i in 0..grads.len() { out.push(grads[i]) }
+    return t_get(av_value(loss), [0])
+}
+
+var m = gpu_init()
+print("device: {gpu_device_name(m)}")
+
+// ---- CPU ------------------------------------------------------------------
+gpu_ops_disable()
+MATMUL_CALLS = 0
+var g_cpu: [Tensor] = []
+let o_cpu = adamw_new(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.01)
+let loss_cpu = step(p_cpu, o_cpu, g_cpu)
+
+// ---- the same step with every supported op on the device -------------------
+gpu_ops_enable(m)
+var g_gpu: [Tensor] = []
+let o_gpu = adamw_new(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.01)
+let loss_gpu = step(p_gpu, o_gpu, g_gpu)
+let dispatched = MATMUL_CALLS
+gpu_ops_disable()
+
+// ---- the loss gate ---------------------------------------------------------
+let dl = fabs(loss_gpu - loss_cpu) / (1.0 + fabs(loss_cpu))
+chk(dl < 0.000000000001, "loss agrees: {loss_cpu} against {loss_gpu}, relative {dl}")
+chk(loss_cpu == loss_cpu and loss_cpu > 0.0, "the loss is finite and positive, so the comparison is not on NaN")
+
+// ---- the gradient gate -----------------------------------------------------
+chk(g_cpu.len() == 8 and g_gpu.len() == 8, "both paths produced eight gradients")
+var worst = 0.0
+var compared = 0
+var moved = 0
+for i in 0..g_cpu.len() {
+    chk(g_cpu[i].dt == g_gpu[i].dt, "gradient {i} has the same dtype on both paths")
+    var idx = idx_zeros(g_cpu[i].shape.len())
+    var more = t_numel(g_cpu[i]) > 0
+    while more {
+        if dtype_is_complex(g_cpu[i].dt) {
+            let wr = t_get_re(g_cpu[i], idx)
+            let wi = t_get_im(g_cpu[i], idx)
+            let dr = fabs(t_get_re(g_gpu[i], idx) - wr) / (1.0 + fabs(wr))
+            let di = fabs(t_get_im(g_gpu[i], idx) - wi) / (1.0 + fabs(wi))
+            if dr > worst { worst = dr }
+            if di > worst { worst = di }
+            if fabs(wr) > 0.0001 or fabs(wi) > 0.0001 { moved = moved + 1 }
+            compared = compared + 2
+        } else {
+            let w = t_get(g_cpu[i], idx)
+            let d = fabs(t_get(g_gpu[i], idx) - w) / (1.0 + fabs(w))
+            if d > worst { worst = d }
+            if fabs(w) > 0.0001 { moved = moved + 1 }
+            compared = compared + 1
+        }
+        more = idx_next(idx, g_cpu[i].shape)
+    }
+}
+chk(worst < 0.000000000001, "gradients agree across {compared} components, worst relative {worst}")
+// A gradient of all zeros would match trivially and would also mean the tape
+// never reached most of the model.
+chk(moved > compared / 4, "at least a quarter of the gradient components are non-trivial ({moved} of {compared})")
+
+// ---- the update gate -------------------------------------------------------
+// AdamW with a non-zero weight decay, so the decoupled-decay term is part of
+// what is being compared and not just the gradient.
+var upd = 0
+var uworst = 0.0
+let pc = params_of(p_cpu)
+let pg = params_of(p_gpu)
+for i in 0..pc.len() {
+    var idx = idx_zeros(pc[i].shape.len())
+    var more = t_numel(pc[i]) > 0
+    while more {
+        if dtype_is_complex(pc[i].dt) {
+            let wr = t_get_re(pc[i], idx)
+            let wi = t_get_im(pc[i], idx)
+            let dr = fabs(t_get_re(pg[i], idx) - wr) / (1.0 + fabs(wr))
+            let di = fabs(t_get_im(pg[i], idx) - wi) / (1.0 + fabs(wi))
+            if dr > uworst { uworst = dr }
+            if di > uworst { uworst = di }
+            upd = upd + 2
+        } else {
+            let w = t_get(pc[i], idx)
+            let d = fabs(t_get(pg[i], idx) - w) / (1.0 + fabs(w))
+            if d > uworst { uworst = d }
+            upd = upd + 1
+        }
+        more = idx_next(idx, pc[i].shape)
+    }
+}
+chk(uworst < 0.000000000001, "parameters after one AdamW step agree across {upd} components, worst relative {uworst}")
+
+// ---- the work actually went to the device ----------------------------------
+// Without this the three gates above could all pass because every hook fell
+// back to the CPU and the two paths were literally the same code.
+chk(dispatched > 0, "matmuls were dispatched during the device step ({dispatched})")
+print("device step: {dispatched} matmuls, {compared} gradient components, {upd} parameter components")
+
+gpu_done(m)
+
+if failed == 0 {
+    print("gpu grad: {passed} checks passed")
+} else {
+    print("gpu grad: {failed} FAILED, {passed} passed")
+    panic("gpu grad tests failed")
+}

@@ -1,0 +1,138 @@
+// Native loader for the frozen M7 datasets. No Python at run time: the files
+// in data/m7/ are written once by tools/ml_reference/freeze_datasets.py and
+// read here.
+//
+// Binary format, little-endian:
+//
+//     magic   : 8 bytes, ASCII "ZML7DATA"
+//     version : u32 = 1
+//     n_rows  : u32
+//     seq_len : u32        (all rows padded to this with the PAD id)
+//     vocab   : u32        (input vocabulary size)
+//     n_class : u32        (output vocabulary size, i.e. number of target classes)
+//     pad_id  : u32
+//     reserved: u32 = 0
+//     then n_rows * seq_len  i32 token ids
+//     then n_rows            i32 targets
+//
+// Every header field is validated before a single element is read, and the
+// payload size has to match the header exactly: a truncated file is rejected
+// rather than read as far as it goes. Token ids and targets are range-checked
+// as they are read, so a Dataset that exists is a Dataset that is in range.
+import "ml/tensor.zeph"
+
+let DS_HEADER = 36
+
+struct Dataset {
+    tokens: Tensor,     // I64, [n_rows, seq_len]
+    targets: [int],     // length n_rows
+    seq_len: int,
+    vocab: int,
+    n_class: int,
+    pad_id: int,
+}
+
+// read_file panics on a missing path rather than returning empty, so the
+// existence question has to be asked first -- same as gpu.zeph does.
+fn ds_file_exists(path: str) -> bool {
+    var cp = cbytes(path)
+    let attrs = win("GetFileAttributesA", cp.addr())
+    return attrs != 4294967295 and attrs != 0 - 1
+}
+
+fn ds_u32(s: str, off: int) -> int {
+    return s.byte(off) + s.byte(off + 1) * 256 + s.byte(off + 2) * 65536 + s.byte(off + 3) * 16777216
+}
+
+fn ds_i32(s: str, off: int) -> int {
+    let v = ds_u32(s, off)
+    if v >= 2147483648 { return v - 4294967296 }
+    return v
+}
+
+fn dataset_load(path: str) -> Dataset {
+    if not ds_file_exists(path) {
+        panic("dataset_load: {path} does not exist. Run: python tools/ml_reference/freeze_datasets.py")
+    }
+    let raw = read_file(path)
+    if raw.len() < DS_HEADER {
+        panic("dataset_load: {path} is {raw.len()} bytes, too short for the {DS_HEADER}-byte header")
+    }
+    let magic = raw.sub(0, 8)
+    if magic != "ZML7DATA" {
+        panic("dataset_load: {path} has bad magic, expected ZML7DATA")
+    }
+    let version = ds_u32(raw, 8)
+    if version != 1 {
+        panic("dataset_load: {path} has unknown version {version}, this reader understands version 1 only")
+    }
+    let n_rows = ds_u32(raw, 12)
+    let seq_len = ds_u32(raw, 16)
+    let vocab = ds_u32(raw, 20)
+    let n_class = ds_u32(raw, 24)
+    let pad_id = ds_u32(raw, 28)
+    let reserved = ds_u32(raw, 32)
+    if reserved != 0 {
+        panic("dataset_load: {path} has reserved = {reserved}, expected 0")
+    }
+    if vocab <= 0 {
+        panic("dataset_load: {path} declares a vocabulary of {vocab}")
+    }
+    if n_class <= 0 {
+        panic("dataset_load: {path} declares {n_class} target classes")
+    }
+    if pad_id >= vocab {
+        panic("dataset_load: {path} has pad id {pad_id} outside its vocabulary of {vocab}")
+    }
+    let payload = raw.len() - DS_HEADER
+    // Bound each count by the payload before multiplying, so a header with
+    // absurd counts cannot overflow its way into looking consistent.
+    if n_rows > payload / 4 or seq_len > payload / 4 {
+        panic("dataset_load: {path} claims {n_rows} rows of {seq_len} tokens but only {payload} bytes follow the header")
+    }
+    let want = (n_rows * seq_len + n_rows) * 4
+    if want != payload {
+        panic("dataset_load: {path} claims {n_rows} rows of {seq_len} tokens, needing {want} payload bytes, but {payload} follow the header")
+    }
+
+    let tokens = t_zeros(DType.I64, [n_rows, seq_len])
+    var idx = [0, 0]
+    var off = DS_HEADER
+    for r in 0..n_rows {
+        idx[0] = r
+        for c in 0..seq_len {
+            let v = ds_i32(raw, off)
+            if v < 0 or v >= vocab {
+                panic("dataset_load: {path} row {r} position {c} has token id {v}, outside the vocabulary of {vocab}")
+            }
+            idx[1] = c
+            t_set_int(tokens, idx, v)
+            off += 4
+        }
+    }
+    var targets: [int] = []
+    for r in 0..n_rows {
+        let v = ds_i32(raw, off)
+        if v < 0 or v >= n_class {
+            panic("dataset_load: {path} row {r} has target {v}, outside the {n_class} target classes")
+        }
+        targets.push(v)
+        off += 4
+    }
+    return Dataset{tokens: tokens, targets: targets, seq_len: seq_len, vocab: vocab,
+                   n_class: n_class, pad_id: pad_id}
+}
+
+// Rows [start, start + count) as a view over the same storage. An
+// out-of-range request is an error, never a clamp: a short last batch that
+// silently appeared would be a training bug nobody sees.
+fn dataset_batch(d: Dataset, start: int, count: int) -> Dataset {
+    let n = d.targets.len()
+    if start < 0 or count < 0 or start + count > n {
+        panic("dataset_batch: rows [{start}, {start + count}) requested from a dataset of {n} rows")
+    }
+    var rows: [int] = []
+    for i in 0..count { rows.push(d.targets[start + i]) }
+    return Dataset{tokens: t_slice(d.tokens, 0, start, start + count), targets: rows,
+                   seq_len: d.seq_len, vocab: d.vocab, n_class: d.n_class, pad_id: d.pad_id}
+}

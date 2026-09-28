@@ -1,0 +1,31 @@
+#version 450
+// Complex float64 matmul. Elements are interleaved re,im pairs of doubles, so
+// the buffers hold 2*M*K, 2*K*N and 2*M*N doubles respectively -- this matches
+// the C64 memory layout in lib/ml/tensor.zeph exactly, which is what lets the
+// host upload by t_get_re/t_get_im without a repack.
+#extension GL_ARB_gpu_shader_fp64 : enable
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer BufA { double a[]; };
+layout(std430, binding = 1) readonly buffer BufB { double b[]; };
+layout(std430, binding = 2) writeonly buffer BufC { double c[]; };
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.M || col >= pc.N) { return; }
+    double sr = 0.0lf;
+    double si = 0.0lf;
+    for (uint i = 0u; i < pc.K; ++i) {
+        uint ia = 2u * (row * pc.K + i);
+        uint ib = 2u * (i * pc.N + col);
+        double ar = a[ia];
+        double ai = a[ia + 1u];
+        double br = b[ib];
+        double bi = b[ib + 1u];
+        sr += ar * br - ai * bi;
+        si += ar * bi + ai * br;
+    }
+    uint ic = 2u * (row * pc.N + col);
+    c[ic] = sr;
+    c[ic + 1u] = si;
+}
