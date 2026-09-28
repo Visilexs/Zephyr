@@ -277,6 +277,11 @@ var g_enums: [EDef] = []
 var g_ifaces: [IDef] = []
 var g_fnsigs: [FnSig] = []
 var g_fns: [FDef] = []
+// Keep the first entry when closures or generic instances share a name.
+var g_fn_names: [str: int] = [:]
+var g_struct_names: [str: int] = [:]
+var g_enum_names: [str: int] = [:]
+var g_iface_names: [str: int] = [:]
 // interface vtables to emit: parallel (struct-def index, interface index) pairs
 var g_vt_sd: [int] = []
 var g_vt_if: [int] = []
@@ -1440,10 +1445,7 @@ fn type_str(t: int) -> str {
 }
 
 fn find_enum(name: str) -> int {
-    for i in 0..g_enums.len() {
-        if g_enums[i].name == name { return i }
-    }
-    return 0 - 1
+    return g_enum_names.get(name).or(-1)
 }
 
 fn is_num(t: int) -> bool { return ty_kind[t] == K_INT or ty_kind[t] == K_FLOAT }
@@ -1461,17 +1463,11 @@ fn fits(want: int, got: int) -> bool {
 }
 
 fn find_struct(name: str) -> int {
-    for i in 0..g_structs.len() {
-        if g_structs[i].name == name { return i }
-    }
-    return -1
+    return g_struct_names.get(name).or(-1)
 }
 
 fn find_fn(name: str) -> int {
-    for i in 0..g_fns.len() {
-        if g_fns[i].name == name { return i }
-    }
-    return -1
+    return g_fn_names.get(name).or(-1)
 }
 
 fn is_builtin_name(n: str) -> bool {
@@ -2033,6 +2029,7 @@ fn check_fnlit(e: Node) -> int {
                     body: e.kids[2], nslots: nslots, line: e.line,
                     tparams: no_tp, node: e, label: "cl__" + (idx as str), has_env: true,
                     pristine: e, prist_ok: false, prist_nslots: 0})
+    if not g_fn_names.has("closure") { g_fn_names["closure"] = idx }
     g_insts.push(idx)
     e.refi = idx
     // Resolve each captured name in the enclosing scope, now that the closure's
@@ -2144,6 +2141,7 @@ fn instantiate(fi: int, names: [str], types: [int]) -> int {
                     body: clone_node(f.body), nslots: 0, line: f.line,
                     tparams: no_tp, node: node, label: f.name + "__" + (idx as str), has_env: false,
                     pristine: node, prist_ok: false, prist_nslots: 0})
+    if not g_fn_names.has(f.name) { g_fn_names[f.name] = idx }
     g_inst_keys.push(key)                        // cache before checking, so a
     g_inst_fis.push(idx)                         // recursive generic terminates
     g_insts.push(idx)
@@ -2950,10 +2948,7 @@ fn fn_asm_label(name: str) -> str {
 }
 
 fn find_iface(name: str) -> int {
-    for i in 0..g_ifaces.len() {
-        if g_ifaces[i].name == name { return i }
-    }
-    return 0 - 1
+    return g_iface_names.get(name).or(-1)
 }
 fn iface_of(id: int) -> int { return new_type(K_IFACE, 0, id) }
 
@@ -3002,6 +2997,7 @@ fn check(prog: Node) {
                 members.push(m.name)
             }
             g_enums.push(EDef{name: n.name, members: members, line: n.line})
+            if not g_enum_names.has(n.name) { g_enum_names[n.name] = g_enums.len() - 1 }
             n.refi = g_enums.len() - 1
         }
     }
@@ -3014,6 +3010,7 @@ fn check(prog: Node) {
             var fnames: [str] = []
             var ftypes: [int] = []
             g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line})
+            if not g_struct_names.has(n.name) { g_struct_names[n.name] = g_structs.len() - 1 }
             n.refi = g_structs.len() - 1
         }
     }
@@ -3042,6 +3039,7 @@ fn check(prog: Node) {
                 msigs.push(fn_of(ps, ret))
             }
             g_ifaces.push(IDef{name: n.name, mnames: mnames, msigs: msigs, line: n.line})
+            if not g_iface_names.has(n.name) { g_iface_names[n.name] = g_ifaces.len() - 1 }
             n.refi = g_ifaces.len() - 1
         }
     }
@@ -3086,6 +3084,7 @@ fn check(prog: Node) {
                             body: n.kids[2], nslots: 0, line: n.line,
                             tparams: tparams, node: n, label: fn_asm_label(n.name), has_env: false,
                             pristine: n, prist_ok: false, prist_nslots: 0})
+            if not g_fn_names.has(n.name) { g_fn_names[n.name] = g_fns.len() - 1 }
             n.refi = g_fns.len() - 1
         }
     }
@@ -3156,6 +3155,7 @@ fn drain_pending() {
 }
 
 // ---------------- codegen ----------------
+var g_uses_r12 = false
 fn o(s: str) {
     // peephole: "movq rax, xmm0" then "movq xmm0, rax" reloads xmm0 with the
     // value it already holds -- a no-op. Drops the float-result round-trip that
@@ -3163,9 +3163,14 @@ fn o(s: str) {
     if s == "movq xmm0, rax" and g_lines.len() > 0 {
         if g_lines[g_lines.len() - 1] == "  movq rax, xmm0\n" { return }
     }
+    if not g_uses_r12 { g_uses_r12 = line_uses_r12(s) }
     g_lines.push("  " + s + "\n")
 }
-fn raw(s: str) { g_lines.push(s + "\n") }
+fn raw(s: str) {
+    if not g_uses_r12 { g_uses_r12 = line_uses_r12(s) }
+    if s.len() > 3 and s.byte(0) == 114 { asm_predefine(s) }
+    g_lines.push(s + "\n")
+}
 
 // runtime functions keep bare names so they satisfy the codegen's rt_ calls
 fn fn_label(name: str) -> str {
@@ -7412,11 +7417,6 @@ fn gen_block(blk: Node, retlabel: int) {
     }
 }
 
-fn no_lines() -> [str] {
-    var a: [str] = []
-    return a
-}
-
 // does this emitted line mention r12? (byte scan: the C seed, which must be
 // able to compile this file, has no .contains())
 fn line_uses_r12(s: str) -> bool {
@@ -7528,11 +7528,15 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
     g_lb_base = spillbase + nspill
     g_lb_next = 0
     let frame = xbase + g_nfpromo + dslots + nspill + lbslots
-    // generate the body into a side buffer first: r12 is only needed by
-    // functions that make a runtime/FFI call (the rsp-alignment dance), and a
-    // leaf function shouldn't pay push/pop r12 on every single call.
-    let outer = g_lines
-    g_lines = no_lines()
+    // Emit the body in place, reserving the optional r12 save. An empty entry
+    // contributes no text and the assembler skips it. Cold panic blocks bypass
+    // o/raw, so only returning paths affect the callee-save decision.
+    raw(label + ":")
+    o("push rbp")
+    o("mov rbp, rsp")
+    let r12_save = g_lines.len()
+    g_lines.push("")
+    g_uses_r12 = false
     // slots are addressed from [rbp-16] down, which assumes the 8 bytes that
     // "push r12" occupies. If it turns out we can skip that push, the space
     // still has to be reserved -- Windows x64 has no red zone, so a slot below
@@ -7617,20 +7621,8 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
     }
     for k in 0..g_npromo { o("mov {PROMO_REGS[k]}, [rbp - {16 + 8 * (base + k)}]") }
     for k in 0..g_nfpromo { o("movsd {FPROMO_REGS[k]}, [rbp - {16 + 8 * (xbase + k)}]") }
-    // does the body really use r12? (the out-of-line bounds-failure blocks may,
-    // but they end in a panic that never returns, so they don't count)
-    var uses_r12 = false
-    for i in 0..g_lines.len() {
-        if line_uses_r12(g_lines[i]) { uses_r12 = true }
-    }
-    let body = g_lines
-    g_lines = outer
-    raw(label + ":")
-    o("push rbp")
-    o("mov rbp, rsp")
-    if uses_r12 { o("push r12") }
-    for i in 0..body.len() { g_lines.push(body[i]) }
-    if uses_r12 {
+    if g_uses_r12 {
+        g_lines[r12_save] = "  push r12\n"
         o("lea rsp, [rbp - 8]")
         o("pop r12")
     } else {
@@ -7830,9 +7822,7 @@ fn gen_program(prog: Node) {
 }
 
 // ---------------- assembler ----------------
-// Same design as the C compiler's: encodes exactly the vocabulary our own
-// code generator emits. No bitwise operators in Zephyr, so byte math is done
-// with floor-division arithmetic (two's-complement adjusted).
+// Encodes exactly the vocabulary our own code generator emits.
 let SEC_TEXT = 0
 let SEC_RDATA = 1
 let SEC_BSS = 2
@@ -7851,6 +7841,8 @@ struct Op { kind: int, reg: int, size: int, imm: int, base: int, index: int, sca
 
 var t_bytes: [int] = []
 var r_bytes: [int] = []
+var t_len = 0
+var r_len = 0
 var a_bss = 0
 var a_sect = 0
 var a_syms: [ASym] = []
@@ -7862,62 +7854,66 @@ var a_imports: [str] = []
 var a_import_dll: [int] = []      // 0 = zephyr_rt.dll, 1 = kernel32.dll
 var g_trail = 0
 var a_curline = ""
-
-let REG64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+var a_ops: [Op] = []
+for i in 0..3 {
+    a_ops.push(Op{kind: 0, reg: 0, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""})
+}
 
 fn asm_fail(msg: str) { panic("assembler: {msg} | line: {a_curline}") }
 
-fn tb(v: int) { t_bytes.push(v) }
+// Lists own packed byte storage; offsets remain byte counts. Re-read the data
+// pointer after push, which may grow and relocate the list's backing allocation.
+fn tb(v: int) {
+    if (t_len & 7) == 0 { t_bytes.push(0) }
+    store8(load64(addr(t_bytes) + 16) + t_len, v)
+    t_len += 1
+}
+fn rb(v: int) {
+    if (r_len & 7) == 0 { r_bytes.push(0) }
+    store8(load64(addr(r_bytes) + 16) + r_len, v)
+    r_len += 1
+}
 fn tb32(v: int) {
     var x = v
     for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        t_bytes.push(b)
-        x = (x - b) / 256
+        tb(x & 255)
+        x = x >> 8
     }
 }
 fn tb64(v: int) {
     var x = v
     for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        t_bytes.push(b)
-        x = (x - b) / 256
+        tb(x & 255)
+        x = x >> 8
     }
 }
 fn rb32(v: int) {
     var x = v
     for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        r_bytes.push(b)
-        x = (x - b) / 256
+        rb(x & 255)
+        x = x >> 8
     }
 }
 fn rb64(v: int) {
     var x = v
     for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        r_bytes.push(b)
-        x = (x - b) / 256
+        rb(x & 255)
+        x = x >> 8
     }
 }
 
 fn strhash(s: str) -> int {
     var h = 0
-    for i in 0..s.len() { h = (h * 31 + s.byte(i)) % 1073741824 }
+    for i in 0..s.len() { h = (h * 31 + s.byte(i)) & 1073741823 }
     return h
 }
 
 fn sym_intern(name: str) -> int {
-    var h = strhash(name) % a_symcap
+    var h = strhash(name) & (a_symcap - 1)
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return idx }
-        h = (h + 1) % a_symcap
+        h = (h + 1) & (a_symcap - 1)
     }
     a_syms.push(ASym{name: name, sect: 0, off: 0, defined: false, predef: false})
     a_symhash[h] = a_syms.len()
@@ -7933,20 +7929,20 @@ fn sym_grow() {
     var nh: [int] = []
     for i in 0..a_symcap { nh.push(0) }
     for k in 0..a_syms.len() {
-        var h = strhash(a_syms[k].name) % a_symcap
-        while nh[h] != 0 { h = (h + 1) % a_symcap }
+        var h = strhash(a_syms[k].name) & (a_symcap - 1)
+        while nh[h] != 0 { h = (h + 1) & (a_symcap - 1) }
         nh[h] = k + 1
     }
     a_symhash = nh
 }
 
-// read-only: is `name` a locally defined/pre-scanned label?
+// Read-only: is `name` a locally defined or predeclared runtime label?
 fn sym_is_local(name: str) -> bool {
-    var h = strhash(name) % a_symcap
+    var h = strhash(name) & (a_symcap - 1)
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return a_syms[idx].predef or a_syms[idx].defined }
-        h = (h + 1) % a_symcap
+        h = (h + 1) & (a_symcap - 1)
     }
     return false
 }
@@ -7962,64 +7958,126 @@ fn import_intern2(name: str, dll: int) -> int {
 fn import_intern(name: str) -> int { return import_intern2(name, 0) }
 
 fn add_fix(kind: int, sym: int, addend: int) {
-    var off = t_bytes.len()
-    if a_sect == SEC_RDATA { off = r_bytes.len() }
+    var off = t_len
+    if a_sect == SEC_RDATA { off = r_len }
     a_fixes.push(AFix{off: off, sect: a_sect, kind: kind, sym: sym, addend: addend})
 }
 
 fn starts_with(s: str, p: str) -> bool {
-    if s.len() < p.len() { return false }
-    return s.sub(0, p.len()) == p
+    return span_starts(s, 0, s.len(), p)
 }
 
-// returns reg + size*16, or -1
-fn reg_lookup(s: str) -> int {
-    for i in 0..16 {
-        if REG64[i] == s { return i + 64 * 16 }
+// Match within the original line; no temporary prefix/token strings.
+fn span_starts(s: str, lo: int, hi: int, prefix: str) -> bool {
+    if hi - lo < prefix.len() { return false }
+    for i in 0..prefix.len() {
+        if s.byte(lo + i) != prefix.byte(i) { return false }
     }
-    if s == "eax" { return 0 + 32 * 16 }
-    if s == "ecx" { return 1 + 32 * 16 }
-    if s == "edx" { return 2 + 32 * 16 }
-    if s == "ebx" { return 3 + 32 * 16 }
-    if s == "esi" { return 6 + 32 * 16 }
-    if s == "edi" { return 7 + 32 * 16 }
-    if s == "al" { return 0 + 8 * 16 }
-    if s == "cl" { return 1 + 8 * 16 }
-    if s == "dl" { return 2 + 8 * 16 }
+    return true
+}
+
+// Returns reg + size*16, or -1, for exactly the assembler's register vocabulary.
+fn reg_lookup(s: str, lo: int, hi: int) -> int {
+    let n = hi - lo
+    if n < 2 or n > 3 { return -1 }
+    let a = s.byte(lo)
+    let b = s.byte(lo + 1)
+    if n == 2 {
+        if a == 114 and (b == 56 or b == 57) { return b - 48 + 64 * 16 }
+        if b == 108 {
+            if a == 97 { return 8 * 16 }
+            if a == 99 { return 1 + 8 * 16 }
+            if a == 100 { return 2 + 8 * 16 }
+        }
+        return -1
+    }
+    let c = s.byte(lo + 2)
+    if a == 114 and b == 49 and c >= 48 and c <= 53 { return 10 + c - 48 + 64 * 16 }
+    if a != 114 and a != 101 { return -1 }
+    var r = -1
+    if c == 120 {
+        if b == 97 { r = 0 }
+        else if b == 99 { r = 1 }
+        else if b == 100 { r = 2 }
+        else if b == 98 { r = 3 }
+    } else if c == 112 and a == 114 {
+        if b == 115 { r = 4 }
+        else if b == 98 { r = 5 }
+    } else if c == 105 {
+        if b == 115 { r = 6 }
+        else if b == 100 { r = 7 }
+    }
+    if r >= 0 {
+        if a == 114 { return r + 64 * 16 }
+        return r + 32 * 16
+    }
     return -1
 }
 
 fn is_digit_b(c: int) -> bool { return c >= 48 and c <= 57 }
 
-fn parse_operand(text0: str) -> Op {
-    var op = Op{kind: 0, reg: 0, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""}
-    var text = text0
-    while text.len() > 0 and text.byte(0) == 32 { text = text.sub(1, text.len()) }
-    if starts_with(text, "qword ptr ") { text = text.sub(10, text.len()) }
-    else if starts_with(text, "dword ptr ") {
+// Decimal conversion with the same space/sign rules as str -> int, operating
+// directly on a token span. Accumulation retains the original i64 wraparound.
+fn asm_int(s: str, lo: int, hi: int) -> int {
+    var p = lo
+    while p < hi and s.byte(p) == 32 { p += 1 }
+    var neg = false
+    if p < hi and (s.byte(p) == 43 or s.byte(p) == 45) {
+        neg = s.byte(p) == 45
+        p += 1
+    }
+    let start = p
+    var v = 0
+    while p < hi and is_digit_b(s.byte(p)) {
+        v = v * 10 + s.byte(p) - 48
+        p += 1
+    }
+    if p == start { asm_fail("expected integer") }
+    while p < hi and s.byte(p) == 32 { p += 1 }
+    if p != hi { asm_fail("invalid integer") }
+    if neg { return 0 - v }
+    return v
+}
+
+// Refill one of three reusable operands. Only symbol names need owned strings;
+// register, displacement, and immediate tokens stay spans of the source line.
+fn parse_operand(text: str, lo: int, hi: int, op: Op) {
+    op.kind = 0
+    op.reg = 0
+    op.size = 64
+    op.imm = 0
+    op.base = -1
+    op.index = -1
+    op.scale = 0
+    op.disp = 0
+    op.sym = ""
+    var start = lo
+    while start < hi and text.byte(start) == 32 { start += 1 }
+    if span_starts(text, start, hi, "qword ptr ") { start += 10 }
+    else if span_starts(text, start, hi, "dword ptr ") {
         op.size = 32
-        text = text.sub(10, text.len())
+        start += 10
     }
-    else if starts_with(text, "word ptr ") {
+    else if span_starts(text, start, hi, "word ptr ") {
         op.size = 16
-        text = text.sub(9, text.len())
+        start += 9
     }
-    else if starts_with(text, "byte ptr ") {
+    else if span_starts(text, start, hi, "byte ptr ") {
         op.size = 8
-        text = text.sub(9, text.len())
+        start += 9
     }
-    if text.byte(0) == 91 { // '['
+    if start >= hi { asm_fail("missing operand") }
+    if text.byte(start) == 91 { // '['
         op.kind = OPK_MEM
         var close = -1
-        for i in 0..text.len() {
+        for i in start..hi {
             if text.byte(i) == 93 { close = i }
         }
         if close < 0 { asm_fail("missing ]") }
-        let inner = text.sub(1, close)
-        var p = 0
+        var p = start + 1
         var sign = 1
-        while p < inner.len() {
-            let c = inner.byte(p)
+        while p < close {
+            let c = text.byte(p)
             if c == 32 {
                 p += 1
                 continue
@@ -8035,29 +8093,25 @@ fn parse_operand(text0: str) -> Op {
                 continue
             }
             var q = p
-            while q < inner.len() {
-                let cq = inner.byte(q)
+            var star = -1
+            while q < close {
+                let cq = text.byte(q)
                 if cq == 32 or cq == 43 or cq == 45 { break }
+                if cq == 42 { star = q }
                 q += 1
             }
-            let tkn = inner.sub(p, q)
-            p = q
-            if is_digit_b(tkn.byte(0)) {
-                op.disp += sign * (tkn as int)
-            } else if tkn == "rip" {
+            if is_digit_b(c) {
+                op.disp += sign * asm_int(text, p, q)
+            } else if q - p == 3 and span_starts(text, p, q, "rip") {
                 op.base = -2
             } else {
-                var star = -1
-                for i in 0..tkn.len() {
-                    if tkn.byte(i) == 42 { star = i } // '*'
-                }
                 if star >= 0 {
-                    let r = reg_lookup(tkn.sub(0, star))
+                    let r = reg_lookup(text, p, star)
                     if r < 0 { asm_fail("bad index register") }
                     op.index = r % 16
-                    op.scale = tkn.sub(star + 1, tkn.len()) as int
+                    op.scale = asm_int(text, star + 1, q)
                 } else {
-                    let r = reg_lookup(tkn)
+                    let r = reg_lookup(text, p, q)
                     if r >= 0 {
                         if op.base == -1 { op.base = r % 16 }
                         else {
@@ -8065,35 +8119,35 @@ fn parse_operand(text0: str) -> Op {
                             op.scale = 1
                         }
                     } else {
-                        op.sym = tkn
+                        op.sym = text.sub(p, q)
                     }
                 }
             }
+            p = q
             sign = 1
         }
-        return op
+        return
     }
-    let c0 = text.byte(0)
+    let c0 = text.byte(start)
     if is_digit_b(c0) or c0 == 45 {
         op.kind = OPK_IMM
-        op.imm = text as int
-        return op
+        op.imm = asm_int(text, start, hi)
+        return
     }
-    if starts_with(text, "xmm") {
+    if span_starts(text, start, hi, "xmm") {
         op.kind = OPK_XMM
-        op.reg = text.sub(3, text.len()) as int
-        return op
+        op.reg = asm_int(text, start + 3, hi)
+        return
     }
-    let r = reg_lookup(text)
+    let r = reg_lookup(text, start, hi)
     if r >= 0 {
         op.kind = OPK_REG
         op.reg = r % 16
         op.size = r / 16
-        return op
+        return
     }
     op.kind = OPK_SYM
-    op.sym = text
-    return op
+    op.sym = text.sub(start, hi)
 }
 
 // emit REX + opcodes + modrm/sib/disp; opc2 < 0 means single-byte opcode
@@ -8167,61 +8221,65 @@ fn enc_rr(rexw: int, opc1: int, opc2: int, reg: int, rmreg: int, pfx66: bool, pf
     enc_rm(rexw, opc1, opc2, reg, Op{kind: OPK_REG, reg: rmreg, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""}, pfx66, pfxF2)
 }
 
-fn cc_code(cc: str) -> int {
-    if cc == "e" { return 4 }
-    if cc == "ne" { return 5 }
-    if cc == "l" { return 12 }
-    if cc == "le" { return 14 }
-    if cc == "g" { return 15 }
-    if cc == "ge" { return 13 }
-    if cc == "a" { return 7 }
-    if cc == "ae" { return 3 }
-    if cc == "b" { return 2 }
-    if cc == "be" { return 6 }
-    if cc == "p" { return 10 }
-    if cc == "np" { return 11 }
-    if cc == "s" { return 8 }
-    if cc == "ns" { return 9 }
-    return -1
-}
-
-let ALU_NAMES = ["add", "or", "and", "sub", "xor", "cmp"]
+// ALU mnemonics are 0..5; jcc and setcc add 100 and 200 to the x86 condition code.
+let ASM_MNEMONICS: [str: int] = [
+    "add": 0, "or": 1, "and": 2, "sub": 3, "xor": 4, "cmp": 5,
+    "mov": 6, "push": 7, "pop": 8, "ret": 9, "cqo": 10, "syscall": 11,
+    "movabs": 12, "test": 13, "imul": 14, "idiv": 15, "div": 16, "mul": 17,
+    "neg": 18, "inc": 19, "sar": 20, "shl": 21, "shr": 22, "sal": 23,
+    "movzx": 24, "lea": 25, "jmp": 26, "call": 27, "movq": 28, "movsd": 29,
+    "movapd": 30, "addsd": 31, "subsd": 32, "mulsd": 33, "divsd": 34,
+    "minsd": 35, "maxsd": 36, "sqrtsd": 37, "comisd": 38, "ucomisd": 39,
+    "cvtsi2sd": 40, "cvttsd2si": 41,
+    "je": 104, "jne": 105, "jl": 112, "jle": 114, "jg": 115, "jge": 113,
+    "ja": 107, "jae": 103, "jb": 102, "jbe": 106, "jp": 110, "jnp": 111,
+    "js": 108, "jns": 109,
+    "sete": 204, "setne": 205, "setl": 212, "setle": 214, "setg": 215, "setge": 213,
+    "seta": 207, "setae": 203, "setb": 202, "setbe": 206, "setp": 210, "setnp": 211,
+    "sets": 208, "setns": 209
+]
 let ALU_RM_R = [1, 9, 33, 41, 49, 57]     // 0x01 0x09 0x21 0x29 0x31 0x39
 let ALU_R_RM = [3, 11, 35, 43, 51, 59]
 let ALU_EXT = [0, 1, 4, 5, 6, 7]
+// Minimum operand counts for IDs 0..41; every jcc/setcc takes one. imul's
+// one-, two-, and three-operand forms are selected in asm_ins.
+let ASM_MIN_OPS = [2, 2, 2, 2, 2, 2, 2, 1, 1, 0, 0, 0, 2, 2,
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
 
-fn asm_ins(mn: str, ops: [Op], nops: int) {
-    if mn == "push" {
+// Encode a numeric mnemonic ID; preserve the existing x86 instruction forms.
+fn asm_ins(mn: int, ops: [Op], nops: int) {
+    if mn == 7 { // push
         if ops[0].reg >= 8 { tb(65) }
         tb(80 + ops[0].reg % 8)
         return
     }
-    if mn == "pop" {
+    if mn == 8 { // pop
         if ops[0].reg >= 8 { tb(65) }
         tb(88 + ops[0].reg % 8)
         return
     }
-    if mn == "ret" {
+    if mn == 9 { // ret
         tb(195)
         return
     }
-    if mn == "cqo" {
+    if mn == 10 { // cqo
         tb(72)
         tb(153)
         return
     }
-    if mn == "syscall" {
+    if mn == 11 { // syscall
         tb(15)
         tb(5)
         return
     }
-    if mn == "movabs" {
+    if mn == 12 { // movabs
         tb(64 + 8 + ops[0].reg / 8)
         tb(184 + ops[0].reg % 8)
         tb64(ops[1].imm)
         return
     }
-    if mn == "mov" {
+    if mn == 6 { // mov
         let a = ops[0]
         let b = ops[1]
         if a.kind == OPK_REG and b.kind == OPK_IMM {
@@ -8265,41 +8323,40 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         asm_fail("mov form")
     }
-    for k in 0..6 {
-        if mn == ALU_NAMES[k] {
-            let a = ops[0]
-            let b = ops[1]
-            var w = 1
-            if a.size == 32 or a.size == 8 { w = 0 }
-            if b.kind == OPK_IMM {
-                var opc = 129
-                if a.size == 8 { opc = 128 }
-                if a.size == 8 { g_trail = 1 } else { g_trail = 4 }
-                enc_rm(w, opc, -1, ALU_EXT[k], a, false, false)
-                if a.size == 8 {
-                    var bb = b.imm % 256
-                    if bb < 0 { bb += 256 }
-                    tb(bb)
-                } else {
-                    tb32(b.imm)
-                }
-                return
+    if mn >= 0 and mn < 6 { // add, or, and, sub, xor, cmp
+        let k = mn
+        let a = ops[0]
+        let b = ops[1]
+        var w = 1
+        if a.size == 32 or a.size == 8 { w = 0 }
+        if b.kind == OPK_IMM {
+            var opc = 129
+            if a.size == 8 { opc = 128 }
+            if a.size == 8 { g_trail = 1 } else { g_trail = 4 }
+            enc_rm(w, opc, -1, ALU_EXT[k], a, false, false)
+            if a.size == 8 {
+                var bb = b.imm % 256
+                if bb < 0 { bb += 256 }
+                tb(bb)
+            } else {
+                tb32(b.imm)
             }
-            if a.kind == OPK_REG and b.kind == OPK_MEM {
-                enc_rm(w, ALU_R_RM[k], -1, a.reg, b, false, false)
-                return
-            }
-            var opc = ALU_RM_R[k]
-            if a.size == 8 { opc = opc - 1 }
-            enc_rm(w, opc, -1, b.reg, a, false, false)
             return
         }
+        if a.kind == OPK_REG and b.kind == OPK_MEM {
+            enc_rm(w, ALU_R_RM[k], -1, a.reg, b, false, false)
+            return
+        }
+        var opc = ALU_RM_R[k]
+        if a.size == 8 { opc = opc - 1 }
+        enc_rm(w, opc, -1, b.reg, a, false, false)
+        return
     }
-    if mn == "test" {
+    if mn == 13 { // test
         enc_rr(1, 133, -1, ops[1].reg, ops[0].reg, false, false)
         return
     }
-    if mn == "imul" {
+    if mn == 14 { // imul
         if nops == 1 {
             enc_rm(1, 247, -1, 5, ops[0], false, false)
             return
@@ -8313,30 +8370,30 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         enc_rm(1, 15, 175, ops[0].reg, ops[1], false, false)
         return
     }
-    if mn == "idiv" {
+    if mn == 15 { // idiv
         enc_rm(1, 247, -1, 7, ops[0], false, false)
         return
     }
-    if mn == "div" {                       // unsigned divide, F7 /6
+    if mn == 16 {                          // div: unsigned divide, F7 /6
         enc_rm(1, 247, -1, 6, ops[0], false, false)
         return
     }
-    if mn == "mul" {                       // unsigned multiply, F7 /4 (rdx:rax = rax * r/m)
+    if mn == 17 {                          // mul: unsigned multiply, F7 /4 (rdx:rax = rax * r/m)
         enc_rm(1, 247, -1, 4, ops[0], false, false)
         return
     }
-    if mn == "neg" {
+    if mn == 18 { // neg
         enc_rm(1, 247, -1, 3, ops[0], false, false)
         return
     }
-    if mn == "inc" {
+    if mn == 19 { // inc
         enc_rm(1, 255, -1, 0, ops[0], false, false)
         return
     }
-    if mn == "sar" or mn == "shl" or mn == "shr" or mn == "sal" {
+    if mn == 20 or mn == 21 or mn == 22 or mn == 23 { // sar, shl, shr, sal
         var ext = 7                             // sar
-        if mn == "shl" or mn == "sal" { ext = 4 }
-        else if mn == "shr" { ext = 5 }
+        if mn == 21 or mn == 23 { ext = 4 }       // shl, sal
+        else if mn == 22 { ext = 5 }             // shr
         if ops[1].kind == OPK_IMM {             // OP r/m64, imm8
             g_trail = 1
             enc_rm(1, 193, -1, ext, ops[0], false, false)
@@ -8348,38 +8405,36 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movzx" {
+    if mn == 24 { // movzx
         var opc = 182
         if ops[1].size == 16 { opc = 183 }
         enc_rm(0, 15, opc, ops[0].reg, ops[1], false, false)
         return
     }
-    if mn == "lea" {
+    if mn == 25 { // lea
         enc_rm(1, 141, -1, ops[0].reg, ops[1], false, false)
         return
     }
-    if starts_with(mn, "set") {
-        let cc = cc_code(mn.sub(3, mn.len()))
-        if cc < 0 { asm_fail("bad setcc") }
+    if mn >= 200 and mn < 216 { // setcc
+        let cc = mn - 200
         enc_rm(0, 15, 144 + cc, 0, ops[0], false, false)
         return
     }
-    if mn == "jmp" {
+    if mn == 26 { // jmp
         tb(233)
         add_fix(FX_REL32, sym_intern(ops[0].sym), 0)
         tb32(0)
         return
     }
-    if mn.byte(0) == 106 { // 'j' conditional
-        let cc = cc_code(mn.sub(1, mn.len()))
-        if cc < 0 { asm_fail("bad jcc") }
+    if mn >= 100 and mn < 116 { // jcc
+        let cc = mn - 100
         tb(15)
         tb(128 + cc)
         add_fix(FX_REL32, sym_intern(ops[0].sym), 0)
         tb32(0)
         return
     }
-    if mn == "call" {
+    if mn == 27 { // call
         if ops[0].kind == OPK_REG {                // call through a register (fn value)
             enc_rm(0, 255, -1, 2, ops[0], false, false)
             return
@@ -8416,7 +8471,7 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movq" {
+    if mn == 28 { // movq
         if ops[0].kind == OPK_XMM {
             enc_rm(1, 15, 110, ops[0].reg, ops[1], true, false)
         } else {
@@ -8424,7 +8479,7 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movsd" {
+    if mn == 29 { // movsd
         if ops[0].kind == OPK_XMM {
             enc_rm(0, 15, 16, ops[0].reg, ops[1], false, true)   // movsd xmm, xmm/m64  (F2 0F 10)
         } else {
@@ -8432,55 +8487,55 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movapd" {                                          // xmm<-xmm copy, no partial-reg merge
+    if mn == 30 { // movapd: xmm<-xmm copy, no partial-reg merge
         enc_rm(0, 15, 40, ops[0].reg, ops[1], true, false)       // 66 0F 28 /r
         return
     }
-    if mn == "addsd" {
+    if mn == 31 { // addsd
         enc_rm(0, 15, 88, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "subsd" {
+    if mn == 32 { // subsd
         enc_rm(0, 15, 92, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "mulsd" {
+    if mn == 33 { // mulsd
         enc_rm(0, 15, 89, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "divsd" {
+    if mn == 34 { // divsd
         enc_rm(0, 15, 94, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "minsd" {
+    if mn == 35 { // minsd
         enc_rm(0, 15, 93, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "maxsd" {
+    if mn == 36 { // maxsd
         enc_rm(0, 15, 95, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "sqrtsd" {
+    if mn == 37 { // sqrtsd
         enc_rr(0, 15, 81, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    if mn == "comisd" {
+    if mn == 38 { // comisd
         enc_rm(0, 15, 47, ops[0].reg, ops[1], true, false)   // xmm, xmm/m64
         return
     }
-    if mn == "ucomisd" {
+    if mn == 39 { // ucomisd
         enc_rr(0, 15, 46, ops[0].reg, ops[1].reg, true, false)
         return
     }
-    if mn == "cvtsi2sd" {
+    if mn == 40 { // cvtsi2sd
         enc_rr(1, 15, 42, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    if mn == "cvttsd2si" {
+    if mn == 41 { // cvttsd2si
         enc_rr(1, 15, 44, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    asm_fail("unknown mnemonic '{mn}'")
+    asm_fail("unknown mnemonic")
 }
 
 fn asm_label(name: str) {
@@ -8488,15 +8543,18 @@ fn asm_label(name: str) {
     if a_syms[si].defined { asm_fail("duplicate label {name}") }
     a_syms[si].defined = true
     a_syms[si].sect = a_sect
-    var off = t_bytes.len()
-    if a_sect == SEC_RDATA { off = r_bytes.len() }
+    var off = t_len
+    if a_sect == SEC_RDATA { off = r_len }
     if a_sect == SEC_BSS { off = a_bss }
     a_syms[si].off = off
 }
 
+// Parse spans of the original emitted line into three reusable operands.
 fn asm_line(line: str) {
     a_curline = line
-    if line.len() == 0 { return }
+    var n = line.len()
+    if n > 0 and line.byte(n - 1) == 10 { n -= 1 }
+    if n == 0 { return }
     if line.byte(0) != 32 { // label or directive
         if line.byte(0) == 46 { // '.'
             if starts_with(line, ".section .rdata") {
@@ -8507,14 +8565,14 @@ fn asm_line(line: str) {
                 a_sect = SEC_BSS
                 return
             }
-            if line == ".text" {
+            if n == 5 and starts_with(line, ".text") {
                 a_sect = SEC_TEXT
                 return
             }
             if starts_with(line, ".balign") {
-                let al = line.sub(8, line.len()) as int
+                let al = asm_int(line, 8, n)
                 if a_sect == SEC_RDATA {
-                    while r_bytes.len() % al != 0 { r_bytes.push(0) }
+                    while r_len % al != 0 { rb(0) }
                 } else if a_sect == SEC_BSS {
                     while a_bss % al != 0 { a_bss += 1 }
                 }
@@ -8522,127 +8580,129 @@ fn asm_line(line: str) {
             }
             if starts_with(line, ".intel_syntax") or starts_with(line, ".globl") { return }
             if starts_with(line, ".zloc ") { // -g: record current .text offset for this source line
-                dbg_off.push(t_bytes.len())
-                dbg_line.push(line.sub(6, line.len()) as int)
+                dbg_off.push(t_len)
+                dbg_line.push(asm_int(line, 6, n))
                 return
             }
-            if line.byte(line.len() - 1) == 58 { // .L label
-                asm_label(line.sub(0, line.len() - 1))
+            if line.byte(n - 1) == 58 { // .L label
+                asm_label(line.sub(0, n - 1))
                 return
             }
             asm_fail("unknown directive")
         }
-        if line.byte(line.len() - 1) != 58 { asm_fail("expected label") }
-        asm_label(line.sub(0, line.len() - 1))
+        if line.byte(n - 1) != 58 { asm_fail("expected label") }
+        asm_label(line.sub(0, n - 1))
         return
     }
-    let p = line.sub(2, line.len())
-    if p.byte(0) == 46 { // data directive
-        if starts_with(p, ".quad ") {
-            let v = p.sub(6, p.len())
-            let c0 = v.byte(0)
+    if line.byte(2) == 46 { // data directive
+        if span_starts(line, 2, n, ".quad ") {
+            let c0 = line.byte(8)
             if is_digit_b(c0) or c0 == 45 {
-                rb64(v as int)
+                rb64(asm_int(line, 8, n))
             } else {
-                add_fix(FX_ABS64, sym_intern(v), 0)
+                add_fix(FX_ABS64, sym_intern(line.sub(8, n)), 0)
                 rb64(0)
             }
             return
         }
-        if starts_with(p, ".byte ") {
-            var q = 6
-            while q < p.len() {
+        if span_starts(line, 2, n, ".byte ") {
+            var q = 8
+            while q < n {
                 var e = q
-                while e < p.len() and p.byte(e) != 44 { e += 1 }
-                let v = p.sub(q, e) as int
-                if a_sect == SEC_TEXT { t_bytes.push(v) } else { r_bytes.push(v) }
+                while e < n and line.byte(e) != 44 { e += 1 }
+                let v = asm_int(line, q, e)
+                if a_sect == SEC_TEXT { tb(v) } else { rb(v) }
                 q = e + 1
             }
             return
         }
-        if starts_with(p, ".space ") {
-            a_bss += p.sub(7, p.len()) as int
+        if span_starts(line, 2, n, ".space ") {
+            a_bss += asm_int(line, 9, n)
             return
         }
         asm_fail("unknown data directive")
     }
     // instruction
-    var sp = 0
-    while sp < p.len() and p.byte(sp) != 32 { sp += 1 }
-    let mn = p.sub(0, sp)
-    var rest = ""
-    if sp < p.len() { rest = p.sub(sp + 1, p.len()) }
-    var ops: [Op] = []
-    var q = 0
-    while q < rest.len() and ops.len() < 3 {
+    var sp = 2
+    while sp < n and line.byte(sp) != 32 { sp += 1 }
+    let name = line.sub(2, sp)
+    let mn = ASM_MNEMONICS.get(name).or(-1)
+    if mn < 0 { asm_fail("unknown mnemonic '{name}'") }
+    var nops = 0
+    var q = sp + 1
+    while q < n and nops < 3 {
         var depth = 0
         var e = q
-        while e < rest.len() {
-            let c = rest.byte(e)
+        while e < n {
+            let c = line.byte(e)
             if c == 91 { depth += 1 }
             if c == 93 { depth -= 1 }
             if c == 44 and depth == 0 { break }
             e += 1
         }
-        var t = rest.sub(q, e)
-        while t.len() > 0 and t.byte(t.len() - 1) == 32 { t = t.sub(0, t.len() - 1) }
-        ops.push(parse_operand(t))
+        var end = e
+        while end > q and line.byte(end - 1) == 32 { end -= 1 }
+        parse_operand(line, q, end, a_ops[nops])
+        nops += 1
         q = e + 1
-        while q < rest.len() and rest.byte(q) == 32 { q += 1 }
+        while q < n and line.byte(q) == 32 { q += 1 }
     }
-    asm_ins(mn, ops, ops.len())
+    var required = 1
+    if mn < 100 { required = ASM_MIN_OPS[mn] }
+    if nops < required { asm_fail("missing operand") }
+    asm_ins(mn, a_ops, nops)
 }
 
 // ---------------- PE writer ----------------
-var pe_out: [int] = []
+var pe_out = ""
+var pe_len = 0
 
-fn pw(v: int) { pe_out.push(v) }
+// The final file size is known before writing its headers. Keep this string
+// rooted while filling its payload, then use the normal checked file writer.
+fn pw(v: int) {
+    store8(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 1
+}
 fn pw2(v: int) {
-    pe_out.push(v % 256)
-    pe_out.push((v / 256) % 256)
+    pw(v & 255)
+    pw((v >> 8) & 255)
 }
 fn pw4(v: int) {
-    var x = v
-    for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        pe_out.push(b)
-        x = (x - b) / 256
-    }
+    store32(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 4
 }
 fn pw8(v: int) {
-    var x = v
-    for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        pe_out.push(b)
-        x = (x - b) / 256
-    }
+    store64(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 8
 }
 fn pw_pad(target: int) {
-    while pe_out.len() < target { pe_out.push(0) }
+    if pe_len < target { pe_len = target }
+}
+// Copy packed section bytes without writing past a partial final word (ELF
+// need not pad its last section to eight bytes).
+fn pw_bytes(buf: [int], n: int) {
+    let src = load64(addr(buf) + 16)
+    let dest = addr(pe_out) + 8 + pe_len
+    var i = 0
+    while i + 8 <= n {
+        store64(dest + i, load64(src + i))
+        i += 8
+    }
+    while i < n {
+        store8(dest + i, load8(src + i))
+        i += 1
+    }
+    pe_len += n
 }
 fn pe_align(v: int, al: int) -> int {
     return ((v + al - 1) / al) * al
 }
 
 fn patch4(buf: [int], off: int, v: int) {
-    var x = v
-    for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        buf[off + i] = b
-        x = (x - b) / 256
-    }
+    store32(load64(addr(buf) + 16) + off, v)
 }
 fn patch8(buf: [int], off: int, v: int) {
-    var x = v
-    for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        buf[off + i] = b
-        x = (x - b) / 256
-    }
+    store64(load64(addr(buf) + 16) + off, v)
 }
 
 // ---------------- imports ----------------
@@ -11571,7 +11631,7 @@ let IMAGE_BASE = 5368709120  // 0x140000000
 
 fn write_pe(path: str) {
     let rt_mode = sym_is_local("rt_alloc")   // Zephyr runtime linked: kernel32-only
-    let entry_off = t_bytes.len()
+    let entry_off = t_len
     a_sect = SEC_TEXT
     if rt_mode {
         tb(72)                               // sub rsp, 40
@@ -11648,10 +11708,10 @@ fn write_pe(path: str) {
     let idata_size = pe_align(no, 16)
 
     let text_rva = 4096
-    let text_size = t_bytes.len()
+    let text_size = t_len
     let rdata_rva = pe_align(text_rva + text_size, 4096)
     let data_off = idata_size
-    let rdata_size = idata_size + r_bytes.len()
+    let rdata_size = idata_size + r_len
     let bss_rva = pe_align(rdata_rva + rdata_size, 4096)
     var image_size = pe_align(bss_rva, 4096)
     if a_bss > 0 { image_size = pe_align(bss_rva + a_bss, 4096) }
@@ -11683,6 +11743,7 @@ fn write_pe(path: str) {
     let text_raw = hdrs_size
     let rdata_raw = text_raw + pe_align(text_size, 512)
     let file_size = rdata_raw + pe_align(rdata_size, 512)
+    pe_out = chr(0).repeat(file_size)
 
     // DOS header
     pw(77)
@@ -11779,7 +11840,7 @@ fn write_pe(path: str) {
         pw4(schr[i])
     }
     pw_pad(text_raw)
-    for i in 0..t_bytes.len() { pe_out.push(t_bytes[i]) }
+    pw_bytes(t_bytes, t_len)
     pw_pad(rdata_raw)
     // import descriptor table: one entry per used DLL, then a null entry
     for gi in 0..ndll {
@@ -11809,7 +11870,7 @@ fn write_pe(path: str) {
         let nm = a_imports[i]
         for j in 0..nm.len() { pw(nm.byte(j)) }
         pw(0)
-        if (pe_out.len() - rdata_raw) % 2 == 1 { pw(0) }
+        if (pe_len - rdata_raw) % 2 == 1 { pw(0) }
     }
     for gi in 0..ndll {
         let dn = DLLNAMES[dmap[gi]]
@@ -11817,12 +11878,10 @@ fn write_pe(path: str) {
         pw(0)
     }
     pw_pad(rdata_raw + idata_size)
-    for i in 0..r_bytes.len() { pe_out.push(r_bytes[i]) }
+    pw_bytes(r_bytes, r_len)
     pw_pad(file_size)
 
-    var parts: [str] = []
-    for i in 0..pe_out.len() { parts.push(chr(pe_out[i])) }
-    write_file(path, parts.join())
+    write_file(path, pe_out)
 }
 
 // ---------------- ELF writer (--linux) ----------------
@@ -11836,13 +11895,13 @@ let ELF_BASE = 4194304   // 0x400000
 fn ew8(v: int) {
     var x = v
     for i in 0..8 {
-        pe_out.push(x % 256)
+        pw(x % 256)
         x = x / 256
     }
 }
 
 fn write_elf(path: str) {
-    let entry_off = t_bytes.len()
+    let entry_off = t_len
     a_sect = SEC_TEXT
     tb(232)                              // call zephyr_main
     add_fix(FX_REL32, sym_intern("zephyr_main"), 0)
@@ -11855,10 +11914,11 @@ fn write_elf(path: str) {
     tb(5)
 
     let text_rva = 4096
-    let text_size = t_bytes.len()
+    let text_size = t_len
     let rdata_rva = pe_align(text_rva + text_size, 4096)
-    let rdata_size = r_bytes.len()
+    let rdata_size = r_len
     let bss_rva = pe_align(rdata_rva + rdata_size, 4096)
+    pe_out = chr(0).repeat(rdata_rva + rdata_size)
 
     for i in 0..a_fixes.len() {
         let fx = a_fixes[i]
@@ -11920,41 +11980,26 @@ fn write_elf(path: str) {
     ew8(4096)
 
     pw_pad(text_rva)
-    for i in 0..t_bytes.len() { pe_out.push(t_bytes[i]) }
+    pw_bytes(t_bytes, t_len)
     pw_pad(rdata_rva)
-    for i in 0..r_bytes.len() { pe_out.push(r_bytes[i]) }
+    pw_bytes(r_bytes, r_len)
 
-    var parts: [str] = []
-    for i in 0..pe_out.len() { parts.push(chr(pe_out[i])) }
-    write_file(path, parts.join())
+    write_file(path, pe_out)
 }
 
 fn is_label_char(c: int) -> bool {
     return c == 95 or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57)
 }
 
-// mark every defined label so `call rt_X` can pick local-vs-import
-fn asm_prescan() {
-    for i in 0..g_lines.len() {
-        var line = g_lines[i]
-        if line.len() > 0 and line.byte(line.len() - 1) == 10 {
-            line = line.sub(0, line.len() - 1)
-        }
-        let n = line.len()
-        if n < 2 { continue }
-        let c0 = line.byte(0)
-        if c0 == 32 or c0 == 46 { continue }         // instruction or directive
-        if line.byte(n - 1) != 58 { continue }       // must end with ':'
-        var ok = c0 == 95 or (c0 >= 65 and c0 <= 90) or (c0 >= 97 and c0 <= 122)
-        var k = 1
-        while k < n - 1 and ok {
-            if not is_label_char(line.byte(k)) { ok = false }
-            k += 1
-        }
-        if not ok { continue }
-        let si = sym_intern(line.sub(0, n - 1))
-        a_syms[si].predef = true
+// Only rt_* calls distinguish forward local definitions from DLL imports.
+// Record those labels during emission instead of scanning every assembly line.
+fn asm_predefine(line: str) {
+    let n = line.len()
+    if not starts_with(line, "rt_") or line.byte(n - 1) != 58 { return }
+    for i in 3..n - 1 {
+        if not is_label_char(line.byte(i)) { return }
     }
+    a_syms[sym_intern(line.sub(0, n - 1))].predef = true
 }
 
 // ---- .zdbg sidecar (little-endian) ----
@@ -13844,10 +13889,11 @@ fn write_wasm(path: str) {
     wserialise(path)
 }
 
+// Fill one counted byte string instead of allocating a string for every byte.
 fn wserialise(path: str) {
-    var parts: [str] = []
-    for i in 0..w_out.len() { parts.push(chr(w_out[i])) }
-    write_file(path, parts.join())
+    let data = chr(0).repeat(w_out.len())
+    for i in 0..w_out.len() { store8(addr(data) + 8 + i, w_out[i]) }
+    write_file(path, data)
 }
 
 fn assemble_and_link(path: str) {
@@ -13856,13 +13902,8 @@ fn assemble_and_link(path: str) {
         return
     }
     a_sect = SEC_TEXT
-    asm_prescan()
     for i in 0..g_lines.len() {
-        var line = g_lines[i]
-        if line.len() > 0 and line.byte(line.len() - 1) == 10 {
-            line = line.sub(0, line.len() - 1)
-        }
-        asm_line(line)
+        asm_line(g_lines[i])
     }
     if g_linux { write_elf(path) } else { write_pe(path) }
     if g_debug and not g_linux { write_zdbg(path + ".zdbg") }
