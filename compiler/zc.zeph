@@ -3748,7 +3748,8 @@ fn float_reg(kind: int, idx: int) -> str {
 // observable order of side effects is preserved.
 var g_inl_fi = 0 - 1        // g_fns index whose slots we allocate from (-1 = top level)
 var g_hoisted: [Node] = []
-var g_inlend: [int] = []    // codegen: label stack for nested N_INLINE ends
+var g_inlend: [int] = []
+var g_inl_subs: [Node] = []   // inl_arg: per-param substitutions    // codegen: label stack for nested N_INLINE ends
 
 fn node_count(n: Node) -> int {
     var c = 1
@@ -3797,6 +3798,9 @@ fn inl_clone(n: Node, pbase: int, lbase: int, res: int, depth: int) -> Node {
     c.aux = n.aux
     c.refi = n.refi
     c.mut = n.mut
+    if n.k == N_ID and n.aux == ID_PARAM and n.slot < g_inl_subs.len() and g_inl_subs[n.slot].k != N_NONE {
+        return clone_node(g_inl_subs[n.slot])      // argument substituted in place
+    }
     for kid in n.kids { c.kids.push(inl_clone(kid, pbase, lbase, res, depth)) }
     if c.k == N_ID {
         if c.aux == ID_PARAM {
@@ -3843,6 +3847,26 @@ fn inl_mkdecl(slot: int, val: Node, line: int) {
     g_hoisted.push(d)
 }
 
+// Arguments the inlined body may read directly instead of through a fresh
+// local: literals (so `b.put32(4, v)` folds its bounds check), and scalar
+// locals/params of the caller, which nothing inside the body can write. Only
+// when the body never assigns that parameter. Indexed by param slot; N_NONE
+// means "declare a local as usual" (declared with the inliner globals above).
+
+fn inl_arg(f: FDef, pidx: int, arg: Node, slot: int, line: int, subs: [Node]) {
+    var substitute = arg.k == N_INT or arg.k == N_FLOAT or arg.k == N_BOOL
+    if arg.k == N_ID and (arg.aux == ID_LOCAL or arg.aux == ID_PARAM) {
+        let tk = ty_kind[arg.ty]
+        substitute = tk == K_INT or tk == K_FLOAT or tk == K_BOOL
+    }
+    if substitute and not div_assigned_in(f.pristine, ID_PARAM, pidx) {
+        subs.push(arg)
+        return
+    }
+    subs.push(nnode(N_NONE, line))
+    inl_mkdecl(slot, arg, line)
+}
+
 // expand an inlinable call at parent.kids[i]: hoist param decls + inlined
 // body, replace the call with the result temp
 fn expand_call(parent: Node, i: int) {
@@ -3852,22 +3876,26 @@ fn expand_call(parent: Node, i: int) {
     let pbase = inl_slots(f.pnames.len())
     let lbase = inl_slots(f.prist_nslots)
     let res = inl_slots(1)
+    // a local list: an argument's own nested expansion re-enters expand_call
+    var subs = no_nodes()
     var pi = 0
     if call.op == 1 {                       // UFCS receiver is param 0
         let x = try_kid(call.kids[0], 0)
-        inl_mkdecl(pbase + pi, call.kids[0].kids[0], call.line)
+        inl_arg(f, pi, call.kids[0].kids[0], pbase + pi, call.line, subs)
         pi += 1
     }
     for ai in 1..call.kids.len() {
         let x = try_kid(call, ai)
-        inl_mkdecl(pbase + pi, call.kids[ai], call.line)
+        inl_arg(f, pi, call.kids[ai], pbase + pi, call.line, subs)
         pi += 1
     }
     var inl = nnode(N_INLINE, call.line)
     inl.name = f.name
     inl.slot = res
     inl.ty = call.ty
+    g_inl_subs = subs
     for st in f.pristine.kids { inl.kids.push(inl_clone(st, pbase, lbase, res, depth)) }
+    g_inl_subs = no_nodes()
     g_hoisted.push(inl)
     g_inl_hits += 1
     var id = nnode(N_ID, call.line)
@@ -4034,9 +4062,37 @@ fn cf_eval(e: Node) -> Node {
         }
         return nnode(N_NONE, e.line)
     }
+    if e.k == N_NOT {
+        let a = cf_eval(e.kids[0])
+        if a.k != N_BOOL { return nnode(N_NONE, e.line) }
+        var c = nnode(N_BOOL, e.line)
+        c.ival = 1 - a.ival
+        c.ty = TI_BOOL
+        return c
+    }
     if e.k == N_BIN {
         let a = cf_eval(e.kids[0])
         let b = cf_eval(e.kids[1])
+        if a.k == N_BOOL and b.k == N_BOOL and (e.op == T_AND or e.op == T_OR) {
+            var c = nnode(N_BOOL, e.line)
+            if e.op == T_AND { c.ival = a.ival & b.ival } else { c.ival = a.ival | b.ival }
+            c.ty = TI_BOOL
+            return c
+        }
+        if a.k == N_INT and b.k == N_INT and cmp_op(e.op) {
+            let op = e.op
+            var r = false
+            if op == T_EQEQ { r = a.ival == b.ival }
+            else if op == T_NE { r = a.ival != b.ival }
+            else if op == T_LT { r = a.ival < b.ival }
+            else if op == T_LE { r = a.ival <= b.ival }
+            else if op == T_GT { r = a.ival > b.ival }
+            else { r = a.ival >= b.ival }
+            var c = nnode(N_BOOL, e.line)
+            if r { c.ival = 1 }
+            c.ty = TI_BOOL
+            return c
+        }
         if a.k == N_INT and b.k == N_INT {
             var v = 0
             let op = e.op
@@ -4094,9 +4150,44 @@ fn cf_subst(e: Node) {
 // and nothing folded those -- the multiply was recomputed every iteration of
 // the loop it sat in. Runs over every tree, so literal arithmetic written out
 // by hand folds too.
+fn cmp_op(op: int) -> bool {
+    return op == T_EQEQ or op == T_NE or op == T_LT or op == T_LE or op == T_GT or op == T_GE
+}
+
+// overwrite e with src in place (parents keep their reference to e)
+fn node_become(e: Node, src: Node) {
+    e.k = src.k
+    e.op = src.op
+    e.name = src.name
+    e.ival = src.ival
+    e.fval = src.fval
+    e.ty = src.ty
+    e.slot = src.slot
+    e.aux = src.aux
+    e.refi = src.refi
+    e.mut = src.mut
+    e.kids = src.kids
+}
+
 fn cf_fold(e: Node) {
     for i in 0..e.kids.len() { cf_fold(e.kids[i]) }
-    if e.k != N_BIN and e.k != N_NEG and e.k != N_CAST { return }
+    // `and`/`or` with a literal side: true-and-X is X, X-and-true is X (X is
+    // evaluated either way), false-or-X is X, X-or-false is X. The dropped
+    // side is a literal, so no effect is lost.
+    if e.k == N_BIN and (e.op == T_AND or e.op == T_OR) {
+        let unit = e.op == T_AND                 // the neutral literal: true for and
+        let l = e.kids[0]
+        let r = e.kids[1]
+        if l.k == N_BOOL and (l.ival == 1) == unit and r.ty == TI_BOOL {
+            node_become(e, r)
+            return
+        }
+        if r.k == N_BOOL and (r.ival == 1) == unit and l.ty == TI_BOOL {
+            node_become(e, l)
+            return
+        }
+    }
+    if e.k != N_BIN and e.k != N_NEG and e.k != N_CAST and e.k != N_NOT { return }
     let v = cf_eval(e)
     if v.k != N_INT and v.k != N_FLOAT and v.k != N_BOOL { return }
     e.k = v.k
@@ -4208,6 +4299,7 @@ fn div_present(e: Node) -> bool {
 // identity key of an eligible divisor node, "" if not eligible
 fn div_key(e: Node, d: Node) -> str {
     if e.aux == BC_FLOAT or e.aux == BC_STR { return "" }
+    if div_const_ok(d) { return "" }                 // folded at compile time instead
     if d.k == N_INT and d.ival >= 1 { return "c{d.ival}" }
     if d.k == N_ID and (d.aux == ID_LOCAL or d.aux == ID_PARAM) and ty_kind[d.ty] == K_INT {
         return "v{d.aux}_{d.slot}"
@@ -4287,17 +4379,25 @@ fn emit_div_setup(pair: int, dv: Node) {
 // one independent load of the data pointer plus the element load, which is
 // what a C compiler's register-held base does.
 //
-// "Can't change" means: the variable is not assigned in the loop, and the body
-// makes no real call -- a callee could reassign a global, and a push could
-// reallocate the data block out from under the cached pointer. Builtins that
-// compile to inline instructions (sqrt, len, load/store, abs/min/max) are not
-// real calls and don't disqualify the loop. Caching into stack slots rather
-// than registers means an unrelated call would be harmless anyway.
+// "Can't change" means: the list expression is not reassigned in the loop,
+// and every real call sits where its effects can be caught up with. A callee
+// could reassign a global or push onto (reallocate) any list, so a call is
+// only allowed as the root of a statement (`f(..)`, `x = f(..)`,
+// `let y = f(..)`) with call-free arguments; after such a statement every
+// active hoisted base is reloaded (lb_refresh). Calls anywhere else --
+// conditions, ranges, the middle of an expression -- disqualify the loop, as
+// does a closure. Builtins that compile to inline instructions (sqrt, len,
+// load/store, abs/min/max) and runtime-only helpers that never run user code
+// or touch a list (assert, print, pow, optionals) are not real calls.
+//
+// Bases are list variables (`xs[i]`) or a field of one (`r.xs[i]`); for a
+// field, the loop must not assign that field of any struct of the same type.
 let LB_MAX = 6
 var g_lb_next = 0
 var g_lb_base = 0
 var g_lb_keys: [str] = []
 var g_lb_nodes: [Node] = []
+var g_lb_active: [Node] = []     // list expression of each claimed pair, for lb_refresh
 
 fn lb_dslot(p: int) -> str { return "[rbp - {16 + 8 * (g_lb_base + 2 * p)}]" }
 fn lb_lslot(p: int) -> str { return "[rbp - {16 + 8 * (g_lb_base + 2 * p + 1)}]" }
@@ -4310,53 +4410,145 @@ fn inline_ck(a: int) -> bool {
     return false
 }
 
-// true if the subtree contains anything that could reassign or reallocate a list
-fn lb_unsafe(e: Node) -> bool {
-    if e.k == N_CALL {
-        if not inline_ck(e.aux) { return true }
-    }
+fn lb_harmless(a: int) -> bool {
+    if inline_ck(a) { return true }
+    return a == CK_ASSERT or a == CK_PANIC or a == CK_PRINT or a == CK_POW or a == CK_OPT_HAS or a == CK_OPT_GET or a == CK_OPT_OR
+}
+
+// any real call (or closure) anywhere in the subtree
+fn lb_has_call(e: Node) -> bool {
+    if e.k == N_CALL and not lb_harmless(e.aux) { return true }
     if e.k == N_FNLIT { return true }
-    for c in e.kids { if lb_unsafe(c) { return true } }
+    for c in e.kids { if lb_has_call(c) { return true } }
     return false
 }
 
+// an expression in statement-root position: a call is fine if its own
+// arguments are call-free (it runs last; lb_refresh follows the statement)
+fn lb_root_ok(e: Node) -> bool {
+    if e.k == N_CALL and not lb_harmless(e.aux) {
+        for c in e.kids { if lb_has_call(c) { return false } }
+        return true
+    }
+    return not lb_has_call(e)
+}
+
+// does statement s end with a call that lb_refresh must follow?
+fn lb_root_call(s: Node) -> bool {
+    if s.k == N_EXPRST or s.k == N_DECL { return s.kids.len() > 0 and lb_has_call(s.kids[0]) }
+    if s.k == N_ASSIGN { return lb_has_call(s.kids[1]) }
+    return false
+}
+
+// true if the statement list could change a hoisted base behind our back
+fn lb_unsafe(blk: Node) -> bool {
+    for s in blk.kids { if lb_unsafe_stmt(s) { return true } }
+    return false
+}
+
+fn lb_unsafe_stmt(s: Node) -> bool {
+    let k = s.k
+    if k == N_EXPRST { return not lb_root_ok(s.kids[0]) }
+    if k == N_DECL {
+        if s.kids.len() == 0 { return false }
+        return not lb_root_ok(s.kids[0])
+    }
+    if k == N_ASSIGN {
+        if s.kids[0].k == N_ID { return not lb_root_ok(s.kids[1]) }
+        return lb_has_call(s)
+    }
+    if k == N_IF {
+        if lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) { return true }
+        return s.kids[2].k != N_NONE and lb_unsafe(s.kids[2])
+    }
+    if k == N_WHILE { return lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) }
+    if k == N_FORR { return lb_has_call(s.kids[0]) or lb_has_call(s.kids[1]) or lb_unsafe(s.kids[2]) }
+    if k == N_FORIN { return lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) }
+    if k == N_INLINE { return lb_unsafe(s) }
+    if k == N_RET { return false }            // leaves the loop: nothing reads a base after it
+    return lb_has_call(s)
+}
+
+// loop header parts, evaluated before setup or on every iteration, must not call
+fn lb_header_ok(s: Node) -> bool {
+    if s.k == N_WHILE { return not lb_has_call(s.kids[0]) }
+    if s.k == N_FORR { return not lb_has_call(s.kids[0]) and not lb_has_call(s.kids[1]) }
+    return true
+}
+
+// hoistable list expression: a list variable, or a field of a struct variable
+fn lb_base_ok(v: Node) -> bool {
+    if ty_kind[v.ty] != K_LIST { return false }
+    var b = v
+    if v.k == N_MEMBER {
+        b = v.kids[0]
+        if ty_kind[b.ty] != K_STRUCT { return false }
+    }
+    if b.k != N_ID { return false }
+    return b.aux == ID_LOCAL or b.aux == ID_GLOBAL or b.aux == ID_PARAM
+}
+
+fn lb_key(v: Node) -> str {
+    if v.k == N_MEMBER { return "{v.kids[0].aux}_{v.kids[0].slot}.{v.slot}" }
+    return "{v.aux}_{v.slot}"
+}
+
 fn lb_scan(e: Node) {
-    if e.k == N_INDEX and e.op == 0 and e.kids[0].k == N_ID and ty_kind[e.kids[0].ty] == K_LIST {
+    if e.k == N_INDEX and e.op == 0 and lb_base_ok(e.kids[0]) {
         let v = e.kids[0]
-        if v.aux == ID_LOCAL or v.aux == ID_GLOBAL or v.aux == ID_PARAM {
-            let key = "{v.aux}_{v.slot}"
-            var seen = false
-            for i in 0..g_lb_keys.len() { if g_lb_keys[i] == key { seen = true } }
-            if not seen {
-                g_lb_keys.push(key)
-                g_lb_nodes.push(v)
-            }
+        let key = lb_key(v)
+        var seen = false
+        for i in 0..g_lb_keys.len() { if g_lb_keys[i] == key { seen = true } }
+        if not seen {
+            g_lb_keys.push(key)
+            g_lb_nodes.push(v)
         }
     }
     for c in e.kids { lb_scan(c) }
 }
 
-fn lb_mark(e: Node, aux: int, slot: int, pair: int) {
-    if e.k == N_INDEX and e.op == 0 and e.kids[0].k == N_ID {
-        let v = e.kids[0]
-        if v.aux == aux and v.slot == slot and ty_kind[v.ty] == K_LIST { e.op = pair + 1 }
+fn lb_mark(e: Node, key: str, pair: int) {
+    if e.k == N_INDEX and e.op == 0 and lb_base_ok(e.kids[0]) {
+        if lb_key(e.kids[0]) == key { e.op = pair + 1 }
     }
-    for c in e.kids { lb_mark(c, aux, slot, pair) }
+    for c in e.kids { lb_mark(c, key, pair) }
+}
+
+// is field `slot` of a struct of type `ty` assigned anywhere in the subtree?
+fn lb_field_assigned(e: Node, ty: int, slot: int) -> bool {
+    if e.k == N_ASSIGN {
+        let t = e.kids[0]
+        if t.k == N_MEMBER and t.slot == slot and type_eq(t.kids[0].ty, ty) { return true }
+    }
+    for c in e.kids { if lb_field_assigned(c, ty, slot) { return true } }
+    return false
 }
 
 fn emit_lb_setup(pair: int, v: Node) {
-    gen_leaf("rcx", v)                     // the list object
+    if v.k == N_MEMBER {
+        gen_leaf("rcx", v.kids[0])         // the struct
+        o("mov rcx, [rcx + {8 * v.slot}]") // the list object
+    } else {
+        gen_leaf("rcx", v)                 // the list object
+    }
     o("mov rdx, [rcx]")                    // length
     o("mov " + lb_lslot(pair) + ", rdx")
     o("mov rcx, [rcx + 16]")               // data pointer
     o("mov " + lb_dslot(pair) + ", rcx")
+    while g_lb_active.len() <= pair { g_lb_active.push(v) }
+    g_lb_active[pair] = v
 }
 
-// hoist up to (LB_MAX - g_lb_next) list bases for a loop body; returns how many
+// after a statement that called out: reload every active hoisted base
+fn lb_refresh() {
+    for p in 0..g_lb_next { emit_lb_setup(p, g_lb_active[p]) }
+}
+
+// hoist up to (LB_MAX - g_lb_next) list bases for a loop; returns how many
 // were claimed (the caller releases them after the loop)
-fn lb_promote_loop(body: Node) -> int {
+fn lb_promote_loop(loop_stmt: Node, body: Node) -> int {
     if g_lb_next >= LB_MAX { return 0 }
-    if lb_unsafe(body) { return 0 }
+    if not lb_header_ok(loop_stmt) or lb_unsafe(body) { return 0 }
     sclear(g_lb_keys)
     nclear(g_lb_nodes)
     lb_scan(body)
@@ -4364,8 +4556,15 @@ fn lb_promote_loop(body: Node) -> int {
     var ci = 0
     while ci < g_lb_keys.len() and g_lb_next < LB_MAX {
         let v = g_lb_nodes[ci]
-        if not div_assigned_in(body, v.aux, v.slot) {
-            lb_mark(body, v.aux, v.slot, g_lb_next)
+        var ok = true
+        if v.k == N_MEMBER {
+            let b = v.kids[0]
+            ok = not div_assigned_in(body, b.aux, b.slot) and not lb_field_assigned(body, b.ty, v.slot)
+        } else {
+            ok = not div_assigned_in(body, v.aux, v.slot)
+        }
+        if ok {
+            lb_mark(body, g_lb_keys[ci], g_lb_next)
             emit_lb_setup(g_lb_next, v)
             g_lb_next += 1
             took += 1
@@ -4414,6 +4613,61 @@ fn div_promote_loop(body: Node, whole: Node) -> int {
         ci += 1
     }
     return took
+}
+
+// A literal divisor 2..2^31-1 needs no zero check and no runtime reciprocal:
+// powers of two become shifts/masks with a sign bias (truncating semantics),
+// the rest use M = floor((2^64-1)/d) computed here. Only rax, rcx, rdx.
+fn div_const_ok(d: Node) -> bool {
+    return d.k == N_INT and d.ival >= 2 and d.ival <= 2147483647
+}
+
+fn gen_div_const(e: Node) {
+    let d = e.kids[1].ival
+    var k = 0
+    while (1 << k) < d { k += 1 }
+    gen_expr(e.kids[0])                   // n -> rax
+    if (1 << k) == d {
+        o("mov rcx, rax")
+        o("sar rcx, 63")
+        o("shr rcx, {64 - k}")            // bias = n < 0 ? d-1 : 0
+        if e.op == T_SLASH {
+            o("add rax, rcx")
+            o("sar rax, {k}")
+        } else {
+            o("add rcx, rax")
+            o("and rcx, {0 - d}")
+            o("sub rax, rcx")
+        }
+        return
+    }
+    // (2^64-1)/d without unsigned ints: 2^64-1 = 2a+1 with a = 2^63-1
+    let a = 9223372036854775807
+    let magic = 2 * (a / d) + (2 * (a % d) + 1) / d
+    let slow = newlabel()
+    let qok = newlabel()
+    let end = newlabel()
+    o("test rax, rax")
+    o("js {lbl(slow)}")
+    o("mov rcx, rax")                     // n
+    o("movabs rdx, {magic}")
+    o("mul rdx")                          // rdx = q0 = mulhi(n, M), q or q-1
+    o("imul rax, rdx, {d}")
+    o("sub rcx, rax")                     // r = n - q0*d
+    o("mov rax, rdx")
+    o("cmp rcx, {d}")
+    o("jb {lbl(qok)}")
+    o("add rax, 1")
+    o("sub rcx, {d}")
+    olabel(qok)
+    if e.op == T_PCT { o("mov rax, rcx") }
+    o("jmp {lbl(end)}")
+    olabel(slow)
+    o("mov rcx, {d}")
+    o("cqo")
+    o("idiv rcx")
+    if e.op == T_PCT { o("mov rax, rdx") }
+    olabel(end)
 }
 
 // q0 = mulhi(n, M) is q or q-1 for any n >= 0 (signed => n < 2^63); one
@@ -4800,6 +5054,10 @@ fn gen_binop(e: Node) {
     // div/mod site with a loop-invariant divisor promoted at loop entry
     if (op == T_SLASH or op == T_PCT) and e.slot > 0 {
         gen_div_fast(e)
+        return
+    }
+    if (op == T_SLASH or op == T_PCT) and cat != BC_FLOAT and cat != BC_STR and div_const_ok(e.kids[1]) {
+        gen_div_const(e)
         return
     }
     // whole subtree is an addressing mode: one lea instead of shift/mov/add
@@ -5281,6 +5539,10 @@ fn cond_ops_ok(cond: Node) -> bool {
 }
 
 fn gen_cond(cond: Node, target: int, jfalse: bool) {
+    if cond.k == N_BOOL {                   // folded condition: jump or fall through
+        if (cond.ival == 0) == jfalse { o("jmp {lbl(target)}") }
+        return
+    }
     // short-circuit and/or lowered directly to branches -- no boolean is ever
     // materialized, so the comparisons inside fuse to cmp/comisd + jcc.
     if cond.k == N_BIN and cond.op == T_AND {
@@ -5823,10 +6085,9 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_ASSERT {
-        gen_expr(e.kids[1])
+        if e.kids[1].k == N_BOOL and e.kids[1].ival == 1 { return }
         let ok = newlabel()
-        o("test rax, rax")
-        o("jne {lbl(ok)}")
+        gen_cond(e.kids[1], ok, false)      // fused compare-and-branch
         if e.kids.len() > 2 {
             gen_expr(e.kids[2])
             o("mov rcx, rax")
@@ -6940,7 +7201,7 @@ fn gen_stmt(s: Node, retlabel: int) {
             if iop != "" and not starts_with(iop, "[") { ixr = iop }
             var bt = false
             var pushed = false
-            if is_leaf(t.kids[0]) {          // list is a var: load it last, skip its push/pop
+            if is_leaf(t.kids[0]) or t.op > 0 {   // list is a var (or hoisted): load it last, skip its push/pop
                 if ixr != "rdx" {
                     gen_expr(s.kids[1])      // value -> rax
                 } else {
@@ -6985,6 +7246,11 @@ fn gen_stmt(s: Node, retlabel: int) {
         }
         return
     }
+    if s.k == N_IF and s.kids[0].k == N_BOOL {   // folded: only the live arm
+        if s.kids[0].ival == 1 { gen_block(s.kids[1], retlabel) }
+        else if s.kids[2].k != N_NONE { gen_block(s.kids[2], retlabel) }
+        return
+    }
     if s.k == N_IF {
         let els = newlabel()
         let end = newlabel()
@@ -7002,7 +7268,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         let top = newlabel()
         let end = newlabel()
         let ndp = div_promote_loop(s.kids[1], s)
-        let nlb = lb_promote_loop(s.kids[1])
+        let nlb = lb_promote_loop(s, s.kids[1])
         olabel(top)
         gen_cond(s.kids[0], end, true)
         g_brk.push(end)
@@ -7024,7 +7290,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         let cont = newlabel()
         let end = newlabel()
         let ndp = div_promote_loop(s.kids[2], s)
-        let nlb = lb_promote_loop(s.kids[2])
+        let nlb = lb_promote_loop(s, s.kids[2])
         let iv = slot_addr(ID_LOCAL, s.slot)     // loop var (may be promoted)
         let hv = slot_addr(ID_LOCAL, s.aux)      // limit (hidden, never promoted)
         gen_expr(s.kids[0])
@@ -7106,7 +7372,10 @@ fn gen_stmt(s: Node, retlabel: int) {
         // one store at the end label instead of one per return path
         let iend = newlabel()
         g_inlend.push(iend)
-        for st in s.kids { gen_stmt(st, retlabel) }
+        for st in s.kids {
+            gen_stmt(st, retlabel)
+            if g_lb_next > 0 and lb_root_call(st) { lb_refresh() }
+        }
         let x = g_inlend.pop()
         olabel(iend)
         let fr = float_reg(ID_LOCAL, s.slot)   // only floats get xmm-promoted, so
@@ -7137,7 +7406,10 @@ fn gen_stmt(s: Node, retlabel: int) {
 }
 
 fn gen_block(blk: Node, retlabel: int) {
-    for s in blk.kids { gen_stmt(s, retlabel) }
+    for s in blk.kids {
+        gen_stmt(s, retlabel)
+        if g_lb_next > 0 and lb_root_call(s) { lb_refresh() }
+    }
 }
 
 fn no_lines() -> [str] {
@@ -13693,6 +13965,7 @@ if d_in == "" and d_version {
     g_file = basename(d_in)
     fold_globals(prog)
     inline_pass(prog)
+    cf_fold_all(prog)                       // fold what inlined literal args exposed
     let is_s = d_out.len() > 2 and d_out.sub(d_out.len() - 2, d_out.len()) == ".s"
     // -g only affects native exe output; keep .zloc markers out of .s (gcc path)
     g_main_file = d_in
