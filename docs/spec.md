@@ -150,7 +150,8 @@ empty map literal and, like `[]`, needs an annotation to supply its type.
 Reading a missing key panics; use `.has(k)` to test first. Methods: `.len()`,
 `.has(k)`, `.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
 `for k in m.keys()`. Iteration order is unspecified. Maps are open-addressed
-and grow at 70% load, so insert/lookup are amortized O(1).
+and rehash at 50% occupied slots (including tombstones), so insert/lookup
+are amortized O(1).
 
 ### 3.0.2 Modules
 

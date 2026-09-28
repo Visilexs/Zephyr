@@ -1,0 +1,41 @@
+// Call before/after the callee's visit and after the wrapper's body is rewritten.
+fn before(n: int) -> int { return leaf(n) }
+fn leaf(n: int) -> int { return n * 2 + 1 }
+fn wrapper(n: int) -> int { return leaf(n) + leaf(n + 1) }
+fn after(n: int) -> int { return wrapper(n) + leaf(n) }
+
+// Recursive and nested expansions must keep using an untouched body.
+fn sum_to(n: int) -> int {
+    if n == 0 { return 0 }
+    return n + sum_to(n - 1)
+}
+fn nested(n: int) -> int { return leaf(leaf(n)) + wrapper(wrapper(n)) }
+
+// Keep closures pristine when a later expansion needs their original indexing.
+fn indexed(xs: [int]) -> int {
+    var n = 0
+    for i in 0..xs.len() { n += xs[i] }
+    return n
+}
+fn factory() -> fn([int]) -> int {
+    return fn(xs: [int]) -> int { return indexed(xs) }
+}
+fn wrap() -> fn([int]) -> int { return factory() }
+fn entry() -> int {
+    let f = wrap()
+    return f([1, 2, 3])
+}
+
+assert(before(3) == 7)
+assert(wrapper(3) == 16)
+assert(after(3) == 23)
+assert(sum_to(6) == 21)
+assert(nested(2) == 63)
+assert(entry() == 6)
+print(before(3))
+print(wrapper(3))
+print(after(3))
+print(sum_to(6))
+print(nested(2))
+print(entry())
+print("inline pristine ok")

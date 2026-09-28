@@ -483,22 +483,19 @@ fn rx_drop_children(obj: int, desc: int) {
         rx_drop_child(data)
     } else if kind == 3 {
         let cap = load64(obj + 8)
-        let keys = load64(obj + 16)
-        let vals = load64(obj + 24)
-        let state = load64(obj + 32)
+        let slots = load64(obj + 16)
         let kref = load64(desc + 8)
         let vref = load64(desc + 16)
         var i = 0
         while i < cap {
-            if load8(state + i) == 1 {
-                if kref == 1 { rx_drop_child(load64(keys + i * 8)) }
-                if vref == 1 { rx_drop_child(load64(vals + i * 8)) }
+            let slot = slots + i * 24
+            if load64(slot) == 1 {
+                if kref == 1 { rx_drop_child(load64(slot + 8)) }
+                if vref == 1 { rx_drop_child(load64(slot + 16)) }
             }
             i += 1
         }
-        rx_drop_child(keys)
-        rx_drop_child(vals)
-        rx_drop_child(state)
+        rx_drop_child(slots)
     }
 }
 
@@ -893,11 +890,11 @@ fn rt_list_contains_str(l: int, v: int) -> int {
     return 0
 }
 // ---- hash map ----
-// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind [48]tombstones
-// state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.
-// Tombstones count toward the load factor: a probe only stops at an empty slot,
-// so a map with insert/remove churn at a steady size used to fill every empty
-// slot with tombstones and die with "map overflow" without ever growing.
+// layout: [0]count [8]cap(pow2) [16]slots [24]keykind [32]tombstones [40]hash shift
+// Each 24-byte slot is {state, key, value}, touching at most two cache lines.
+// state: 0 = empty, 1 = live, 2 = tombstone. keykind: 0 = by value, 1 = str.
+// Keeping state beside the key preserves the full integer key domain. Counting
+// tombstones toward the load limit guarantees an empty slot ends every probe.
 // Called by name from the compiler; a map whose keys and values it will not drop.
 fn rt_map_new(keykind: int) -> int {
     return rt_map_new_d(keykind, 0)
@@ -907,23 +904,18 @@ fn rt_map_new(keykind: int) -> int {
 fn rt_map_new_d(keykind: int, desc: int) -> int {
     var d = desc
     if d == 0 { d = __d_map_val }     // the buffers still have to go when the map does
-    let m = rt_alloc_d(56, d)
+    let m = rt_alloc_d(48, d)
     let cap = 8
     store64(m, 0)
     store64(m + 8, cap)
-    store64(m + 16, rt_alloc(cap * 8))
-    store64(m + 24, rt_alloc(cap * 8))
-    store64(m + 32, rt_alloc(cap))
-    store64(m + 40, keykind)
-    store64(m + 48, 0)
+    store64(m + 16, rt_alloc(cap * 24))
+    store64(m + 24, keykind)
+    store64(m + 32, 0)
+    store64(m + 40, 61)               // high 3 bits of a 64-bit multiplicative hash
     return m
 }
 fn rx_hash_int(k: int) -> int {
-    var h = k * 1000003
-    h = h ^ (h >> 31)
-    h = h * 2654435761
-    h = h ^ (h >> 29)
-    return h & 9223372036854775807
+    return k * -7046029254386353131    // 64-bit golden ratio; callers take high bits
 }
 fn rx_hash_str(s: int) -> int {
     let n = load64(s)
@@ -937,169 +929,140 @@ fn rx_hash_str(s: int) -> int {
     return h & 9223372036854775807
 }
 fn rx_map_hash(m: int, k: int) -> int {
-    if load64(m + 40) == 1 { return rx_hash_str(k) }
-    return rx_hash_int(k)
+    if load64(m + 24) == 1 { return rx_hash_str(k) }
+    return rx_hash_int(k) >> load64(m + 40)
 }
 fn rx_key_eq(m: int, a: int, b: int) -> int {
-    if load64(m + 40) == 1 { return rt_str_eq(a, b) }
+    if load64(m + 24) == 1 { return rt_str_eq(a, b) }
     if a == b { return 1 }
     return 0
 }
 // slot holding k, or -1
 fn rx_map_lookup(m: int, k: int) -> int {
     let cap = load64(m + 8)
-    let keys = load64(m + 16)
-    let state = load64(m + 32)
+    let slots = load64(m + 16)
     var i = rx_map_hash(m, k) & (cap - 1)
-    var probes = 0
-    while probes < cap {
-        let st = load8(state + i)
+    while true {
+        let slot = slots + i * 24
+        let st = load64(slot)
         if st == 0 { return 0 - 1 }
-        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 { return i }
+        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 { return i }
         i = (i + 1) & (cap - 1)
-        probes += 1
     }
     return 0 - 1
 }
 fn rx_map_insert(m: int, k: int, v: int) {
     let cap = load64(m + 8)
-    let keys = load64(m + 16)
-    let vals = load64(m + 24)
-    let state = load64(m + 32)
+    let slots = load64(m + 16)
     var i = rx_map_hash(m, k) & (cap - 1)
     var tomb = 0 - 1
-    var probes = 0
-    while probes < cap {
-        let st = load8(state + i)
-        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 {
-            if rx_vref(m) == 1 { rx_assign(vals + i * 8, v) }   // update in place
-            else { store64(vals + i * 8, v) }
+    while true {
+        let slot = slots + i * 24
+        let st = load64(slot)
+        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 {
+            if rx_vref(m) == 1 { rx_assign(slot + 16, v) }   // update in place
+            else { store64(slot + 16, v) }
             if rx_kref(m) == 1 { rx_drop(k) }                    // the old key stays
             return
         }
         if st == 2 and tomb < 0 { tomb = i }
         if st == 0 {
-            var slot = i
+            var dest = slot
             if tomb >= 0 {
-                slot = tomb
-                store64(m + 48, load64(m + 48) - 1)
+                dest = slots + tomb * 24
+                store64(m + 32, load64(m + 32) - 1)
             }
-            store64(keys + slot * 8, k)
-            store64(vals + slot * 8, v)
-            store8(state + slot, 1)
+            store64(dest + 8, k)
+            store64(dest + 16, v)
+            store64(dest, 1)
             store64(m, load64(m) + 1)
             return
         }
         i = (i + 1) & (cap - 1)
-        probes += 1
     }
-    // no empty slot anywhere: the key is absent, so a tombstone is free to take
-    if tomb < 0 { rt_die("map overflow") }
-    store64(keys + tomb * 8, k)
-    store64(vals + tomb * 8, v)
-    store8(state + tomb, 1)
-    store64(m, load64(m) + 1)
-    store64(m + 48, load64(m + 48) - 1)
 }
-// Move every live entry into fresh arrays of ncap slots, dropping tombstones.
+// Move every live entry into a fresh buffer, dropping tombstones, not references.
 fn rx_map_rehash(m: int, ncap: int) {
     let oldcap = load64(m + 8)
-    let oldkeys = load64(m + 16)
-    let oldvals = load64(m + 24)
-    let oldstate = load64(m + 32)
+    let oldslots = load64(m + 16)
+    // Allocate before changing the header; the collector still sees the old buffer.
+    let slots = rt_alloc(ncap * 24)
     store64(m + 8, ncap)
-    store64(m + 16, rt_alloc(ncap * 8))
-    store64(m + 24, rt_alloc(ncap * 8))
-    store64(m + 32, rt_alloc(ncap))       // fresh pages are zero = all empty
+    store64(m + 16, slots)              // zeroed = all empty
     store64(m, 0)
-    store64(m + 48, 0)
-    let isint = load64(m + 40) == 0
+    store64(m + 32, 0)
+    var shift = 64
+    var n = ncap
+    while n > 1 {
+        shift -= 1
+        n = n >> 1
+    }
+    store64(m + 40, shift)
+    let isint = load64(m + 24) == 0
     var i = 0
     while i < oldcap {
-        if load8(oldstate + i) == 1 {
-            if isint { rx_iinsert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) }
-            else { rx_map_insert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) }
+        let slot = oldslots + i * 24
+        if load64(slot) == 1 {
+            if isint { rx_iinsert(m, load64(slot + 8), load64(slot + 16)) }
+            else { rx_map_insert(m, load64(slot + 8), load64(slot + 16)) }
         }
         i += 1
     }
-    // The entries moved, not their counts: only the old arrays themselves die.
-    rx_drop(oldkeys)
-    rx_drop(oldvals)
-    rx_drop(oldstate)
+    rx_drop(oldslots)
 }
 // ---- int-key fast paths: hash and == inlined, no call per probe ----
 fn rx_ilookup(m: int, k: int) -> int {
     let cap = load64(m + 8)
-    let keys = load64(m + 16)
-    let state = load64(m + 32)
-    var h = k * 1000003
-    h = h ^ (h >> 31)
-    h = h * 2654435761
-    h = h ^ (h >> 29)
-    var i = h & 9223372036854775807 & (cap - 1)
-    var probes = 0
-    while probes < cap {
-        let st = load8(state + i)
+    let slots = load64(m + 16)
+    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)
+    while true {
+        let slot = slots + i * 24
+        let st = load64(slot)
         if st == 0 { return 0 - 1 }
-        if st == 1 and load64(keys + i * 8) == k { return i }
+        if st == 1 and load64(slot + 8) == k { return i }
         i = (i + 1) & (cap - 1)
-        probes += 1
     }
     return 0 - 1
 }
 fn rx_iinsert(m: int, k: int, v: int) {
     let cap = load64(m + 8)
-    let keys = load64(m + 16)
-    let vals = load64(m + 24)
-    let state = load64(m + 32)
-    var h = k * 1000003
-    h = h ^ (h >> 31)
-    h = h * 2654435761
-    h = h ^ (h >> 29)
-    var i = h & 9223372036854775807 & (cap - 1)
+    let slots = load64(m + 16)
+    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)
     var tomb = 0 - 1
-    var probes = 0
-    while probes < cap {
-        let st = load8(state + i)
-        if st == 1 and load64(keys + i * 8) == k {
-            if rx_vref(m) == 1 { rx_assign(vals + i * 8, v) }
-            else { store64(vals + i * 8, v) }
+    while true {
+        let slot = slots + i * 24
+        let st = load64(slot)
+        if st == 1 and load64(slot + 8) == k {
+            if rx_vref(m) == 1 { rx_assign(slot + 16, v) }
+            else { store64(slot + 16, v) }
             return
         }
         if st == 2 and tomb < 0 { tomb = i }
         if st == 0 {
-            var slot = i
+            var dest = slot
             if tomb >= 0 {
-                slot = tomb
-                store64(m + 48, load64(m + 48) - 1)
+                dest = slots + tomb * 24
+                store64(m + 32, load64(m + 32) - 1)
             }
-            store64(keys + slot * 8, k)
-            store64(vals + slot * 8, v)
-            store8(state + slot, 1)
+            store64(dest + 8, k)
+            store64(dest + 16, v)
+            store64(dest, 1)
             store64(m, load64(m) + 1)
             return
         }
         i = (i + 1) & (cap - 1)
-        probes += 1
     }
-    // no empty slot anywhere: the key is absent, so a tombstone is free to take
-    if tomb < 0 { rt_die("map overflow") }
-    store64(keys + tomb * 8, k)
-    store64(vals + tomb * 8, v)
-    store8(state + tomb, 1)
-    store64(m, load64(m) + 1)
-    store64(m + 48, load64(m + 48) - 1)
 }
 fn rt_map_set(m: int, k: int, v: int) {
-    // Rehash at 70% of slots in use, tombstones included. Double when the live
-    // entries alone would fill over 35%; otherwise it is mostly tombstones, and
+    // Rehash at 50% of slots in use, tombstones included. Double when the live
+    // entries alone would fill over 25%; otherwise it is mostly tombstones, and
     // rebuilding at the same size clears them.
     let cap = load64(m + 8)
-    if (load64(m) + load64(m + 48) + 1) * 10 >= cap * 7 {
-        if (load64(m) + 1) * 20 >= cap * 7 { rx_map_rehash(m, cap * 2) }
+    if (load64(m) + load64(m + 32) + 1) * 2 >= cap {
+        if (load64(m) + 1) * 4 >= cap { rx_map_rehash(m, cap * 2) }
         else { rx_map_rehash(m, cap) }
     }
-    if load64(m + 40) == 0 {
+    if load64(m + 24) == 0 {
         rx_iinsert(m, k, v)
         return
     }
@@ -1112,7 +1075,7 @@ fn rt_map_set(m: int, k: int, v: int) {
 fn rt_map_get(m: int, k: int) -> int {
     let i = rx_lookup(m, k)
     if i < 0 { rt_die("map key not found") }
-    let v = load64(load64(m + 24) + i * 8)
+    let v = load64(load64(m + 16) + i * 24 + 16)
     if rx_vref(m) == 1 { let d = rx_dup(v) }
     return v
 }
@@ -1120,20 +1083,26 @@ fn rt_map_get(m: int, k: int) -> int {
 fn rt_map_get_or(m: int, k: int, d: int) -> int {
     let i = rx_lookup(m, k)
     var v = d
-    if i >= 0 { v = load64(load64(m + 24) + i * 8) }
+    if i >= 0 { v = load64(load64(m + 16) + i * 24 + 16) }
     if rx_vref(m) == 1 { let d = rx_dup(v) }
     return v
 }
+// The compiler selects this when neither keys nor values need reference handling.
+fn rt_map_get_or_val(m: int, k: int, d: int) -> int {
+    let i = rx_ilookup(m, k)
+    if i < 0 { return d }
+    return load64(load64(m + 16) + i * 24 + 16)
+}
 // dispatch: int-keyed maps take the inlined fast path
 fn rx_lookup(m: int, k: int) -> int {
-    if load64(m + 40) == 0 { return rx_ilookup(m, k) }
+    if load64(m + 24) == 0 { return rx_ilookup(m, k) }
     return rx_map_lookup(m, k)
 }
 // safe lookup: returns an optional cell (0 = none)
 fn rt_map_get_opt(m: int, k: int) -> int {
     let i = rx_lookup(m, k)
     if i < 0 { return 0 }
-    let v = load64(load64(m + 24) + i * 8)
+    let v = load64(load64(m + 16) + i * 24 + 16)
     var cell = 0
     if rx_vref(m) == 1 {
         cell = rt_alloc_d(8, __d_box_ref)
@@ -1151,36 +1120,50 @@ fn rt_map_has(m: int, k: int) -> int {
 fn rt_map_remove(m: int, k: int) {
     let i = rx_lookup(m, k)
     if i < 0 { return }
-    store8(load64(m + 32) + i, 2)         // tombstone
+    let slot = load64(m + 16) + i * 24
+    store64(slot, 2)                     // tombstone
     store64(m, load64(m) - 1)
-    store64(m + 48, load64(m + 48) + 1)
-    if rx_kref(m) == 1 { rx_drop(load64(load64(m + 16) + i * 8)) }
-    if rx_vref(m) == 1 { rx_drop(load64(load64(m + 24) + i * 8)) }
+    store64(m + 32, load64(m + 32) + 1)
+    if rx_kref(m) == 1 { rx_drop(load64(slot + 8)) }
+    if rx_vref(m) == 1 { rx_drop(load64(slot + 16)) }
+    // The conservative collector must not retain deleted keys or values.
+    store64(slot + 8, 0)
+    store64(slot + 16, 0)
 }
 fn rt_map_keys(m: int) -> int {
     let cap = load64(m + 8)
-    let keys = load64(m + 16)
-    let state = load64(m + 32)
+    let slots = load64(m + 16)
+    let kref = rx_kref(m)
     var ld = __d_list_val
-    if rx_kref(m) == 1 { ld = __d_list_ref }
+    if kref == 1 { ld = __d_list_ref }
     let out = rt_list_new_d(0, ld)
     var i = 0
     while i < cap {
-        if load8(state + i) == 1 { rt_list_push(out, rx_dup(load64(keys + i * 8))) }
+        let slot = slots + i * 24
+        if load64(slot) == 1 {
+            let k = load64(slot + 8)
+            if kref == 1 { let d = rx_dup(k) }
+            rt_list_push(out, k)
+        }
         i += 1
     }
     return out
 }
 fn rt_map_values(m: int) -> int {
     let cap = load64(m + 8)
-    let vals = load64(m + 24)
-    let state = load64(m + 32)
+    let slots = load64(m + 16)
+    let vref = rx_vref(m)
     var ld = __d_list_val
-    if rx_vref(m) == 1 { ld = __d_list_ref }
+    if vref == 1 { ld = __d_list_ref }
     let out = rt_list_new_d(0, ld)
     var i = 0
     while i < cap {
-        if load8(state + i) == 1 { rt_list_push(out, rx_dup(load64(vals + i * 8))) }
+        let slot = slots + i * 24
+        if load64(slot) == 1 {
+            let v = load64(slot + 16)
+            if vref == 1 { let d = rx_dup(v) }
+            rt_list_push(out, v)
+        }
         i += 1
     }
     return out
@@ -1898,22 +1881,21 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
         let ktd = load64(td + 8)
         let vtd = load64(td + 16)
         let cap = load64(v + 8)
-        let keys = load64(v + 16)
-        let vals = load64(v + 24)
-        let state = load64(v + 32)
+        let slots = load64(v + 16)
         rx_sb_byte(123)
         var shown = 0
         var i = 0
         while i < cap {
-            if load8(state + i) == 1 {
+            let slot = slots + i * 24
+            if load64(slot) == 1 {
                 if shown > 0 {
                     rx_sb_byte(44)
                     rx_sb_byte(32)
                 }
-                rx_fmt_val(load64(keys + i * 8), ktd, 1)
+                rx_fmt_val(load64(slot + 8), ktd, 1)
                 rx_sb_byte(58)
                 rx_sb_byte(32)
-                rx_fmt_val(load64(vals + i * 8), vtd, 1)
+                rx_fmt_val(load64(slot + 16), vtd, 1)
                 shown += 1
             }
             i += 1
