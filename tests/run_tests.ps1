@@ -1498,6 +1498,114 @@ print(pow(4, 0.5))
 $exp = @("x = 5 [1, 2] done", "", "a, b, c", "[]", "1.41421356237309", "3.375", "-8", "nan", "2") -join [Environment]::NewLine
 Check "lang-builtins4" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
+# ---- modules: import as, private, main(), test blocks ----
+$modDir = Join-Path $tmp "modules"
+New-Item -ItemType Directory -Force "$modDir\lib" | Out-Null
+Set-Content "$modDir\lib\geometry.zeph" @'
+// a namespaced module
+struct Point {
+    x: float
+    y: float
+}
+impl Point {
+    fn length(self) -> float { return sqrt(square(self.x) + square(self.y)) }
+    fn origin() -> Point { return Point{x: 0, y: 0} }
+}
+enum Axis { Horizontal, Vertical }
+enum Shape {
+    Circle(float)
+    Square(float)
+}
+let UNIT = 1.0
+var created = 0
+private fn square(v: float) -> float { return v * v }
+private let SECRET = 42
+fn make(x: float, y: float) -> Point {
+    created += 1
+    return Point{x: x, y: y}
+}
+fn area(shape: Shape) -> float {
+    return match shape {
+        Circle(r) { 3.0 * r * r }
+        Square(side) { side * side }
+    }
+}
+fn secret() -> int { return SECRET }
+type Path = [Point]
+'@ -Encoding ascii
+Set-Content "$modDir\lib\helpers.zeph" @'
+// a plain module with a private helper of the same name as the main file's
+private fn describe() -> str { return "helpers' own describe" }
+fn helper_message() -> str { return describe() }
+'@ -Encoding ascii
+Set-Content "$modDir\main.zeph" @'
+import "lib/geometry.zeph" as geo
+import "lib/helpers.zeph"
+fn square(v: int) -> int { return v * v * v }
+fn describe() -> str { return "main's describe" }
+let p = geo.make(3, 4)
+print(p.length())
+print(p)
+let q: geo.Point = geo.Point{x: 1, y: 0}
+print(q.length() + geo.UNIT)
+print(geo.Point.origin())
+let path: geo.Path = [p, q]
+print(path.len())
+print(geo.Axis.Vertical)
+print(geo.area(geo.Shape.Circle(1)))
+print(geo.created)
+print(geo.secret())
+print(square(2))
+print(describe())
+print(helper_message())
+fn main() {
+    print("main runs last")
+}
+print("top level first")
+test "never in a normal run" { print("nope") }
+'@ -Encoding ascii
+Set-Content "$modDir\tested.zeph" @'
+import "lib/geometry.zeph" as geo
+fn add(a: int, b: int) -> int { return a + b }
+fn main() { print("main should not run under --test") }
+test "adds small numbers" {
+    assert(add(2, 3) == 5, "2 + 3")
+}
+test "uses a module" {
+    assert(geo.make(3, 4).length() == 5.0, "3-4-5")
+}
+test "fails on purpose" {
+    assert(add(1, 1) == 3, "1 + 1 is not 3")
+}
+test "never reached" { print("unreachable") }
+'@ -Encoding ascii
+function RunModule($file, $flags) {
+    $exe = Join-Path $modDir ($file + ".exe")
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $build = (cmd /c ".\zc.exe $flags `"$modDir\$file`" `"$exe`" 2>&1" | Out-String).Trim()
+    if (-not (Test-Path $exe)) { return @{ code = -1; out = $build } }
+    $runOut = (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", ""
+    return @{ code = $LASTEXITCODE; out = $runOut }
+}
+$r = RunModule "main.zeph" "--rt"
+$exp = @("5", "geo.Point{x: 3, y: 4}", "2", "geo.Point{x: 0, y: 0}", "2", "Vertical", "3", "1", "42", "8", "main's describe", "helpers' own describe", "top level first", "main runs last") -join "`n"
+Check "modules-namespaces" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+$r = RunModule "tested.zeph" "--test"
+$exp = @("test adds small numbers ... ok", "test uses a module ... ok", "test fails on purpose ... panic: tested.zeph:11: 1 + 1 is not 3") -join "`n"
+Check "modules-test-blocks" ($r.code -eq 1 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+$moduleErrors = @{
+    "private-from-outside" = "import `"lib/geometry.zeph`" as geo`nprint(geo.square(2.0))"
+    "unqualified-namespaced" = "import `"lib/geometry.zeph`" as geo`nprint(make(1, 2))"
+    "plain-after-as"       = "import `"lib/geometry.zeph`" as geo`nimport `"lib/geometry.zeph`""
+    "alias-reused"         = "import `"lib/geometry.zeph`" as geo`nimport `"lib/helpers.zeph`" as geo"
+    "main-with-params"     = "fn main(n: int) { }"
+}
+foreach ($name in $moduleErrors.Keys) {
+    Set-Content "$modDir\err_$name.zeph" $moduleErrors[$name] -Encoding ascii
+    $r = RunModule "err_$name.zeph" "--rt"
+    Check "error:$name" ($r.code -eq -1 -and $r.out -match "error:") "expected compile error, got($($r.code)): $($r.out)"
+}
+
 Write-Host ""
 Write-Host "$pass passed, $fail failed"
 if ($fail) { exit 1 }

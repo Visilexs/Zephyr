@@ -75,7 +75,7 @@ EBNF; `NL` is one or more newline terminators.
 ```ebnf
 program    = { toplevel } ;
 toplevel   = fndecl | structdecl | enumdecl | impldecl | ifacedecl
-           | externdecl | import | typealias | stmt ;
+           | externdecl | import | typealias | private | test | stmt ;
 typealias  = "type" ID "=" type ;
 externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
              [ "->" type ] "from" STRING ;                    (* §3.6, native DLL import *)
@@ -91,7 +91,9 @@ member     = ID [ "(" type { "," type } ")" ] ;              (* Circle(float) *)
 impldecl   = "impl" ID [ "[" ID { "," ID } "]" ] "{" { fndecl } "}" ; (* methods on a struct or enum *)
 ifacedecl  = "interface" ID "{" { fnsig } "}" ;               (* method signatures *)
 fnsig      = "fn" ID "(" [ param { "," param } ] ")" [ "->" type ] ;
-import     = "import" STRING ;
+import     = "import" STRING [ "as" ID ] ;
+private    = "private" ( fndecl | structdecl | enumdecl | ifacedecl | typealias | decl ) ;
+test       = "test" STRING block ;                           (* run by zc --test *)
 
 type       = basetype [ "?" ] ;                              (* T? optional *)
 basetype   = "int" | "i32" | "float" | "bool" | "str"
@@ -311,6 +313,35 @@ Each path is included at most once, so importing the same file twice is a
 no-op and mutually-importing files terminate. There is no separate namespace:
 imported names share the one global scope, and a duplicate name across files
 is a redeclaration error.
+
+### 3.0.2.1 Namespaces, private, main, tests
+
+    import "geometry.zeph" as geo
+    let p = geo.make(3, 4)             // a function
+    let q: geo.Point = geo.Point{x: 1, y: 0}
+    print(geo.UNIT, geo.Axis.Vertical, geo.Shape.Circle(1.0))
+
+`import "file" as name` keeps the module's declarations out of the
+importer's namespace: they are reached as `name.thing`, for functions,
+globals, structs, enums, interfaces and type aliases alike. Inside the module
+they keep their plain names. A module imported with `as` anywhere must be
+imported with `as` everywhere (under the same or another alias); an alias
+names one module. A plain `import` is unchanged: its declarations join the
+importer's namespace.
+
+`private` before a top-level `fn`, `struct`, `enum`, `interface`, `type`,
+`let`, `var` or `const` makes it visible only inside its own file. Another
+file may then declare the same name without a clash.
+
+If the main file declares `fn main()` (no parameters) and does not call it
+at the top level, it is called after all top-level statements have run.
+
+`test "name" { ... }` blocks at the top level of the main file are ignored by
+a normal build. `zc --test file.zeph out.exe` (which implies `--rt`) builds a
+program that runs the top-level statements, then each test in order, printing
+`test name ... ok`, and finally the count; `main()` is not called. A failing
+`assert` or panic ends the run at that test with a non-zero exit code. Test
+blocks in imported files are ignored.
 
 ### 3.0.3 Function values
 

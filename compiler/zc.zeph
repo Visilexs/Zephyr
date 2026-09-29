@@ -1,4 +1,4 @@
-// zc â€” the Zephyr compiler, written in Zephyr.
+// zc -- the Zephyr compiler, written in Zephyr.
 // Same pipeline as src/zephyr.c: lex -> parse -> typecheck -> x86-64 assembly.
 // Usage: zc <input.zeph> <output.s>   (assemble/link with gcc + runtime.o)
 
@@ -149,6 +149,8 @@ let N_TYTUPLE = 59   // (A, B) tuple type: kids = element types
 let N_TUPLE = 60     // (a, b) tuple literal: kids = elements; checked into an N_SLIT
 let N_GROUP = 61     // several statements from one (let (a, b) = t); spliced by the parser
 let N_IS = 62        // x is Member (parse only): kids = [value, N_ID or N_MEMBER]
+let N_PRIVATE = 63   // private <declaration> (parse only; scope_module renames it): kids = [decl]
+let N_TEST = 64      // test "name" { ... } (parse only): name = the test's name, kids = [block]
 
 // ---------------- type kinds & table ----------------
 let K_INT = 0
@@ -302,6 +304,13 @@ struct Inst { fi: int, tnames: [str], ttypes: [int] }
 
 // ---------------- compiler state ----------------
 var g_file = ""
+// Name scoping for modules. A file's private declarations are renamed
+// "__privateN.name" and an `import ... as ns` module's public ones "ns.name";
+// lookups from a file try its own prefixes first, then the plain name.
+var g_file_prefixes: [str: [str]] = [:]  // file -> prefixes its own names may carry
+var g_namespace_prefix: [str: str] = [:] // import alias -> the prefix its module's names carry
+var g_import_prefix: [str: str] = [:]    // module key -> the prefix it was imported under
+var g_private_count = 0
 // -g debug info: line -> .text offset table, captured during assembly
 var g_debug = false
 var g_main_file = ""
@@ -1056,6 +1065,10 @@ fn p_type_base() -> Node {
     let id = expect(T_IDENT, "a type")
     var n = nnode(N_TYNAME, id.line)
     n.name = id.s
+    if at(T_DOT) {                       // geo.Point: a type from an `import ... as geo`
+        let dot = pnext()
+        n.name = n.name + "." + expect(T_IDENT, "a type name after '.'").s
+    }
     if at(T_LS) {                        // Box[int]: type arguments of a generic struct
         let ls = pnext()
         n.kids.push(p_type())
@@ -1283,6 +1296,10 @@ fn p_import() -> Node {
         die(start.line, "import needs a plain string path, e.g. import \"util.zeph\"")
     }
     n.name = s.kids[0].name
+    if at(T_AS) {                            // import "geometry.zeph" as geo
+        let asWord = pnext()
+        n.kids.push(name_node(expect(T_IDENT, "a name after 'as'").s, start.line))
+    }
     return n
 }
 
@@ -1905,6 +1922,10 @@ fn p_postfix() -> Node {
             var memberName = name.s
             if name.t == T_INTLIT { memberName = "{name.i}" }   // tuple element: t.0
             if memberName == "" { die(name.line, "expected a member name, got '{tokdesc(name)}'") }
+            if e.k == N_ID and at(T_LB) and P_nostruct == 0 {   // geo.Point{x: 1}
+                e = p_slit(e.name + "." + memberName, e.line)
+                continue
+            }
             var n = nnode(N_MEMBER, name.line)
             n.name = memberName
             n.kids.push(e)
@@ -1948,6 +1969,13 @@ fn push_stmt(block: Node, statement: Node) {
     } else {
         block.kids.push(statement)
     }
+}
+
+// what may follow `private` at the top level
+fn private_follows(t: Tok) -> bool {
+    if t.t == T_FN or t.t == T_STRUCT or t.t == T_ENUM or t.t == T_INTERFACE { return true }
+    if t.t == T_LET or t.t == T_VAR or t.t == T_CONST { return true }
+    return t.t == T_IDENT and t.s == "type"
 }
 
 fn p_slit(name: str, line: int) -> Node {
@@ -2127,7 +2155,37 @@ fn parse(toks: [Tok]) -> Node {
     var prog = nnode(N_PROG, 1)
     skip_nl()
     while not at(T_EOF) {
-        if at(T_FN) { prog.kids.push(p_fn()) }
+        if at(T_IDENT) and peek().s == "private" and P_pos + 1 < P_toks.len() and private_follows(P_toks[P_pos + 1]) {
+            let privateWord = pnext()
+            var wrapped = nnode(N_PRIVATE, privateWord.line)
+            if at(T_FN) { wrapped.kids.push(p_fn()) }
+            else if at(T_STRUCT) { wrapped.kids.push(p_structdef()) }
+            else if at(T_ENUM) { wrapped.kids.push(p_enumdef()) }
+            else if at(T_INTERFACE) { wrapped.kids.push(p_interface()) }
+            else if at(T_IDENT) {                // private type Name = T
+                let typeWord = pnext()
+                var alias = nnode(N_TYALIAS, typeWord.line)
+                alias.name = expect(T_IDENT, "alias name").s
+                let equals = expect(T_ASSIGN, "'='")
+                alias.kids.push(p_type())
+                wrapped.kids.push(alias)
+            } else {
+                let declaration = p_stmt()
+                if declaration.k != N_DECL { die(privateWord.line, "'private' applies to one declaration") }
+                wrapped.kids.push(declaration)
+            }
+            prog.kids.push(wrapped)
+        }
+        else if at(T_IDENT) and peek().s == "test" and P_pos + 1 < P_toks.len() and P_toks[P_pos + 1].t == T_STRTOK {
+            let testWord = pnext()               // test "adds up" { ... }
+            let title = p_primary()
+            if title.kids.len() != 1 or title.kids[0].k != N_STRTXT { die(testWord.line, "a test name is a plain string") }
+            var test = nnode(N_TEST, testWord.line)
+            test.name = title.kids[0].name
+            test.kids.push(p_block())
+            prog.kids.push(test)
+        }
+        else if at(T_FN) { prog.kids.push(p_fn()) }
         else if at(T_STRUCT) { prog.kids.push(p_structdef()) }
         else if at(T_ENUM) { prog.kids.push(p_enumdef()) }
         else if at(T_IMPL) { prog.kids.push(p_impl()) }
@@ -2497,14 +2555,20 @@ fn field_type_node(template: SDef, fieldIndex: int) -> Node {
 }
 
 // the name impl methods are filed under, and print shows: the template's for an instance
-fn struct_base_name(sd: SDef) -> str {
+// the name an instance's impl methods are filed under: the template's
+fn struct_scope_name(sd: SDef) -> str {
     if sd.template >= 0 { return g_structs[sd.template].name }
-    if sd.unionIndex >= 0 { return sd.node.name }             // a variant prints as its member
     return sd.name
 }
 
+// what print shows for a struct: the template's name, a variant's member
+fn struct_base_name(sd: SDef) -> str {
+    if sd.unionIndex >= 0 { return sd.node.name }
+    return display_name(struct_scope_name(sd))
+}
+
 fn method_scope(t: int) -> str {
-    if ty_kind[t] == K_STRUCT { return struct_base_name(g_structs[ty_sd[t]]) }
+    if ty_kind[t] == K_STRUCT { return struct_scope_name(g_structs[ty_sd[t]]) }
     return type_str(t)
 }
 
@@ -2670,7 +2734,10 @@ fn type_str(t: int) -> str {
 }
 
 fn find_enum(name: str) -> int {
-    return g_enum_names.get(name).or(-1)
+    for scoped in scoped_names(name) {
+        if g_enum_names.has(scoped) { return g_enum_names[scoped] }
+    }
+    return -1
 }
 
 fn is_num(t: int) -> bool { return ty_kind[t] == K_INT or ty_kind[t] == K_FLOAT }
@@ -2688,11 +2755,109 @@ fn fits(want: int, got: int) -> bool {
 }
 
 fn find_struct(name: str) -> int {
-    return g_struct_names.get(name).or(-1)
+    for scoped in scoped_names(name) {
+        if g_struct_names.has(scoped) { return g_struct_names[scoped] }
+    }
+    return -1
 }
 
 fn find_fn(name: str) -> int {
-    return g_fn_names.get(name).or(-1)
+    for scoped in scoped_names(name) {
+        if g_fn_names.has(scoped) { return g_fn_names[scoped] }
+    }
+    return -1
+}
+
+// The names `name` may stand for in the current file, most local first: its
+// private declaration, its module namespace's, then the name itself.
+fn scoped_names(name: str) -> [str] {
+    var names: [str] = []
+    if g_file_prefixes.has(g_file) {
+        for prefix in g_file_prefixes[g_file] { names.push(prefix + name) }
+    }
+    names.push(name)
+    return names
+}
+
+// geo.Point -> the name the module's Point was declared under
+fn qualify_name(name: str) -> str {
+    let dot = name.index_of(".")
+    if dot <= 0 { return name }
+    let alias = name.sub(0, dot)
+    if not g_namespace_prefix.has(alias) { return name }
+    return g_namespace_prefix[alias] + name.sub(dot + 1, name.len())
+}
+
+// a variable: a local wins; otherwise the file's own global, then any global
+fn find_var(name: str) -> int {
+    let found = env_find(name)
+    if found >= 1000000 { return found }
+    if g_file_prefixes.has(g_file) {
+        for prefix in g_file_prefixes[g_file] {
+            let scoped = env_find(prefix + name)
+            if scoped >= 0 { return scoped }
+        }
+    }
+    return found
+}
+
+fn find_alias(name: str) -> str {
+    for scoped in scoped_names(name) {
+        if g_alias_names.has(scoped) { return scoped }
+    }
+    return ""
+}
+
+// ns.name, where ns is an import alias (and not a variable)
+fn namespace_member(e: Node) -> bool {
+    return e.k == N_MEMBER and e.kids[0].k == N_ID and g_namespace_prefix.has(e.kids[0].name) and env_find(e.kids[0].name) < 0
+}
+fn resolve_namespace(e: Node) {
+    if namespace_member(e) {
+        let qualified = g_namespace_prefix[e.kids[0].name] + e.name
+        node_become(e, name_node(qualified, e.line))
+    }
+}
+
+// Rename a file's top-level declarations for its scope: private ones get a
+// prefix only this file resolves, and (for `import ... as ns`) public ones "ns.".
+// Tests are dropped here; the driver collects the main file's before this runs.
+fn scope_module(prog: Node, fileName: str, namespacePrefix: str) {
+    g_private_count += 1
+    let privatePrefix = "__private{g_private_count}."
+    var prefixes: [str] = []
+    prefixes.push(privatePrefix)
+    if namespacePrefix != "" { prefixes.push(namespacePrefix) }
+    g_file_prefixes[fileName] = prefixes
+    var renamed: [str: str] = [:]
+    var out: [Node] = []
+    for n in prog.kids {
+        var node = n
+        var prefix = namespacePrefix
+        if n.k == N_PRIVATE {
+            node = n.kids[0]
+            prefix = privatePrefix
+        }
+        if node.k == N_TEST { continue }
+        let scoped = node.k == N_FN or node.k == N_STRUCTDEF or node.k == N_ENUMDEF or node.k == N_INTERFACE or node.k == N_TYALIAS or node.k == N_DECL
+        if prefix != "" and scoped {
+            renamed[node.name] = prefix + node.name
+            node.name = prefix + node.name
+        }
+        out.push(node)
+    }
+    for node in out {                            // an impl block follows its type
+        if node.k == N_IMPL and renamed.has(node.name) { node.name = renamed[node.name] }
+    }
+    prog.kids = out
+}
+
+// strip the private prefix, for printing
+fn display_name(name: str) -> str {
+    if not starts_with(name, "__private") { return name }
+    let dot = name.index_of(".")
+    if dot < 0 { return name }
+    return name.sub(dot + 1, name.len())
 }
 
 fn is_builtin_name(n: str) -> bool {
@@ -2715,7 +2880,17 @@ fn td_index(t: int) -> int {
     return g_descs.len() - 1
 }
 
+// Names in a type resolve where the type was written, which matters once a
+// module's type is used from another file (an alias, a generic's field).
 fn resolve_type(te: Node) -> int {
+    let savedFile = g_file
+    if te.file != "" { g_file = te.file }
+    let resolved = resolve_type_here(te)
+    g_file = savedFile
+    return resolved
+}
+
+fn resolve_type_here(te: Node) -> int {
     if te.k == N_TYOPT {
         let inner = resolve_type(te.kids[0])
         if ty_kind[inner] == K_OPT { die(te.line, "'??' is not a type; an optional cannot wrap an optional") }
@@ -2745,7 +2920,7 @@ fn resolve_type(te: Node) -> int {
         if not valid_map_key(kt) { die(te.line, "{type_str(kt)} cannot be a map key (use int, str, bool, an enum, or a list, struct or optional of those)") }
         return map_of(kt, resolve_type(te.kids[1]))
     }
-    let n = te.name
+    let n = qualify_name(te.name)
     if te.kids.len() > 0 and find_struct(n) < 0 { die(te.line, "'{n}' takes no type arguments") }
     if n == "int" { return TI_INT }
     if n == "float" { return TI_FLOAT }
@@ -2758,10 +2933,11 @@ fn resolve_type(te: Node) -> int {
         if g_tbind_names[b] == n { return g_tbind_types[b] }
         b -= 1
     }
-    if g_alias_names.has(n) {
+    let aliasName = find_alias(n)
+    if aliasName != "" {
         g_alias_depth += 1
         if g_alias_depth > 50 { die(te.line, "type alias '{n}' refers to itself") }
-        let aliased = resolve_type(g_alias_names[n])
+        let aliased = resolve_type(g_alias_names[aliasName])
         g_alias_depth -= 1
         return aliased
     }
@@ -2950,6 +3126,7 @@ fn check_bin(e: Node) -> int {
 
 fn check_method(e: Node) -> int {
     let c = e.kids[0]
+    resolve_namespace(c.kids[0])                           // geo.Point.new(), geo.Shape.Circle(1)
     // associated function: `Type.func(args)` -- the receiver is a struct type
     // name, not a value, so no `self` is passed.
     let recv = c.kids[0]
@@ -3406,7 +3583,7 @@ fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> b
     if te.k == N_TYNAME and te.kids.len() > 0 {    // Box[T] against an instance of Box
         if ty_kind[got] != K_STRUCT { return false }
         let instance = g_structs[ty_sd[got]]
-        if instance.template < 0 or g_structs[instance.template].name != te.name { return false }
+        if instance.template < 0 or find_struct(qualify_name(te.name)) != instance.template { return false }
         if instance.typeArgs.len() != te.kids.len() { return false }
         for i in 0..te.kids.len() {
             if not unify_tp(te.kids[i], instance.typeArgs[i], tparams, names, types) { return false }
@@ -3457,7 +3634,7 @@ fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> b
 
 // Get (or create) the monomorphisation of generic fi for these bindings.
 // Every value is 64 bits, so an instantiation is just the body re-checked with
-// T bound â€” which also gives each one the right ==, <, and print for its T.
+// T bound -- which also gives each one the right ==, <, and print for its T.
 fn instantiate(fi: int, names: [str], types: [int]) -> int {
     let f = g_fns[fi]
     var kp: [str] = []
@@ -3564,6 +3741,7 @@ fn check_indirect(e: Node, vt: int) -> int {
 
 fn check_call(e: Node) -> int {
     let c = e.kids[0]
+    resolve_namespace(c)                                   // geo.area(r) is a plain call
     if c.k == N_MEMBER { return check_method(e) }
     if c.k != N_ID { return check_indirect(e, ce(c)) }   // any expression of fn type
     var nargs = e.kids.len() - 1
@@ -3871,7 +4049,7 @@ fn ce_inner(e: Node) -> int {
         return TI_STR
     }
     if e.k == N_ID {
-        let h = env_find(e.name)
+        let h = find_var(e.name)
         if h < 0 {
             let fi = find_fn(e.name)             // bare function name = function value
             if fi >= 0 {
@@ -3886,7 +4064,7 @@ fn ce_inner(e: Node) -> int {
                 return fn_of(ps, f.ret)
             }
             if is_builtin_name(e.name) {
-                die(e.line, "'{e.name}' is a builtin â€” call it with (...)")
+                die(e.line, "'{e.name}' is a builtin -- call it with (...)")
             }
             die(e.line, "unknown variable '{e.name}'")
         }
@@ -4019,6 +4197,7 @@ fn ce_inner(e: Node) -> int {
         return ce_inner(e)
     }
     if e.k == N_SLIT {
+        e.name = qualify_name(e.name)
         let si = find_struct(e.name)
         if si < 0 { die(e.line, "unknown struct '{e.name}'") }
         if not e.mut and (g_structs[si].node.mut or g_structs[si].unionIndex >= 0) {
@@ -4135,7 +4314,12 @@ fn ce_inner(e: Node) -> int {
         }
         return ty_el[ot]
     }
+    if e.k == N_MEMBER and namespace_member(e) {    // geo.ORIGIN: a module's global or function
+        resolve_namespace(e)
+        return ce_inner(e)
+    }
     if e.k == N_MEMBER {
+        resolve_namespace(e.kids[0])                // geo.Color.Red
         // Enum member access: `Name.A` folds to its ordinal at compile time.
         // A variable of the same name shadows the enum type.
         if e.kids[0].k == N_ID and env_find(e.kids[0].name) < 0 {
@@ -4186,7 +4370,10 @@ fn ce_inner(e: Node) -> int {
 }
 
 fn ce(e: Node) -> int {
+    let savedFile = g_file                   // names resolve in the file the node came from
+    if e.file != "" { g_file = e.file }
     let t = ce_inner(e)
+    g_file = savedFile
     e.ty = t
     return t
 }
@@ -4198,7 +4385,7 @@ fn ce(e: Node) -> int {
 fn ce_expect(e: Node, want: int) -> int {
     if e.k == N_SLIT and ty_kind[want] == K_STRUCT {        // Box{...} where a Box[int] is expected
         let wanted = g_structs[ty_sd[want]]
-        if wanted.template >= 0 and g_structs[wanted.template].name == e.name { e.name = wanted.name }
+        if wanted.template >= 0 and find_struct(qualify_name(e.name)) == wanted.template { e.name = wanted.name }
     }
     if e.k == N_CALL or e.k == N_MEMBER { e.ival = want + 1 }   // lets a generic call infer from it
     if e.k == N_TUPLE and is_tuple(want) and g_structs[ty_sd[want]].fnames.len() == e.kids.len() {
@@ -4325,7 +4512,7 @@ fn check_stmt(s: Node) {
         let t = s.kids[0]
         let x = ce(s.kids[1])
         if t.k == N_ID {
-            let h = env_find(t.name)
+            let h = find_var(t.name)
             if h < 0 { die(t.line, "unknown variable '{t.name}'") }
             let v = env_get(h)
             if v.isConst { die(t.line, "'{t.name}' is a const and cannot be assigned to") }
@@ -5113,7 +5300,10 @@ fn fn_asm_label(name: str) -> str {
 }
 
 fn find_iface(name: str) -> int {
-    return g_iface_names.get(name).or(-1)
+    for scoped in scoped_names(name) {
+        if g_iface_names.has(scoped) { return g_iface_names[scoped] }
+    }
+    return -1
 }
 fn iface_of(id: int) -> int { return new_type(K_IFACE, 0, id) }
 
@@ -8366,7 +8556,7 @@ fn gen_call(e: Node) {
     }
     if k == CK_INDIRECT {
         // Call through a {code, env} cell. env is pushed FIRST so it lands deepest,
-        // at [rbp + 16 + 8*nparams] â€” past the args. A plain function simply never
+        // at [rbp + 16 + 8*nparams] -- past the args. A plain function simply never
         // looks there; a closure reads its captures from it.
         var csafe = true
         for i in 1..e.kids.len() { if has_call(e.kids[i]) { csafe = false } }
@@ -9173,7 +9363,7 @@ fn expr_eq(a: Node, b: Node) -> bool {
 }
 
 // AVX2 fill: for i in lo..hi { L[i] = K }  (K a loop-invariant leaf). Stores 4
-// 8 bytes per element via `rep stosq` (ERMSB â€” same path memset uses). Bounds
+// 8 bytes per element via `rep stosq` (ERMSB -- same path memset uses). Bounds
 // pre-check; scalar loop fallback when the range can't be proven in-bounds.
 fn try_fill(s: Node, retlabel: int) -> bool {
     let jslot = s.slot
@@ -15933,6 +16123,77 @@ fn canon_key(path: str) -> str {
     return key.lower()
 }
 
+// The main file's test blocks, in order (scope_module drops them from the program).
+fn collect_tests(prog: Node) -> [Node] {
+    var tests: [Node] = []
+    for n in prog.kids {
+        if n.k == N_TEST { tests.push(n) }
+    }
+    return tests
+}
+
+// A main file that declares fn main() and never calls it at the top level
+// gets the call appended, after every other top-level statement.
+fn call_main(prog: Node) {
+    var mainNode = nnode(N_NONE, 0)
+    for n in prog.kids {
+        if n.k == N_FN and n.name == "main" { mainNode = n }
+        if n.k == N_EXPRST and n.kids[0].k == N_CALL and n.kids[0].kids[0].k == N_ID and n.kids[0].kids[0].name == "main" { return }
+    }
+    if mainNode.k == N_NONE { return }
+    if mainNode.kids[0].kids.len() > 0 { die(mainNode.line, "main takes no parameters (read them with args())") }
+    if mainNode.kids[3].kids.len() > 0 { die(mainNode.line, "main cannot be generic") }
+    prog.kids.push(call_statement("main", mainNode.line))
+}
+
+fn call_statement(name: str, line: int) -> Node {
+    var call = nnode(N_CALL, line)
+    call.kids.push(name_node(name, line))
+    var statement = nnode(N_EXPRST, line)
+    statement.kids.push(call)
+    return statement
+}
+
+// emit(text) or print(text) as a statement
+fn text_statement(builtin: str, text: str, line: int) -> Node {
+    var part = nnode(N_STRTXT, line)
+    part.name = text
+    var literal = nnode(N_STRLIT, line)
+    literal.kids.push(part)
+    var call = nnode(N_CALL, line)
+    call.kids.push(name_node(builtin, line))
+    call.kids.push(literal)
+    var statement = nnode(N_EXPRST, line)
+    statement.kids.push(call)
+    return statement
+}
+
+// zc --test: each test block becomes a function, run in order after the
+// top-level statements (main() is not called). A failing test panics, which
+// ends the run at that test.
+// ponytail: no isolation; the first failure stops the run. A process per test
+// would let the rest run.
+fn add_test_runner(prog: Node, tests: [Node]) {
+    for i in 0..tests.len() {
+        let test = tests[i]
+        var body = nnode(N_FN, test.line)
+        body.name = "__test{i}"
+        body.kids.push(nnode(N_PROG, test.line))     // no parameters
+        body.kids.push(nnode(N_NONE, test.line))     // returns nothing
+        body.kids.push(test.kids[0])
+        body.kids.push(nnode(N_PROG, test.line))     // not generic
+        prog.kids.push(body)
+    }
+    for i in 0..tests.len() {
+        prog.kids.push(text_statement("emit", "test {tests[i].name} ... ", tests[i].line))
+        prog.kids.push(call_statement("__test{i}", tests[i].line))
+        prog.kids.push(text_statement("print", "ok", tests[i].line))
+    }
+    var plural = "s"
+    if tests.len() == 1 { plural = "" }
+    prog.kids.push(text_statement("print", "{tests.len()} test{plural} passed", 0))
+}
+
 // splice each `import "path"` in place with that file's declarations.
 // Each path is included once, so diamonds and cycles terminate.
 fn expand_imports(prog: Node, basedir: str) -> Node {
@@ -15972,18 +16233,38 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
             for i in 0..g_imported.len() {
                 if g_imported[i] == key { seen = true }
             }
+            var prefix = ""
+            if n.kids.len() > 0 { prefix = n.kids[0].name + "." }
+            if seen {
+                let earlier = g_import_prefix.get(key).or("")
+                if prefix == "" and earlier != "" {
+                    die(n.line, "'{n.name}' is imported with 'as' elsewhere, so its names are qualified; import it with 'as' here too")
+                }
+                prefix = earlier
+            } else {
+                g_import_prefix[key] = prefix
+            }
+            if n.kids.len() > 0 {
+                let alias = n.kids[0].name
+                if g_namespace_prefix.has(alias) and (g_namespace_prefix[alias] != prefix or not seen) {
+                    die(n.line, "'{alias}' already names another import")
+                }
+                g_namespace_prefix[alias] = prefix
+            }
             if not seen {
                 g_imported.push(key)
                 let prev = g_file
                 if ei >= 0 {
                     g_file = display
                     let inner = parse(lex_src(embedded_src(ei), 1))
+                    scope_module(inner, display, prefix)
                     let expanded = expand_imports(inner, "")
                     g_file = prev
                     for i in 0..expanded.kids.len() { out.push(expanded.kids[i]) }
                 } else {
                     g_file = display
                     let inner = parse(lex_src(read_file(path), 1))
+                    scope_module(inner, display, prefix)
                     let expanded = expand_imports(inner, dirname(path))
                     g_file = prev
                     for i in 0..expanded.kids.len() { out.push(expanded.kids[i]) }
@@ -18317,6 +18598,7 @@ fn assemble_and_link(path: str) {
 let argv = args()
 var d_rt = false
 var d_version = false
+var d_test = false
 var d_in = ""
 var d_out = ""
 var ai = 1
@@ -18327,22 +18609,30 @@ while ai < argv.len() {
     else if a == "--wasm" { g_wasm = true }
     else if a == "--version" { d_version = true }
     else if a == "-g" or a == "--debug" { g_debug = true }
+    else if a == "--test" {                  // run the main file's test blocks instead of main()
+        d_test = true
+        d_rt = true
+    }
     else if d_in == "" { d_in = a }
     else { d_out = a }
     ai += 1
 }
 if d_version {
-    print("zc 0.2 â€” the Zephyr compiler, written in Zephyr")
+    print("zc 0.2 -- the Zephyr compiler, written in Zephyr")
 }
 if d_in == "" and d_version {
     // --version alone: nothing to compile
 } else {
     if d_in == "" or d_out == "" {
-        panic("usage: zc [--rt] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>")
+        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>")
     }
     g_file = basename(d_in)
     g_exedir = exe_dir()
     var prog = parse(lex_src(read_file(d_in), 1))
+    let tests = collect_tests(prog)
+    scope_module(prog, basename(d_in), "")
+    if d_test { add_test_runner(prog, tests) }
+    else { call_main(prog) }
     prog = expand_imports(prog, dirname(d_in))
     var firstUserNode = 0
     g_file = basename(d_in)
