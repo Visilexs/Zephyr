@@ -9,7 +9,7 @@ own assembler + PE linker, and depends only on `kernel32.dll`. `.zeph` sources.
 - `docs/spec.md` — grammar, type rules, conversion table, runtime semantics. **Authoritative.**
 - `docs/tour.md` — the language in ten minutes.
 - `lib/std/list.zeph` — the standard library, written in ordinary Zephyr (not compiler builtins).
-- `compiler/zc.zeph` — the compiler itself (~11,500 hand-written lines plus a generated `>>>EMBED` section holding runtime.zeph and lib/std): lexer, parser, typechecker, optimizer, x86-64 and wasm codegen, assembler, PE/ELF linkers. Never hand-edit the EMBED section; `scripts/embed-gen.ps1` rewrites it.
+- `compiler/zc.zeph` — the compiler itself (~14,000 hand-written lines plus a generated `>>>EMBED` section holding runtime.zeph and lib/std): lexer, parser, typechecker, optimizer, x86-64 and wasm codegen, assembler, PE/ELF linkers. Never hand-edit the EMBED section; `scripts/embed-gen.ps1` rewrites it.
 
 Zephyr *looks* like Rust/Swift but is its own language. When behavior isn't
 obvious from a `.zeph` file, check `docs/spec.md` — don't assume Rust semantics.
@@ -66,7 +66,16 @@ until an installed `zc.exe` understands it — stage 1 is always built by the ol
 - **Literals:** `0xFF`, `0b1010`, `1_000`, `6.02e23`, `'a'` (an int byte), raw `r"C:\dir"`,
   multi-line `"""..."""` (indentation stripped). Comments: `//` and nesting `/* */`.
 - **`const`** is a compile-time constant, usable from any function regardless of order.
-- **Comparisons chain:** `0 <= i < n`. `x == none` tests an optional.
+- **Comparisons chain:** `0 <= i < n`. `x == none` tests an optional. `==` on lists,
+  structs, tuples, optionals and maps compares by value.
+- **Control flow:** `match x { A { } B, C { } else { } }` (no `=>`, also an expression),
+  `if c { a } else { b }` as an expression (no `?:`), `if let v = opt { }`, `for i, x in xs`,
+  `for i in a..b step s`, `label: for`/`break label`, `defer`.
+- **Types:** tuples `(int, str)` / `t.0` / `let (a, b) = t`, `type Alias = T`, struct field
+  defaults, default parameters, `struct Box[T]`, enums with values `Circle(float)` matched as
+  `Circle(r)`, `x is Member`, packed `[u8]`/`[f32]` (convert with `as`).
+- **Modules:** `import "m.zeph" as m` (qualified `m.name`), `private` declarations,
+  `fn main()` auto-called, `test "name" { }` run by `zc --test`.
 
 ## Layout
 
@@ -90,8 +99,8 @@ against `zc.exe`'s directory, so nesting an example deeper does not change them.
 ## Constraints
 
 - **Three targets.** Windows x86-64 (PE, kernel32), Linux x86-64 (static ELF, raw
-  syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Not yet on any
-  non-native target: threads. Not on wasm: files, closures and interfaces.
+  syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Threads run on
+  Windows and Linux. Not on wasm: files, closures, interfaces and threads.
   wasm frames live in a shadow stack in linear memory so the conservative GC can
   scan them — see the memory-map comment above `write_wasm` in `zc.zeph`.
 - One name, one function — **no overloading** (generics cover the real cases).
