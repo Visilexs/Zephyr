@@ -312,6 +312,154 @@ assert(now_ms() >= startMs + 10 and now_ns() > startNs, "monotonic clocks")
 assert(run("cmd.exe /c exit 7") == 7, "child exit")
 print("ok")
 '@
+# Run every concurrency scenario on Windows and compile the same source to Linux ELF.
+function TestThreadSrc($name, $source) {
+    TestSrc $name $source
+    $sourcePath = Join-Path $tempRoot "$name.zeph"
+    $elfPath = Join-Path $tempRoot "$name.elf"
+    $compilerOutput = & .\zc.exe --linux --rt $sourcePath $elfPath 2>&1 | Out-String
+    $compileCode = $LASTEXITCODE
+    $validElf = $false
+    if (Test-Path -LiteralPath $elfPath) {
+        $elfBytes = [IO.File]::ReadAllBytes($elfPath)
+        $validElf = $elfBytes.Length -ge 4 -and $elfBytes[0] -eq 127 -and $elfBytes[1] -eq 69 -and $elfBytes[2] -eq 76 -and $elfBytes[3] -eq 70
+    }
+    Check "$name linux (compile only)" ($compileCode -eq 0 -and $validElf) "exit=$compileCode, ELF=$validElf, compiler=$compilerOutput"
+}
+TestThreadSrc 'sync_mutex' @'
+import "std/thread.zeph"
+import "std/sync.zeph"
+let counterAddress = sync_alloc(8)
+let guard = mutex_new()
+let guardAddress = guard.address
+assert(guard.try_lock(), "uncontended try lock")
+assert(guard.try_lock(), "recursive try lock")
+guard.unlock()
+let blockedWorker = thread_spawn(fn(unusedIndex: int) {
+    let localGuard = Mutex{address: guardAddress}
+    assert(not localGuard.try_lock(), "other thread cannot acquire")
+}, 0)
+blockedWorker.join()
+guard.unlock()
+parallel_for(8, fn(workerIndex: int) {
+    let localGuard = Mutex{address: guardAddress}
+    for i in 0..2000 {
+        localGuard.lock()
+        store64(counterAddress, load64(counterAddress) + 1)
+        localGuard.unlock()
+    }
+})
+assert(load64(counterAddress) == 16000, "mutex exact counter")
+assert(cpu_count() >= 1, "processor count")
+print("ok")
+'@
+TestThreadSrc 'sync_atomic' @'
+import "std/thread.zeph"
+import "std/sync.zeph"
+let counter = atomic_new(3)
+assert(counter.load() == 3, "initial load")
+counter.store(10)
+assert(counter.add(-2) == 8, "add returns new value")
+assert(counter.swap(20) == 8 and counter.load() == 20, "swap returns old value")
+assert(not counter.compare_exchange(19, 30) and counter.load() == 20, "failed compare exchange")
+assert(counter.compare_exchange(20, 30) and counter.load() == 30, "successful compare exchange")
+counter.store(0)
+let counterAddress = counter.address
+parallel_for(8, fn(workerIndex: int) {
+    let localCounter = Atomic{address: counterAddress}
+    for i in 0..5000 { let nextCount = localCounter.add(1) }
+})
+assert(counter.load() == 40000, "atomic exact counter")
+print("ok")
+'@
+TestThreadSrc 'sync_channel' @'
+import "std/thread.zeph"
+import "std/sync.zeph"
+let messages = channel_new(3)
+assert(not messages.try_receive().has(), "empty try receive")
+let channelAddress = messages.address
+let channelGuard = Mutex{address: channelAddress}
+channelGuard.lock()
+let probingWorker = thread_spawn(fn(unusedIndex: int) {
+    let localMessages = Channel{address: channelAddress}
+    assert(not localMessages.try_receive().has(), "contended try receive never blocks")
+}, 0)
+probingWorker.join()
+channelGuard.unlock()
+let producer = thread_spawn(fn(unusedIndex: int) {
+    let localMessages = Channel{address: channelAddress}
+    for i in 1..1001 { localMessages.send(i) }
+    localMessages.close()
+}, 0)
+var receivedSum = 0
+for i in 1..1001 {
+    let message = messages.receive()
+    assert(message.has() and message.get() == i, "FIFO sequence")
+    receivedSum += message.get()
+}
+assert(receivedSum == 500500, "received sum")
+assert(not messages.receive().has(), "closed drained receive")
+producer.join()
+assert(messages.len() == 0 and not messages.try_receive().has(), "closed drained length")
+let buffered = channel_new(2)
+buffered.send(7)
+buffered.send(9)
+assert(buffered.len() == 2, "buffered length")
+buffered.close()
+buffered.close()
+assert(buffered.receive().get() == 7 and buffered.try_receive().get() == 9, "drain after close")
+assert(not buffered.receive().has(), "none after drain")
+print("ok")
+'@
+TestThreadSrc 'sync_wait_group' @'
+import "std/thread.zeph"
+import "std/sync.zeph"
+let completed = atomic_new(0)
+let completedAddress = completed.address
+let group = wait_group_new()
+let groupAddress = group.address
+group.wait()
+group.add(8)
+var workers: [Thread] = []
+for i in 0..8 {
+    workers.push(thread_spawn(fn(workerIndex: int) {
+        let localGroup = WaitGroup{address: groupAddress}
+        let localCompleted = Atomic{address: completedAddress}
+        let nextCount = localCompleted.add(1)
+        localGroup.done()
+    }, i))
+}
+group.wait()
+assert(completed.load() == 8, "wait observes all workers")
+for worker in workers { worker.join() }
+group.add(2)
+group.add(-2)
+group.wait()
+print("ok")
+'@
+TestThreadSrc 'thread_tls_reuse' @'
+import "std/thread.zeph"
+for i in 0..20 {
+    parallel_for(4, fn(workerIndex: int) {
+        for j in 0..100 {
+            let message = "worker {workerIndex} value {j}"
+            assert(message == "worker " + (workerIndex as str) + " value " + (j as str), "thread-local interpolation")
+        }
+    })
+}
+print("ok")
+'@
+TestPanic 'sync_invalid_capacity' 'import "std/sync.zeph"
+channel_new(0)' 'channel: invalid capacity'
+TestPanic 'sync_capacity_overflow' 'import "std/sync.zeph"
+channel_new(9223372036854775807)' 'channel: invalid capacity'
+TestPanic 'sync_send_closed' 'import "std/sync.zeph"
+let messages = channel_new(1)
+messages.close()
+messages.send(1)' 'channel: send after close'
+TestPanic 'sync_wait_group_underflow' 'import "std/sync.zeph"
+let group = wait_group_new()
+group.done()' 'wait_group: invalid count'
 TestSrc 'all_imports' @'
 import "std/string.zeph"
 import "std/math.zeph"
@@ -320,6 +468,7 @@ import "std/io.zeph"
 import "std/list.zeph"
 import "std/bytes.zeph"
 import "std/thread.zeph"
+import "std/sync.zeph"
 print(fmt_fixed(sum([1.0, 2.0]), 1))
 '@ '3.0'
 $linuxSource = Join-Path $tempRoot 'linux_build.zeph'
