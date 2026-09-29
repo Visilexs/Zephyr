@@ -226,6 +226,14 @@ fn kernel32ExitProcess(code: int) -> int {
     return 0
 }
 
+// `zc run` loads a Windows image into its own process. A Linux-built zc has no
+// DLLs to resolve that image against, so these fail and zc run reports it.
+fn kernel32LoadLibraryA(name: int) -> int { return 0 }
+fn kernel32GetProcAddress(module: int, name: int) -> int { return 0 }
+fn kernel32VirtualProtect(address: int, byteCount: int, protection: int, oldProtectionAddress: int) -> int { return 0 }
+fn kernel32FlushInstructionCache(process: int, address: int, byteCount: int) -> int { return 0 }
+fn kernel32GetCurrentProcess() -> int { return 0 }
+
 // ---- reading a whole /proc file into an off-heap page ----
 
 // The two /proc paths, written out a byte at a time. runtimeCollectGarbage calls into
