@@ -150,6 +150,64 @@ fn k32_GetFileAttributesA(cp: int) -> int {
 // reads the buffer directly.
 var __lx_scratch = 0
 
+// Absolute form of `path` with `.`, `..` and repeated slashes resolved (no symlinks),
+// as the import de-duplicator needs. Returns the length, or the size needed if it won't fit.
+fn k32_GetFullPathNameA(path: int, capacity: int, dest: int, filePart: int) -> int {
+    let joined = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
+    var joinedLength = 0
+    if load8(path) != 47 {
+        let cwdLength = syscall(79, joined, 4096)          // getcwd, length includes the NUL
+        if cwdLength <= 0 {
+            let freed = syscall(11, joined, 8192)
+            return 0
+        }
+        joinedLength = cwdLength - 1
+        store8(joined + joinedLength, 47)
+        joinedLength += 1
+    }
+    var i = 0
+    while load8(path + i) != 0 and joinedLength < 8191 {
+        store8(joined + joinedLength, load8(path + i))
+        joinedLength += 1
+        i += 1
+    }
+    var outLength = 0
+    var position = 0
+    while position < joinedLength {
+        while position < joinedLength and load8(joined + position) == 47 { position += 1 }
+        var segmentEnd = position
+        while segmentEnd < joinedLength and load8(joined + segmentEnd) != 47 { segmentEnd += 1 }
+        let segmentLength = segmentEnd - position
+        let isDot = segmentLength == 1 and load8(joined + position) == 46
+        let isDotDot = segmentLength == 2 and load8(joined + position) == 46 and load8(joined + position + 1) == 46
+        if isDotDot {
+            if outLength > 0 { outLength -= 1 }
+            while outLength > 0 and load8(dest + outLength) != 47 { outLength -= 1 }
+        } else if segmentLength > 0 and not isDot {
+            if outLength + segmentLength + 2 > capacity {
+                let freed = syscall(11, joined, 8192)
+                return outLength + segmentLength + 2
+            }
+            store8(dest + outLength, 47)
+            outLength += 1
+            var j = 0
+            while j < segmentLength {
+                store8(dest + outLength, load8(joined + position + j))
+                outLength += 1
+                j += 1
+            }
+        }
+        position = segmentEnd
+    }
+    let released = syscall(11, joined, 8192)
+    if outLength == 0 {
+        store8(dest, 47)
+        outLength = 1
+    }
+    store8(dest + outLength, 0)
+    return outLength
+}
+
 fn k32_GetModuleFileNameA(module: int, buf: int, cap: int) -> int {
     if __lx_scratch == 0 { __lx_scratch = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
     let p = lx_path_proc_self(__lx_scratch)
