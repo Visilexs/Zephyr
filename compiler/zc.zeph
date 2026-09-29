@@ -164,6 +164,8 @@ let K_FN = 9       // ty_sd = index into g_fnsigs
 let K_OPT = 10     // ty_el = the wrapped type; represented as a pointer, 0 = none
 let K_NONE = 11    // the type of the `none` literal; fits any optional
 let K_IFACE = 12   // interface; ty_sd = index into g_ifaces. A value is a {vtable, data} cell.
+let K_U8 = 13      // element of a packed [u8]; reads as int. Not a type of its own.
+let K_F32 = 14     // element of a packed [f32]; reads as float.
 
 // types are indices into these parallel tables
 var ty_kind: [int] = []
@@ -187,12 +189,20 @@ ty_sd.push(0)
 ty_kind.push(K_NONE)
 ty_el.push(0)
 ty_sd.push(0)
+ty_kind.push(K_U8)
+ty_el.push(0)
+ty_sd.push(0)
+ty_kind.push(K_F32)
+ty_el.push(0)
+ty_sd.push(0)
 let TI_INT = 0
 let TI_FLOAT = 1
 let TI_BOOL = 2
 let TI_STR = 3
 let TI_VOID = 4
 let TI_NONE = 5
+let TI_U8 = 6
+let TI_F32 = 7
 
 // call kinds
 let CK_USER = 0
@@ -2224,6 +2234,42 @@ fn add_struct(name: str, line: int, tparams: [str], node: Node, template: int, t
     return g_structs.len() - 1
 }
 
+fn is_packed(t: int) -> bool {
+    return ty_kind[t] == K_LIST and (ty_kind[ty_el[t]] == K_U8 or ty_kind[ty_el[t]] == K_F32)
+}
+// what a packed list's elements read as, and the runtime family ("u8" / "f32")
+fn packed_value_type(t: int) -> int {
+    if ty_kind[ty_el[t]] == K_U8 { return TI_INT }
+    return TI_FLOAT
+}
+fn packed_family(t: int) -> str { return type_str(ty_el[t]) }
+
+// turn e into a runtime call on an already-checked receiver and arguments
+fn packed_call(e: Node, rtName: str, receiver: Node, extra: [Node], resultType: int) -> int {
+    var member = nnode(N_MEMBER, e.line)
+    member.name = rtName
+    member.ty = receiver.ty
+    member.kids.push(receiver)
+    var call = nnode(N_CALL, e.line)
+    call.aux = CK_RTCALL
+    call.name = rtName
+    call.kids.push(member)
+    for x in extra { call.kids.push(x) }
+    node_become(e, call)
+    e.ty = resultType
+    return resultType
+}
+
+// "file:line: " as a str literal, for a runtime panic message
+fn site_literal(e: Node) -> Node {
+    var text = nnode(N_STRTXT, e.line)
+    text.name = panic_site(e)
+    var literal = nnode(N_STRLIT, e.line)
+    literal.kids.push(text)
+    literal.ty = TI_STR
+    return literal
+}
+
 fn is_union(t: int) -> bool {
     return ty_kind[t] == K_STRUCT and g_structs[ty_sd[t]].node.mut
 }
@@ -2561,8 +2607,8 @@ fn check_tuple(e: Node, wants: [int]) -> int {
 // maps are out: NaN breaks equality and a map key would need an order-free hash.
 fn value_comparable(t: int, asKey: bool, visiting: [int]) -> bool {
     let k = ty_kind[t]
-    if k == K_INT or k == K_BOOL or k == K_STR or k == K_ENUM { return true }
-    if k == K_FLOAT { return not asKey }
+    if k == K_INT or k == K_BOOL or k == K_STR or k == K_ENUM or k == K_U8 { return true }
+    if k == K_FLOAT or k == K_F32 { return not asKey }
     if k == K_LIST or k == K_OPT { return value_comparable(ty_el[t], asKey, visiting) }
     if k == K_MAP { return not asKey and value_comparable(ty_sd[t], true, visiting) and value_comparable(ty_el[t], false, visiting) }
     if k == K_STRUCT {
@@ -2601,6 +2647,8 @@ fn type_str(t: int) -> str {
     if k == K_STR { return "str" }
     if k == K_VOID { return "void" }
     if k == K_NONE { return "none" }
+    if k == K_U8 { return "u8" }
+    if k == K_F32 { return "f32" }
     if k == K_OPT { return type_str(ty_el[t]) + "?" }
     if k == K_LIST { return "[{type_str(ty_el[t])}]" }
     if k == K_MAP { return "[{type_str(ty_sd[t])}: {type_str(ty_el[t])}]" }
@@ -2681,7 +2729,12 @@ fn resolve_type(te: Node) -> int {
         if rk.k != N_NONE { ret = resolve_type(rk) }
         return fn_of(ps, ret)
     }
-    if te.k == N_TYLIST { return list_of(resolve_type(te.kids[0])) }
+    if te.k == N_TYLIST {
+        let element = te.kids[0]
+        if element.k == N_TYNAME and element.kids.len() == 0 and element.name == "u8" { return list_of(TI_U8) }
+        if element.k == N_TYNAME and element.kids.len() == 0 and element.name == "f32" { return list_of(TI_F32) }
+        return list_of(resolve_type(element))
+    }
     if te.k == N_TYTUPLE {
         var elementTypes: [int] = []
         for kid in te.kids { elementTypes.push(resolve_type(kid)) }
@@ -2699,6 +2752,7 @@ fn resolve_type(te: Node) -> int {
     if n == "bool" { return TI_BOOL }
     if n == "str" { return TI_STR }
     if n == "void" { die(te.line, "'void' is not a usable type") }
+    if n == "u8" or n == "f32" { die(te.line, "'{n}' exists only as a packed list element: [{n}]") }
     var b = g_tbind_names.len() - 1          // innermost binding wins
     while b >= 0 {
         if g_tbind_names[b] == n { return g_tbind_types[b] }
@@ -2939,6 +2993,24 @@ fn check_method(e: Node) -> int {
     }
     let ot = ce(c.kids[0])
     var nargs = e.kids.len() - 1
+    if is_packed(ot) and c.name != "len" {
+        if c.name == "push" {
+            if nargs != 1 { die(e.line, ".push(value) takes exactly one argument") }
+            let pushed = ce_expect(e.kids[1], packed_value_type(ot))
+            var extra: [Node] = []
+            extra.push(coerce(e.kids[1], packed_value_type(ot), "argument 1"))
+            return packed_call(e, "rt_{packed_family(ot)}_push", c.kids[0], extra, TI_VOID)
+        }
+        if c.name == "pop" {
+            if nargs != 0 { die(e.line, ".pop() takes no arguments") }
+            var extra: [Node] = []
+            extra.push(site_literal(e))
+            return packed_call(e, "rt_{packed_family(ot)}_pop", c.kids[0], extra, packed_value_type(ot))
+        }
+        if find_fn(c.name) < 0 {
+            die(e.line, "{type_str(ot)} has no method '{c.name}' (a packed list has len, push and pop; convert with 'as [{type_str(packed_value_type(ot))}]' for more)")
+        }
+    }
     if ty_kind[ot] == K_STRUCT {
         let sd = g_structs[ty_sd[ot]]
         for i in 0..sd.fnames.len() {
@@ -3350,6 +3422,7 @@ fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> b
     }
     if te.k == N_TYLIST {
         if ty_kind[got] != K_LIST { return false }
+        if is_packed(got) { return te.kids[0].k == N_TYNAME and te.kids[0].name == packed_family(got) }
         return unify_tp(te.kids[0], ty_el[got], tparams, names, types)
     }
     if te.k == N_TYMAP {
@@ -3969,6 +4042,26 @@ fn ce_inner(e: Node) -> int {
         }
         let from = ce(e.kids[0])
         let to = resolve_type(e.kids[1])
+        if is_packed(from) or is_packed(to) {
+            var noExtra: [Node] = []
+            if type_eq(from, to) {
+                e.aux = C_NOP
+                return to
+            }
+            if is_packed(to) and ty_kind[from] == K_LIST and type_eq(ty_el[from], packed_value_type(to)) {
+                return packed_call(e, "rt_{packed_family(to)}_from_list", e.kids[0], noExtra, to)
+            }
+            if is_packed(from) and ty_kind[to] == K_LIST and type_eq(ty_el[to], packed_value_type(from)) {
+                return packed_call(e, "rt_{packed_family(from)}_to_list", e.kids[0], noExtra, to)
+            }
+            if ty_kind[from] == K_STR and is_packed(to) and ty_kind[ty_el[to]] == K_U8 {
+                return packed_call(e, "rt_u8_from_str", e.kids[0], noExtra, to)
+            }
+            if is_packed(from) and ty_kind[ty_el[from]] == K_U8 and ty_kind[to] == K_STR {
+                return packed_call(e, "rt_u8_to_str", e.kids[0], noExtra, to)
+            }
+            die(e.line, "no conversion from {type_str(from)} to {type_str(to)}")
+        }
         if ty_kind[from] == K_INT and ty_kind[to] == K_ENUM {
             lower_enum_from_int(e, to)
             return ce_inner(e)
@@ -3999,6 +4092,12 @@ fn ce_inner(e: Node) -> int {
         }
         if ty_kind[ot] != K_LIST { die(e.line, "cannot index into {type_str(ot)}") }
         if ty_kind[ce(e.kids[1])] != K_INT { die(e.line, "list index must be int") }
+        if is_packed(ot) {
+            var extra: [Node] = []
+            extra.push(e.kids[1])
+            extra.push(site_literal(e))
+            return packed_call(e, "rt_{packed_family(ot)}_get", e.kids[0], extra, packed_value_type(ot))
+        }
         return ty_el[ot]
     }
     if e.k == N_MEMBER {
@@ -4077,6 +4176,14 @@ fn ce_expect(e: Node, want: int) -> int {
     if e.k == N_MAPLIT and e.kids.len() == 0 and ty_kind[want] == K_MAP {
         e.ty = want
         return want
+    }
+    if e.k == N_LIST and e.kids.len() > 0 and is_packed(want) {   // [1, 2, 3] where a [u8] is expected
+        let plainType = list_of(packed_value_type(want))
+        var literal = nnode(N_LIST, e.line)
+        literal.kids = e.kids
+        let checked = ce_expect(literal, plainType)
+        var noExtra: [Node] = []
+        return packed_call(e, "rt_{packed_family(want)}_from_list", coerce(literal, plainType, "list"), noExtra, want)
     }
     if e.k == N_LIST and e.kids.len() > 0 and ty_kind[want] == K_LIST {
         let el = ty_el[want]
@@ -4196,7 +4303,25 @@ fn check_stmt(s: Node) {
             t.ty = v.ty
             s.kids[1] = coerce(s.kids[1], v.ty, "assignment")
         } else {
-            let ft = ce(t)
+            var ft = 0
+            if t.k == N_CALL and t.aux == CK_RTCALL { ft = t.ty }      // buf[i] += 1: lowered with the value
+            else { ft = ce(t) }
+            if t.k == N_CALL and t.aux == CK_RTCALL and (t.name == "rt_u8_get" or t.name == "rt_f32_get") {
+                var setter = nnode(N_CALL, s.line)           // packed store; the getter may be shared
+                setter.aux = CK_RTCALL
+                setter.name = "rt_u8_set"
+                if t.name == "rt_f32_get" { setter.name = "rt_f32_set" }
+                setter.ty = TI_VOID
+                setter.kids.push(t.kids[0])
+                setter.kids.push(t.kids[1])
+                setter.kids.push(coerce(s.kids[1], ft, "assignment"))
+                setter.kids.push(t.kids[2])
+                s.k = N_EXPRST
+                var only: [Node] = []
+                only.push(setter)
+                s.kids = only
+                return
+            }
             if t.k == N_MEMBER and is_tuple(t.kids[0].ty) {
                 die(t.line, "tuple elements cannot be assigned; build a new tuple")
             }
@@ -4239,8 +4364,8 @@ fn check_stmt(s: Node) {
     }
     if s.k == N_FORIN {
         let lt = ce(s.kids[0])
-        if ty_kind[lt] != K_LIST {
-            lower_for(s, lt)                 // str bytes, map keys
+        if ty_kind[lt] != K_LIST or is_packed(lt) {
+            lower_for(s, lt)                 // str bytes, map keys, packed lists
             check_stmt(s)
             return
         }
@@ -4598,6 +4723,9 @@ fn lower_for(s: Node, iterableType: int) {
         } else {
             die(s.line, "'for {s.name}, {second} in ...' needs a list, str or map, got {type_str(iterableType)}")
         }
+    } else if is_packed(iterableType) {
+        loopHead = "for {hidden}_i in 0..{hidden}.len()"
+        element = "let {s.name} = {hidden}[{hidden}_i]"
     } else if kind == K_STR {
         loopHead = "for {hidden}_i in 0..{hidden}.len()"
         element = "let {s.name} = {hidden}.byte({hidden}_i)"
@@ -9963,7 +10091,11 @@ fn gen_program(prog: Node) {
         let k = ty_kind[t]
         raw(".balign 8")
         raw("__td{di}:")
-        if k == K_LIST {
+        if k == K_LIST and ty_kind[ty_el[t]] == K_U8 {
+            o(".quad 10")
+        } else if k == K_LIST and ty_kind[ty_el[t]] == K_F32 {
+            o(".quad 11")
+        } else if k == K_LIST {
             o(".quad 4")
             o(".quad __td{td_index(ty_el[t])}")
         } else if k == K_STRUCT and is_union(t) {       // kind 9: a descriptor per variant
@@ -12010,6 +12142,22 @@ fn __emb_rt() -> str {
     p.push("        if load64(a) != load64(b) \{ return 0 \}\n")
     p.push("        return rt_value_eq(a, b, load64(td + 16 + load64(a) * 8))\n")
     p.push("    \}\n")
+    p.push("    if kind == 10 or kind == 11 \{         // packed lists, element by element\n")
+    p.push("        let count = load64(a)\n")
+    p.push("        if count != load64(b) \{ return 0 \}\n")
+    p.push("        var width = 1\n")
+    p.push("        if kind == 11 \{ width = 4 \}\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < count \{\n")
+    p.push("            if kind == 10 \{\n")
+    p.push("                if rx_packed_load(a, i, 1) != rx_packed_load(b, i, 1) \{ return 0 \}\n")
+    p.push("            \} else \{\n")
+    p.push("                if frombits(rx_packed_load(a, i, 4)) != frombits(rx_packed_load(b, i, 4)) \{ return 0 \}\n")
+    p.push("            \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return 1\n")
+    p.push("    \}\n")
     p.push("    if kind == 7 \{\n")
     p.push("        if load64(a) != load64(b) \{ return 0 \}\n")
     p.push("        let valueTd = load64(td + 16)\n")
@@ -12069,6 +12217,16 @@ fn __emb_rt() -> str {
     p.push("        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))\n")
     p.push("    \}\n")
     p.push("    if kind == 9 \{ return rt_value_hash(v, load64(td + 16 + load64(v) * 8)) \}\n")
+    p.push("    if kind == 10 \{                       // [u8]; [f32] cannot be a key\n")
+    p.push("        let count = load64(v)\n")
+    p.push("        var hash = count\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < count \{\n")
+    p.push("            hash = rx_hash_mix(hash, rx_packed_load(v, i, 1))\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return hash\n")
+    p.push("    \}\n")
     p.push("    return rx_hash_mix(0, v)\n")
     p.push("\}\n")
     p.push("// slot holding k, or -1\n")
@@ -12819,6 +12977,167 @@ fn __emb_rt() -> str {
     p.push("    return load64(load64(l + 16) + (n - 1) * 8)\n")
     p.push("\}\n")
     p.push("\n")
+    p.push("// ---- packed lists: [u8] and [f32] ----\n")
+    p.push("// The list header \{len, cap, data\}, but with 1- or 4-byte elements. An f32 is\n")
+    p.push("// stored as its 32-bit pattern and enters Zephyr as a float (a double):\n")
+    p.push("// rx_f32_widen on the way out, rx_f32_narrow (round to nearest even) on the way in.\n")
+    p.push("fn rt_packed_new(n: int, width: int) -> int \{\n")
+    p.push("    let l = rt_alloc_d(24, __d_list_val)\n")
+    p.push("    var cap = n\n")
+    p.push("    if cap < 4 \{ cap = 4 \}\n")
+    p.push("    store64(l, n)\n")
+    p.push("    store64(l + 8, cap)\n")
+    p.push("    store64(l + 16, rt_alloc(cap * width))\n")
+    p.push("    return l\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_fail(site: str, msg: str) \{\n")
+    p.push("    let h = win(\"GetStdHandle\", 0 - 12)   // stderr\n")
+    p.push("    rx_out(h, addr(\"panic: \") + 8, 7)\n")
+    p.push("    rx_out(h, addr(site) + 8, site.len())\n")
+    p.push("    rx_out(h, addr(msg) + 8, msg.len())\n")
+    p.push("    rx_out(h, addr(\"\\n\") + 8, 1)\n")
+    p.push("    let r = win(\"ExitProcess\", 1)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_f32_widen(bits32: int) -> int \{\n")
+    p.push("    let sign = (bits32 >> 31) & 1\n")
+    p.push("    var exponent = (bits32 >> 23) & 255\n")
+    p.push("    var mantissa = bits32 & 8388607\n")
+    p.push("    if exponent == 255 \{ return (sign << 63) | (2047 << 52) | (mantissa << 29) \}   // inf, nan\n")
+    p.push("    if exponent == 0 \{\n")
+    p.push("        if mantissa == 0 \{ return sign << 63 \}\n")
+    p.push("        exponent = 1                      // subnormal: normalize the mantissa\n")
+    p.push("        while mantissa & 8388608 == 0 \{\n")
+    p.push("            mantissa = mantissa << 1\n")
+    p.push("            exponent -= 1\n")
+    p.push("        \}\n")
+    p.push("        mantissa = mantissa & 8388607\n")
+    p.push("    \}\n")
+    p.push("    return (sign << 63) | ((exponent + 896) << 52) | (mantissa << 29)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_f32_narrow(bits: int) -> int \{\n")
+    p.push("    let sign = (bits >> 63) & 1\n")
+    p.push("    let exponent = (bits >> 52) & 2047\n")
+    p.push("    let mantissa = bits & 4503599627370495\n")
+    p.push("    if exponent == 2047 \{\n")
+    p.push("        if mantissa == 0 \{ return (sign << 31) | (255 << 23) \}\n")
+    p.push("        return (sign << 31) | (255 << 23) | 4194304 | (mantissa >> 29)   // a quiet nan\n")
+    p.push("    \}\n")
+    p.push("    let biased = exponent - 896\n")
+    p.push("    if biased >= 255 \{ return (sign << 31) | (255 << 23) \}             // too large: infinity\n")
+    p.push("    if biased <= 0 \{                                                    // an f32 subnormal, or zero\n")
+    p.push("        if biased < 0 - 24 \{ return sign << 31 \}\n")
+    p.push("        let full = mantissa | 4503599627370496\n")
+    p.push("        let shift = 30 - biased\n")
+    p.push("        let kept = full >> shift\n")
+    p.push("        let dropped = full & ((1 << shift) - 1)\n")
+    p.push("        let half = 1 << (shift - 1)\n")
+    p.push("        var rounded = kept\n")
+    p.push("        if dropped > half or (dropped == half and kept & 1 == 1) \{ rounded += 1 \}\n")
+    p.push("        return (sign << 31) | rounded\n")
+    p.push("    \}\n")
+    p.push("    let kept = mantissa >> 29\n")
+    p.push("    let dropped = mantissa & 536870911\n")
+    p.push("    var result = (biased << 23) | kept\n")
+    p.push("    if dropped > 268435456 or (dropped == 268435456 and kept & 1 == 1) \{ result += 1 \}   // may carry to infinity\n")
+    p.push("    return (sign << 31) | result\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_load(l: int, i: int, width: int) -> int \{\n")
+    p.push("    if width == 1 \{ return load8(load64(l + 16) + i) \}\n")
+    p.push("    return rx_f32_widen(load32(load64(l + 16) + i * 4) & 4294967295)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_store(l: int, i: int, v: int, width: int) \{\n")
+    p.push("    if width == 1 \{ store8(load64(l + 16) + i, v & 255) \}\n")
+    p.push("    else \{ store32(load64(l + 16) + i * 4, rx_f32_narrow(v)) \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_get(l: int, i: int, width: int, site: str) -> int \{\n")
+    p.push("    if i < 0 or i >= load64(l) \{ rx_packed_fail(site, \"index out of bounds\") \}\n")
+    p.push("    return rx_packed_load(l, i, width)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_set(l: int, i: int, v: int, width: int, site: str) \{\n")
+    p.push("    if i < 0 or i >= load64(l) \{ rx_packed_fail(site, \"index out of bounds\") \}\n")
+    p.push("    rx_packed_store(l, i, v, width)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_push(l: int, v: int, width: int) \{\n")
+    p.push("    let n = load64(l)\n")
+    p.push("    let cap = load64(l + 8)\n")
+    p.push("    if n == cap \{\n")
+    p.push("        let ncap = cap * 2\n")
+    p.push("        let nd = rt_alloc(ncap * width)\n")
+    p.push("        let od = load64(l + 16)\n")
+    p.push("        rx_mcopy(nd, od, n * width)\n")
+    p.push("        store64(l + 8, ncap)\n")
+    p.push("        store64(l + 16, nd)\n")
+    p.push("        rx_drop(od)\n")
+    p.push("    \}\n")
+    p.push("    store64(l, n + 1)\n")
+    p.push("    rx_packed_store(l, n, v, width)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_packed_pop(l: int, width: int, site: str) -> int \{\n")
+    p.push("    let n = load64(l)\n")
+    p.push("    if n == 0 \{ rx_packed_fail(site, \"pop from empty list\") \}\n")
+    p.push("    store64(l, n - 1)\n")
+    p.push("    return rx_packed_load(l, n - 1, width)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rt_u8_get(l: int, i: int, site: str) -> int \{ return rx_packed_get(l, i, 1, site) \}\n")
+    p.push("fn rt_f32_get(l: int, i: int, site: str) -> int \{ return rx_packed_get(l, i, 4, site) \}\n")
+    p.push("fn rt_u8_set(l: int, i: int, v: int, site: str) \{ rx_packed_set(l, i, v, 1, site) \}\n")
+    p.push("fn rt_f32_set(l: int, i: int, v: int, site: str) \{ rx_packed_set(l, i, v, 4, site) \}\n")
+    p.push("fn rt_u8_push(l: int, v: int) \{ rx_packed_push(l, v, 1) \}\n")
+    p.push("fn rt_f32_push(l: int, v: int) \{ rx_packed_push(l, v, 4) \}\n")
+    p.push("fn rt_u8_pop(l: int, site: str) -> int \{ return rx_packed_pop(l, 1, site) \}\n")
+    p.push("fn rt_f32_pop(l: int, site: str) -> int \{ return rx_packed_pop(l, 4, site) \}\n")
+    p.push("\n")
+    p.push("// [int] as [u8] (low 8 bits), [float] as [f32]\n")
+    p.push("fn rx_packed_from_list(src: int, width: int) -> int \{\n")
+    p.push("    let n = load64(src)\n")
+    p.push("    let l = rt_packed_new(n, width)\n")
+    p.push("    var i = 0\n")
+    p.push("    while i < n \{\n")
+    p.push("        rx_packed_store(l, i, load64(load64(src + 16) + i * 8), width)\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    return l\n")
+    p.push("\}\n")
+    p.push("fn rt_u8_from_list(src: int) -> int \{ return rx_packed_from_list(src, 1) \}\n")
+    p.push("fn rt_f32_from_list(src: int) -> int \{ return rx_packed_from_list(src, 4) \}\n")
+    p.push("\n")
+    p.push("// [u8] as [int], [f32] as [float]\n")
+    p.push("fn rx_packed_to_list(src: int, width: int) -> int \{\n")
+    p.push("    let n = load64(src)\n")
+    p.push("    let l = rt_list_new(n)\n")
+    p.push("    var i = 0\n")
+    p.push("    while i < n \{\n")
+    p.push("        store64(load64(l + 16) + i * 8, rx_packed_load(src, i, width))\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    return l\n")
+    p.push("\}\n")
+    p.push("fn rt_u8_to_list(src: int) -> int \{ return rx_packed_to_list(src, 1) \}\n")
+    p.push("fn rt_f32_to_list(src: int) -> int \{ return rx_packed_to_list(src, 4) \}\n")
+    p.push("\n")
+    p.push("fn rt_u8_from_str(s: int) -> int \{\n")
+    p.push("    let n = load64(s)\n")
+    p.push("    let l = rt_packed_new(n, 1)\n")
+    p.push("    rx_mcopy(load64(l + 16), s + 8, n)\n")
+    p.push("    return l\n")
+    p.push("\}\n")
+    p.push("fn rt_u8_to_str(l: int) -> int \{\n")
+    p.push("    let n = load64(l)\n")
+    p.push("    let s = rx_str_alloc(n)\n")
+    p.push("    rx_mcopy(s + 8, load64(l + 16), n)\n")
+    p.push("    return s\n")
+    p.push("\}\n")
+    p.push("\n")
     p.push("// ---- output: unbuffered WriteFile ----\n")
     p.push("var __scratch = 0\n")
     p.push("var __stdout = 0\n")
@@ -13082,6 +13401,22 @@ fn __emb_rt() -> str {
     p.push("            let nameptr = load64(td + 16 + v * 8)\n")
     p.push("            rx_sb_bytes(nameptr, rx_cstrlen(nameptr))\n")
     p.push("        \}\n")
+    p.push("    \} else if kind == 10 or kind == 11 \{  // packed list: [u8] or [f32]\n")
+    p.push("        var width = 1\n")
+    p.push("        if kind == 11 \{ width = 4 \}\n")
+    p.push("        let n = load64(v)\n")
+    p.push("        rx_sb_byte(91)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < n \{\n")
+    p.push("            if i > 0 \{\n")
+    p.push("                rx_sb_byte(44)\n")
+    p.push("                rx_sb_byte(32)\n")
+    p.push("            \}\n")
+    p.push("            if kind == 10 \{ rx_sb_int(rx_packed_load(v, i, 1)) \}\n")
+    p.push("            else \{ rx_sb_float(rx_packed_load(v, i, 4)) \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        rx_sb_byte(93)\n")
     p.push("    \} else \{\n")
     p.push("        rx_sb_float(v)\n")
     p.push("    \}\n")
@@ -17315,7 +17650,11 @@ fn wlayout() {
         g_wtaddr.push(wdaddr())
         let t = g_descs[di]
         let k = ty_kind[t]
-        if k == K_LIST {
+        if k == K_LIST and ty_kind[ty_el[t]] == K_U8 {
+            wd64(10)
+        } else if k == K_LIST and ty_kind[ty_el[t]] == K_F32 {
+            wd64(11)
+        } else if k == K_LIST {
             wd64(4)
             wpatch(0, td_index(ty_el[t]))
         } else if k == K_STRUCT and is_union(t) {

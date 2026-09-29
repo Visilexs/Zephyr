@@ -358,6 +358,11 @@ $errors = @{
     "generic-enum-plain"   = "enum E[T] { A, B }"
     "generic-enum-infer"   = "enum R[T, E] { Ok(T), Err(E) }`nlet r = R.Ok(1)"
     "float-payload-key"    = "enum S { A(float) }`nvar m: [S: int] = [:]"
+    "u8-scalar"            = "let x: u8 = 1"
+    "packed-method"        = "var b: [u8] = []`nb.sort()"
+    "packed-bad-cast"      = "let b = [1.5] as [u8]"
+    "f32-list-key"         = "var m: [[f32]: int] = [:]"
+    "packed-no-implicit"   = "var b: [u8] = []`nlet c: [int] = b"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -396,6 +401,9 @@ $locatedPanics = @{
     "write-file"  = @{ src = 'write_file("?:", "x")'; line = 1 }
     "byte"        = @{ src = 'print("a".byte(2))'; line = 1 }
     "index-store" = @{ src = "var xs = [1]`nxs[3] = 4"; line = 2 }
+    "packed-index" = @{ src = "let b = `"ab`" as [u8]`nprint(b[5])"; line = 2 }
+    "packed-store" = @{ src = "var b: [f32] = []`nb[0] = 1.5"; line = 2 }
+    "packed-pop"   = @{ src = "var b: [u8] = []`nprint(b.pop())"; line = 2 }
 }
 foreach ($name in $locatedPanics.Keys) {
     $case = $locatedPanics[$name]
@@ -1427,6 +1435,50 @@ print(c is Green)
 '@
 $exp = @("Circle(2) 12", "Rect(3, 4.5) 13.5", "Empty 0", "true", "false", "true", "true", "6.5", "Ok(7)", "Err(`"not a digit: x`")", "true false 7 -1", "Err(`"none yet`")", "6", "Node(Leaf(1), Node(Leaf(2), Leaf(3)))", "1 2", "true") -join [Environment]::NewLine
 Check "lang-enum-values" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: packed [u8] / [f32] lists ----
+$r = RunSrc "lang_packed_lists" @'
+var bytes: [u8] = [72, 105, 300]
+print(bytes)
+bytes.push(33)
+bytes[2] = 256 + 33
+print(bytes.len())
+print(bytes as str)
+let text = "Zeph" as [u8]
+var sum = 0
+for b in text { sum += b }
+print("{text} {sum}")
+text[0] += 1
+print(text as str)
+let back = text as [int]
+print(back)
+var samples: [f32] = [0.1, 2.5, -1]
+samples.push(1e39)
+samples.push(1.0e-45)
+print(samples)
+print(samples[0] == 0.1)
+print(samples[0])
+let wide = samples as [float]
+print(wide[1])
+let narrow = [3.14159265358979] as [f32]
+print(narrow)
+print(bytes == ("Hi!!" as [u8]))
+print(samples.pop())
+var counts: [[u8]: int] = [:]
+counts["ab" as [u8]] = 3
+print(counts["ab" as [u8]])
+for i, value in narrow { print("{i}: {value}") }
+fn checksum(data: [u8]) -> int {
+    var total = 0
+    for b in data { total = (total * 31 + b) % 65521 }
+    return total
+}
+print(bytes.checksum())
+let zeroed = zeros(3) as [u8]
+print(zeroed)
+'@
+$exp = @("[72, 105, 44]", "4", "Hi!!", "[90, 101, 112, 104] 407", "[eph", "[91, 101, 112, 104]", "[0.100000001490116, 2.5, -1, inf, 0]", "false", "0.100000001490116", "2.5", "[3.14159274101257]", "true", "0", "3", "0: 3.14159274101257", "19199", "[0, 0, 0]") -join [Environment]::NewLine
+Check "lang-packed-lists" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

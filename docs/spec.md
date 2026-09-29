@@ -97,6 +97,7 @@ type       = basetype [ "?" ] ;                              (* T? optional *)
 basetype   = "int" | "i32" | "float" | "bool" | "str"
            | ID [ "[" type { "," type } "]" ]                (* Box[int]: generic struct *)
            | "[" type "]"                                    (* list *)
+           | "[" ( "u8" | "f32" ) "]"                        (* packed list *)
            | "[" type ":" type "]"                           (* map *)
            | "fn" "(" [ type { "," type } ] ")" [ "->" type ]  (* function value *)
            | "(" type "," type { "," type } ")" ;             (* tuple *)
@@ -249,6 +250,31 @@ types are the same when their element types are. `let (a, b) = t` (or `var`)
 binds each element to a name; the number of names must match the tuple.
 Tuples compare with `==` element by element, print as `(1, "a")`, and can be
 map keys when their elements can (§3.0.1).
+
+### 3.0.0.3 Packed lists: [u8] and [f32]
+
+    var pixels: [u8] = [255, 128, 0]
+    pixels.push(300)                 // stored as 300 & 255 = 44
+    let bytes = "Zeph" as [u8]
+    var weights: [f32] = [0.1, 2.5]
+    let doubles = weights as [float] // [0.100000001490116, 2.5]
+
+`[u8]` stores one byte per element and `[f32]` four (an IEEE single). They
+are the only places `u8` and `f32` appear: there are no `u8` or `f32`
+values, variables or fields. Reading an element gives an `int` (0 to 255) or
+a `float` (the single widened exactly); storing one keeps the low 8 bits of
+the int, or rounds the float to the nearest single (to infinity when too
+large).
+
+A packed list has `.len()`, `.push(v)`, `.pop()`, indexing, `for` (including
+`for i, x in`), `==`, printing, and `[u8]` can be a map key. Anything else
+(sorting, the std list helpers, generic functions) takes a plain list:
+convert with `as`. The conversions are `[int] as [u8]`, `[u8] as [int]`,
+`[float] as [f32]`, `[f32] as [float]`, `str as [u8]` and `[u8] as str`
+(the bytes, unchanged). A list literal where a packed list is expected is
+converted element by element. Packed lists are for large numeric buffers
+(images, audio, meshes); they use an eighth or a half of a plain list's
+memory, at the cost of a runtime call per element access.
 
 ### 3.0.1 Maps
 
