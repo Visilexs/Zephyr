@@ -77,7 +77,7 @@ impl Bytes {
     fn getf32(self, off: int) -> float { return f32_from(self.get32(off)) }
 
     fn putf64(self, off: int, x: float) { self.put64(off, bits(x)) }
-    fn getf64(self, off: int) -> float { return frombits(self.get64(off)) }
+    fn getf64(self, off: int) -> float { return floatFromBits(self.get64(off)) }
 
     // copy a Zephyr string in and NUL-terminate it -- a C `const char*`
     fn put_cstr(self, off: int, s: str) {
@@ -86,7 +86,7 @@ impl Bytes {
         store8(self.p + off + s.len(), 0)
     }
 
-    // copy raw bytes of a str (e.g. a .spv file read with read_file) in
+    // copy raw bytes of a str (e.g. a .spv file read with readFile) in
     fn put_str(self, off: int, s: str) {
         assert(off >= 0 and off + s.len() <= self.n, "Bytes.put_str: out of range")
         for i in 0..s.len() { store8(self.p + off + i, s.byte(i)) }
@@ -207,17 +207,17 @@ fn f32_from(v: int) -> float {
     let exp = (v >> 23) & 255
     let man = v & 8388607                           // 2^23 - 1
     if exp == 0 {
-        if man == 0 { return frombits(sign << 63) }
+        if man == 0 { return floatFromBits(sign << 63) }
         // subnormal: man * 2^-149, renormalised into a double
         var p = 22
         while p > 0 and (man & (1 << p)) == 0 { p -= 1 }
         let dexp = 0 - 149 + p + 1023
         let dman = (man << (52 - p)) & 4503599627370495
-        return frombits((sign << 63) | (dexp << 52) | dman)
+        return floatFromBits((sign << 63) | (dexp << 52) | dman)
     }
     if exp == 255 {
-        if man != 0 { return frombits((sign << 63) | (2047 << 52) | 1) }
-        return frombits((sign << 63) | (2047 << 52))
+        if man != 0 { return floatFromBits((sign << 63) | (2047 << 52) | 1) }
+        return floatFromBits((sign << 63) | (2047 << 52))
     }
-    return frombits((sign << 63) | ((exp - 127 + 1023) << 52) | (man << 29))
+    return floatFromBits((sign << 63) | ((exp - 127 + 1023) << 52) | (man << 29))
 }

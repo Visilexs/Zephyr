@@ -32,7 +32,7 @@ struct Dataset {
     pad_id: int,
 }
 
-// read_file panics on a missing path rather than returning empty, so the
+// readFile panics on a missing path rather than returning empty, so the
 // existence question has to be asked first -- same as gpu.zeph does.
 fn ds_file_exists(path: str) -> bool {
     var cp = cbytes(path)
@@ -54,7 +54,7 @@ fn dataset_load(path: str) -> Dataset {
     if not ds_file_exists(path) {
         panic("dataset_load: {path} does not exist. Run: python tools/ml_reference/freeze_datasets.py")
     }
-    let raw = read_file(path)
+    let raw = readFile(path)
     if raw.len() < DS_HEADER {
         panic("dataset_load: {path} is {raw.len()} bytes, too short for the {DS_HEADER}-byte header")
     }

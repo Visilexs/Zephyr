@@ -285,8 +285,8 @@ print(s.byte(0))
 print(s.sub(6, 11))
 print(chr(65) + chr(66))
 print(["a", "b", "c"].join())
-write_file("$tmpFwd/io_test.txt", "round {1 + 1}")
-print(read_file("$tmpFwd/io_test.txt"))
+writeFile("$tmpFwd/io_test.txt", "round {1 + 1}")
+print(readFile("$tmpFwd/io_test.txt"))
 print(args().len())
 "@
 $want = "2`nhi`n104`nworld`nAB`nabc`nround 2`n1".Replace("`n", [Environment]::NewLine)
@@ -399,8 +399,8 @@ $locatedPanics = @{
     "chr"         = @{ src = 'print(chr(256))'; line = 1 }
     "substring"   = @{ src = 'print("hi".sub(0, 3))'; line = 1 }
     "map-key"     = @{ src = "let m = [`"a`": 1]`nprint(m[`"b`"])"; line = 2 }
-    "read-file"   = @{ src = 'print(read_file("zephyr-no-such-file-9274"))'; line = 1 }
-    "write-file"  = @{ src = 'write_file("?:", "x")'; line = 1 }
+    "read-file"   = @{ src = 'print(readFile("zephyr-no-such-file-9274"))'; line = 1 }
+    "write-file"  = @{ src = 'writeFile("?:", "x")'; line = 1 }
     "byte"        = @{ src = 'print("a".byte(2))'; line = 1 }
     "index-store" = @{ src = "var xs = [1]`nxs[3] = 4"; line = 2 }
     "packed-index" = @{ src = "let b = `"ab`" as [u8]`nprint(b[5])"; line = 2 }

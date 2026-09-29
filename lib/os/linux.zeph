@@ -514,7 +514,7 @@ fn linuxNativeInitialize() {
 // Return the current worker's native record, or zero for the main thread.
 // ponytail: linear range lookup; index ranges if many live records make TLS hot.
 fn linuxCurrentThread() -> int {
-    let stackAddress = stackptr()
+    let stackAddress = stackPointer()
     var threadRecord = linuxThreads
     while threadRecord != 0 {
         // An odd or changed generation belongs to another thread's reuse/close.
@@ -548,7 +548,7 @@ fn kernel32TryEnterCriticalSection(lockAddress: int) -> int {
         store64(lockAddress + 8, load64(lockAddress + 8) + 1)
         return 1
     }
-    if callptr(linuxNative, lockAddress, 0, threadId) != 0 { return 0 }
+    if callPointer(linuxNative, lockAddress, 0, threadId) != 0 { return 0 }
     store64(lockAddress + 8, 1)
     return 1
 }
@@ -600,13 +600,13 @@ fn kernel32SleepConditionVariableCS(conditionAddress: int, lockAddress: int, wai
 
 // Change the sequence before waking one sleeper, preventing missed wakeups.
 fn kernel32WakeConditionVariable(conditionAddress: int) -> int {
-    let previousSequence = callptr(linuxNative + 16, conditionAddress, 1)
+    let previousSequence = callPointer(linuxNative + 16, conditionAddress, 1)
     return syscall(202, conditionAddress, 129, 1)
 }
 
 // Change the sequence and wake every sleeper.
 fn kernel32WakeAllConditionVariable(conditionAddress: int) -> int {
-    let previousSequence = callptr(linuxNative + 16, conditionAddress, 1)
+    let previousSequence = callPointer(linuxNative + 16, conditionAddress, 1)
     return syscall(202, conditionAddress, 129, 2147483647)
 }
 
@@ -654,7 +654,7 @@ fn kernel32CreateThread(securityAddress: int, stackSize: int, entryAddress: int,
     let childStack = stackMapping + mappingSize - 8
     store64(childStack, threadRecord)
     // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID.
-    let cloneResult = callptr(linuxNative + 32, 3477248, childStack, threadRecord, threadRecord)
+    let cloneResult = callPointer(linuxNative + 32, 3477248, childStack, threadRecord, threadRecord)
     if cloneResult < 0 {
         let freed = syscall(11, stackMapping, mappingSize)
         store64(threadRecord + 56, load64(threadRecord + 56) + 1)

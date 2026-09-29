@@ -125,7 +125,7 @@ Generic operations are checked against the element type when instantiated. Reduc
 | Signature | Description |
 | --- | --- |
 | `contains[T](items: [T], target: T) -> bool` | Test membership. |
-| `index_of[T](items: [T], target: T) -> int` | First matching index, or -1. |
+| `indexOf[T](items: [T], target: T) -> int` | First matching index, or -1. |
 | `reverse[T](items: [T])` | Reverse in place. |
 | `slice[T](items: [T], low: int, high: int) -> [T]` | Copy [low, high); panic for invalid bounds. |
 | `first[T](items: [T]) -> T?` | First element, or none. |
@@ -136,14 +136,14 @@ Generic operations are checked against the element type when instantiated. Reduc
 | `any[T](items: [T], predicate: fn(T) -> bool) -> bool` | Test whether at least one element matches. |
 | `all[T](items: [T], predicate: fn(T) -> bool) -> bool` | Test whether every element matches; true on empty lists. |
 | `count[T](items: [T], target: T) -> int` | Count equal elements. |
-| `sort_by[T](items: [T], compare: fn(T, T) -> int)` | Stable in-place merge sort: O(n log n) comparisons and O(n) scratch storage. |
+| `sortBy[T](items: [T], compare: fn(T, T) -> int)` | Stable in-place merge sort: O(n log n) comparisons and O(n) scratch storage. |
 | `sum[T](items: [T]) -> T` | Add elements; panic on empty input. |
 | `min_of[T](items: [T]) -> T` | Smallest element; panic on empty input. |
 | `max_of[T](items: [T]) -> T` | Largest element; panic on empty input. |
 
 ```zeph
 let values = [3, 1, 2]
-sort_by(values, fn(left: int, right: int) -> int { return left - right })
+sortBy(values, fn(left: int, right: int) -> int { return left - right })
 print(values.sum()) // 6
 ```
 
@@ -267,7 +267,7 @@ task.join()
 import "std/sync.zeph"
 ```
 
-Windows and Linux x86-64 synchronization uses off-heap native memory. Atomics and channels hold `int` values; encode floats with `bits` and decode with `frombits`. The `Mutex`, `Atomic`, `Channel`, and `WaitGroup` wrappers are counted heap objects: pass or capture their integer `address` fields and construct a local wrapper in each worker. Never share the wrapper itself or send a counted heap object's address. Native allocations last until process exit; there is no explicit destruction API.
+Windows and Linux x86-64 synchronization uses off-heap native memory. Atomics and channels hold `int` values; encode floats with `bits` and decode with `floatFromBits`. The `Mutex`, `Atomic`, `Channel`, and `WaitGroup` wrappers are counted heap objects: pass or capture their integer `address` fields and construct a local wrapper in each worker. Never share the wrapper itself or send a counted heap object's address. Native allocations last until process exit; there is no explicit destruction API.
 
 | Signature | Description |
 | --- | --- |

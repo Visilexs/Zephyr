@@ -540,7 +540,7 @@ impl Gfx {
     }
 
     fn shader(self, path: str) -> int {
-        let spv = read_file(path)
+        let spv = readFile(path)
         if spv.len() == 0 { panic("empty or missing shader: {path}") }
         if spv.len() % 4 != 0 { panic("SPIR-V size not a multiple of 4: {path}") }
         // pCode must be 4-byte aligned -- Bytes is 16-aligned, so copying in is enough
@@ -1436,7 +1436,7 @@ fn write_bmp(path: str, px: Bytes, w: int, h: int) {
             out.push(chr(px.get8(o + 3)))
         }
     }
-    write_file(path, out.join())
+    writeFile(path, out.join())
 }
 
 fn le16(v: int) -> str {

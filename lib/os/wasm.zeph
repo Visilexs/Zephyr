@@ -4,7 +4,7 @@
 // string machinery and the collections compile unchanged for all three targets.
 //
 // Nothing here may allocate: runtimeInitializeHeap calls kernel32VirtualAlloc before the GC heap
-// exists, so these functions use raw loads/stores and memgrow only.
+// exists, so these functions use raw loads/stores and growMemory only.
 
 // The compiler writes three constants into the first words of linear memory,
 // because only it knows where the data segment and globals block ended:
@@ -73,7 +73,7 @@ fn wasmEnsure(need: int) -> bool {
     wasmInitialize()
     if need <= wasmMemoryEnd { return true }
     let pages = (need - wasmMemoryEnd + 65535) / 65536
-    if memgrow(pages) < 0 { return false }
+    if growMemory(pages) < 0 { return false }
     wasmMemoryEnd = wasmMemoryEnd + pages * 65536
     return true
 }
@@ -126,19 +126,19 @@ fn kernel32GetStdHandle(which: int) -> int {
 }
 
 fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCountAddress: int, overlapped: int) -> int {
-    hostwrite(handle, bytesAddress, byteCount)
+    hostWrite(handle, bytesAddress, byteCount)
     if writtenCountAddress != 0 { store64(writtenCountAddress, byteCount) }
     return 1
 }
 
 fn kernel32ExitProcess(code: int) -> int {
-    hostexit(code)
+    hostExit(code)
     return 0
 }
 
 // ---- files ----
 //
-// ponytail: no filesystem. read_file/write_file panic rather than silently
+// ponytail: no filesystem. readFile/writeFile panic rather than silently
 // returning nothing; wire them to host imports if a wasm build ever needs them.
 fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, securityAttributes: int, creationDisposition: int, flags: int, templateHandle: int) -> int {
     return 0 - 1

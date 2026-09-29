@@ -60,7 +60,7 @@ until an installed `zc.exe` understands it — stage 1 is always built by the ol
 - **Interfaces** give dynamic dispatch: `fn describe(s: Shape)` accepts any impl.
 - **Collections:** lists `[T]`, maps `[K: V]` (`["alice": 30]`, `.has`, `.keys`, `.remove`).
 - **Strings** interpolate with braces: `"len = {p.len()}"`. Methods: `.upper`,
-  `.split`, `.replace`, `.contains`, `.trim`, `.repeat`, `.starts_with`, `.index_of`.
+  `.split`, `.replace`, `.contains`, `.trim`, `.repeat`, `.startsWith`, `.indexOf`.
 - **Multi-file:** `import "std/list.zeph"` — library paths resolve relative to zc.exe (it looks in `lib/`), so they work from any directory.
 - **`assert(cond)` / `assert(cond, msg)`** is built in.
 - **Literals:** `0xFF`, `0b1010`, `1_000`, `6.02e23`, `'a'` (an int byte), raw `r"C:\dir"`,

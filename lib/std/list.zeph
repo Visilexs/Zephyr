@@ -18,7 +18,7 @@ fn contains[T](items: [T], target: T) -> bool {
     return false
 }
 
-fn index_of[T](items: [T], target: T) -> int {
+fn indexOf[T](items: [T], target: T) -> int {
     for i in 0..items.len() {
         if items[i] == target { return i }
     }
@@ -98,7 +98,7 @@ fn count[T](items: [T], target: T) -> int {
 
 // Stable bottom-up merge sort: O(n log n) comparisons, O(n) scratch space.
 // compare(left, right) < 0 when left should come first; ties retain their original order.
-fn sort_by[T](items: [T], compare: fn(T, T) -> int) {
+fn sortBy[T](items: [T], compare: fn(T, T) -> int) {
     let length = items.len()
     if length < 2 { return }
     let scratch = slice(items, 0, length)

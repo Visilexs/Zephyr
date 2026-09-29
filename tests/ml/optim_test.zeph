@@ -38,7 +38,7 @@ fn rejects(mode: int, message: str) -> bool {
     win("CloseHandle", process.get64(0))
     win("CloseHandle", process.get64(8))
     win("CloseHandle", log)
-    let output = read_file("optim-child.log")
+    let output = readFile("optim-child.log")
     return status.get32(0) == 1 and output.contains(message)
 }
 
@@ -232,17 +232,17 @@ for i in 0..messages.len() { n += ck(rejects(i + 1, "checkpoint: {messages[i]}")
 for mode in [11, 12, 14] { n += ck(rejects(mode, "checkpoint: implausibly large allocation"), "oversized metadata rejected before allocation") }
 n += ck(rejects(13, "checkpoint: truncated file"), "truncated tensor descriptor")
 n += ck(rejects(8, "checkpoint: write failed"), "partial write fails")
-n += ck(read_file("optim-good.ckpt") == initial_file, "failed write preserves original bytes")
+n += ck(readFile("optim-good.ckpt") == initial_file, "failed write preserves original bytes")
 n += ck(t_hex(checkpoint_load("optim-good.ckpt").params[1]) == t_hex(round_params[1]), "original loads after failed write")
 n += ck(rejects(9, "interrupted after header"), "interrupted partial write")
-n += ck(read_file("optim-good.ckpt") == initial_file, "interrupted write preserves original bytes")
+n += ck(readFile("optim-good.ckpt") == initial_file, "interrupted write preserves original bytes")
 n += ck(checkpoint_load("optim-good.ckpt").optim.step == 17, "original loads after interruption")
 let locked_name = cbytes("optim-good.ckpt")
 let locked = win("CreateFileA", locked_name.p, 2147483648, 1, 0, 3, 128, 0)
 n += ck(locked != 0 - 1, "lock target against rename")
 n += ck(rejects(10, "checkpoint: atomic rename failed"), "failed atomic publication")
 win("CloseHandle", locked)
-n += ck(read_file("optim-good.ckpt") == initial_file, "failed rename preserves original bytes")
+n += ck(readFile("optim-good.ckpt") == initial_file, "failed rename preserves original bytes")
 n += ck(checkpoint_load("optim-good.ckpt").optim.step == 17, "original loads after rename failure")
 // Successful replacement must work too, not merely the failure paths.
 round_o.step = 18

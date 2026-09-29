@@ -92,7 +92,7 @@ scripts compile both native targets from the same sources and require identical
 output.
 
 **Talks to the machine.** A native-interop layer — `win("user32!GetDC", …)`, the
-`callptr` intrinsic, `extern fn … from "x.dll"`, and raw-memory builtins — lets
+`callPointer` intrinsic, `extern fn … from "x.dll"`, and raw-memory builtins — lets
 pure Zephyr call the OS and the GPU. On top of it the repo ships a Vulkan
 wrapper (`lib/vk`, with a Zephyr→SPIR-V shader compiler in `tools/zspv.zeph`),
 an immediate-mode GUI toolkit (`lib/ui`), and threads (`lib/std/thread.zeph`,
@@ -101,7 +101,7 @@ rasterizer to a real-time geodesic-ray-traced black hole. See
 [docs/graphics.md](docs/graphics.md).
 
 **A standard library in Zephyr, not welded into the compiler.** `contains`,
-`map`, `filter`, `fold`, `sort_by` and the rest live in `lib/std/list.zeph` as
+`map`, `filter`, `fold`, `sortBy` and the rest live in `lib/std/list.zeph` as
 ordinary generic code:
 
 ```zephyr

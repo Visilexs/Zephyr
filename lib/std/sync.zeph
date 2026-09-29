@@ -1,5 +1,5 @@
 // Off-heap synchronization for Windows and Linux x86-64.
-// Only ints cross threads: reference counts are not atomic. Use bits/frombits
+// Only ints cross threads: reference counts are not atomic. Use bits/floatFromBits
 // for floats. Pass address fields, then construct a local wrapper in each worker;
 // never share the heap-allocated wrapper itself. Storage lasts until process exit.
 
@@ -54,12 +54,12 @@ impl Atomic {
     // Write the aligned cell atomically (x86 release ordering).
     fn store(self, value: int) { store64(self.address, value) }
     // Add delta atomically and return the new value, wrapping on overflow.
-    fn add(self, delta: int) -> int { return callptr(self.address + 16, self.address, delta) }
+    fn add(self, delta: int) -> int { return callPointer(self.address + 16, self.address, delta) }
     // Replace the value atomically and return the old value.
-    fn swap(self, value: int) -> int { return callptr(self.address + 32, self.address, value) }
+    fn swap(self, value: int) -> int { return callPointer(self.address + 32, self.address, value) }
     // Replace expected with replacement atomically, returning success.
     fn compare_exchange(self, expected: int, replacement: int) -> bool {
-        return callptr(self.address + 48, self.address, expected, replacement) != 0
+        return callPointer(self.address + 48, self.address, expected, replacement) != 0
     }
 }
 

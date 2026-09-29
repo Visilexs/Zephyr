@@ -6,7 +6,7 @@ geodesic-ray-traced black hole. This guide covers how: the native-interop
 layer everything rests on, the `lib/vk` Vulkan wrapper, the Zephyr→SPIR-V
 shader compiler, and the `examples/graphics` programs that exercise it all.
 
-The interop primitives themselves (`win`, `callptr`, `extern fn … from`, the
+The interop primitives themselves (`win`, `callPointer`, `extern fn … from`, the
 raw-memory builtins) are specified in [spec.md §3.6](spec.md); this document is
 the practical layer on top. Everything here needs `--rt` and is
 Windows-only unless noted.
@@ -15,7 +15,7 @@ Windows-only unless noted.
 
 There are two ways to reach the platform, and the examples use both:
 
-- **Raw** — `win("user32!CreateWindowExA", …)`, `callptr(addr, …)`, and
+- **Raw** — `win("user32!CreateWindowExA", …)`, `callPointer(addr, …)`, and
   `load64`/`store32`/`addr`. This is how the OpenGL demos and the `lib/ui`
   toolkit are written: direct Win64 calls with hand-packed structs. It is
   unsafe (raw addresses, no bounds checks) and verbose, but it needs nothing
@@ -58,7 +58,7 @@ Five files, imported through `vk/gfx.zeph`:
 
 | File | Contents |
 |------|----------|
-| `raw.zeph` | mechanical Vulkan bindings — every `vk*` entry point as an `extern`/`callptr` against `vulkan-1.dll`, all params `int` |
+| `raw.zeph` | mechanical Vulkan bindings — every `vk*` entry point as an `extern`/`callPointer` against `vulkan-1.dll`, all params `int` |
 | `consts.zeph` | result codes, enums, and struct sizes/offsets — **generated** by `tools/vkgen.c` from the Vulkan SDK headers (1.4.350) |
 | `structs.zeph` | typed `Bytes` builders — `VkFooCreateInfo.new().field(x)…`, each `new()` fills in `sType` |
 | `win.zeph` | a minimal Win32 window for presentation (uses `DefWindowProcA` + `PeekMessageA`, so no Zephyr window-proc callback is ever needed) |

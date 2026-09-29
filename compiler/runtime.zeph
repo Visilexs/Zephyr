@@ -323,7 +323,7 @@ fn runtimeCollectGarbage() {
     let lowLimitAddress = runtimeCollectorScratchAddress
     let highLimitAddress = lowLimitAddress + 8
     let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)   // returns VOID
-    runtimeScanRootRange(stackptr(), load64(highLimitAddress))
+    runtimeScanRootRange(stackPointer(), load64(highLimitAddress))
     runtimeScanThreadRoots()
     // trace
     while runtimeWorklistCount > 0 {
@@ -789,7 +789,7 @@ fn runtimeCharacterFromCode(character: int) -> int {
 // 2^31, e^(y ln x) otherwise. Bits in and out. runtimeFloatExponentialCore / runtimeFloatNaturalLogCore are the
 // algorithms of std/math_core.zeph's fexp / fln, which stay usable without --rt.
 fn runtimeFloatBitsPower(baseBits: int, exponentBits: int) -> int {
-    return bits(runtimeFloatPowerCore(frombits(baseBits), frombits(exponentBits)))
+    return bits(runtimeFloatPowerCore(floatFromBits(baseBits), floatFromBits(exponentBits)))
 }
 
 fn runtimeFloatAbsoluteCore(value: float) -> float {
@@ -800,7 +800,7 @@ fn runtimeFloatAbsoluteCore(value: float) -> float {
 fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
     if exponent == 0.0 or base == 1.0 { return 1.0 }
     if base != base or exponent != exponent { return base + exponent }   // nan
-    let infinity = frombits(2047 << 52)
+    let infinity = floatFromBits(2047 << 52)
     if runtimeFloatAbsoluteCore(exponent) == infinity {
         let magnitude = runtimeFloatAbsoluteCore(base)
         if magnitude == 1.0 { return 1.0 }
@@ -830,7 +830,7 @@ fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
     }
     var magnitudeBase = base
     if base < 0.0 {
-        if not exponentIsWhole { return frombits((2047 << 52) | (1 << 51)) }
+        if not exponentIsWhole { return floatFromBits((2047 << 52) | (1 << 51)) }
         magnitudeBase = 0.0 - base
     }
     if magnitudeBase == 0.0 {
@@ -845,7 +845,7 @@ fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
 fn runtimeFloatExponentialCore(value: float) -> float {
     if value != value { return value }
     if value < 0.0 - 745.2 { return 0.0 }
-    if value > 709.782712893384 { return frombits(2047 << 52) }
+    if value > 709.782712893384 { return floatFromBits(2047 << 52) }
     let scaled = value / 0.6931471805599453
     var binaryExponent = 0
     if scaled >= 0.0 { binaryExponent = (scaled + 0.5) as int }
@@ -861,18 +861,18 @@ fn runtimeFloatExponentialCore(value: float) -> float {
         sum += term
         index += 1
     }
-    if binaryExponent < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + binaryExponent + 1022) << 52) }
-    return sum * frombits((1023 + binaryExponent) << 52)
+    if binaryExponent < 0 - 1022 { return sum * floatFromBits(1 << 52) * floatFromBits((1023 + binaryExponent + 1022) << 52) }
+    return sum * floatFromBits((1023 + binaryExponent) << 52)
 }
 
 fn runtimeFloatNaturalLogCore(value: float) -> float {
-    if value < 0.0 { return frombits((2047 << 52) | (1 << 51)) }
-    if value == 0.0 { return 0.0 - frombits(2047 << 52) }
-    if value != value or value == frombits(2047 << 52) { return value }
-    if value < frombits(1 << 52) { return runtimeFloatNaturalLogCore(value * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
+    if value < 0.0 { return floatFromBits((2047 << 52) | (1 << 51)) }
+    if value == 0.0 { return 0.0 - floatFromBits(2047 << 52) }
+    if value != value or value == floatFromBits(2047 << 52) { return value }
+    if value < floatFromBits(1 << 52) { return runtimeFloatNaturalLogCore(value * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
     let floatBits = bits(value)
     let exponent = ((floatBits >> 52) & 2047) - 1023
-    let significand = frombits((floatBits & ((1 << 52) - 1)) | (1023 << 52))
+    let significand = floatFromBits((floatBits & ((1 << 52) - 1)) | (1023 << 52))
     let seriesArgument = (significand - 1.0) / (significand + 1.0)
     let seriesArgumentSquared = seriesArgument * seriesArgument
     var term = seriesArgument
@@ -1119,7 +1119,7 @@ fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> i
     let kind = load64(typeDescriptor)
     if kind == 3 { return runtimeStringsEqual(leftValue, rightValue) }
     if kind == 1 {
-        if frombits(leftValue) == frombits(rightValue) { return 1 }
+        if floatFromBits(leftValue) == floatFromBits(rightValue) { return 1 }
         return 0
     }
     if kind == 4 {
@@ -1165,7 +1165,7 @@ fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> i
             if kind == 10 {
                 if runtimePackedLoad(leftValue, index, 1) != runtimePackedLoad(rightValue, index, 1) { return 0 }
             } else {
-                if frombits(runtimePackedLoad(leftValue, index, 4)) != frombits(runtimePackedLoad(rightValue, index, 4)) { return 0 }
+                if floatFromBits(runtimePackedLoad(leftValue, index, 4)) != floatFromBits(runtimePackedLoad(rightValue, index, 4)) { return 0 }
             }
             index += 1
         }
@@ -1480,8 +1480,8 @@ fn runtimeMapValues(mapAddress: int) -> int {
 fn runtimeCompareValuesByKind(kind: int, leftValue: int, rightValue: int) -> int {
     if kind == 1 { return runtimeCompareStrings(leftValue, rightValue) }
     if kind == 2 {
-        let leftFloat = frombits(leftValue)
-        let rightFloat = frombits(rightValue)
+        let leftFloat = floatFromBits(leftValue)
+        let rightFloat = floatFromBits(rightValue)
         if leftFloat < rightFloat { return 0 - 1 }
         if leftFloat > rightFloat { return 1 }
         return 0
@@ -2520,7 +2520,7 @@ fn runtimeFormatLargeIntegerFloat(inputValue: float) {
 }
 
 fn runtimeAppendStringBuilderFloat(bitPattern: int) {
-    let value = frombits(bitPattern)
+    let value = floatFromBits(bitPattern)
     if value != value {                          // NaN
         runtimeAppendStringBuilderByte(110)
         runtimeAppendStringBuilderByte(97)
@@ -2532,7 +2532,7 @@ fn runtimeAppendStringBuilderFloat(bitPattern: int) {
         runtimeAppendStringBuilderByte(45)                   // '-'
         magnitude = 0.0 - magnitude
     }
-    let infinity = frombits(9218868437227405312)   // 0x7FF0000000000000
+    let infinity = floatFromBits(9218868437227405312)   // 0x7FF0000000000000
     if magnitude == infinity {
         runtimeAppendStringBuilderByte(105)
         runtimeAppendStringBuilderByte(110)

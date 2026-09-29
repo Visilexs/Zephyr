@@ -25,7 +25,7 @@ let GPU_SPV_C64 = "examples/shaders/matmul_c64.comp.spv"
 // Returns "" when the backend can run, and otherwise a message that says what
 // is missing and what to do about it. Callers should print it verbatim: a
 // backend that is unavailable for a fixable reason should not look like a bug.
-// read_file dies on a missing path rather than returning empty, so existence
+// readFile dies on a missing path rather than returning empty, so existence
 // has to be asked before the read -- the whole point here is to report the
 // absence with a fix, not to abort on it.
 fn gpu_file_exists(path: str) -> bool {

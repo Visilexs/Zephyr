@@ -20,8 +20,8 @@ let LN2 = 0.6931471805599453
 // exact and the reduced argument keeps full precision for large |n|.
 let LN2_HI = 0.6931471803691238
 let LN2_LO = 0.00000000019082149292705877
-let NAN = frombits((2047 << 52) | (1 << 51))
-let INF = frombits(2047 << 52)
+let NAN = floatFromBits((2047 << 52) | (1 << 51))
+let INF = floatFromBits(2047 << 52)
 
 fn round_i(v: float) -> int {
     if v >= 0.0 { return (v + 0.5) as int }
@@ -52,9 +52,9 @@ fn fexp(x: float) -> float {
     }
     if n < -1022 {
         // subnormal result: split the scale so both factors stay representable
-        return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52)
+        return sum * floatFromBits(1 << 52) * floatFromBits((1023 + n + 1022) << 52)
     }
-    return sum * frombits((1023 + n) << 52)
+    return sum * floatFromBits((1023 + n) << 52)
 }
 
 // ln(x) = e*ln2 + 2*atanh((m-1)/(m+1)), where x = m * 2^e, m in [1,2)
@@ -64,10 +64,10 @@ fn fln(x: float) -> float {
     if x < 0.0 { return NAN }
     if x == 0.0 { return 0.0 - INF }
     if is_nan(x) or x == INF { return x }
-    if x < frombits(1 << 52) { return fln(x * 4503599627370496.0) - 52.0 * LN2 }
+    if x < floatFromBits(1 << 52) { return fln(x * 4503599627370496.0) - 52.0 * LN2 }
     let b = bits(x)
     let e = ((b >> 52) & 2047) - 1023
-    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
+    let m = floatFromBits((b & ((1 << 52) - 1)) | (1023 << 52))
     let t = (m - 1.0) / (m + 1.0)
     let t2 = t * t
     var term = t

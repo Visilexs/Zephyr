@@ -7,7 +7,7 @@ let E = 2.718281828459045
 fn trunc(x: float) -> float {
     if is_nan(x) or fabs(x) >= 4503599627370496.0 or x == 0.0 { return x }
     let integral = (x as int) as float
-    if integral == 0.0 { return frombits(bits(x) & (1 << 63)) }
+    if integral == 0.0 { return floatFromBits(bits(x) & (1 << 63)) }
     return integral
 }
 
@@ -95,7 +95,7 @@ fn fmod(x: float, y: float) -> float {
         if scaled == divisor { break }
         scaled /= 2.0
     }
-    return frombits(bits(remaining) | (bits(x) & (1 << 63)))
+    return floatFromBits(bits(remaining) | (bits(x) & (1 << 63)))
 }
 
 // Signed zeros distinguish the two sides of the negative x axis.
@@ -115,7 +115,7 @@ fn atan2(y: float, x: float) -> float {
         angle = fatan(fabs(y / x))
         if x < 0.0 { angle = PI - angle }
     }
-    if negativeY { return frombits(bits(angle) | (1 << 63)) }
+    if negativeY { return floatFromBits(bits(angle) | (1 << 63)) }
     return angle
 }
 

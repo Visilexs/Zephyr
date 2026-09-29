@@ -1,7 +1,7 @@
 // The standard library: math, string methods, list generics, assert, enums,
 // optionals, closures.
 // Compile with the self-hosted compiler: zc.exe --rt examples/stdlib.zeph out.exe
-import "../std/list.zeph"        // contains/index_of/reverse/slice/map/... are
+import "../std/list.zeph"        // contains/indexOf/reverse/slice/map/... are
                                  // ordinary generic Zephyr, not compiler builtins
 enum Color { Red, Green, Blue }
 
@@ -14,8 +14,8 @@ let s = "Hello, World"
 print(s.upper())                     // HELLO, WORLD
 print(s.replace("World", "Zephyr"))    // Hello, Zephyr
 print(s.contains("World"))           // true
-print(s.index_of("World"))           // 7
-print(s.starts_with("Hello"))        // true
+print(s.indexOf("World"))           // 7
+print(s.startsWith("Hello"))        // true
 print("a,b,c".split(",").len())      // 3
 print("  hi  ".trim())               // hi
 print("ab".repeat(3))                // ababab

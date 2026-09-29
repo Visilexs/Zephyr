@@ -519,7 +519,7 @@ for a in argv {
 }
 g_src_name = inpath
 
-let src = read_file(inpath)
+let src = readFile(inpath)
 if src.len() == 0 { panic("cannot read {inpath}") }
 lex(src)
 
@@ -604,5 +604,5 @@ for w in mod {
     out.push(chr((w >> 16) & 255))
     out.push(chr((w >> 24) & 255))
 }
-write_file(outpath, out.join())
+writeFile(outpath, out.join())
 print("{outpath}: {mod.len()} words, {g_next_id - 1} ids")

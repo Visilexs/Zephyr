@@ -136,7 +136,7 @@ fn phase_update(p: PhaseParams, z: Tensor, embedding: Tensor) -> Tensor {
 
 // fln's normal-number implementation needs explicit scaling for subnormals.
 fn phase_log_positive(x: float) -> float {
-    if x > 0.0 and x < frombits(1 << 52) { return fln(x * 4503599627370496.0) - 52.0 * LN2 }
+    if x > 0.0 and x < floatFromBits(1 << 52) { return fln(x * 4503599627370496.0) - 52.0 * LN2 }
     return fln(x)
 }
 

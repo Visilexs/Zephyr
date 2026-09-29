@@ -186,7 +186,7 @@ for a in args() {
 }
 if args().len() > 1 {
     let a1 = args()[1]
-    if not a1.starts_with("-") {          // a flag, not a particle count
+    if not a1.startsWith("-") {          // a flag, not a particle count
         let n = a1 as int
         if n > 1000 { COUNT = n }
     }

@@ -87,7 +87,7 @@ if args().len() > 1 {
     let bad_tokens = test_tokens()
     if mode == "zero" { bad.z_init = t_zeros(DType.C64, [4]) }
     if mode == "nonfinite" { t_set_c(bad.z_init, [0], INF, 0.0) }
-    if mode == "overflow_norm" { t_set_c(bad.z_init, [0], frombits(2046 << 52), 0.0) }
+    if mode == "overflow_norm" { t_set_c(bad.z_init, [0], floatFromBits(2046 << 52), 0.0) }
     if mode == "token" { t_set_int(bad_tokens, [0, 0], 7) }
     if mode == "negative_token" { t_set_int(bad_tokens, [0, 0], 0 - 1) }
     if mode == "odd" { bad.config.D = 3 }
@@ -207,10 +207,10 @@ t_set_c(readout_params.M, [0, 0], sqrt(readout_params.config.eps), 0.0)
 let smoothed = phase_readout(readout_params, basis)
 n += ck(near(t_get(smoothed, [0, 0]), 0.5), "denominator sum(w) + V*eps")
 n += ck(near(t_get(smoothed, [0, 1]), 0.25), "epsilon included for zero class")
-t_set_c(readout_params.M, [0, 0], frombits(1800 << 52), frombits(1800 << 52))
+t_set_c(readout_params.M, [0, 0], floatFromBits(1800 << 52), floatFromBits(1800 << 52))
 let saturated = phase_readout(readout_params, basis)
 n += ck(near(t_sum_all(saturated), 1.0) and near(t_get(saturated, [0, 0]), 1.0), "large finite amplitudes do not overflow abs2")
-t_set_c(readout_params.M, [0, 0], frombits(1), frombits(1))
+t_set_c(readout_params.M, [0, 0], floatFromBits(1), floatFromBits(1))
 let tiny = phase_readout(readout_params, basis)
 n += ck(near(t_get(tiny, [0, 0]), 1.0 / 3.0), "subnormal amplitude stability")
 let empty_sequence = phase_forward(readout_params, t_zeros(DType.I64, [1, 0]), true)

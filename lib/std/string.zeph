@@ -192,7 +192,7 @@ fn parse_float(text: str) -> float? {
     if negativeExponent { exponent = 0 - exponent }
     var sign = 0
     if negative { sign = 1 << 63 }
-    if digits.len() == 0 { return frombits(sign) }
+    if digits.len() == 0 { return floatFromBits(sign) }
     var decimalPower = exponent - fractionalDigits
     while digits.len() > 0 and digits[digits.len() - 1] == 0 {
         digits.pop()
@@ -200,7 +200,7 @@ fn parse_float(text: str) -> float? {
     }
     let decimalPoint = digits.len() + decimalPower
     if decimalPoint > 309 { return none }
-    if decimalPoint < -323 { return frombits(sign) }
+    if decimalPoint < -323 { return floatFromBits(sign) }
     return string_decimal_float(digits, decimalPoint, sign)
 }
 
@@ -249,10 +249,10 @@ fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
         while string_fraction_bit(fraction) == 0 and binaryExponent >= -1075 { binaryExponent -= 1 }
     }
     if binaryExponent > 1023 { return none }
-    if binaryExponent < -1075 { return frombits(sign) }
+    if binaryExponent < -1075 { return floatFromBits(sign) }
     if binaryExponent == -1075 {
-        if string_nonzero(fraction) { return frombits(sign | 1) }
-        return frombits(sign)
+        if string_nonzero(fraction) { return floatFromBits(sign | 1) }
+        return floatFromBits(sign)
     }
     var significand = 1
     var integerPosition = integerBits.len() - 2
@@ -270,13 +270,13 @@ fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
     var sticky = string_nonzero(fraction)
     for i in 0..max(integerPosition, 0) { if integerBits[i] != 0 { sticky = true } }
     if guard == 1 and (sticky or (significand & 1) == 1) { significand += 1 }
-    if binaryExponent < -1022 { return frombits(sign | significand) }
+    if binaryExponent < -1022 { return floatFromBits(sign | significand) }
     if significand == 9007199254740992 {
         significand /= 2
         binaryExponent += 1
     }
     if binaryExponent > 1023 { return none }
-    return frombits(sign | ((binaryExponent + 1023) << 52) | (significand - 4503599627370496))
+    return floatFromBits(sign | ((binaryExponent + 1023) << 52) | (significand - 4503599627370496))
 }
 // Internal decimal multiplication, least-significant digit first.
 fn string_scale_digits(digits: [int], factor: int) {

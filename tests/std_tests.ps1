@@ -83,7 +83,7 @@ assert(fmt_fixed(-1.25, 1) == "-1.3", "negative tie")
 assert(fmt_fixed(2.5, 0) == "3" and fmt_fixed(-2.5, 0) == "-3", "integer tie")
 assert(fmt_fixed(9.999, 2) == "10.00", "carry")
 assert(fmt_fixed(0.0, 3) == "0.000", "zero")
-assert(fmt_fixed(frombits(1 << 63), 2) == "-0.00", "negative zero")
+assert(fmt_fixed(floatFromBits(1 << 63), 2) == "-0.00", "negative zero")
 assert(fmt_fixed(100000000000000000000.0, 2) == "100000000000000000000.00", "large fixed")
 assert(fmt_fixed(1.125, 2) == "1.13", "exact tie")
 assert(fmt_fixed(2.675, 2) == "2.67", "binary decimal boundary")
@@ -130,12 +130,12 @@ assert(floor(-1.2) == -2.0 and floor(1.2) == 1.0, "floor")
 assert(ceil(-1.2) == -1.0 and ceil(1.2) == 2.0, "ceil")
 assert(trunc(-1.9) == -1.0 and trunc(1.9) == 1.0, "trunc")
 assert(round(-1.5) == -2.0 and round(1.5) == 2.0 and round(1.49) == 1.0, "round")
-let negativeZero = frombits(1 << 63)
+let negativeZero = floatFromBits(1 << 63)
 assert(bits(trunc(negativeZero)) == bits(negativeZero) and bits(ceil(-0.25)) == bits(negativeZero), "signed zero")
 for value in [4503599627370496.0, -4503599627370496.0, 9007199254740992.0, -9007199254740992.0] {
     assert(floor(value) == value and ceil(value) == value and trunc(value) == value and round(value) == value, "large integral")
 }
-assert(round(frombits(bits(0.5) - 1)) == 0.0, "below half")
+assert(round(floatFromBits(bits(0.5) - 1)) == 0.0, "below half")
 assert(floor(INF) == INF and ceil(0.0 - INF) == 0.0 - INF and is_nan(round(NAN)), "nonfinite rounding")
 assert(clamp(-2.0, 0.0, 1.0) == 0.0 and clamp(2.0, 0.0, 1.0) == 1.0 and clamp(0.5, 0.0, 1.0) == 0.5, "clamp")
 assert(clamp_int(-2, 0, 1) == 0 and clamp_int(2, 0, 1) == 1 and clamp_int(0, 0, 1) == 0, "clamp int")
@@ -153,13 +153,13 @@ assert(is_nan(powf(-2.0, 0.5)), "negative fractional power")
 assert(fmod(-5.5, 2.0) == -1.5 and fmod(5.5, -2.0) == 1.5, "fmod sign")
 assert(bits(fmod(-4.0, 2.0)) == (1 << 63), "fmod signed zero")
 assert(is_nan(fmod(1.0, 0.0)) and fmod(3.0, INF) == 3.0, "fmod special")
-assert(fmod(frombits(9218868437227405311), 2.0) == 0.0, "fmod maximum finite")
-assert(fmod(frombits(1123 << 52), 3.0) == 1.0, "fmod large quotient")
+assert(fmod(floatFromBits(9218868437227405311), 2.0) == 0.0, "fmod maximum finite")
+assert(fmod(floatFromBits(1123 << 52), 3.0) == 1.0, "fmod large quotient")
 close_value(atan2(1.0, 1.0), PI / 4.0)
 close_value(atan2(1.0, -1.0), 3.0 * PI / 4.0)
 close_value(atan2(-1.0, -1.0), -3.0 * PI / 4.0)
 close_value(atan2(-1.0, 1.0), 0.0 - PI / 4.0)
-assert(atan2(0.0, -1.0) == PI and atan2(frombits(1 << 63), -1.0) == 0.0 - PI, "atan2 zero")
+assert(atan2(0.0, -1.0) == PI and atan2(floatFromBits(1 << 63), -1.0) == 0.0 - PI, "atan2 zero")
 assert(atan2(1.0, 0.0) == HALF_PI and atan2(-1.0, 0.0) == 0.0 - HALF_PI, "atan2 axis")
 assert(bits(atan2(-1.0, INF)) == (1 << 63), "atan2 signed zero at infinity")
 close_value(hypot(3.0, 4.0), 5.0)
@@ -251,14 +251,14 @@ fn compare_item(left: SortItem, right: SortItem) -> int {
 }
 var items: [SortItem] = []
 for i in 0..4096 { items.push(SortItem{key: (4096 - i) % 17, original: i}) }
-sort_by(items, compare_item)
+sortBy(items, compare_item)
 for i in 1..items.len() {
     assert(items[i - 1].key <= items[i].key, "sorted")
     if items[i - 1].key == items[i].key { assert(items[i - 1].original < items[i].original, "stable") }
 }
 assert(comparisons <= 49152, "n log n comparisons")
 let emptyItems: [SortItem] = []
-sort_by(emptyItems, compare_item)
+sortBy(emptyItems, compare_item)
 print("ok")
 '@
 TestSrc 'io_read_line' @'
@@ -290,7 +290,7 @@ let path = directory + "/append file.txt"
 assert(not file_exists(path), "initial absence")
 append_file(path, "first")
 append_file(path, " second")
-assert(file_exists(path) and read_file(path) == "first second", "append contents")
+assert(file_exists(path) and readFile(path) == "first second", "append contents")
 let names = list_dir(directory)
 assert(names.len() == 1 and names.contains("append file.txt"), "directory names")
 assert(not names.contains(".") and not names.contains(".."), "dot entries")

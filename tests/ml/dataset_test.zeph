@@ -72,7 +72,7 @@ fn child(case: str) -> int {
 // entry follows its "file" key and precedes the next one.
 fn jnum(chunk: str, key: str) -> int {
     let k = "\"{key}\":"
-    let at = chunk.index_of(k)
+    let at = chunk.indexOf(k)
     if at < 0 { panic("dataset_test: manifest entry has no {key}") }
     var i = at + k.len()
     while i < chunk.len() and chunk.byte(i) == 32 { i += 1 }
@@ -89,7 +89,7 @@ fn jnum(chunk: str, key: str) -> int {
 fn entry_of(man: str, name: str) -> str {
     let parts = man.split("\"file\":")
     for i in 1..parts.len() {
-        if parts[i].trim().starts_with("\"{name}\"") { return parts[i] }
+        if parts[i].trim().startsWith("\"{name}\"") { return parts[i] }
     }
     panic("dataset_test: manifest has no entry for {name}")
     return ""
@@ -121,7 +121,7 @@ if not IS_CHILD {
     if not ds_file_exists(DATA_DIR) or not ds_file_exists("{DATA_DIR}/manifest.json") {
         panic("dataset_test: {DATA_DIR}/manifest.json is missing. Run: python tools/ml_reference/freeze_datasets.py")
     }
-    let man = read_file("{DATA_DIR}/manifest.json")
+    let man = readFile("{DATA_DIR}/manifest.json")
     let n_entries = man.split("\"file\":").len() - 1
     chk(man.contains("\"preset\": \"m7-reduced\""), "the manifest declares the m7-reduced preset")
     chk(jnum(man, "seed") == 20260921, "the manifest records the generation seed")
@@ -196,18 +196,18 @@ if not IS_CHILD {
     chk(dataset_batch(d, n - 8, 8).targets.len() == 8, "the last eight rows are a legal batch")
 
     // ---- malformed input, each in its own child ----------------------------
-    let raw = read_file(SRC)
+    let raw = readFile(SRC)
     let hdr = 36
     let seq = d.seq_len
-    write_file(bad_path("magic"), "X" + raw.sub(1, raw.len()))
-    write_file(bad_path("version"), raw.sub(0, 8) + le32(2) + raw.sub(12, raw.len()))
-    write_file(bad_path("truncated"), raw.sub(0, raw.len() - 8))
-    write_file(bad_path("token"), raw.sub(0, hdr) + le32(d.vocab) + raw.sub(hdr + 4, raw.len()))
+    writeFile(bad_path("magic"), "X" + raw.sub(1, raw.len()))
+    writeFile(bad_path("version"), raw.sub(0, 8) + le32(2) + raw.sub(12, raw.len()))
+    writeFile(bad_path("truncated"), raw.sub(0, raw.len() - 8))
+    writeFile(bad_path("token"), raw.sub(0, hdr) + le32(d.vocab) + raw.sub(hdr + 4, raw.len()))
     let toff = hdr + n * seq * 4
-    write_file(bad_path("target"), raw.sub(0, toff) + le32(d.n_class) + raw.sub(toff + 4, raw.len()))
+    writeFile(bad_path("target"), raw.sub(0, toff) + le32(d.n_class) + raw.sub(toff + 4, raw.len()))
 
     // The corrupted files differ from a loadable one only in the corruption.
-    chk(read_file(bad_path("magic")).len() == raw.len(), "the corrupted files are otherwise the real file")
+    chk(readFile(bad_path("magic")).len() == raw.len(), "the corrupted files are otherwise the real file")
 
     let cases = ["magic", "version", "truncated", "token", "target", "batch"]
     for i in 0..cases.len() {
