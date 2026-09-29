@@ -148,6 +148,7 @@ let N_TYALIAS = 58   // type Name = T (top level): kids = [type]
 let N_TYTUPLE = 59   // (A, B) tuple type: kids = element types
 let N_TUPLE = 60     // (a, b) tuple literal: kids = elements; checked into an N_SLIT
 let N_GROUP = 61     // several statements from one (let (a, b) = t); spliced by the parser
+let N_IS = 62        // x is Member (parse only): kids = [value, N_ID or N_MEMBER]
 
 // ---------------- type kinds & table ----------------
 let K_INT = 0
@@ -271,8 +272,12 @@ struct Node {
 struct VarInfo { name: str, ty: int, mut: bool, kind: int, idx: int, isConst: bool }
 // A generic struct (tparams set) is a template: its ftypes are placeholders, and
 // each use with type arguments makes an instance named "Box[int]" (template, typeArgs).
+// An enum whose members carry values is a struct too (node.mut set): its one field is
+// __tag, and each member is a variant struct "Shape.Circle" {__tag, 0, 1, ...}
+// (unionIndex set) that values of the enum actually point at.
 struct SDef { name: str, fnames: [str], ftypes: [int], line: int, defaults: [Node],
-              tparams: [str], node: Node, template: int, typeArgs: [int] }
+              tparams: [str], node: Node, template: int, typeArgs: [int],
+              variantNames: [str], variants: [int], unionIndex: int }
 struct EDef { name: str, members: [str], line: int }
 // an interface: method names + their signatures (K_FN types, self excluded)
 struct IDef { name: str, mnames: [str], msigs: [int], line: int }
@@ -1276,18 +1281,38 @@ fn p_enumdef() -> Node {
     let start = pnext()
     var n = nnode(N_ENUMDEF, start.line)
     n.name = expect(T_IDENT, "enum name").s
+    let typeParams = p_type_params()              // enum Result[T, E] { ... }
     let a = expect(T_LB, "'\{'")
     skip_nl()
+    var carriesValues = false
     while not at(T_RB) {
         let mnm = expect(T_IDENT, "enum member name")
         var m = nnode(N_FIELDDEF, mnm.line)
         m.name = mnm.s
+        if at(T_LP) {                             // Circle(float): a member carrying values
+            let open = pnext()
+            carriesValues = true
+            m.kids.push(p_type())
+            while at(T_COMMA) {
+                let c = pnext()
+                m.kids.push(p_type())
+            }
+            let close = expect(T_RP, "')'")
+        }
         n.kids.push(m)
         if at(T_COMMA) { let c = pnext() }
         skip_nl()
     }
     let d = expect(T_RB, "'\}'")
     if n.kids.len() == 0 { die(n.line, "enum '{n.name}' has no members") }
+    if typeParams.kids.len() > 0 and not carriesValues {
+        die(n.line, "a generic enum needs members that carry values, e.g. Some(T)")
+    }
+    if carriesValues {                            // a tagged union, checked as a struct
+        n.k = N_STRUCTDEF
+        n.mut = true
+        for t in typeParams.kids { n.kids.push(t) }
+    }
     return n
 }
 
@@ -1741,6 +1766,24 @@ fn p_expr(minbp: int) -> Node {
     var going = true
     while going {
         let t = peek()
+        if t.t == T_IDENT and t.s == "is" and minbp <= 4 {     // x is Circle: a member test
+            let isWord = pnext()
+            var test = nnode(N_IS, t.line)
+            test.kids.push(lhs)
+            let first = expect(T_IDENT, "a member name after 'is'")
+            var pattern = name_node(first.s, first.line)
+            if at(T_DOT) {
+                let dot = pnext()
+                let second = expect(T_IDENT, "a member name")
+                var qualified = nnode(N_MEMBER, second.line)
+                qualified.name = second.s
+                qualified.kids.push(pattern)
+                pattern = qualified
+            }
+            test.kids.push(pattern)
+            lhs = test
+            continue
+        }
         let bp = binprec(t.t)
         if bp == 0 or bp < minbp {
             going = false
@@ -2152,23 +2195,210 @@ fn tuple_type(elementTypes: [int]) -> int {
     name = name + ")"
     let existing = find_struct(name)
     if existing >= 0 { return struct_of(existing) }
-    var fieldNames: [str] = []
-    var fieldTypes: [int] = []
-    var defaults: [Node] = []
+    let index = add_struct(name, 0, no_names(), nnode(N_NONE, 0), -1, emptyIntList())
+    let tuple = g_structs[index]
     for i in 0..elementTypes.len() {
-        fieldNames.push("{i}")
-        fieldTypes.push(elementTypes[i])
-        defaults.push(nnode(N_NONE, 0))
+        tuple.fnames.push("{i}")
+        tuple.ftypes.push(elementTypes[i])
+        tuple.defaults.push(nnode(N_NONE, 0))
     }
-    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: 0, defaults: defaults,
-                        tparams: no_names(), node: nnode(N_NONE, 0), template: -1, typeArgs: emptyIntList()})
-    g_struct_names[name] = g_structs.len() - 1
-    return struct_of(g_structs.len() - 1)
+    return struct_of(index)
 }
 
 fn no_names() -> [str] {
     var names: [str] = []
     return names
+}
+
+// register a struct with empty field lists (filled by the caller); returns its index
+fn add_struct(name: str, line: int, tparams: [str], node: Node, template: int, typeArgs: [int]) -> int {
+    var fieldNames: [str] = []
+    var fieldTypes: [int] = []
+    var defaults: [Node] = []
+    var variantNames: [str] = []
+    var variants: [int] = []
+    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: line, defaults: defaults,
+                        tparams: tparams, node: node, template: template, typeArgs: typeArgs,
+                        variantNames: variantNames, variants: variants, unionIndex: -1})
+    if not g_struct_names.has(name) { g_struct_names[name] = g_structs.len() - 1 }
+    return g_structs.len() - 1
+}
+
+fn is_union(t: int) -> bool {
+    return ty_kind[t] == K_STRUCT and g_structs[ty_sd[t]].node.mut
+}
+
+// the members of a union's declaration, in order
+fn union_members(union: SDef) -> [Node] {
+    var members: [Node] = []
+    for m in union.node.kids {
+        if m.k == N_FIELDDEF { members.push(m) }
+    }
+    return members
+}
+
+// A (concrete) union's one field and its variant structs; type params must be bound.
+fn make_variants(unionIndex: int) {
+    let union = g_structs[unionIndex]
+    union.fnames.push("__tag")
+    union.ftypes.push(TI_INT)
+    union.defaults.push(nnode(N_NONE, union.line))
+    for m in union_members(union) {
+        let variantIndex = add_struct(union.name + "." + m.name, m.line, no_names(), m, -1, emptyIntList())
+        let variant = g_structs[variantIndex]
+        variant.unionIndex = unionIndex
+        variant.fnames.push("__tag")
+        variant.ftypes.push(TI_INT)
+        variant.defaults.push(nnode(N_NONE, m.line))
+        for i in 0..m.kids.len() {
+            variant.fnames.push("{i}")
+            variant.ftypes.push(resolve_type(m.kids[i]))
+            variant.defaults.push(nnode(N_NONE, m.line))
+        }
+        union.variants.push(variantIndex)
+    }
+}
+
+// Shape.Circle(r) or Shape.Empty: the variant struct's literal, retyped as the enum.
+// A generic enum's type arguments come from the values, or from the expected type.
+fn construct_variant(e: Node, unionIndex: int, memberName: str, memberValues: [Node]) -> int {
+    let union = g_structs[unionIndex]
+    let variantIndex = index_in(union.variantNames, memberName)
+    let member = union_members(union)[variantIndex]
+    if memberValues.len() != member.kids.len() {
+        if member.kids.len() == 0 { die(e.line, "{union.name}.{memberName} carries no values") }
+        die(e.line, "{union.name}.{memberName} takes {member.kids.len()} value(s), got {memberValues.len()}")
+    }
+    var values: [Node] = []
+    for value in memberValues { values.push(value) }
+    var holders: [Node] = []
+    var instanceIndex = unionIndex
+    if union.tparams.len() > 0 {
+        var names: [str] = []
+        var types: [int] = []
+        for i in 0..values.len() {
+            let value = values[i]
+            let emptyLiteral = (value.k == N_LIST or value.k == N_MAPLIT) and value.kids.len() == 0
+            if not emptyLiteral and value.k != N_NONELIT {
+                let valueType = ce(value)
+                if not unify_tp(member.kids[i], valueType, union.tparams, names, types) {
+                    die(e.line, "{union.name}.{memberName} cannot hold {type_str(valueType)} as value {i + 1}")
+                }
+                g_lower_count += 1
+                var holder = nnode(N_DECL, e.line)
+                holder.name = "__z{g_lower_count}_value"
+                holder.op = DECL_PRECHECKED
+                holder.kids.push(value)
+                holder.kids.push(nnode(N_NONE, e.line))
+                holders.push(holder)
+                values[i] = name_node(holder.name, e.line)
+            }
+        }
+        var typeArgs: [int] = []
+        for p in 0..union.tparams.len() {
+            var found = -1
+            for j in 0..names.len() {
+                if names[j] == union.tparams[p] { found = j }
+            }
+            if found >= 0 {
+                typeArgs.push(types[found])
+            } else if e.ival > 0 and ty_kind[e.ival - 1] == K_STRUCT and g_structs[ty_sd[e.ival - 1]].template == unionIndex {
+                typeArgs.push(g_structs[ty_sd[e.ival - 1]].typeArgs[p])     // from the expected type
+            } else {
+                die(e.line, "cannot infer '{union.tparams[p]}' for {union.name}.{memberName}; annotate, e.g. let x: {union.name}[int, ...] = ...")
+            }
+        }
+        instanceIndex = ty_sd[instantiate_struct(unionIndex, typeArgs)]
+    }
+    let variantSd = g_structs[instanceIndex].variants[variantIndex]
+    var literal = nnode(N_SLIT, e.line)
+    literal.mut = true                           // compiler-made: may build a variant
+    literal.name = g_structs[variantSd].name
+    var tagInit = nnode(N_FIELDINIT, e.line)
+    tagInit.name = "__tag"
+    var tagValue = nnode(N_INT, e.line)
+    tagValue.ival = variantIndex
+    tagInit.kids.push(tagValue)
+    literal.kids.push(tagInit)
+    for i in 0..values.len() {
+        var init = nnode(N_FIELDINIT, e.line)
+        init.name = "{i}"
+        init.kids.push(values[i])
+        literal.kids.push(init)
+    }
+    var retyped = nnode(N_CAST, e.line)          // the same object, typed as the enum
+    retyped.mut = true
+    retyped.aux = C_NOP
+    retyped.ty = struct_of(instanceIndex)
+    retyped.kids.push(literal)
+    retyped.kids.push(nnode(N_NONE, e.line))
+    var lowered = retyped
+    var i = holders.len() - 1
+    while i >= 0 {
+        var wrap = nnode(N_LETEXPR, e.line)
+        wrap.kids.push(holders[i])
+        wrap.kids.push(lowered)
+        lowered = wrap
+        i -= 1
+    }
+    node_become(e, lowered)
+    return ce_inner(e)
+}
+
+// the member a pattern / `is` names on a union subject (bare, or Enum.Member), or ""
+fn union_member_name(pattern: Node) -> str {
+    var callee = pattern
+    if pattern.k == N_CALL { callee = pattern.kids[0] }
+    if callee.k == N_ID { return callee.name }
+    if callee.k == N_MEMBER and callee.kids[0].k == N_ID { return callee.name }
+    return ""
+}
+
+fn tag_of(hidden: str, line: int) -> Node {
+    var tag = nnode(N_MEMBER, line)
+    tag.name = "__tag"
+    tag.kids.push(name_node(hidden, line))
+    return tag
+}
+
+// Circle(r) in an arm: a view of the subject as the variant, then one let per name.
+fn union_bindings(pattern: Node, hidden: str, subjectType: int, memberNames: [str]) -> [Node] {
+    var decls: [Node] = []
+    if pattern.k != N_CALL { return decls }
+    let line = pattern.line
+    let variantIndex = index_in(memberNames, union_member_name(pattern))
+    let variantSd = g_structs[ty_sd[subjectType]].variants[variantIndex]
+    let payloadCount = g_structs[variantSd].fnames.len() - 1
+    if pattern.kids.len() - 1 != payloadCount {
+        die(line, "{union_member_name(pattern)} carries {payloadCount} value(s); the pattern names {pattern.kids.len() - 1}")
+    }
+    g_lower_count += 1
+    let viewName = "__z{g_lower_count}_variant"
+    var view = nnode(N_CAST, line)
+    view.mut = true
+    view.aux = C_NOP
+    view.ty = struct_of(variantSd)
+    view.kids.push(name_node(hidden, line))
+    view.kids.push(nnode(N_NONE, line))
+    var viewDecl = nnode(N_DECL, line)
+    viewDecl.name = viewName
+    viewDecl.kids.push(view)
+    viewDecl.kids.push(nnode(N_NONE, line))
+    decls.push(viewDecl)
+    for i in 1..pattern.kids.len() {
+        let binding = pattern.kids[i]
+        if binding.k != N_ID { die(line, "a pattern's values must be names, e.g. Circle(radius)") }
+        if binding.name == "_" { continue }
+        var field = nnode(N_MEMBER, line)
+        field.name = "{i - 1}"
+        field.kids.push(name_node(viewName, line))
+        var decl = nnode(N_DECL, line)
+        decl.name = binding.name
+        decl.kids.push(field)
+        decl.kids.push(nnode(N_NONE, line))
+        decls.push(decl)
+    }
+    return decls
 }
 
 // Box[int] from the template Box: resolve its field types with the type parameters
@@ -2183,23 +2413,23 @@ fn instantiate_struct(templateIndex: int, typeArgs: [int]) -> int {
     name = name + "]"
     let existing = find_struct(name)
     if existing >= 0 { return struct_of(existing) }
-    var fieldNames: [str] = []
-    var fieldTypes: [int] = []
-    var defaults: [Node] = []
-    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: template.line, defaults: defaults,
-                        tparams: no_names(), node: template.node, template: templateIndex, typeArgs: typeArgs})
-    let index = g_structs.len() - 1
-    g_struct_names[name] = index
+    let index = add_struct(name, template.line, no_names(), template.node, templateIndex, typeArgs)
+    let instance = g_structs[index]
     for i in 0..template.tparams.len() {
         g_tbind_names.push(template.tparams[i])
         g_tbind_types.push(typeArgs[i])
     }
-    for f in template.node.kids {
-        if f.k != N_FIELDDEF { continue }
-        fieldNames.push(f.name)
-        fieldTypes.push(resolve_type(f.kids[0]))
-        if f.kids.len() > 1 { defaults.push(f.kids[1]) }
-        else { defaults.push(nnode(N_NONE, f.line)) }
+    if template.node.mut {                       // an enum with values: its variants, per instance
+        for memberName in template.variantNames { instance.variantNames.push(memberName) }
+        make_variants(index)
+    } else {
+        for f in template.node.kids {
+            if f.k != N_FIELDDEF { continue }
+            instance.fnames.push(f.name)
+            instance.ftypes.push(resolve_type(f.kids[0]))
+            if f.kids.len() > 1 { instance.defaults.push(f.kids[1]) }
+            else { instance.defaults.push(nnode(N_NONE, f.line)) }
+        }
     }
     for i in 0..template.tparams.len() {
         let boundName = g_tbind_names.pop()
@@ -2223,6 +2453,7 @@ fn field_type_node(template: SDef, fieldIndex: int) -> Node {
 // the name impl methods are filed under, and print shows: the template's for an instance
 fn struct_base_name(sd: SDef) -> str {
     if sd.template >= 0 { return g_structs[sd.template].name }
+    if sd.unionIndex >= 0 { return sd.node.name }             // a variant prints as its member
     return sd.name
 }
 
@@ -2341,6 +2572,11 @@ fn value_comparable(t: int, asKey: bool, visiting: [int]) -> bool {
         visiting.push(ty_sd[t])
         for fieldType in g_structs[ty_sd[t]].ftypes {
             if not value_comparable(fieldType, asKey, visiting) { return false }
+        }
+        for variant in g_structs[ty_sd[t]].variants {
+            for fieldType in g_structs[variant].ftypes {
+                if not value_comparable(fieldType, asKey, visiting) { return false }
+            }
         }
         return true
     }
@@ -2674,6 +2910,14 @@ fn check_method(e: Node) -> int {
         }
         node_become(e, members)
         return ce_inner(e)
+    }
+    if recv.k == N_ID and env_find(recv.name) < 0 and find_struct(recv.name) >= 0 {
+        let unionIndex = find_struct(recv.name)
+        if g_structs[unionIndex].node.mut and index_in(g_structs[unionIndex].variantNames, c.name) >= 0 {
+            var memberValues: [Node] = []
+            for i in 1..e.kids.len() { memberValues.push(e.kids[i]) }
+            return construct_variant(e, unionIndex, c.name, memberValues)
+        }
     }
     if recv.k == N_ID and env_find(recv.name) < 0 and (find_struct(recv.name) >= 0 or find_enum(recv.name) >= 0) {
         let mname = recv.name + "." + c.name
@@ -3633,9 +3877,45 @@ fn ce_inner(e: Node) -> int {
         return list_of(el)
     }
     if e.k == N_TUPLE { return check_tuple(e, emptyIntList()) }
+    if e.k == N_IS {
+        let subjectType = ce(e.kids[0])
+        let memberName = union_member_name(e.kids[1])
+        g_lower_count += 1
+        let hidden = "__z{g_lower_count}_is"
+        var decl = nnode(N_DECL, e.line)
+        decl.name = hidden
+        decl.op = DECL_PRECHECKED
+        decl.kids.push(e.kids[0])
+        decl.kids.push(nnode(N_NONE, e.line))
+        var test = nnode(N_NONE, e.line)
+        if is_union(subjectType) {
+            let index = index_in(g_structs[ty_sd[subjectType]].variantNames, memberName)
+            if index < 0 { die(e.line, "'{memberName}' is not a member of {type_str(subjectType)}") }
+            var tagValue = nnode(N_INT, e.line)
+            tagValue.ival = index
+            test = binary_node(T_EQEQ, tag_of(hidden, e.line), tagValue, e.line)
+        } else if ty_kind[subjectType] == K_ENUM {
+            let ed = g_enums[ty_sd[subjectType]]
+            if index_in(ed.members, memberName) < 0 { die(e.line, "'{memberName}' is not a member of {ed.name}") }
+            var member = nnode(N_MEMBER, e.line)
+            member.name = memberName
+            member.kids.push(name_node(ed.name, e.line))
+            test = binary_node(T_EQEQ, name_node(hidden, e.line), member, e.line)
+        } else {
+            die(e.line, "'is' needs an enum value, got {type_str(subjectType)}")
+        }
+        var lowered = nnode(N_LETEXPR, e.line)
+        lowered.kids.push(decl)
+        lowered.kids.push(test)
+        node_become(e, lowered)
+        return ce_inner(e)
+    }
     if e.k == N_SLIT {
         let si = find_struct(e.name)
         if si < 0 { die(e.line, "unknown struct '{e.name}'") }
+        if not e.mut and (g_structs[si].node.mut or g_structs[si].unionIndex >= 0) {
+            die(e.line, "'{e.name}' is an enum; make a value with {e.name}.Member(...)")
+        }
         if g_structs[si].tparams.len() > 0 { return check_generic_slit(e, si) }
         let sd = g_structs[si]
         var seen: [bool] = []
@@ -3745,6 +4025,13 @@ fn ce_inner(e: Node) -> int {
                 die(e.line, "enum '{ed.name}' has no member '{e.name}'")
             }
         }
+        if e.kids[0].k == N_ID and env_find(e.kids[0].name) < 0 {   // Shape.Empty
+            let unionIndex = find_struct(e.kids[0].name)
+            if unionIndex >= 0 and g_structs[unionIndex].node.mut and index_in(g_structs[unionIndex].variantNames, e.name) >= 0 {
+                var noArgs: [Node] = []
+                return construct_variant(e, unionIndex, e.name, noArgs)
+            }
+        }
         let ot = ce(e.kids[0])
         if ty_kind[ot] == K_STRUCT {
             let sd = g_structs[ty_sd[ot]]
@@ -3779,7 +4066,7 @@ fn ce_expect(e: Node, want: int) -> int {
         let wanted = g_structs[ty_sd[want]]
         if wanted.template >= 0 and g_structs[wanted.template].name == e.name { e.name = wanted.name }
     }
-    if e.k == N_CALL { e.ival = want + 1 }                   // lets a generic call infer from it
+    if e.k == N_CALL or e.k == N_MEMBER { e.ival = want + 1 }   // lets a generic call infer from it
     if e.k == N_TUPLE and is_tuple(want) and g_structs[ty_sd[want]].fnames.len() == e.kids.len() {
         return check_tuple(e, g_structs[ty_sd[want]].ftypes)
     }
@@ -4141,6 +4428,10 @@ fn lower_match(s: Node, isExpression: bool) {
     if subjectKind == K_ENUM {
         for name in g_enums[ty_sd[subjectType]].members { memberNames.push(name) }
     }
+    let onUnion = is_union(subjectType)
+    if onUnion {
+        for name in g_structs[ty_sd[subjectType]].variantNames { memberNames.push(name) }
+    }
     if subjectKind == K_BOOL {
         memberNames.push("false")
         memberNames.push("true")
@@ -4156,13 +4447,45 @@ fn lower_match(s: Node, isExpression: bool) {
             elseBody = arm.kids[0]
         } else {
             var condition = nnode(N_NONE, arm.line)
+            var body = arm.kids[0]
             for p in 1..arm.kids.len() {
-                let test = pattern_test(arm.kids[p], hidden, subjectType, memberNames, covered)
+                var test = nnode(N_NONE, arm.line)
+                if onUnion {
+                    let memberName = union_member_name(arm.kids[p])
+                    let index = index_in(memberNames, memberName)
+                    if index < 0 { die(arm.line, "'{memberName}' is not a member of {type_str(subjectType)}") }
+                    if covered[index] { die(arm.line, "'{memberName}' is already matched by an earlier arm") }
+                    covered[index] = true
+                    var tagValue = nnode(N_INT, arm.line)
+                    tagValue.ival = index
+                    test = binary_node(T_EQEQ, tag_of(hidden, arm.line), tagValue, arm.line)
+                    let bindings = union_bindings(arm.kids[p], hidden, subjectType, memberNames)
+                    if bindings.len() > 0 {
+                        if arm.kids.len() > 2 { die(arm.line, "an arm that names a member's values has one pattern") }
+                        if isExpression {
+                            var i = bindings.len() - 1
+                            while i >= 0 {
+                                var wrap = nnode(N_LETEXPR, arm.line)
+                                wrap.kids.push(bindings[i])
+                                wrap.kids.push(body)
+                                body = wrap
+                                i -= 1
+                            }
+                        } else {
+                            var bound = nnode(N_PROG, arm.line)
+                            for decl in bindings { bound.kids.push(decl) }
+                            for statement in body.kids { bound.kids.push(statement) }
+                            body = bound
+                        }
+                    }
+                } else {
+                    test = pattern_test(arm.kids[p], hidden, subjectType, memberNames, covered)
+                }
                 if condition.k == N_NONE { condition = test }
                 else { condition = binary_node(T_OR, condition, test, arm.line) }
             }
             conditions.push(condition)
-            bodies.push(arm.kids[0])
+            bodies.push(body)
         }
     }
     var missing: [str] = []
@@ -4699,17 +5022,19 @@ fn check(prog: Node) {
             if find_struct(n.name) >= 0 { die(n.line, "duplicate struct '{n.name}'") }
             if g_alias_names.has(n.name) { die(n.line, "'{n.name}' is already a type alias") }
             if find_enum(n.name) >= 0 { die(n.line, "'{n.name}' is already an enum") }
-            var fnames: [str] = []
-            var ftypes: [int] = []
-            var defaults: [Node] = []
             var tparams: [str] = []
             for t in n.kids {
                 if t.k == N_TYNAME { tparams.push(t.name) }
             }
-            g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line, defaults: defaults,
-                                tparams: tparams, node: n, template: -1, typeArgs: emptyIntList()})
-            if not g_struct_names.has(n.name) { g_struct_names[n.name] = g_structs.len() - 1 }
-            n.refi = g_structs.len() - 1
+            n.refi = add_struct(n.name, n.line, tparams, n, -1, emptyIntList())
+            if n.mut {                               // enum with values: its member names
+                let union = g_structs[n.refi]
+                for m in n.kids {
+                    if m.k != N_FIELDDEF { continue }
+                    if index_in(union.variantNames, m.name) >= 0 { die(m.line, "duplicate member '{m.name}' in enum '{n.name}'") }
+                    union.variantNames.push(m.name)
+                }
+            }
         }
     }
     // pass 1a.5: interface names + method signatures (self excluded from sigs)
@@ -4746,6 +5071,10 @@ fn check(prog: Node) {
         g_file = n.file
         if n.k == N_STRUCTDEF {
             let sd = g_structs[n.refi]
+            if n.mut {                               // enum with values
+                if sd.tparams.len() == 0 { make_variants(n.refi) }
+                continue
+            }
             for f in n.kids {
                 if f.k != N_FIELDDEF { continue }
                 for k in 0..sd.fnames.len() {
@@ -9637,6 +9966,11 @@ fn gen_program(prog: Node) {
         if k == K_LIST {
             o(".quad 4")
             o(".quad __td{td_index(ty_el[t])}")
+        } else if k == K_STRUCT and is_union(t) {       // kind 9: a descriptor per variant
+            let sd = g_structs[ty_sd[t]]
+            o(".quad 9")
+            o(".quad {sd.variants.len()}")
+            for v in sd.variants { o(".quad __td{td_index(struct_of(v))}") }
         } else if k == K_STRUCT {
             let sd = g_structs[ty_sd[t]]
             o(".quad 5")
@@ -11672,6 +12006,10 @@ fn __emb_rt() -> str {
     p.push("        \}\n")
     p.push("        return rt_value_eq(load64(a), load64(b), load64(td + 8))\n")
     p.push("    \}\n")
+    p.push("    if kind == 9 \{                        // same variant, then its fields\n")
+    p.push("        if load64(a) != load64(b) \{ return 0 \}\n")
+    p.push("        return rt_value_eq(a, b, load64(td + 16 + load64(a) * 8))\n")
+    p.push("    \}\n")
     p.push("    if kind == 7 \{\n")
     p.push("        if load64(a) != load64(b) \{ return 0 \}\n")
     p.push("        let valueTd = load64(td + 16)\n")
@@ -11730,6 +12068,7 @@ fn __emb_rt() -> str {
     p.push("        if v == 0 \{ return 0 \}\n")
     p.push("        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))\n")
     p.push("    \}\n")
+    p.push("    if kind == 9 \{ return rt_value_hash(v, load64(td + 16 + load64(v) * 8)) \}\n")
     p.push("    return rx_hash_mix(0, v)\n")
     p.push("\}\n")
     p.push("// slot holding k, or -1\n")
@@ -12687,6 +13026,24 @@ fn __emb_rt() -> str {
     p.push("        \}\n")
     p.push("        if isTuple \{ rx_sb_byte(41) \}\n")
     p.push("        else \{ rx_sb_byte(125) \}\n")
+    p.push("    \} else if kind == 9 \{                 // enum with values: the variant, then its values\n")
+    p.push("        let variantTd = load64(td + 16 + load64(v) * 8)\n")
+    p.push("        let variantName = load64(variantTd + 8)\n")
+    p.push("        let fieldCount = load64(variantTd + 16)\n")
+    p.push("        rx_sb_bytes(variantName, rx_cstrlen(variantName))\n")
+    p.push("        if fieldCount > 1 \{\n")
+    p.push("            rx_sb_byte(40)\n")
+    p.push("            var f = 1\n")
+    p.push("            while f < fieldCount \{\n")
+    p.push("                if f > 1 \{\n")
+    p.push("                    rx_sb_byte(44)\n")
+    p.push("                    rx_sb_byte(32)\n")
+    p.push("                \}\n")
+    p.push("                rx_fmt_val(load64(v + f * 8), load64(variantTd + 32 + f * 16), 1)\n")
+    p.push("                f += 1\n")
+    p.push("            \}\n")
+    p.push("            rx_sb_byte(41)\n")
+    p.push("        \}\n")
     p.push("    \} else if kind == 8 \{                 // optional: none, or the wrapped value\n")
     p.push("        if v == 0 \{\n")
     p.push("            rx_sb_bytes(addr(\"none\") + 8, 4)\n")
@@ -16961,6 +17318,11 @@ fn wlayout() {
         if k == K_LIST {
             wd64(4)
             wpatch(0, td_index(ty_el[t]))
+        } else if k == K_STRUCT and is_union(t) {
+            let sd = g_structs[ty_sd[t]]
+            wd64(9)
+            wd64(sd.variants.len())
+            for v in sd.variants { wpatch(0, td_index(struct_of(v))) }
         } else if k == K_STRUCT {
             let sd = g_structs[ty_sd[t]]
             wd64(5)

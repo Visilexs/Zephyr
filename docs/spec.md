@@ -85,7 +85,9 @@ fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
 param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
 structdecl = "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
              "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
-enumdecl   = "enum" ID "{" ID { "," ID } "}" ;
+enumdecl   = "enum" ID [ "[" ID { "," ID } "]" ]
+             "{" member { "," member } "}" ;
+member     = ID [ "(" type { "," type } ")" ] ;              (* Circle(float) *)
 impldecl   = "impl" ID [ "[" ID { "," ID } "]" ] "{" { fndecl } "}" ; (* methods on a struct or enum *)
 ifacedecl  = "interface" ID "{" { fnsig } "}" ;               (* method signatures *)
 fnsig      = "fn" ID "(" [ param { "," param } ] ")" [ "->" type ] ;
@@ -113,7 +115,8 @@ for        = [ ID ":" ] "for" ID [ "," ID ] "in" expr
              [ ".." expr [ "step" expr ] ] block ;
 match      = "match" expr "{" { arm } [ "else" block ] "}" ;
 arm        = pattern { "," pattern } block ;
-pattern    = expr [ ".." expr ] ;                            (* value, range, or member *)
+pattern    = expr [ ".." expr ]                             (* value, range, or member *)
+           | ID "(" ID { "," ID } ")" ;                      (* a member's values, by name *)
 defer      = "defer" ( block | stmt ) ;
 return     = "return" [ expr ] ;
 
@@ -183,6 +186,39 @@ ordinal) and `as str` (the member name). `print` shows the member name.
 member's ordinal. `Color.all()` is the list of members in order and
 `Color.count` their number. An `impl Color { ... }` block adds methods and
 associated functions to an enum exactly as to a struct (§3.0.6).
+
+### 3.0.0.2 Enums with values
+
+    enum Shape {
+        Circle(float)
+        Rect(float, float)
+        Empty
+    }
+    let s = Shape.Rect(3, 4.5)
+    let area = match s {
+        Circle(r) { 3.14159 * r * r }
+        Rect(w, h) { w * h }
+        Empty { 0.0 }
+    }
+
+A member may carry values, listed as types in parentheses. Such an enum is a
+tagged union: `Shape.Circle(2.0)` makes one (a member without values is
+written `Shape.Empty`), and a `match` arm `Circle(r)` runs for that member
+with its values bound to the names given; `_` skips one. An arm that binds
+values has a single pattern. The coverage rules of §3.4.1 apply. `x is
+Circle` (or `x is Shape.Circle`) tests the member without binding; `is` also
+works on plain enums.
+
+An enum may take type parameters when its members carry values:
+
+    enum Result[T, E] { Ok(T), Err(E) }
+    fn parse_digit(text: str) -> Result[int, str] { ... return Result.Ok(7) }
+
+The type arguments are inferred from the values, or from the expected type
+(`let r: Result[int, str] = Result.Err("no")`). `impl` blocks work as for
+generic structs (§3.0.5.1). Enums with values are references, like structs;
+they print as `Rect(3, 4.5)`, compare with `==` member and values alike, and
+can be map keys when every value type can.
 
 ### 3.0.0 Type aliases and struct defaults
 

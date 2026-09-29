@@ -1029,6 +1029,10 @@ fn rt_value_eq(a: int, b: int, td: int) -> int {
         }
         return rt_value_eq(load64(a), load64(b), load64(td + 8))
     }
+    if kind == 9 {                        // same variant, then its fields
+        if load64(a) != load64(b) { return 0 }
+        return rt_value_eq(a, b, load64(td + 16 + load64(a) * 8))
+    }
     if kind == 7 {
         if load64(a) != load64(b) { return 0 }
         let valueTd = load64(td + 16)
@@ -1087,6 +1091,7 @@ fn rt_value_hash(v: int, td: int) -> int {
         if v == 0 { return 0 }
         return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))
     }
+    if kind == 9 { return rt_value_hash(v, load64(td + 16 + load64(v) * 8)) }
     return rx_hash_mix(0, v)
 }
 // slot holding k, or -1
@@ -2044,6 +2049,24 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
         }
         if isTuple { rx_sb_byte(41) }
         else { rx_sb_byte(125) }
+    } else if kind == 9 {                 // enum with values: the variant, then its values
+        let variantTd = load64(td + 16 + load64(v) * 8)
+        let variantName = load64(variantTd + 8)
+        let fieldCount = load64(variantTd + 16)
+        rx_sb_bytes(variantName, rx_cstrlen(variantName))
+        if fieldCount > 1 {
+            rx_sb_byte(40)
+            var f = 1
+            while f < fieldCount {
+                if f > 1 {
+                    rx_sb_byte(44)
+                    rx_sb_byte(32)
+                }
+                rx_fmt_val(load64(v + f * 8), load64(variantTd + 32 + f * 16), 1)
+                f += 1
+            }
+            rx_sb_byte(41)
+        }
     } else if kind == 8 {                 // optional: none, or the wrapped value
         if v == 0 {
             rx_sb_bytes(addr("none") + 8, 4)

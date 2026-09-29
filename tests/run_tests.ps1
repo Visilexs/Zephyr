@@ -349,6 +349,15 @@ $errors = @{
     "generic-struct-infer" = "struct B[T] { items: [T] }`nlet b = B{items: []}"
     "type-args-on-plain"   = "struct P { x: int }`nlet p: P[int] = P{x: 1}"
     "generic-field-clash"  = "struct B[T] { a: T`n b: T }`nlet x = B{a: 1, b: `"s`"}"
+    "enum-raw-literal"     = "enum S { A(int) }`nlet s = S{__tag: 0}"
+    "variant-arity"        = "enum S { A(int) }`nlet s = S.A(1, 2)"
+    "variant-no-values"    = "enum S { A(int), B }`nlet s = S.B(1)"
+    "match-union-missing"  = "enum S { A(int), B }`nlet s = S.B`nmatch s {`n A(x) { print(x) }`n}"
+    "pattern-arity"        = "enum S { A(int), B }`nlet s = S.B`nmatch s {`n A(x, y) { print(x) }`n else { }`n}"
+    "is-non-enum"          = "let x = 1`nprint(x is A)"
+    "generic-enum-plain"   = "enum E[T] { A, B }"
+    "generic-enum-infer"   = "enum R[T, E] { Ok(T), Err(E) }`nlet r = R.Ok(1)"
+    "float-payload-key"    = "enum S { A(float) }`nvar m: [S: int] = [:]"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -1339,6 +1348,85 @@ print(byPair[Pair{first: 1, second: 2}])
 '@
 $exp = @("Pair{first: 1, second: `"one`"}", "1 one", "Pair{first: 2, second: []}", "2 4", "4", "Stack{items: [`"n3`"]}", "0", "Pair{first: `"one`", second: 1}", "2", "true", "x") -join [Environment]::NewLine
 Check "lang-generic-structs" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: enums with values ----
+$r = RunSrc "lang_enum_values" @'
+enum Shape {
+    Circle(float)
+    Rect(float, float)
+    Empty
+}
+impl Shape {
+    fn area(self) -> float {
+        return match self {
+            Circle(r) { 3.0 * r * r }
+            Rect(w, h) { w * h }
+            Empty { 0.0 }
+        }
+    }
+}
+let shapes = [Shape.Circle(2), Shape.Rect(3, 4.5), Shape.Empty]
+for s in shapes { print("{s} {s.area()}") }
+print(shapes[0] is Circle)
+print(shapes[1] is Shape.Circle)
+print(shapes[1] == Shape.Rect(3, 4.5))
+print(shapes[2] == Shape.Empty)
+var total = 0.0
+for s in shapes {
+    match s {
+        Circle(r) { total += r }
+        Rect(_, h) { total += h }
+        else { }
+    }
+}
+print(total)
+enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+impl Result[T, E] {
+    fn is_ok(self) -> bool { return self is Ok }
+    fn unwrap_or(self, fallback: T) -> T {
+        return match self {
+            Ok(value) { value }
+            Err(_) { fallback }
+        }
+    }
+}
+fn parse_digit(text: str) -> Result[int, str] {
+    if text.len() == 1 and text.byte(0) >= 48 and text.byte(0) <= 57 { return Result.Ok(text.byte(0) - 48) }
+    return Result.Err("not a digit: {text}")
+}
+let good = parse_digit("7")
+let bad = parse_digit("x")
+print(good)
+print(bad)
+print("{good.is_ok()} {bad.is_ok()} {good.unwrap_or(0)} {bad.unwrap_or(-1)}")
+let explicit: Result[float, str] = Result.Err("none yet")
+print(explicit)
+enum Tree {
+    Leaf(int)
+    Node(Tree, Tree)
+}
+fn sum_tree(t: Tree) -> int {
+    return match t {
+        Leaf(v) { v }
+        Node(left, right) { sum_tree(left) + sum_tree(right) }
+    }
+}
+let tree = Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))
+print(sum_tree(tree))
+print(tree)
+var tally: [Tree: int] = [:]
+tally[Tree.Leaf(1)] = 1
+tally[tree] = 2
+print("{tally[Tree.Leaf(1)]} {tally[Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))]}")
+enum Color { Red, Green }
+let c = Color.Green
+print(c is Green)
+'@
+$exp = @("Circle(2) 12", "Rect(3, 4.5) 13.5", "Empty 0", "true", "false", "true", "true", "6.5", "Ok(7)", "Err(`"not a digit: x`")", "true false 7 -1", "Err(`"none yet`")", "6", "Node(Leaf(1), Node(Leaf(2), Leaf(3)))", "1 2", "true") -join [Environment]::NewLine
+Check "lang-enum-values" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"
