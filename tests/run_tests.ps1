@@ -322,6 +322,16 @@ $errors = @{
     "const-assign"         = "const C = 1`nC = 2"
     "chain-call-middle"    = "fn f() -> int { return 1 }`nprint(1 < f() < 3)"
     "multiline-dedent"     = "let s = `"`"`"`n  a`n b`n  `"`"`""
+    "match-not-exhaustive" = "enum C { A, B, D }`nlet c = C.A`nmatch c {`n A { print(1) }`n B { print(2) }`n}"
+    "match-duplicate-arm"  = "enum C { A, B }`nlet c = C.A`nmatch c {`n A { print(1) }`n A, B { print(2) }`n}"
+    "match-int-no-else"    = "let n = 3`nmatch n {`n 1 { print(1) }`n}"
+    "if-expr-no-else"      = "let v = if true { 1 }"
+    "if-expr-mixed-types"  = "let v = if true { 1 } else { `"a`" }"
+    "unknown-loop-label"   = "for i in 0..3 { break nope }"
+    "defer-return"         = "fn f() -> int {`n defer { return 1 }`n return 2`n}"
+    "step-zero"            = "for i in 0..3 step 0 { print(i) }"
+    "if-let-not-optional"  = "let v = 5`nif let w = v { print(w) }"
+    "labeled-break-exits"  = "fn g() -> int {`n inner: while true {`n  for i in 0..2 { break inner }`n }`n}"
 }
 foreach ($name in $errors.Keys) {
     $r = RunSrc "err_$name" $errors[$name]
@@ -1043,6 +1053,77 @@ print(pack[1].name())
 '@
 $exp = @("440", "-1", "1000.0025", "172", "8", "C:\dir\{raw}", "first", "  indented", "last", "1", "-7", "true", "1507", "true", "7", "fido") -join [Environment]::NewLine
 Check "lang-literals-operators" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: control flow ----
+$r = RunSrc "lang_control" @'
+enum Color { Red, Green, Blue }
+fn describe(c: Color) -> str {
+    match c {
+        Red { return "warm" }
+        Color.Green, Blue { return "cool" }
+    }
+}
+let c = Color.Green
+let name = match c {
+    Color.Red { "red" }
+    Green { "green" }
+    else { "other" }
+}
+print("{describe(Color.Red)} {describe(Color.Blue)} {name}")
+fn grade(score: int) -> str {
+    return match score {
+        90..101 { "A" }
+        80..90 { "B" }
+        else { "C" }
+    }
+}
+print(grade(95) + grade(85) + grade(12))
+let x = 7
+let size = if x > 10 { 1 } else if x > 5 { 2 } else { 3 }
+print("{if x > 5 { "big" } else { "small" }} {size} {if x % 2 == 0 { x / 2 } else { 3.5 }}")
+fn find(xs: [int], target: int) -> int? {
+    for i, v in xs {
+        if v == target { return i }
+    }
+    return none
+}
+if let at = find([4, 5, 6], 6) { print("found at {at}") } else { print("missing") }
+if let at = find([4, 5, 6], 9) { print("found at {at}") } else { print("missing") }
+let maybe = if x > 0 { x } else { none }
+print(maybe)
+var codes = 0
+for ch in "abc" { codes += ch }
+let ages = ["ann": 30]
+for k, v in ages { print("{codes} {k}={v}") }
+for i in 10..0 step -3 { emit("{i} ") }
+let stride = 4
+for i in 0..10 step stride { emit("{i} ") }
+print("")
+outer: for i in 0..5 {
+    for j in 0..5 {
+        if j == 2 { continue outer }
+        if i == 3 { break outer }
+        emit("{i}{j} ")
+    }
+}
+print("")
+fn work(n: int) -> [int] {
+    defer emit("cleanup ")
+    defer { emit("first ") }
+    if n > 5 { return [n * 2] }
+    return []
+}
+print(work(9))
+print(work(2))
+for i in 0..3 {
+    defer emit("d{i} ")
+    if i == 1 { continue }
+    emit("b{i} ")
+}
+print("")
+'@
+$exp = @("warm cool green", "ABC", "big 2 3.5", "found at 2", "missing", "7", "294 ann=30", "10 7 4 1 0 4 8 ", "00 01 10 11 20 21 ", "first cleanup [18]", "first cleanup []", "b0 d0 d1 b2 d2") -join [Environment]::NewLine
+Check "lang-control-flow" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

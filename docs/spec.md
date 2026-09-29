@@ -24,11 +24,11 @@ Keywords:
 
 ```
 fn let var const if else while for in return struct enum impl interface import
-as extern from true false none and or not break continue
+as extern from true false none and or not break continue match defer
 ```
 
-`from` is only a keyword after an `extern fn` signature; elsewhere it is an
-ordinary identifier.
+`from` is only a keyword after an `extern fn` signature, and `step` only after
+a range in a `for` header; elsewhere both are ordinary identifiers.
 
 Identifiers: `[A-Za-z_][A-Za-z0-9_]*`, excluding keywords.
 
@@ -96,15 +96,20 @@ basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
            | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ; (* function value *)
 
 block      = "{" { stmt } "}" ;
-stmt       = decl | assign | ifstmt | while | for | return
-           | "break" | "continue" | expr ;
+stmt       = decl | assign | ifstmt | while | for | match | defer | return
+           | "break" [ ID ] | "continue" [ ID ] | expr ;
 decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr ;
 assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" | "%="
                     | "&=" | "|=" | "^=" | "<<=" | ">>=" ) expr ;
 target     = ID | postfix "." ID | postfix "[" expr "]" ;
-ifstmt     = "if" expr block [ "else" ( ifstmt | block ) ] ;
-while      = "while" expr block ;
-for        = "for" ID "in" expr [ ".." expr ] block ;
+ifstmt     = "if" [ "let" ID "=" ] expr block [ "else" ( ifstmt | block ) ] ;
+while      = [ ID ":" ] "while" expr block ;
+for        = [ ID ":" ] "for" ID [ "," ID ] "in" expr
+             [ ".." expr [ "step" expr ] ] block ;
+match      = "match" expr "{" { arm } [ "else" block ] "}" ;
+arm        = pattern { "," pattern } block ;
+pattern    = expr [ ".." expr ] ;                            (* value, range, or member *)
+defer      = "defer" ( block | stmt ) ;
 return     = "return" [ expr ] ;
 
 expr       = orexpr ;
@@ -119,6 +124,9 @@ castexpr   = unary { "as" type } ;
 unary      = ( "-" | "not" | "~" ) unary | postfix ;
 postfix    = primary { "(" args ")" | "[" expr "]" | "." ID } ;
 primary    = INT | FLOAT | STRING | "true" | "false" | "none" | ID
+           | "if" expr "{" expr "}" "else" ( "{" expr "}" | primary ) (* if-expression *)
+           | "match" expr "{" { pattern { "," pattern } "{" expr "}" }
+                 [ "else" "{" expr "}" ] "}"                (* match expression *)
            | ID "{" fieldinits "}"                           (* struct literal *)
            | "fn" "(" [ param { "," param } ] ")" [ "->" type ] block  (* closure *)
            | "(" expr ")"
@@ -402,6 +410,85 @@ are shared: a call resolves builtins first, then declared functions.
 
 Method syntax is universal function call syntax: `a.f(b)` is exactly
 `f(a, b)` for any declared function `f` whose first parameter accepts `a`.
+
+### 3.4.1 Control flow
+
+**If-expressions.** `if c { a } else { b }` is also an expression, which is
+how Zephyr spells a conditional value (there is no `?:`). Each branch holds a
+single expression, `else` is required, and `else if` chains:
+
+    let size = if n > 100 { "big" } else if n > 10 { "medium" } else { "small" }
+
+Both branches must have the same type (an `int` branch widens to `float` to
+match a `float` one). If one branch is `none`, the result is the other
+branch's type made optional: `if found { i } else { none }` is an `int?`.
+
+**match.** A `match` compares one value against each arm's patterns in order
+and runs the first arm that matches:
+
+    match shape {
+        Circle { area = PI * r * r }
+        Square, Rect { area = w * h }
+        else { area = 0.0 }
+    }
+
+A pattern is a value compared with `==` (a literal, a const, any expression),
+a half-open range `lo..hi` (matches `lo <= x < hi`), or, when the subject is
+an enum, a member name — bare (`Red`) or qualified (`Color.Red`). Commas list
+several patterns for one arm. The subject is evaluated once. The optional
+`else` arm comes last.
+
+A match on an enum must cover every member (or have an `else` arm), and a
+match on a `bool` must cover both values; a match on any other type needs an
+`else` arm. Covering the same member twice is an error. Arms are written
+`pattern { ... }` — there is no `=>`.
+
+A match is also an expression. Each arm then holds a single expression, as an
+if-expression's branches do, and the same coverage rules apply:
+
+    let name = match c {
+        Red { "red" }
+        Green, Blue { "cool" }
+    }
+
+**if let.** `if let name = optional { ... } else { ... }` runs the first block
+with `name` bound to the unwrapped value when the optional holds one, and the
+`else` block (optional) when it is `none`.
+
+**Loops.** Beyond `for i in lo..hi` and `for x in list`:
+
+| Form | Iterates |
+|------|----------|
+| `for i in lo..hi step s` | from `lo` toward `hi` (excluded) in steps of `s`; a negative `s` counts down (`for i in 10..0 step -1` is 10 to 1). `s` may be any int expression; 0 panics. |
+| `for i, x in list` | index and element |
+| `for b in text` | the bytes of a `str`, as `int`s (`'a'` is also an `int`) |
+| `for i, b in text` | index and byte |
+| `for key in map` | the keys (same as `map.keys()`) |
+| `for key, value in map` | keys and their values |
+
+**Labeled loops.** A loop may carry a label, `name: for ...` or
+`name: while ...`, and `break name` / `continue name` then act on that loop
+instead of the innermost one:
+
+    outer: for row in grid {
+        for cell in row {
+            if cell == 0 { continue outer }
+            if cell < 0 { break outer }
+        }
+    }
+
+**defer.** `defer stmt` or `defer { ... }` schedules code to run when control
+leaves the enclosing block: at its end, and before every `return`, `break` or
+`continue` that exits it. Several defers in one block run in reverse order.
+A `return` value is computed before the deferred code runs. Deferred code may
+not itself return, break or continue out; a panic ends the program without
+running it.
+
+    fn save(path: str, data: str) {
+        let log = open_log()
+        defer log.close()
+        ...
+    }
 
 ### 3.5 Builtins
 

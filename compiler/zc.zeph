@@ -74,6 +74,8 @@ let T_CARETEQ = 67
 let T_SHLEQ = 68
 let T_SHREQ = 69
 let T_TILDE = 70
+let T_MATCH = 71
+let T_DEFER = 72
 
 let TOKNAMES = ["end of file", "newline", "int literal", "float literal", "string",
     "identifier", "fn", "let", "var", "if", "else", "while", "for", "in", "return",
@@ -81,7 +83,7 @@ let TOKNAMES = ["end of file", "newline", "int literal", "float literal", "strin
     "(", ")", "\{", "\}", "[", "]", ",", ":", ".", "..",
     "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "=", "->",
     "+=", "-=", "*=", "/=", "&", "|", "^", "<<", ">>", "enum", "import", "?", "none",
-    "impl", "interface", "extern", "const", "%=", "&=", "|=", "^=", "<<=", ">>=", "~"]
+    "impl", "interface", "extern", "const", "%=", "&=", "|=", "^=", "<<=", ">>=", "~", "match", "defer"]
 
 // ---------------- node kinds ----------------
 let N_NONE = 0
@@ -133,7 +135,15 @@ let N_IRET = 45      // an inlined body's return: result -> rax, jmp to the inli
 let N_IMPL = 46      // impl Type { methods } -- desugared into plain functions
 let N_INTERFACE = 47 // interface Name { method signatures }
 let N_IBOX = 48      // box a struct into an interface value {vtable, data}; refi=iface, op=vtable idx
-let N_EXTERN = 49    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
+let N_EXTERN = 49
+let N_IFEXPR = 50    // if c { a } else { b } as a value: kids = [cond, a, b]
+let N_LETEXPR = 51   // a hidden local, then a value: kids = [N_DECL, value]
+let N_MATCH = 52     // match statement (parse only; lowered by the checker): kids = [subject, N_ARM...]
+let N_MATCHEXPR = 53 // match as a value (parse only)
+let N_ARM = 54       // one match arm: kids = [body, patterns...]; mut = the else arm
+let N_FOR2 = 55      // for a, b in xs (parse only): name = a; kids = [xs, body, N_TYNAME b]
+let N_IFLET = 56     // if let name = optional (parse only): kids = [optional, then, else or N_NONE]
+let N_DEFER = 57     // defer block (parse only; lowered before checking): kids = [block]    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
 
 // ---------------- type kinds & table ----------------
 let K_INT = 0
@@ -241,6 +251,8 @@ let ID_GLOBAL = 2
 let ID_FUNC = 3     // N_ID naming a function used as a value (refi = g_fns index)
 let ID_CAPTURE = 4  // N_ID captured by the enclosing closure (slot = capture index)
 let DECL_CONST = 1  // N_DECL.ival: declared with `const`
+let DECL_PRECHECKED = 1   // N_DECL.op: the initializer was already type-checked
+let DECL_RETURN_TYPE = 2  // N_DECL.op: typed as the enclosing function's return value
 
 // ---------------- data structures ----------------
 struct Part { is_expr: bool, text: str, line: int }
@@ -280,6 +292,11 @@ var g_cur_user = false    // generating a main-file function body right now?
 var P_toks: [Tok] = []
 var P_pos = 0
 var P_nostruct = 0
+var g_label_names: [str] = []   // loop labels; a loop's ival is its label's index + 1
+var g_pending_label = 0         // set by `name:` for the loop that follows
+var g_loop_labels: [str] = []   // checker: labels of the enclosing loops, innermost last
+var g_lower_count = 0           // numbers the hidden names of each desugaring apart
+var g_holes_checked = false     // lower_snippet: holes are already type-checked
 // checker
 var g_structs: [SDef] = []
 var g_enums: [EDef] = []
@@ -638,6 +655,8 @@ fn kw_lookup(w: str) -> int {
     if w == "break" { return T_BREAK }
     if w == "continue" { return T_CONTINUE }
     if w == "const" { return T_CONST }
+    if w == "match" { return T_MATCH }
+    if w == "defer" { return T_DEFER }
     return T_IDENT
 }
 
@@ -1237,6 +1256,12 @@ fn p_structdef() -> Node {
 fn p_if() -> Node {
     let t = pnext()
     var n = nnode(N_IF, t.line)
+    if at(T_LET) {                       // if let name = optional { ... }
+        let letWord = pnext()
+        n.k = N_IFLET
+        n.name = expect(T_IDENT, "a name after 'if let'").s
+        let equals = expect(T_ASSIGN, "'='")
+    }
     n.kids.push(p_header_expr())
     n.kids.push(p_block())
     if else_ahead() {
@@ -1251,8 +1276,230 @@ fn p_if() -> Node {
     return n
 }
 
+fn take_label() -> int {
+    let label = g_pending_label
+    g_pending_label = 0
+    return label
+}
+
+fn label_name(labelId: int) -> str {
+    if labelId == 0 { return "" }
+    return g_label_names[labelId - 1]
+}
+
+// `{ expr }` -- a branch of an if-expression, or an arm of a match expression
+fn p_value_block(what: str) -> Node {
+    let open = expect(T_LB, "'\{'")
+    let save = P_nostruct
+    P_nostruct = 0
+    skip_nl()
+    let value = p_expr(1)
+    skip_nl()
+    P_nostruct = save
+    if not at(T_RB) { die(peek().line, "{what} holds a single expression, e.g. \{ x + 1 \}") }
+    let close = pnext()
+    return value
+}
+
+// if c { a } else { b } used as a value
+fn p_if_expr() -> Node {
+    let start = pnext()
+    var n = nnode(N_IFEXPR, start.line)
+    n.kids.push(p_header_expr())
+    n.kids.push(p_value_block("a branch of an if-expression"))
+    if not else_ahead() { die(start.line, "an if-expression needs an else branch: if c \{ a \} else \{ b \}") }
+    let elseWord = pnext()
+    if at(T_IF) { n.kids.push(p_if_expr()) }
+    else { n.kids.push(p_value_block("a branch of an if-expression")) }
+    return n
+}
+
+// match subject { pattern, pattern { body } ... else { body } }
+// Arms are tried in order. A pattern is a value to compare with, a `lo..hi`
+// range, or -- when the subject is an enum -- a bare member name.
+fn p_match(isExpression: bool) -> Node {
+    let start = pnext()
+    var n = nnode(N_MATCH, start.line)
+    if isExpression { n.k = N_MATCHEXPR }
+    n.kids.push(p_header_expr())
+    let open = expect(T_LB, "'\{' after the match subject")
+    skip_nl()
+    var sawElse = false
+    while not at(T_RB) {
+        if at(T_EOF) { die(peek().line, "expected '\}' to close the match") }
+        if sawElse { die(peek().line, "the else arm must be the last arm of a match") }
+        var patterns: [Node] = []
+        let armLine = peek().line
+        var isElse = false
+        if at(T_ELSE) {
+            let elseWord = pnext()
+            isElse = true
+            sawElse = true
+        } else {
+            var more = true
+            while more {
+                P_nostruct += 1
+                var pattern = p_expr(1)
+                if at(T_DOTDOT) {
+                    let dots = pnext()
+                    var range = nnode(N_BIN, pattern.line)
+                    range.op = T_DOTDOT
+                    range.kids.push(pattern)
+                    range.kids.push(p_expr(1))
+                    pattern = range
+                }
+                P_nostruct -= 1
+                patterns.push(pattern)
+                if at(T_COMMA) {
+                    let comma = pnext()
+                    skip_nl()
+                } else {
+                    more = false
+                }
+            }
+        }
+        var arm = nnode(N_ARM, armLine)
+        arm.mut = isElse
+        if isExpression { arm.kids.push(p_value_block("a match arm")) }
+        else { arm.kids.push(p_block()) }
+        for pattern in patterns { arm.kids.push(pattern) }
+        n.kids.push(arm)
+        skip_nl()
+    }
+    let close = expect(T_RB, "'\}'")
+    if n.kids.len() == 1 { die(start.line, "a match needs at least one arm") }
+    return n
+}
+
+// for i in a..b step s { body } counts from a toward b (b excluded) in steps of
+// s, downward when s is negative. The increment runs first in each pass, so a
+// `continue` still advances.
+fn p_step_loop(line: int, name: str, start: Node, limit: Node, stepValue: Node, body: Node, label: int) -> Node {
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}"
+    var zeroCheck = "if {hidden}_step == 0 \{ panic(\"a for loop step must not be 0\") \}"
+    var exitTest = "if {hidden}_step > 0 \{ if {hidden}_next >= {hidden}_end \{ break \} \} else \{ if {hidden}_next <= {hidden}_end \{ break \} \}"
+    if stepValue.k == N_INT {
+        if stepValue.ival == 0 { die(line, "a for loop step must not be 0") }
+        zeroCheck = ""
+        exitTest = "if {hidden}_next >= {hidden}_end \{ break \}"
+    } else if stepValue.k == N_NEG and stepValue.kids[0].k == N_INT {
+        if stepValue.kids[0].ival == 0 { die(line, "a for loop step must not be 0") }
+        zeroCheck = ""
+        exitTest = "if {hidden}_next <= {hidden}_end \{ break \}"
+    }
+    var lines: [str] = []
+    lines.push("if true \{")
+    lines.push("let {hidden}_start = __hole0")
+    lines.push("let {hidden}_end = __hole1")
+    lines.push("let {hidden}_step = __hole2")
+    lines.push(zeroCheck)
+    lines.push("var {hidden}_next = {hidden}_start - {hidden}_step")
+    lines.push("while true \{")
+    lines.push("{hidden}_next += {hidden}_step")
+    lines.push(exitTest)
+    lines.push("let {name} = {hidden}_next")
+    lines.push("if true \{")
+    lines.push("__body0")
+    lines.push("\}")
+    lines.push("\}")
+    lines.push("\}")
+    var holes: [Node] = []
+    holes.push(start)
+    holes.push(limit)
+    holes.push(stepValue)
+    var bodies: [Node] = []
+    bodies.push(body)
+    let lowered = lower_snippet(join_lines(lines), line, holes, bodies)
+    set_loop_label(lowered, label)
+    return lowered
+}
+
+fn join_lines(lines: [str]) -> str {
+    var parts: [str] = []
+    for text in lines {
+        parts.push(text)
+        parts.push("\n")
+    }
+    return parts.join()
+}
+
+// The first loop inside a lowered tree takes the label the source loop had.
+fn set_loop_label(node: Node, label: int) -> bool {
+    if node.k == N_WHILE or node.k == N_FORR or node.k == N_FORIN {
+        node.ival = label
+        return true
+    }
+    for kid in node.kids {
+        if set_loop_label(kid, label) { return true }
+    }
+    return false
+}
+
+// Parse a snippet of Zephyr (one statement) into nodes stamped with `line`. The
+// snippet names its inputs `__hole0`, `__hole1`, ... (replaced by holes[i]) and
+// marks where statement lists go with a bare `__body0`, `__body1`, ... line
+// (replaced by the statements of bodies[i]). Desugarings are written this way,
+// as readable source, instead of as hand-assembled trees. When
+// g_holes_checked is set the holes are already type-checked, so a declaration
+// initialised by one is marked to skip checking it again.
+fn lower_snippet(text: str, line: int, holes: [Node], bodies: [Node]) -> Node {
+    let saveToks = P_toks
+    let savePos = P_pos
+    let saveNostruct = P_nostruct
+    let program = parse(lex_src(text, line))
+    P_toks = saveToks
+    P_pos = savePos
+    P_nostruct = saveNostruct
+    let result = program.kids[0]
+    fill_snippet(result, line, holes, bodies)
+    return result
+}
+
+fn fill_snippet(node: Node, line: int, holes: [Node], bodies: [Node]) {
+    node.line = line
+    var filled: [Node] = []
+    for kid in node.kids {
+        if kid.k == N_ID and kid.name.starts_with("__hole") {
+            filled.push(holes[kid.name.sub(6, kid.name.len()) as int])
+            if node.k == N_DECL and g_holes_checked { node.op = DECL_PRECHECKED }
+        } else if kid.k == N_EXPRST and kid.kids[0].k == N_ID and kid.kids[0].name.starts_with("__body") {
+            let body = bodies[kid.kids[0].name.sub(6, kid.kids[0].name.len()) as int]
+            for statement in body.kids { filled.push(statement) }
+        } else {
+            fill_snippet(kid, line, holes, bodies)
+            filled.push(kid)
+        }
+    }
+    node.kids = filled
+}
+
 fn p_stmt() -> Node {
     let t = peek()
+    // label: for ... / label: while ...
+    if t.t == T_IDENT and P_pos + 2 < P_toks.len() and P_toks[P_pos + 1].t == T_COLON {
+        let loopWord = P_toks[P_pos + 2].t
+        if loopWord == T_FOR or loopWord == T_WHILE {
+            let labelWord = pnext()
+            let colon = pnext()
+            g_label_names.push(t.s)
+            g_pending_label = g_label_names.len()
+            return p_stmt()
+        }
+    }
+    if t.t == T_MATCH { return p_match(false) }
+    if t.t == T_DEFER {
+        let x = pnext()
+        var n = nnode(N_DEFER, t.line)
+        if at(T_LB) {
+            n.kids.push(p_block())
+        } else {
+            var block = nnode(N_PROG, t.line)
+            block.kids.push(p_stmt())
+            n.kids.push(block)
+        }
+        return n
+    }
     if t.t == T_LET or t.t == T_VAR or t.t == T_CONST {
         let x = pnext()
         var n = nnode(N_DECL, t.line)
@@ -1273,26 +1520,53 @@ fn p_stmt() -> Node {
     if t.t == T_WHILE {
         let x = pnext()
         var n = nnode(N_WHILE, t.line)
+        n.ival = take_label()
         n.kids.push(p_header_expr())
         n.kids.push(p_block())
         return n
     }
     if t.t == T_FOR {
         let x = pnext()
+        let label = take_label()
         let name = expect(T_IDENT, "loop variable").s
+        var secondName = ""
+        if at(T_COMMA) {
+            let comma = pnext()
+            secondName = expect(T_IDENT, "second loop variable").s
+        }
         let y = expect(T_IN, "'in'")
         let first = p_header_expr()
         if at(T_DOTDOT) {
+            if secondName != "" { die(t.line, "a range loop has one loop variable") }
             let z = pnext()
+            let limit = p_header_expr()
+            if at(T_IDENT) and peek().s == "step" {
+                let stepWord = pnext()
+                let stepValue = p_header_expr()
+                return p_step_loop(t.line, name, first, limit, stepValue, p_block(), label)
+            }
             var n = nnode(N_FORR, t.line)
             n.name = name
+            n.ival = label
             n.kids.push(first)
-            n.kids.push(p_header_expr())
+            n.kids.push(limit)
             n.kids.push(p_block())
             return n
         }
+        if secondName != "" {
+            var pair = nnode(N_FOR2, t.line)
+            pair.name = name
+            pair.ival = label
+            pair.kids.push(first)
+            pair.kids.push(p_block())
+            var second = nnode(N_TYNAME, t.line)
+            second.name = secondName
+            pair.kids.push(second)
+            return pair
+        }
         var n = nnode(N_FORIN, t.line)
         n.name = name
+        n.ival = label
         n.kids.push(first)
         n.kids.push(p_block())
         return n
@@ -1304,13 +1578,12 @@ fn p_stmt() -> Node {
         else { n.kids.push(p_expr(1)) }
         return n
     }
-    if t.t == T_BREAK {
+    if t.t == T_BREAK or t.t == T_CONTINUE {
         let x = pnext()
-        return nnode(N_BRK, t.line)
-    }
-    if t.t == T_CONTINUE {
-        let x = pnext()
-        return nnode(N_CONT, t.line)
+        var n = nnode(N_BRK, t.line)
+        if t.t == T_CONTINUE { n.k = N_CONT }
+        if at(T_IDENT) { n.name = pnext().s }       // break outer
+        return n
     }
     if t.t == T_FN or t.t == T_STRUCT {
         die(t.line, "'{TOKNAMES[t.t]}' declarations are only allowed at the top level")
@@ -1551,6 +1824,8 @@ fn p_primary() -> Node {
         let x = pnext()
         return nnode(N_NONELIT, t.line)
     }
+    if t.t == T_IF { return p_if_expr() }
+    if t.t == T_MATCH { return p_match(true) }
     if t.t == T_FN {                       // closure literal: fn(x: int) -> int { ... }
         let x = pnext()
         var n = nnode(N_FNLIT, t.line)
@@ -2326,6 +2601,8 @@ fn check_fnlit(e: Node) -> int {
     let save_loop = g_in_loop
     let save_slots = g_nslots
     let save_glob = g_at_global
+    let saveLabels = g_loop_labels
+    g_loop_labels = no_strs()
     g_ret = ret
     g_is_top = false
     g_in_loop = 0
@@ -2338,6 +2615,7 @@ fn check_fnlit(e: Node) -> int {
     g_in_loop = save_loop
     g_nslots = save_slots
     g_at_global = save_glob
+    g_loop_labels = saveLabels
 
     let b = g_lam_base.pop()
     let cn = g_lam_names.pop()
@@ -2806,6 +3084,38 @@ fn ce_inner(e: Node) -> int {
     }
     if e.k == N_NONELIT { return TI_NONE }
     if e.k == N_FNLIT { return check_fnlit(e) }
+    if e.k == N_IFEXPR {
+        if ty_kind[ce(e.kids[0])] != K_BOOL { die(e.line, "if condition must be bool") }
+        let thenType = ce(e.kids[1])
+        let elseType = ce_expect(e.kids[2], thenType)
+        let thenKind = ty_kind[thenType]
+        let elseKind = ty_kind[elseType]
+        if thenKind == K_VOID or elseKind == K_VOID { die(e.line, "both branches of an if-expression must produce a value") }
+        var result = thenType
+        if thenKind == K_NONE and elseKind != K_NONE and elseKind != K_OPT { result = opt_of(elseType) }
+        else if elseKind == K_NONE and thenKind != K_NONE and thenKind != K_OPT { result = opt_of(thenType) }
+        else if fits(thenType, elseType) { result = thenType }
+        else if fits(elseType, thenType) { result = elseType }
+        else { die(e.line, "the branches of this if-expression have different types: {type_str(thenType)} and {type_str(elseType)}") }
+        if ty_kind[result] == K_NONE { die(e.line, "cannot infer the type of an if-expression whose branches are both none") }
+        e.kids[1] = coerce(e.kids[1], result, "if-expression branch")
+        e.kids[2] = coerce(e.kids[2], result, "if-expression branch")
+        return result
+    }
+    if e.k == N_LETEXPR {
+        env_push()
+        let saveGlobal = g_at_global
+        g_at_global = false
+        check_stmt(e.kids[0])
+        let valueType = ce(e.kids[1])
+        g_at_global = saveGlobal
+        env_pop()
+        return valueType
+    }
+    if e.k == N_MATCHEXPR {
+        lower_match(e, true)
+        return ce_inner(e)
+    }
     if e.k == N_SOME { return e.ty }          // built by coerce; already typed
     if e.k == N_MAPLIT {
         if e.kids.len() == 0 {
@@ -3000,37 +3310,55 @@ fn check_block(blk: Node) {
 }
 
 fn check_stmt(s: Node) {
+    if s.k == N_MATCH {
+        lower_match(s, false)
+        check_stmt(s)
+        return
+    }
+    if s.k == N_IFLET {
+        lower_if_let(s)
+        check_stmt(s)
+        return
+    }
+    if s.k == N_FOR2 {
+        lower_for(s, ce(s.kids[0]))
+        check_stmt(s)
+        return
+    }
+    if s.k == N_DEFER { die(s.line, "internal: defer was not lowered") }
     if s.k == N_DECL {
         if env_find_here(s.name) { die(s.line, "'{s.name}' is already declared in this scope") }
         if is_builtin_name(s.name) { die(s.line, "'{s.name}' is a builtin name") }
         // a global may not collide with a function; a local may shadow one
         if g_at_global and find_fn(s.name) >= 0 { die(s.line, "'{s.name}' is already a function") }
+        var annotation = -1                  // the declared type, if any
+        if s.kids[1].k != N_NONE { annotation = resolve_type(s.kids[1]) }
+        if s.op == DECL_RETURN_TYPE { annotation = g_ret }
         var ty = TI_VOID
-        if s.kids[0].k == N_LIST and s.kids[0].kids.len() == 0 {
-            if s.kids[1].k == N_NONE {
-                die(s.line, "cannot infer the type of an empty list; annotate it")
-            }
-            ty = resolve_type(s.kids[1])
+        if s.op == DECL_PRECHECKED {
+            ty = s.kids[0].ty
+            if ty_kind[ty] == K_VOID or ty_kind[ty] == K_NONE { die(s.line, "this expression has no usable value") }
+        } else if s.kids[0].k == N_LIST and s.kids[0].kids.len() == 0 {
+            if annotation < 0 { die(s.line, "cannot infer the type of an empty list; annotate it") }
+            ty = annotation
             if ty_kind[ty] != K_LIST { die(s.line, "empty list literal needs a list type") }
             s.kids[0].ty = ty
         } else if s.kids[0].k == N_MAPLIT and s.kids[0].kids.len() == 0 {
-            if s.kids[1].k == N_NONE {
-                die(s.line, "cannot infer the type of an empty map; annotate it")
-            }
-            ty = resolve_type(s.kids[1])
+            if annotation < 0 { die(s.line, "cannot infer the type of an empty map; annotate it") }
+            ty = annotation
             if ty_kind[ty] != K_MAP { die(s.line, "empty map literal '[:]' needs a map type") }
             s.kids[0].ty = ty
         } else {
             var et = TI_VOID
-            if s.kids[1].k != N_NONE { et = ce_expect(s.kids[0], resolve_type(s.kids[1])) }
+            if annotation >= 0 { et = ce_expect(s.kids[0], annotation) }
             else { et = ce(s.kids[0]) }
             if ty_kind[et] == K_VOID { die(s.line, "cannot assign a void expression") }
-            if ty_kind[et] == K_NONE and s.kids[1].k == N_NONE {
+            if ty_kind[et] == K_NONE and annotation < 0 {
                 die(s.line, "cannot infer the type of 'none'; annotate it, e.g. let {s.name}: int? = none")
             }
             ty = et
-            if s.kids[1].k != N_NONE {
-                ty = resolve_type(s.kids[1])
+            if annotation >= 0 {
+                ty = annotation
                 s.kids[0] = coerce(s.kids[0], ty, "initializer")
             }
         }
@@ -3085,7 +3413,9 @@ fn check_stmt(s: Node) {
     if s.k == N_WHILE {
         if ty_kind[ce(s.kids[0])] != K_BOOL { die(s.line, "while condition must be bool") }
         g_in_loop += 1
+        g_loop_labels.push(label_name(s.ival))
         check_block(s.kids[1])
+        let poppedLabel = g_loop_labels.pop()
         g_in_loop -= 1
         return
     }
@@ -3100,14 +3430,20 @@ fn check_stmt(s: Node) {
         env_push()
         env_add(s.name, TI_INT, false, ID_LOCAL, s.slot)
         g_in_loop += 1
+        g_loop_labels.push(label_name(s.ival))
         check_block(s.kids[2])
+        let poppedLabel = g_loop_labels.pop()
         g_in_loop -= 1
         env_pop()
         return
     }
     if s.k == N_FORIN {
         let lt = ce(s.kids[0])
-        if ty_kind[lt] != K_LIST { die(s.line, "for-in needs a list, got {type_str(lt)}") }
+        if ty_kind[lt] != K_LIST {
+            lower_for(s, lt)                 // str bytes, map keys
+            check_stmt(s)
+            return
+        }
         s.slot = g_nslots
         g_nslots += 1
         s.aux = g_nslots
@@ -3117,7 +3453,9 @@ fn check_stmt(s: Node) {
         env_push()
         env_add(s.name, ty_el[lt], false, ID_LOCAL, s.slot)
         g_in_loop += 1
+        g_loop_labels.push(label_name(s.ival))
         check_block(s.kids[1])
+        let poppedLabel = g_loop_labels.pop()
         g_in_loop -= 1
         env_pop()
         return
@@ -3135,6 +3473,16 @@ fn check_stmt(s: Node) {
     }
     if s.k == N_BRK or s.k == N_CONT {
         if g_in_loop == 0 { die(s.line, "'break'/'continue' outside a loop") }
+        if s.name != "" {                    // break outer: how many loops out
+            var depth = -1
+            var i = g_loop_labels.len() - 1
+            while i >= 0 and depth < 0 {
+                if g_loop_labels[i] == s.name { depth = g_loop_labels.len() - 1 - i }
+                i -= 1
+            }
+            if depth < 0 { die(s.line, "no enclosing loop is labeled '{s.name}'") }
+            s.ival = depth
+        }
         return
     }
     if s.k == N_EXPRST {
@@ -3178,6 +3526,373 @@ fn hoist_consts(prog: Node, firstUserNode: int) {
     prog.kids = reordered
 }
 
+// ---- lowering of control-flow sugar ----
+// Each construct below is rewritten, in place, into statements the rest of
+// the compiler already handles, once its subject has been type-checked. The
+// subject is checked exactly once: it becomes the initializer of a hidden,
+// already-checked local.
+
+fn binary_node(op: int, left: Node, right: Node, line: int) -> Node {
+    var n = nnode(N_BIN, line)
+    n.op = op
+    n.kids.push(left)
+    n.kids.push(right)
+    return n
+}
+
+fn name_node(name: str, line: int) -> Node {
+    var n = nnode(N_ID, line)
+    n.name = name
+    return n
+}
+
+// if true { block } -- a statement that is just a scope
+fn scope_statement(block: Node) -> Node {
+    var always = nnode(N_BOOL, block.line)
+    always.ival = 1
+    var n = nnode(N_IF, block.line)
+    n.kids.push(always)
+    n.kids.push(block)
+    n.kids.push(nnode(N_NONE, block.line))
+    return n
+}
+
+fn index_in(names: [str], name: str) -> int {
+    for i in 0..names.len() {
+        if names[i] == name { return i }
+    }
+    return -1
+}
+
+fn join_names(names: [str]) -> str {
+    var parts: [str] = []
+    for i in 0..names.len() {
+        if i > 0 { parts.push(", ") }
+        parts.push(names[i])
+    }
+    return parts.join()
+}
+
+// The test one match pattern makes against the hidden subject variable, marking
+// which enum members (or bools) it covers.
+fn pattern_test(pattern: Node, hidden: str, subjectType: int, memberNames: [str], covered: [bool]) -> Node {
+    let line = pattern.line
+    if pattern.k == N_BIN and pattern.op == T_DOTDOT {        // lo..hi
+        let atLeast = binary_node(T_LE, pattern.kids[0], name_node(hidden, line), line)
+        let below = binary_node(T_LT, name_node(hidden, line), pattern.kids[1], line)
+        return binary_node(T_AND, atLeast, below, line)
+    }
+    var value = pattern
+    var memberName = ""
+    if ty_kind[subjectType] == K_ENUM {
+        let enumName = g_enums[ty_sd[subjectType]].name
+        if pattern.k == N_ID and index_in(memberNames, pattern.name) >= 0 {
+            memberName = pattern.name                     // bare `Red` means Color.Red
+            value = nnode(N_MEMBER, line)
+            value.name = memberName
+            value.kids.push(name_node(enumName, line))
+        } else if pattern.k == N_MEMBER and pattern.kids[0].k == N_ID and pattern.kids[0].name == enumName {
+            memberName = pattern.name
+        }
+    }
+    if ty_kind[subjectType] == K_BOOL and pattern.k == N_BOOL {
+        memberName = "false"
+        if pattern.ival == 1 { memberName = "true" }
+    }
+    if memberName != "" {
+        let index = index_in(memberNames, memberName)
+        if index >= 0 {
+            if covered[index] { die(line, "'{memberName}' is already matched by an earlier arm") }
+            covered[index] = true
+        }
+    }
+    return binary_node(T_EQEQ, name_node(hidden, line), value, line)
+}
+
+// match: `if true { let hidden = subject; if hidden == p1 or hidden == p2 {..}
+// else if .. else {..} }`, or as a value, a let-expression over the same chain
+// built from if-expressions. Every enum member (or both bools) must be covered,
+// or an else arm given; any other subject type needs the else arm.
+fn lower_match(s: Node, isExpression: bool) {
+    let subjectType = ce(s.kids[0])
+    let subjectKind = ty_kind[subjectType]
+    if subjectKind == K_VOID or subjectKind == K_NONE { die(s.line, "the match subject has no value") }
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_match"
+    var decl = nnode(N_DECL, s.line)
+    decl.name = hidden
+    decl.op = DECL_PRECHECKED
+    decl.kids.push(s.kids[0])
+    decl.kids.push(nnode(N_NONE, s.line))
+    var memberNames: [str] = []
+    if subjectKind == K_ENUM {
+        for name in g_enums[ty_sd[subjectType]].members { memberNames.push(name) }
+    }
+    if subjectKind == K_BOOL {
+        memberNames.push("false")
+        memberNames.push("true")
+    }
+    var covered: [bool] = []
+    for name in memberNames { covered.push(false) }
+    var conditions: [Node] = []
+    var bodies: [Node] = []
+    var elseBody = nnode(N_NONE, s.line)
+    for a in 1..s.kids.len() {
+        let arm = s.kids[a]
+        if arm.mut {
+            elseBody = arm.kids[0]
+        } else {
+            var condition = nnode(N_NONE, arm.line)
+            for p in 1..arm.kids.len() {
+                let test = pattern_test(arm.kids[p], hidden, subjectType, memberNames, covered)
+                if condition.k == N_NONE { condition = test }
+                else { condition = binary_node(T_OR, condition, test, arm.line) }
+            }
+            conditions.push(condition)
+            bodies.push(arm.kids[0])
+        }
+    }
+    var missing: [str] = []
+    for i in 0..covered.len() {
+        if not covered[i] { missing.push(memberNames[i]) }
+    }
+    if elseBody.k == N_NONE {
+        if memberNames.len() == 0 {
+            die(s.line, "a match on {type_str(subjectType)} needs an else arm")
+        }
+        if missing.len() > 0 {
+            die(s.line, "this match on {type_str(subjectType)} does not cover {join_names(missing)}; add an arm for each or an else arm")
+        }
+        let lastTest = conditions.pop()     // every case is covered: the last arm needs no test
+        elseBody = bodies.pop()
+    }
+    var chain = elseBody
+    var i = conditions.len() - 1
+    while i >= 0 {
+        if isExpression {
+            var choice = nnode(N_IFEXPR, s.line)
+            choice.kids.push(conditions[i])
+            choice.kids.push(bodies[i])
+            choice.kids.push(chain)
+            chain = choice
+        } else {
+            var otherwise = chain
+            if chain.k != N_PROG {
+                otherwise = nnode(N_PROG, s.line)
+                otherwise.kids.push(chain)
+            }
+            var branch = nnode(N_IF, s.line)
+            branch.kids.push(conditions[i])
+            branch.kids.push(bodies[i])
+            branch.kids.push(otherwise)
+            chain = branch
+        }
+        i -= 1
+    }
+    if isExpression {
+        var result = nnode(N_LETEXPR, s.line)
+        result.kids.push(decl)
+        result.kids.push(chain)
+        node_become(s, result)
+        return
+    }
+    var body = nnode(N_PROG, s.line)
+    body.kids.push(decl)
+    if chain.k == N_PROG { body.kids.push(scope_statement(chain)) }
+    else { body.kids.push(chain) }
+    node_become(s, scope_statement(body))
+}
+
+// if let name = optional { A } else { B }
+//   => if true { let hidden = optional
+//                if hidden.has() { let name = hidden.get(); A } else { B } }
+fn lower_if_let(s: Node) {
+    let optionalType = ce(s.kids[0])
+    if ty_kind[optionalType] != K_OPT {
+        die(s.line, "'if let' needs an optional value, got {type_str(optionalType)}")
+    }
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_value"
+    var lines: [str] = []
+    lines.push("if true \{")
+    lines.push("let {hidden} = __hole0")
+    lines.push("if {hidden}.has() \{")
+    lines.push("let {s.name} = {hidden}.get()")
+    lines.push("if true \{")
+    lines.push("__body0")
+    lines.push("\}")
+    var bodies: [Node] = []
+    bodies.push(s.kids[1])
+    if s.kids[2].k != N_NONE {
+        lines.push("\} else \{")
+        lines.push("__body1")
+        bodies.push(s.kids[2])
+    }
+    lines.push("\}")
+    lines.push("\}")
+    var holes: [Node] = []
+    holes.push(s.kids[0])
+    g_holes_checked = true
+    let lowered = lower_snippet(join_lines(lines), s.line, holes, bodies)
+    g_holes_checked = false
+    node_become(s, lowered)
+}
+
+// for ch in text      => bytes of a str, as ints
+// for key in map      => the map's keys
+// for i, x in list    => index and element (also over a str: index and byte)
+// for key, value in map
+fn lower_for(s: Node, iterableType: int) {
+    let kind = ty_kind[iterableType]
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_items"
+    var loopHead = ""
+    var element = ""
+    if s.k == N_FOR2 {
+        let second = s.kids[2].name
+        if kind == K_LIST {
+            loopHead = "for {s.name} in 0..{hidden}.len()"
+            element = "let {second} = {hidden}[{s.name}]"
+        } else if kind == K_STR {
+            loopHead = "for {s.name} in 0..{hidden}.len()"
+            element = "let {second} = {hidden}.byte({s.name})"
+        } else if kind == K_MAP {
+            loopHead = "for {s.name} in {hidden}.keys()"
+            element = "let {second} = {hidden}[{s.name}]"
+        } else {
+            die(s.line, "'for {s.name}, {second} in ...' needs a list, str or map, got {type_str(iterableType)}")
+        }
+    } else if kind == K_STR {
+        loopHead = "for {hidden}_i in 0..{hidden}.len()"
+        element = "let {s.name} = {hidden}.byte({hidden}_i)"
+    } else if kind == K_MAP {
+        loopHead = "for {s.name} in {hidden}.keys()"
+    } else {
+        die(s.line, "for-in needs a list, str or map, got {type_str(iterableType)}")
+    }
+    var lines: [str] = []
+    lines.push("if true \{")
+    lines.push("let {hidden} = __hole0")
+    lines.push(loopHead + " \{")
+    lines.push(element)
+    lines.push("if true \{")
+    lines.push("__body0")
+    lines.push("\}")
+    lines.push("\}")
+    lines.push("\}")
+    var holes: [Node] = []
+    holes.push(s.kids[0])
+    var bodies: [Node] = []
+    bodies.push(s.kids[1])
+    g_holes_checked = true
+    let lowered = lower_snippet(join_lines(lines), s.line, holes, bodies)
+    g_holes_checked = false
+    let labelled = set_loop_label(lowered, s.ival)
+    node_become(s, lowered)
+}
+
+// ---- defer ----
+// `defer X` runs X whenever control leaves the enclosing block: at its end and
+// before every return, break or continue that exits it, later defers first. It
+// is lowered before checking by copying X to each of those exits. A panic ends
+// the program without running deferred code.
+fn lower_defers(node: Node) {
+    for kid in node.kids { lower_defers(kid) }
+    if node.k == N_PROG { lower_defer_block(node) }
+}
+
+fn lower_defer_block(block: Node) {
+    var deferAt = -1
+    for i in 0..block.kids.len() {
+        if deferAt < 0 and block.kids[i].k == N_DEFER { deferAt = i }
+    }
+    if deferAt < 0 { return }
+    let deferred = block.kids[deferAt].kids[0]
+    check_defer_body(deferred, 0)
+    var rest = nnode(N_PROG, block.line)
+    for i in deferAt + 1..block.kids.len() { rest.kids.push(block.kids[i]) }
+    lower_defer_block(rest)
+    var innerLabels: [str] = []
+    defer_exits(rest, deferred, 0, innerLabels)
+    rest.kids.push(defer_copy(deferred))
+    var kept: [Node] = []
+    for i in 0..deferAt { kept.push(block.kids[i]) }
+    for statement in rest.kids { kept.push(statement) }
+    block.kids = kept
+}
+
+fn check_defer_body(node: Node, loopDepth: int) {
+    for kid in node.kids {
+        if kid.k == N_RET { die(kid.line, "deferred code cannot return") }
+        if (kid.k == N_BRK or kid.k == N_CONT) and (loopDepth == 0 or kid.name != "") {
+            die(kid.line, "deferred code cannot break or continue out of itself")
+        }
+        if kid.k == N_FNLIT { continue }
+        var depth = loopDepth
+        if kid.k == N_WHILE or kid.k == N_FORR or kid.k == N_FORIN or kid.k == N_FOR2 { depth += 1 }
+        check_defer_body(kid, depth)
+    }
+}
+
+fn defer_copy(deferred: Node) -> Node {
+    return scope_statement(clone_node(deferred))
+}
+
+// Put a copy of the deferred code in front of every exit from `block`.
+fn defer_exits(block: Node, deferred: Node, loopDepth: int, innerLabels: [str]) {
+    for i in 0..block.kids.len() {
+        let statement = block.kids[i]
+        let k = statement.k
+        if k == N_RET {
+            block.kids[i] = defer_before_return(statement, deferred)
+        } else if k == N_BRK or k == N_CONT {
+            var leaves = loopDepth == 0
+            if statement.name != "" { leaves = index_in(innerLabels, statement.name) < 0 }
+            if leaves {
+                var wrapper = defer_copy(deferred)
+                wrapper.kids[1].kids.push(statement)
+                block.kids[i] = wrapper
+            }
+        } else if k == N_WHILE or k == N_FORR or k == N_FORIN or k == N_FOR2 {
+            innerLabels.push(label_name(statement.ival))
+            defer_descend(statement, deferred, loopDepth + 1, innerLabels)
+            let popped = innerLabels.pop()
+        } else if k != N_FN {
+            defer_descend(statement, deferred, loopDepth, innerLabels)
+        }
+    }
+}
+
+fn defer_descend(node: Node, deferred: Node, loopDepth: int, innerLabels: [str]) {
+    for kid in node.kids {
+        if kid.k == N_PROG { defer_exits(kid, deferred, loopDepth, innerLabels) }
+        else if kid.k != N_FNLIT { defer_descend(kid, deferred, loopDepth, innerLabels) }
+    }
+}
+
+// return e  =>  if true { let result = e; <deferred>; return result }
+fn defer_before_return(ret: Node, deferred: Node) -> Node {
+    var body = nnode(N_PROG, ret.line)
+    if ret.kids[0].k == N_NONE {
+        body.kids.push(defer_copy(deferred))
+        body.kids.push(ret)
+        return scope_statement(body)
+    }
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_result"
+    var decl = nnode(N_DECL, ret.line)
+    decl.name = hidden
+    decl.op = DECL_RETURN_TYPE
+    decl.kids.push(ret.kids[0])
+    decl.kids.push(nnode(N_NONE, ret.line))
+    body.kids.push(decl)
+    body.kids.push(defer_copy(deferred))
+    var finalReturn = nnode(N_RET, ret.line)
+    finalReturn.kids.push(name_node(hidden, ret.line))
+    body.kids.push(finalReturn)
+    return scope_statement(body)
+}
+
 fn always_returns(stmts: [Node]) -> bool {
     for s in stmts {
         if s.k == N_RET { return true }
@@ -3195,13 +3910,18 @@ fn always_returns(stmts: [Node]) -> bool {
 
 fn is_true_literal(e: Node) -> bool { return e.k == N_BOOL and e.ival == 1 }
 
-// Does this loop body hold a `break` that leaves this loop (not a nested one)?
-fn breaks_out(body: Node) -> bool {
-    for s in body.kids {
-        if s.k == N_BRK { return true }
-        if s.k == N_IF {
-            if breaks_out(s.kids[1]) { return true }
-            if s.kids[2].k != N_NONE and breaks_out(s.kids[2]) { return true }
+// Does this loop body hold a `break` (or a labeled break or continue) that
+// leaves this loop?
+fn breaks_out(body: Node) -> bool { return exits_loop(body, 0) }
+
+fn exits_loop(block: Node, nesting: int) -> bool {
+    for s in block.kids {
+        if s.k == N_BRK and s.ival >= nesting { return true }
+        if s.k == N_CONT and s.ival > nesting { return true }
+        var inner = nesting
+        if s.k == N_WHILE or s.k == N_FORR or s.k == N_FORIN { inner = nesting + 1 }
+        for kid in s.kids {
+            if kid.k == N_PROG and exits_loop(kid, inner) { return true }
         }
     }
     return false
@@ -3512,6 +4232,8 @@ fn check_fn_body(f: FDef) {
     let save_loop = g_in_loop
     let save_slots = g_nslots
     let save_glob = g_at_global
+    let saveLabels = g_loop_labels
+    g_loop_labels = no_strs()
     g_ret = f.ret
     g_is_top = false
     g_in_loop = 0
@@ -3524,6 +4246,7 @@ fn check_fn_body(f: FDef) {
     g_in_loop = save_loop
     g_nslots = save_slots
     g_at_global = save_glob
+    g_loop_labels = saveLabels
     env_pop()
     if ty_kind[f.ret] != K_VOID and not always_returns(f.body.kids) {
         die(f.line, "function '{f.name}' must return {type_str(f.ret)} on all paths")
@@ -5313,6 +6036,7 @@ fn has_call(e: Node) -> bool {
     }
     if k == N_CALL or k == N_STRLIT or k == N_FNLIT or k == N_SOME or k == N_MAPLIT or k == N_LIST or k == N_IBOX { return true }
     if k == N_INLINE or k == N_IRET { return true }   // inlined body may make an FFI call that clobbers xmm
+    if k == N_LETEXPR { return true }                  // its declaration stores through the runtime
     if k == N_CAST and (e.aux == C_TOSTR or e.aux == C_S2I or e.aux == C_S2F) { return true }
     if k == N_INDEX and ty_kind[e.kids[0].ty] == K_MAP { return true }
     if k == N_BIN and e.aux == BC_STR { return true }
@@ -6984,6 +7708,22 @@ fn gen_expr(e: Node) {
         o("mov eax, {e.ival}")
         return
     }
+    if e.k == N_IFEXPR {
+        let otherwise = newlabel()
+        let done = newlabel()
+        gen_cond(e.kids[0], otherwise, true)
+        gen_expr(e.kids[1])
+        o("jmp {lbl(done)}")
+        olabel(otherwise)
+        gen_expr(e.kids[2])
+        olabel(done)
+        return
+    }
+    if e.k == N_LETEXPR {
+        gen_stmt(e.kids[0], 0)
+        gen_expr(e.kids[1])
+        return
+    }
     if e.k == N_STRLIT {
         // a lone text part is a constant string -- no building needed
         if e.kids.len() == 1 and e.kids[0].k == N_STRTXT {
@@ -7938,12 +8678,12 @@ fn gen_stmt(s: Node, retlabel: int) {
         o("jmp {lbl(g_inlend[g_inlend.len() - 1])}")
         return
     }
-    if s.k == N_BRK {
-        o("jmp {lbl(g_brk[g_brk.len() - 1])}")
+    if s.k == N_BRK {                         // ival: how many loops out
+        o("jmp {lbl(g_brk[g_brk.len() - 1 - s.ival])}")
         return
     }
     if s.k == N_CONT {
-        o("jmp {lbl(g_cont[g_cont.len() - 1])}")
+        o("jmp {lbl(g_cont[g_cont.len() - 1 - s.ival])}")
         return
     }
     if s.k == N_EXPRST {
@@ -11530,7 +12270,7 @@ fn __emb_rt() -> str {
     return p.join()
 }
 fn embedded_runtime() -> str { return __emb_rt() }
-fn embedded_count() -> int { return 4 }
+fn embedded_count() -> int { return 8 }
 fn __emb_0() -> str {
     var p: [str] = []
     p.push("// Raw byte buffers: a fixed-size, GC-managed, non-moving region you can lay C\n")
@@ -11761,6 +12501,168 @@ fn __emb_0() -> str {
 }
 fn __emb_1() -> str {
     var p: [str] = []
+    p.push("// Typed kernel32 wrappers. Linux builds route these calls through os/linux.zeph.\n")
+    p.push("// env and run currently panic explicitly on Linux. Paths/names reject NUL bytes.\n")
+    p.push("import \"std/bytes.zeph\"\n")
+    p.push("\n")
+    p.push("fn io_cstring(value: str) -> Bytes \{\n")
+    p.push("    for i in 0..value.len() \{ assert(value.byte(i) != 0, \"io: embedded NUL\") \}\n")
+    p.push("    return cbytes(value)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Reads one byte at a time so successive calls never consume the next line.\n")
+    p.push("fn read_line() -> str? \{\n")
+    p.push("    let inputHandle = win(\"GetStdHandle\", -10)\n")
+    p.push("    let buffer = Bytes.new(8)\n")
+    p.push("    let countBuffer = Bytes.new(8)\n")
+    p.push("    var pieces: [str] = []\n")
+    p.push("    while true \{\n")
+    p.push("        let success = win(\"ReadFile\", inputHandle, buffer.addr(), 1, countBuffer.addr(), 0)\n")
+    p.push("        // A closed anonymous pipe reports ERROR_BROKEN_PIPE rather than success.\n")
+    p.push("        if success == 0 \{\n")
+    p.push("            assert(win(\"GetLastError\") == 109, \"read_line: ReadFile failed\")\n")
+    p.push("            countBuffer.put32(0, 0)\n")
+    p.push("        \}\n")
+    p.push("        if countBuffer.get32(0) == 0 \{\n")
+    p.push("            if pieces.len() == 0 \{ return none \}\n")
+    p.push("            break\n")
+    p.push("        \}\n")
+    p.push("        let byteValue = buffer.get8(0)\n")
+    p.push("        if byteValue == 10 \{ break \}\n")
+    p.push("        pieces.push(chr(byteValue))\n")
+    p.push("    \}\n")
+    p.push("    if pieces.len() > 0 and pieces[pieces.len() - 1] == chr(13) \{ pieces.pop() \}\n")
+    p.push("    return pieces.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Write all bytes, handling short writes. The caller owns and closes the handle.\n")
+    p.push("fn io_write(handle: int, data: str) \{\n")
+    p.push("    let buffer = cbytes(data)\n")
+    p.push("    let countBuffer = Bytes.new(8)\n")
+    p.push("    var written = 0\n")
+    p.push("    while written < data.len() \{\n")
+    p.push("        let requested = min(data.len() - written, 2147483647)\n")
+    p.push("        let success = win(\"WriteFile\", handle, buffer.at(written), requested, countBuffer.addr(), 0)\n")
+    p.push("        let amount = countBuffer.get32(0)\n")
+    p.push("        assert(success != 0 and amount > 0 and amount <= requested, \"io: WriteFile failed\")\n")
+    p.push("        written += amount\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn eprint(text: str) \{ io_write(win(\"GetStdHandle\", -12), text + \"\\n\") \}\n")
+    p.push("fn exit(code: int) \{ let ignored = win(\"ExitProcess\", code) \}\n")
+    p.push("\n")
+    p.push("// FILE_APPEND_DATA + OPEN_ALWAYS makes each write append, without truncating.\n")
+    p.push("fn append_file(path: str, data: str) \{\n")
+    p.push("    let filename = io_cstring(path)\n")
+    p.push("    let handle = win(\"CreateFileA\", filename.addr(), 4, 7, 0, 4, 128, 0)\n")
+    p.push("    assert(handle != -1, \"append_file: cannot open file\")\n")
+    p.push("    io_write(handle, data)\n")
+    p.push("    let closed = win(\"CloseHandle\", handle)\n")
+    p.push("    assert(closed != 0, \"append_file: close failed\")\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn file_exists(path: str) -> bool \{\n")
+    p.push("    let filename = io_cstring(path)\n")
+    p.push("    let attributes = win(\"GetFileAttributesA\", filename.addr())\n")
+    p.push("    return (attributes & 4294967295) != 4294967295\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn delete_file(path: str) -> bool \{\n")
+    p.push("    let filename = io_cstring(path)\n")
+    p.push("    return win(\"DeleteFileA\", filename.addr()) != 0\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Enumerates immediate entry names in OS order, excluding dot entries.\n")
+    p.push("fn list_dir(path: str) -> [str] \{\n")
+    p.push("    let directory = io_cstring(path)\n")
+    p.push("    let attributes = win(\"GetFileAttributesA\", directory.addr()) & 4294967295\n")
+    p.push("    assert(attributes != 4294967295 and (attributes & 16) != 0, \"list_dir: not a directory\")\n")
+    p.push("    let pattern = io_cstring(path + \"/*\")\n")
+    p.push("    let entry = Bytes.new(320)\n")
+    p.push("    var names: [str] = []\n")
+    p.push("    let handle = win(\"FindFirstFileA\", pattern.addr(), entry.addr())\n")
+    p.push("    if handle == -1 \{\n")
+    p.push("        assert(win(\"GetLastError\") == 18 or win(\"GetLastError\") == 2, \"list_dir: enumeration failed\")\n")
+    p.push("        return names\n")
+    p.push("    \}\n")
+    p.push("    var more = true\n")
+    p.push("    while more \{\n")
+    p.push("        var length = 0\n")
+    p.push("        while length < 260 and entry.get8(44 + length) != 0 \{ length += 1 \}\n")
+    p.push("        let name = entry.get_str(44, length)\n")
+    p.push("        if name != \".\" and name != \"..\" \{ names.push(name) \}\n")
+    p.push("        more = win(\"FindNextFileA\", handle, entry.addr()) != 0\n")
+    p.push("    \}\n")
+    p.push("    let lastError = win(\"GetLastError\")\n")
+    p.push("    let closed = win(\"FindClose\", handle)\n")
+    p.push("    assert(lastError == 18 and closed != 0, \"list_dir: enumeration failed\")\n")
+    p.push("    return names\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Preserve the distinction between an absent variable and a present empty value.\n")
+    p.push("fn env(name: str) -> str? \{\n")
+    p.push("    let variable = io_cstring(name)\n")
+    p.push("    var capacity = 256\n")
+    p.push("    while true \{\n")
+    p.push("        let buffer = Bytes.new(capacity)\n")
+    p.push("        let cleared = win(\"SetLastError\", 0)\n")
+    p.push("        let length = win(\"GetEnvironmentVariableA\", variable.addr(), buffer.addr(), capacity)\n")
+    p.push("        if length == 0 \{\n")
+    p.push("            if win(\"GetLastError\") == 203 \{ return none \}\n")
+    p.push("            assert(win(\"GetLastError\") == 0, \"env: lookup failed\")\n")
+    p.push("            return \"\"\n")
+    p.push("        \}\n")
+    p.push("        if length < capacity \{ return buffer.get_str(0, length) \}\n")
+    p.push("        capacity = length\n")
+    p.push("    \}\n")
+    p.push("    return none\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn now_ms() -> int \{ return win(\"GetTickCount64\") \}\n")
+    p.push("\n")
+    p.push("// Divide first, retaining the fractional tick count without overflowing ticks*1e9.\n")
+    p.push("fn now_ns() -> int \{\n")
+    p.push("    let counter = Bytes.new(8)\n")
+    p.push("    let frequency = Bytes.new(8)\n")
+    p.push("    assert(win(\"QueryPerformanceFrequency\", frequency.addr()) != 0, \"now_ns: no performance frequency\")\n")
+    p.push("    assert(win(\"QueryPerformanceCounter\", counter.addr()) != 0, \"now_ns: no performance counter\")\n")
+    p.push("    let ticks = counter.get64(0)\n")
+    p.push("    let ticksPerSecond = frequency.get64(0)\n")
+    p.push("    assert(ticksPerSecond > 0, \"now_ns: invalid frequency\")\n")
+    p.push("    let remainder = ticks % ticksPerSecond\n")
+    p.push("    var fraction = 0\n")
+    p.push("    if ticksPerSecond <= 9223372036 \{ fraction = remainder * 1000000000 / ticksPerSecond \}\n")
+    p.push("    else \{ fraction = ((remainder as float) * 1000000000.0 / (ticksPerSecond as float)) as int \}\n")
+    p.push("    return (ticks / ticksPerSecond) * 1000000000 + fraction\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn sleep_ms(milliseconds: int) \{\n")
+    p.push("    assert(milliseconds >= 0 and milliseconds < 4294967295, \"sleep_ms: duration out of range\")\n")
+    p.push("    let ignored = win(\"Sleep\", milliseconds)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Windows command line, no implicit shell; pass cmd.exe /c for shell commands.\n")
+    p.push("fn run(command: str) -> int \{\n")
+    p.push("    let commandBuffer = io_cstring(command)\n")
+    p.push("    let startup = Bytes.new(104)\n")
+    p.push("    startup.put32(0, 104)\n")
+    p.push("    let process = Bytes.new(24)\n")
+    p.push("    let created = win(\"CreateProcessA\", 0, commandBuffer.addr(), 0, 0, 0, 0, 0, 0, startup.addr(), process.addr())\n")
+    p.push("    assert(created != 0, \"run: CreateProcess failed\")\n")
+    p.push("    let threadClosed = win(\"CloseHandle\", process.get64(8))\n")
+    p.push("    let waitResult = win(\"WaitForSingleObject\", process.get64(0), 4294967295)\n")
+    p.push("    let result = Bytes.new(8)\n")
+    p.push("    let success = win(\"GetExitCodeProcess\", process.get64(0), result.addr())\n")
+    p.push("    let processClosed = win(\"CloseHandle\", process.get64(0))\n")
+    p.push("    assert(threadClosed != 0 and waitResult == 0 and success != 0 and processClosed != 0, \"run: wait failed\")\n")
+    p.push("    return result.get32(0)\n")
+    p.push("\}\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_2() -> str {
+    var p: [str] = []
     p.push("// std/list.zeph — generic list algorithms, written in Zephyr.\n")
     p.push("//\n")
     p.push("// These used to be compiler builtins, because without generics there was no way\n")
@@ -11768,117 +12670,298 @@ fn __emb_1() -> str {
     p.push("// library code now. Call them directly, or as methods via UFCS:\n")
     p.push("//\n")
     p.push("//     import \"std/list.zeph\"\n")
-    p.push("//     print(xs.contains(3))        // == contains(xs, 3)\n")
+    p.push("//     print(items.contains(3))        // == contains(items, 3)\n")
     p.push("//\n")
-    p.push("// Instantiation is what type-checks each use: `contains` compiles `v == x` for\n")
+    p.push("// Instantiation is what type-checks each use: `contains` compiles `item == target` for\n")
     p.push("// the concrete T, so it works for int/str/enum and is rejected for element types\n")
     p.push("// that have no ==. No trait system needed — the monomorphisation is the contract.\n")
     p.push("\n")
-    p.push("fn contains[T](xs: [T], x: T) -> bool \{\n")
-    p.push("    for v in xs \{\n")
-    p.push("        if v == x \{ return true \}\n")
+    p.push("fn contains[T](items: [T], target: T) -> bool \{\n")
+    p.push("    for item in items \{\n")
+    p.push("        if item == target \{ return true \}\n")
     p.push("    \}\n")
     p.push("    return false\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn index_of[T](xs: [T], x: T) -> int \{\n")
-    p.push("    for i in 0..xs.len() \{\n")
-    p.push("        if xs[i] == x \{ return i \}\n")
+    p.push("fn index_of[T](items: [T], target: T) -> int \{\n")
+    p.push("    for i in 0..items.len() \{\n")
+    p.push("        if items[i] == target \{ return i \}\n")
     p.push("    \}\n")
     p.push("    return 0 - 1\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn reverse[T](xs: [T]) \{\n")
+    p.push("fn reverse[T](items: [T]) \{\n")
     p.push("    var i = 0\n")
-    p.push("    var j = xs.len() - 1\n")
+    p.push("    var j = items.len() - 1\n")
     p.push("    while i < j \{\n")
-    p.push("        let t = xs[i]\n")
-    p.push("        xs[i] = xs[j]\n")
-    p.push("        xs[j] = t\n")
+    p.push("        let saved = items[i]\n")
+    p.push("        items[i] = items[j]\n")
+    p.push("        items[j] = saved\n")
     p.push("        i += 1\n")
     p.push("        j -= 1\n")
     p.push("    \}\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn slice[T](xs: [T], lo: int, hi: int) -> [T] \{\n")
-    p.push("    if lo < 0 or hi < lo or hi > xs.len() \{ panic(\"slice out of range\") \}\n")
+    p.push("fn slice[T](items: [T], low: int, high: int) -> [T] \{\n")
+    p.push("    if low < 0 or high < low or high > items.len() \{ panic(\"slice out of range\") \}\n")
     p.push("    var out: [T] = []\n")
-    p.push("    for i in lo..hi \{ out.push(xs[i]) \}\n")
+    p.push("    for i in low..high \{ out.push(items[i]) \}\n")
     p.push("    return out\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn first[T](xs: [T]) -> T? \{\n")
-    p.push("    if xs.len() == 0 \{ return none \}\n")
-    p.push("    return xs[0]\n")
+    p.push("fn first[T](items: [T]) -> T? \{\n")
+    p.push("    if items.len() == 0 \{ return none \}\n")
+    p.push("    return items[0]\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn last[T](xs: [T]) -> T? \{\n")
-    p.push("    if xs.len() == 0 \{ return none \}\n")
-    p.push("    return xs[xs.len() - 1]\n")
+    p.push("fn last[T](items: [T]) -> T? \{\n")
+    p.push("    if items.len() == 0 \{ return none \}\n")
+    p.push("    return items[items.len() - 1]\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn map[T, U](xs: [T], f: fn(T) -> U) -> [U] \{\n")
+    p.push("fn map[T, U](items: [T], transform: fn(T) -> U) -> [U] \{\n")
     p.push("    var out: [U] = []\n")
-    p.push("    for x in xs \{ out.push(f(x)) \}\n")
+    p.push("    for item in items \{ out.push(transform(item)) \}\n")
     p.push("    return out\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn filter[T](xs: [T], keep: fn(T) -> bool) -> [T] \{\n")
+    p.push("fn filter[T](items: [T], keep: fn(T) -> bool) -> [T] \{\n")
     p.push("    var out: [T] = []\n")
-    p.push("    for x in xs \{\n")
-    p.push("        if keep(x) \{ out.push(x) \}\n")
+    p.push("    for item in items \{\n")
+    p.push("        if keep(item) \{ out.push(item) \}\n")
     p.push("    \}\n")
     p.push("    return out\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn fold[T, A](xs: [T], start: A, f: fn(A, T) -> A) -> A \{\n")
-    p.push("    var acc = start\n")
-    p.push("    for x in xs \{ acc = f(acc, x) \}\n")
-    p.push("    return acc\n")
+    p.push("fn fold[T, A](items: [T], start: A, combine: fn(A, T) -> A) -> A \{\n")
+    p.push("    var accumulator = start\n")
+    p.push("    for item in items \{ accumulator = combine(accumulator, item) \}\n")
+    p.push("    return accumulator\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn any[T](xs: [T], pred: fn(T) -> bool) -> bool \{\n")
-    p.push("    for x in xs \{\n")
-    p.push("        if pred(x) \{ return true \}\n")
+    p.push("fn any[T](items: [T], predicate: fn(T) -> bool) -> bool \{\n")
+    p.push("    for item in items \{\n")
+    p.push("        if predicate(item) \{ return true \}\n")
     p.push("    \}\n")
     p.push("    return false\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn all[T](xs: [T], pred: fn(T) -> bool) -> bool \{\n")
-    p.push("    for x in xs \{\n")
-    p.push("        if not pred(x) \{ return false \}\n")
+    p.push("fn all[T](items: [T], predicate: fn(T) -> bool) -> bool \{\n")
+    p.push("    for item in items \{\n")
+    p.push("        if not predicate(item) \{ return false \}\n")
     p.push("    \}\n")
     p.push("    return true\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("fn count[T](xs: [T], x: T) -> int \{\n")
-    p.push("    var n = 0\n")
-    p.push("    for v in xs \{\n")
-    p.push("        if v == x \{ n += 1 \}\n")
+    p.push("fn count[T](items: [T], target: T) -> int \{\n")
+    p.push("    var matchCount = 0\n")
+    p.push("    for item in items \{\n")
+    p.push("        if item == target \{ matchCount += 1 \}\n")
     p.push("    \}\n")
-    p.push("    return n\n")
+    p.push("    return matchCount\n")
     p.push("\}\n")
     p.push("\n")
-    p.push("// in-place insertion sort with a caller-supplied ordering.\n")
-    p.push("// cmp(a, b) < 0 when a should come first. For the common orders, `.sort()` is a\n")
-    p.push("// native heapsort in the runtime and is what you want on large lists.\n")
-    p.push("fn sort_by[T](xs: [T], cmp: fn(T, T) -> int) \{\n")
-    p.push("    var i = 1\n")
-    p.push("    while i < xs.len() \{\n")
-    p.push("        let v = xs[i]\n")
-    p.push("        var j = i - 1\n")
-    p.push("        while j >= 0 and cmp(xs[j], v) > 0 \{\n")
-    p.push("            xs[j + 1] = xs[j]\n")
-    p.push("            j -= 1\n")
+    p.push("// Stable bottom-up merge sort: O(n log n) comparisons, O(n) scratch space.\n")
+    p.push("// compare(left, right) < 0 when left should come first; ties retain their original order.\n")
+    p.push("fn sort_by[T](items: [T], compare: fn(T, T) -> int) \{\n")
+    p.push("    let length = items.len()\n")
+    p.push("    if length < 2 \{ return \}\n")
+    p.push("    let scratch = slice(items, 0, length)\n")
+    p.push("    var width = 1\n")
+    p.push("    while width < length \{\n")
+    p.push("        var start = 0\n")
+    p.push("        while start < length \{\n")
+    p.push("            let middle = min(start + width, length)\n")
+    p.push("            let end = min(middle + width, length)\n")
+    p.push("            var leftIndex = start\n")
+    p.push("            var rightIndex = middle\n")
+    p.push("            for i in start..end \{\n")
+    p.push("                if leftIndex < middle and (rightIndex >= end or compare(items[leftIndex], items[rightIndex]) <= 0) \{\n")
+    p.push("                    scratch[i] = items[leftIndex]\n")
+    p.push("                    leftIndex += 1\n")
+    p.push("                \} else \{\n")
+    p.push("                    scratch[i] = items[rightIndex]\n")
+    p.push("                    rightIndex += 1\n")
+    p.push("                \}\n")
+    p.push("            \}\n")
+    p.push("            start = end\n")
     p.push("        \}\n")
-    p.push("        xs[j + 1] = v\n")
-    p.push("        i += 1\n")
+    p.push("        for i in 0..length \{ items[i] = scratch[i] \}\n")
+    p.push("        width *= 2\n")
     p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Reductions require a nonempty list and the corresponding operator on T.\n")
+    p.push("fn sum[T](items: [T]) -> T \{\n")
+    p.push("    if items.len() == 0 \{ panic(\"sum: empty list\") \}\n")
+    p.push("    var total = items[0]\n")
+    p.push("    for i in 1..items.len() \{ total = total + items[i] \}\n")
+    p.push("    return total\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn min_of[T](items: [T]) -> T \{\n")
+    p.push("    if items.len() == 0 \{ panic(\"min_of: empty list\") \}\n")
+    p.push("    var smallest = items[0]\n")
+    p.push("    for i in 1..items.len() \{ if items[i] < smallest \{ smallest = items[i] \} \}\n")
+    p.push("    return smallest\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn max_of[T](items: [T]) -> T \{\n")
+    p.push("    if items.len() == 0 \{ panic(\"max_of: empty list\") \}\n")
+    p.push("    var largest = items[0]\n")
+    p.push("    for i in 1..items.len() \{ if items[i] > largest \{ largest = items[i] \} \}\n")
+    p.push("    return largest\n")
     p.push("\}\n")
     p.push("\n")
     return p.join()
 }
-fn __emb_2() -> str {
+fn __emb_3() -> str {
+    var p: [str] = []
+    p.push("// Public math facade. Existing dependency libraries can import math_core.zeph\n")
+    p.push("// to retain the original API without introducing the E global into callers.\n")
+    p.push("import \"std/math_core.zeph\"\n")
+    p.push("let E = 2.718281828459045\n")
+    p.push("\n")
+    p.push("// Integral-valued doubles above 2^52 need no conversion (which could overflow).\n")
+    p.push("fn trunc(x: float) -> float \{\n")
+    p.push("    if is_nan(x) or fabs(x) >= 4503599627370496.0 or x == 0.0 \{ return x \}\n")
+    p.push("    let integral = (x as int) as float\n")
+    p.push("    if integral == 0.0 \{ return frombits(bits(x) & (1 << 63)) \}\n")
+    p.push("    return integral\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn floor(x: float) -> float \{\n")
+    p.push("    let integral = trunc(x)\n")
+    p.push("    if x < integral \{ return integral - 1.0 \}\n")
+    p.push("    return integral\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn ceil(x: float) -> float \{\n")
+    p.push("    let integral = trunc(x)\n")
+    p.push("    if x > integral \{ return integral + 1.0 \}\n")
+    p.push("    return integral\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Half away from zero; avoid x+0.5 rounding up values just below a half.\n")
+    p.push("fn round(x: float) -> float \{\n")
+    p.push("    let integral = trunc(x)\n")
+    p.push("    if x - integral >= 0.5 \{ return integral + 1.0 \}\n")
+    p.push("    if integral - x >= 0.5 \{ return integral - 1.0 \}\n")
+    p.push("    return integral\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn clamp(x: float, low: float, high: float) -> float \{\n")
+    p.push("    assert(low <= high, \"clamp: reversed bounds\")\n")
+    p.push("    if x < low \{ return low \}\n")
+    p.push("    if x > high \{ return high \}\n")
+    p.push("    return x\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn clamp_int(x: int, low: int, high: int) -> int \{\n")
+    p.push("    assert(low <= high, \"clamp_int: reversed bounds\")\n")
+    p.push("    if x < low \{ return low \}\n")
+    p.push("    if x > high \{ return high \}\n")
+    p.push("    return x\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn is_inf(x: float) -> bool \{ return (bits(x) & 9223372036854775807) == (2047 << 52) \}\n")
+    p.push("fn exp(x: float) -> float \{ return fexp(x) \}\n")
+    p.push("fn ln(x: float) -> float \{ return fln(x) \}\n")
+    p.push("fn log10(x: float) -> float \{ return fln(x) / 2.302585092994046 \}\n")
+    p.push("fn log2(x: float) -> float \{ return fln(x) / LN2 \}\n")
+    p.push("\n")
+    p.push("// Integer powers use repeated squaring, retaining exact results when representable.\n")
+    p.push("fn powf(base: float, exponent: float) -> float \{\n")
+    p.push("    if exponent == 0.0 or base == 1.0 \{ return 1.0 \}\n")
+    p.push("    if is_nan(base) or is_nan(exponent) \{ return NAN \}\n")
+    p.push("    if is_inf(exponent) \{\n")
+    p.push("        let magnitude = fabs(base)\n")
+    p.push("        if magnitude == 1.0 \{ return 1.0 \}\n")
+    p.push("        if (magnitude > 1.0) == (exponent > 0.0) \{ return INF \}\n")
+    p.push("        return 0.0\n")
+    p.push("    \}\n")
+    p.push("    if trunc(exponent) == exponent \{\n")
+    p.push("        var remaining = fabs(exponent)\n")
+    p.push("        var factor = base\n")
+    p.push("        if exponent < 0.0 \{ factor = 1.0 / base \}\n")
+    p.push("        var result = 1.0\n")
+    p.push("        while remaining >= 1.0 \{\n")
+    p.push("            let half = floor(remaining / 2.0)\n")
+    p.push("            if remaining - 2.0 * half != 0.0 \{ result *= factor \}\n")
+    p.push("            remaining = half\n")
+    p.push("            if remaining >= 1.0 \{ factor *= factor \}\n")
+    p.push("        \}\n")
+    p.push("        return result\n")
+    p.push("    \}\n")
+    p.push("    if base < 0.0 \{ return NAN \}\n")
+    p.push("    if base == 0.0 \{\n")
+    p.push("        if exponent < 0.0 \{ return INF \}\n")
+    p.push("        return 0.0\n")
+    p.push("    \}\n")
+    p.push("    return fexp(exponent * fln(base))\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Binary long division avoids overflow and catastrophic quotient cancellation.\n")
+    p.push("fn fmod(x: float, y: float) -> float \{\n")
+    p.push("    if is_nan(x) or is_nan(y) or is_inf(x) or y == 0.0 \{ return NAN \}\n")
+    p.push("    var remaining = fabs(x)\n")
+    p.push("    let divisor = fabs(y)\n")
+    p.push("    if remaining < divisor \{ return x \}\n")
+    p.push("    var scaled = divisor\n")
+    p.push("    while scaled <= remaining / 2.0 \{ scaled *= 2.0 \}\n")
+    p.push("    while scaled >= divisor \{\n")
+    p.push("        if remaining >= scaled \{ remaining -= scaled \}\n")
+    p.push("        if scaled == divisor \{ break \}\n")
+    p.push("        scaled /= 2.0\n")
+    p.push("    \}\n")
+    p.push("    return frombits(bits(remaining) | (bits(x) & (1 << 63)))\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Signed zeros distinguish the two sides of the negative x axis.\n")
+    p.push("fn atan2(y: float, x: float) -> float \{\n")
+    p.push("    if is_nan(x) or is_nan(y) \{ return NAN \}\n")
+    p.push("    let negativeY = bits(y) < 0\n")
+    p.push("    var angle = 0.0\n")
+    p.push("    if y == 0.0 \{\n")
+    p.push("        if bits(x) >= 0 \{ return y \}\n")
+    p.push("        angle = PI\n")
+    p.push("    \} else if x == 0.0 \{\n")
+    p.push("        angle = HALF_PI\n")
+    p.push("    \} else if is_inf(x) and is_inf(y) \{\n")
+    p.push("        angle = PI / 4.0\n")
+    p.push("        if x < 0.0 \{ angle = 3.0 * PI / 4.0 \}\n")
+    p.push("    \} else \{\n")
+    p.push("        angle = fatan(fabs(y / x))\n")
+    p.push("        if x < 0.0 \{ angle = PI - angle \}\n")
+    p.push("    \}\n")
+    p.push("    if negativeY \{ return frombits(bits(angle) | (1 << 63)) \}\n")
+    p.push("    return angle\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Scale before squaring to avoid unnecessary overflow and underflow.\n")
+    p.push("fn hypot(x: float, y: float) -> float \{\n")
+    p.push("    if is_inf(x) or is_inf(y) \{ return INF \}\n")
+    p.push("    if is_nan(x) or is_nan(y) \{ return NAN \}\n")
+    p.push("    let larger = max(fabs(x), fabs(y))\n")
+    p.push("    let smaller = min(fabs(x), fabs(y))\n")
+    p.push("    if larger == 0.0 \{ return 0.0 \}\n")
+    p.push("    let ratio = smaller / larger\n")
+    p.push("    return larger * sqrt(1.0 + ratio * ratio)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// A logarithmic estimate followed by Newton refinement, including subnormals.\n")
+    p.push("fn cbrt(x: float) -> float \{\n")
+    p.push("    if x == 0.0 or is_inf(x) or is_nan(x) \{ return x \}\n")
+    p.push("    let magnitude = fabs(x)\n")
+    p.push("    var estimate = fexp(fln(magnitude) / 3.0)\n")
+    p.push("    for i in 0..3 \{ estimate = (2.0 * estimate + (magnitude / estimate) / estimate) / 3.0 \}\n")
+    p.push("    if x < 0.0 \{ return 0.0 - estimate \}\n")
+    p.push("    return estimate\n")
+    p.push("\}\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_4() -> str {
     var p: [str] = []
     p.push("// Transcendental maths for a runtime with no libm (kernel32-only exes).\n")
     p.push("// exp/ln by range reduction + short series, tanh on top, then the inverse\n")
@@ -11919,6 +13002,7 @@ fn __emb_2() -> str {
     p.push("\n")
     p.push("// e^x: e^x = 2^n * e^r with r in [-ln2/2, ln2/2], Taylor for e^r, 2^n from bits\n")
     p.push("fn fexp(x: float) -> float \{\n")
+    p.push("    if is_nan(x) \{ return x \}\n")
     p.push("    if x < -745.2 \{ return 0.0 \}\n")
     p.push("    if x > 709.782712893384 \{ return INF \}\n")
     p.push("    var n = round_i(x / LN2)\n")
@@ -11944,6 +13028,8 @@ fn __emb_2() -> str {
     p.push("    // sqrt builtin do, and -INF is the actual limit at zero\n")
     p.push("    if x < 0.0 \{ return NAN \}\n")
     p.push("    if x == 0.0 \{ return 0.0 - INF \}\n")
+    p.push("    if is_nan(x) or x == INF \{ return x \}\n")
+    p.push("    if x < frombits(1 << 52) \{ return fln(x * 4503599627370496.0) - 52.0 * LN2 \}\n")
     p.push("    let b = bits(x)\n")
     p.push("    let e = ((b >> 52) & 2047) - 1023\n")
     p.push("    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))\n")
@@ -12286,9 +13372,444 @@ fn __emb_2() -> str {
     p.push("    return adapt_p(f, p, a, b, eps, simpson_p(f, p, a, b), 50)\n")
     p.push("\}\n")
     p.push("\n")
+    p.push("\n")
     return p.join()
 }
-fn __emb_3() -> str {
+fn __emb_5() -> str {
+    var p: [str] = []
+    p.push("// xorshift64*: shifts (12, 25, 27), multiplier 2685821657736338717.\n")
+    p.push("// State has period 2^64-1; seed zero maps to a fixed nonzero state.\n")
+    p.push("// Deterministic, mutable, and not suitable for cryptography or shared threads.\n")
+    p.push("struct Rng \{ state: int \}\n")
+    p.push("\n")
+    p.push("fn rng_new(seed: int) -> Rng \{\n")
+    p.push("    var initialState = seed\n")
+    p.push("    if initialState == 0 \{ initialState = 2685821657736338717 \}\n")
+    p.push("    return Rng\{state: initialState\}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Masks make right shifts logical despite Zephyr's signed integer type.\n")
+    p.push("fn next_int(rng: Rng) -> int \{\n")
+    p.push("    var nextState = rng.state\n")
+    p.push("    nextState = nextState ^ ((nextState >> 12) & 4503599627370495)\n")
+    p.push("    nextState = nextState ^ (nextState << 25)\n")
+    p.push("    nextState = nextState ^ ((nextState >> 27) & 137438953471)\n")
+    p.push("    rng.state = nextState\n")
+    p.push("    return nextState * 2685821657736338717\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Rejection sampling avoids modulo bias, including intervals wider than 2^63.\n")
+    p.push("fn int_between(rng: Rng, low: int, high: int) -> int \{\n")
+    p.push("    assert(low < high, \"int_between: low must be less than high\")\n")
+    p.push("    let span = high - low\n")
+    p.push("    if span < 0 \{\n")
+    p.push("        // Unsigned span exceeds 2^63: accept nonzero outputs <= span,\n")
+    p.push("        // then subtract one to map uniformly onto all offsets 0..span-1.\n")
+    p.push("        while true \{\n")
+    p.push("            let candidate = next_int(rng)\n")
+    p.push("            if candidate > 0 or candidate <= span \{ return low + (candidate - 1) \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    // Reject zero before mapping the generator's 2^64-1 nonzero outputs to\n")
+    p.push("    // equal-sized positive pairs. This gives exactly uniform 1..2^63-1.\n")
+    p.push("    let maximum = 9223372036854775807\n")
+    p.push("    let limit = maximum - maximum % span\n")
+    p.push("    while true \{\n")
+    p.push("        let candidate = next_int(rng) & maximum\n")
+    p.push("        if candidate > 0 and candidate <= limit \{ return low + (candidate - 1) % span \}\n")
+    p.push("    \}\n")
+    p.push("    return low\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn next_float(rng: Rng) -> float \{\n")
+    p.push("    return (((next_int(rng) >> 11) & 9007199254740991) as float) / 9007199254740992.0\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn chance(rng: Rng, probability: float) -> bool \{\n")
+    p.push("    assert(probability >= 0.0 and probability <= 1.0, \"chance: probability must be in [0, 1]\")\n")
+    p.push("    return next_float(rng) < probability\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// In-place Fisher-Yates, with an unbiased index at each step.\n")
+    p.push("fn shuffle[T](rng: Rng, items: [T]) \{\n")
+    p.push("    var remaining = items.len()\n")
+    p.push("    while remaining > 1 \{\n")
+    p.push("        let chosenIndex = int_between(rng, 0, remaining)\n")
+    p.push("        remaining -= 1\n")
+    p.push("        let saved = items[remaining]\n")
+    p.push("        items[remaining] = items[chosenIndex]\n")
+    p.push("        items[chosenIndex] = saved\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_6() -> str {
+    var p: [str] = []
+    p.push("// Byte-oriented string utilities; ASCII classification and whitespace.\n")
+    p.push("fn is_digit(byteValue: int) -> bool \{ return byteValue >= 48 and byteValue <= 57 \}\n")
+    p.push("fn is_upper(byteValue: int) -> bool \{ return byteValue >= 65 and byteValue <= 90 \}\n")
+    p.push("fn is_lower(byteValue: int) -> bool \{ return byteValue >= 97 and byteValue <= 122 \}\n")
+    p.push("fn is_alpha(byteValue: int) -> bool \{ return is_upper(byteValue) or is_lower(byteValue) \}\n")
+    p.push("fn is_alnum(byteValue: int) -> bool \{ return is_alpha(byteValue) or is_digit(byteValue) \}\n")
+    p.push("fn is_space(byteValue: int) -> bool \{ return byteValue == 32 or byteValue == 9 or byteValue == 10 or byteValue == 13 \}\n")
+    p.push("\n")
+    p.push("fn ord(text: str) -> int \{\n")
+    p.push("    assert(text.len() > 0, \"ord: empty string\")\n")
+    p.push("    return text.byte(0)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn chars(text: str) -> [str] \{ return text.split(\"\") \}\n")
+    p.push("\n")
+    p.push("fn reverse_str(text: str) -> str \{\n")
+    p.push("    var parts: [str] = []\n")
+    p.push("    var remaining = text.len()\n")
+    p.push("    while remaining > 0 \{\n")
+    p.push("        remaining -= 1\n")
+    p.push("        parts.push(chr(text.byte(remaining)))\n")
+    p.push("    \}\n")
+    p.push("    return parts.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn trim_left(text: str) -> str \{\n")
+    p.push("    var start = 0\n")
+    p.push("    while start < text.len() and is_space(text.byte(start)) \{ start += 1 \}\n")
+    p.push("    return text.sub(start, text.len())\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn trim_right(text: str) -> str \{\n")
+    p.push("    var end = text.len()\n")
+    p.push("    while end > 0 and is_space(text.byte(end - 1)) \{ end -= 1 \}\n")
+    p.push("    return text.sub(0, end)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn join_with(parts: [str], separator: str) -> str \{\n")
+    p.push("    var pieces: [str] = []\n")
+    p.push("    for i in 0..parts.len() \{\n")
+    p.push("        if i > 0 \{ pieces.push(separator) \}\n")
+    p.push("        pieces.push(parts[i])\n")
+    p.push("    \}\n")
+    p.push("    return pieces.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn pad_left(text: str, width: int, fill: str) -> str \{\n")
+    p.push("    assert(fill.len() == 1, \"pad_left: fill must be one byte\")\n")
+    p.push("    if width <= text.len() \{ return text \}\n")
+    p.push("    return fill.repeat(width - text.len()) + text\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn pad_right(text: str, width: int, fill: str) -> str \{\n")
+    p.push("    assert(fill.len() == 1, \"pad_right: fill must be one byte\")\n")
+    p.push("    if width <= text.len() \{ return text \}\n")
+    p.push("    return text + fill.repeat(width - text.len())\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Empty fields, including one after a final newline, are preserved.\n")
+    p.push("fn lines(text: str) -> [str] \{\n")
+    p.push("    let result = text.split(\"\\n\")\n")
+    p.push("    for i in 0..result.len() \{\n")
+    p.push("        let line = result[i]\n")
+    p.push("        if line.len() > 0 and line.byte(line.len() - 1) == 13 \{\n")
+    p.push("            result[i] = line.sub(0, line.len() - 1)\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    return result\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn to_hex(value: int) -> str \{\n")
+    p.push("    let alphabet = \"0123456789abcdef\"\n")
+    p.push("    var parts: [str] = []\n")
+    p.push("    var started = false\n")
+    p.push("    var shift = 60\n")
+    p.push("    while shift >= 0 \{\n")
+    p.push("        let digitValue = (value >> shift) & 15\n")
+    p.push("        if digitValue != 0 or started or shift == 0 \{\n")
+    p.push("            parts.push(alphabet.sub(digitValue, digitValue + 1))\n")
+    p.push("            started = true\n")
+    p.push("        \}\n")
+    p.push("        shift -= 4\n")
+    p.push("    \}\n")
+    p.push("    return parts.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Negative integers use their full 64-bit two's-complement representation.\n")
+    p.push("fn to_binary(value: int) -> str \{\n")
+    p.push("    var parts: [str] = []\n")
+    p.push("    var started = false\n")
+    p.push("    var shift = 63\n")
+    p.push("    while shift >= 0 \{\n")
+    p.push("        let digitValue = (value >> shift) & 1\n")
+    p.push("        if digitValue != 0 or started or shift == 0 \{\n")
+    p.push("            parts.push(chr(48 + digitValue))\n")
+    p.push("            started = true\n")
+    p.push("        \}\n")
+    p.push("        shift -= 1\n")
+    p.push("    \}\n")
+    p.push("    return parts.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Accumulate negatively so INT_MIN is representable; check before each step.\n")
+    p.push("fn parse_int(text: str) -> int? \{\n")
+    p.push("    let input = trim_right(trim_left(text))\n")
+    p.push("    if input.len() == 0 \{ return none \}\n")
+    p.push("    var position = 0\n")
+    p.push("    var negative = false\n")
+    p.push("    if input.byte(0) == 45 or input.byte(0) == 43 \{\n")
+    p.push("        negative = input.byte(0) == 45\n")
+    p.push("        position = 1\n")
+    p.push("    \}\n")
+    p.push("    if position == input.len() \{ return none \}\n")
+    p.push("    var result = 0\n")
+    p.push("    var lastDigit = 7\n")
+    p.push("    if negative \{ lastDigit = 8 \}\n")
+    p.push("    while position < input.len() \{\n")
+    p.push("        let digitByte = input.byte(position)\n")
+    p.push("        if not is_digit(digitByte) \{ return none \}\n")
+    p.push("        let digitValue = digitByte - 48\n")
+    p.push("        if result < -922337203685477580 or (result == -922337203685477580 and digitValue > lastDigit) \{\n")
+    p.push("            return none\n")
+    p.push("        \}\n")
+    p.push("        result = result * 10 - digitValue\n")
+    p.push("        position += 1\n")
+    p.push("    \}\n")
+    p.push("    if negative \{ return result \}\n")
+    p.push("    return 0 - result\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Validate the entire decimal grammar before conversion. Range overflow is none.\n")
+    p.push("fn parse_float(text: str) -> float? \{\n")
+    p.push("    let input = trim_right(trim_left(text))\n")
+    p.push("    if input.len() == 0 \{ return none \}\n")
+    p.push("    var position = 0\n")
+    p.push("    if input.byte(0) == 45 or input.byte(0) == 43 \{ position = 1 \}\n")
+    p.push("    var digitCount = 0\n")
+    p.push("    while position < input.len() and is_digit(input.byte(position)) \{\n")
+    p.push("        position += 1\n")
+    p.push("        digitCount += 1\n")
+    p.push("    \}\n")
+    p.push("    if position < input.len() and input.byte(position) == 46 \{\n")
+    p.push("        position += 1\n")
+    p.push("        while position < input.len() and is_digit(input.byte(position)) \{\n")
+    p.push("            position += 1\n")
+    p.push("            digitCount += 1\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    if digitCount == 0 \{ return none \}\n")
+    p.push("    if position < input.len() and (input.byte(position) == 101 or input.byte(position) == 69) \{\n")
+    p.push("        position += 1\n")
+    p.push("        if position < input.len() and (input.byte(position) == 45 or input.byte(position) == 43) \{ position += 1 \}\n")
+    p.push("        let exponentStart = position\n")
+    p.push("        while position < input.len() and is_digit(input.byte(position)) \{ position += 1 \}\n")
+    p.push("        if exponentStart == position \{ return none \}\n")
+    p.push("    \}\n")
+    p.push("    if position != input.len() \{ return none \}\n")
+    p.push("    // Keep the decimal digits intact: rounding a short mantissa first can\n")
+    p.push("    // misclassify the largest finite double or lose subnormal values.\n")
+    p.push("    var negative = false\n")
+    p.push("    position = 0\n")
+    p.push("    if input.byte(0) == 45 or input.byte(0) == 43 \{\n")
+    p.push("        negative = input.byte(0) == 45\n")
+    p.push("        position = 1\n")
+    p.push("    \}\n")
+    p.push("    var digits: [int] = []\n")
+    p.push("    var fractionalDigits = 0\n")
+    p.push("    var fraction = false\n")
+    p.push("    while position < input.len() and input.byte(position) != 101 and input.byte(position) != 69 \{\n")
+    p.push("        let digitByte = input.byte(position)\n")
+    p.push("        if digitByte == 46 \{ fraction = true \}\n")
+    p.push("        else \{\n")
+    p.push("            if fraction \{ fractionalDigits += 1 \}\n")
+    p.push("            if digitByte != 48 or digits.len() > 0 \{ digits.push(digitByte - 48) \}\n")
+    p.push("        \}\n")
+    p.push("        position += 1\n")
+    p.push("    \}\n")
+    p.push("    var exponent = 0\n")
+    p.push("    var negativeExponent = false\n")
+    p.push("    if position < input.len() \{\n")
+    p.push("        position += 1\n")
+    p.push("        if input.byte(position) == 45 or input.byte(position) == 43 \{\n")
+    p.push("            negativeExponent = input.byte(position) == 45\n")
+    p.push("            position += 1\n")
+    p.push("        \}\n")
+    p.push("        while position < input.len() \{\n")
+    p.push("            // Saturate before multiplication; hostile exponent text cannot wrap.\n")
+    p.push("            if exponent < 1000000000 \{ exponent = min(1000000000, exponent * 10 + input.byte(position) - 48) \}\n")
+    p.push("            position += 1\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    if negativeExponent \{ exponent = 0 - exponent \}\n")
+    p.push("    var sign = 0\n")
+    p.push("    if negative \{ sign = 1 << 63 \}\n")
+    p.push("    if digits.len() == 0 \{ return frombits(sign) \}\n")
+    p.push("    var decimalPower = exponent - fractionalDigits\n")
+    p.push("    while digits.len() > 0 and digits[digits.len() - 1] == 0 \{\n")
+    p.push("        digits.pop()\n")
+    p.push("        decimalPower += 1\n")
+    p.push("    \}\n")
+    p.push("    let decimalPoint = digits.len() + decimalPower\n")
+    p.push("    if decimalPoint > 309 \{ return none \}\n")
+    p.push("    if decimalPoint < -323 \{ return frombits(sign) \}\n")
+    p.push("    return string_decimal_float(digits, decimalPoint, sign)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Multiply decimal fractional digits by two; return the next binary digit.\n")
+    p.push("fn string_fraction_bit(fraction: [int]) -> int \{\n")
+    p.push("    var carry = 0\n")
+    p.push("    var position = fraction.len()\n")
+    p.push("    while position > 0 \{\n")
+    p.push("        position -= 1\n")
+    p.push("        let doubled = fraction[position] * 2 + carry\n")
+    p.push("        fraction[position] = doubled % 10\n")
+    p.push("        carry = doubled / 10\n")
+    p.push("    \}\n")
+    p.push("    return carry\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn string_nonzero(digits: [int]) -> bool \{\n")
+    p.push("    for digitValue in digits \{ if digitValue != 0 \{ return true \} \}\n")
+    p.push("    return false\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Decimal long division/multiplication produces the 53 significand bits plus\n")
+    p.push("// a guard and sticky bit. Round once, to nearest-even, including subnormals.\n")
+    p.push("fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? \{\n")
+    p.push("    var integerDigits: [int] = []\n")
+    p.push("    var fraction: [int] = []\n")
+    p.push("    for i in 0..max(decimalPoint, 0) \{\n")
+    p.push("        var digitValue = 0\n")
+    p.push("        if i < digits.len() \{ digitValue = digits[i] \}\n")
+    p.push("        integerDigits.push(digitValue)\n")
+    p.push("    \}\n")
+    p.push("    for i in 0..max(0 - decimalPoint, 0) \{ fraction.push(0) \}\n")
+    p.push("    for i in max(decimalPoint, 0)..digits.len() \{ fraction.push(digits[i]) \}\n")
+    p.push("    var integerBits: [int] = []\n")
+    p.push("    while string_nonzero(integerDigits) \{\n")
+    p.push("        var remainder = 0\n")
+    p.push("        for i in 0..integerDigits.len() \{\n")
+    p.push("            let dividend = remainder * 10 + integerDigits[i]\n")
+    p.push("            integerDigits[i] = dividend / 2\n")
+    p.push("            remainder = dividend % 2\n")
+    p.push("        \}\n")
+    p.push("        integerBits.push(remainder)\n")
+    p.push("    \}\n")
+    p.push("    var binaryExponent = integerBits.len() - 1\n")
+    p.push("    if integerBits.len() == 0 \{\n")
+    p.push("        while string_fraction_bit(fraction) == 0 and binaryExponent >= -1075 \{ binaryExponent -= 1 \}\n")
+    p.push("    \}\n")
+    p.push("    if binaryExponent > 1023 \{ return none \}\n")
+    p.push("    if binaryExponent < -1075 \{ return frombits(sign) \}\n")
+    p.push("    if binaryExponent == -1075 \{\n")
+    p.push("        if string_nonzero(fraction) \{ return frombits(sign | 1) \}\n")
+    p.push("        return frombits(sign)\n")
+    p.push("    \}\n")
+    p.push("    var significand = 1\n")
+    p.push("    var integerPosition = integerBits.len() - 2\n")
+    p.push("    let significantBits = min(53, binaryExponent + 1075)\n")
+    p.push("    for i in 1..significantBits \{\n")
+    p.push("        var nextBit = 0\n")
+    p.push("        if integerPosition >= 0 \{ nextBit = integerBits[integerPosition] \}\n")
+    p.push("        else \{ nextBit = string_fraction_bit(fraction) \}\n")
+    p.push("        integerPosition -= 1\n")
+    p.push("        significand = significand * 2 + nextBit\n")
+    p.push("    \}\n")
+    p.push("    var guard = 0\n")
+    p.push("    if integerPosition >= 0 \{ guard = integerBits[integerPosition] \}\n")
+    p.push("    else \{ guard = string_fraction_bit(fraction) \}\n")
+    p.push("    var sticky = string_nonzero(fraction)\n")
+    p.push("    for i in 0..max(integerPosition, 0) \{ if integerBits[i] != 0 \{ sticky = true \} \}\n")
+    p.push("    if guard == 1 and (sticky or (significand & 1) == 1) \{ significand += 1 \}\n")
+    p.push("    if binaryExponent < -1022 \{ return frombits(sign | significand) \}\n")
+    p.push("    if significand == 9007199254740992 \{\n")
+    p.push("        significand /= 2\n")
+    p.push("        binaryExponent += 1\n")
+    p.push("    \}\n")
+    p.push("    if binaryExponent > 1023 \{ return none \}\n")
+    p.push("    return frombits(sign | ((binaryExponent + 1023) << 52) | (significand - 4503599627370496))\n")
+    p.push("\}\n")
+    p.push("// Internal decimal multiplication, least-significant digit first.\n")
+    p.push("fn string_scale_digits(digits: [int], factor: int) \{\n")
+    p.push("    var carry = 0\n")
+    p.push("    for i in 0..digits.len() \{\n")
+    p.push("        let product = digits[i] * factor + carry\n")
+    p.push("        digits[i] = product % 10\n")
+    p.push("        carry = product / 10\n")
+    p.push("    \}\n")
+    p.push("    while carry > 0 \{\n")
+    p.push("        digits.push(carry % 10)\n")
+    p.push("        carry /= 10\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Exact binary-to-decimal conversion, then round half away from zero.\n")
+    p.push("// Integer digit arithmetic avoids overflow, double rounding and lost carries.\n")
+    p.push("fn fmt_fixed(value: float, decimals: int) -> str \{\n")
+    p.push("    assert(decimals >= 0, \"fmt_fixed: negative decimals\")\n")
+    p.push("    let representation = bits(value)\n")
+    p.push("    let exponentBits = (representation >> 52) & 2047\n")
+    p.push("    var significand = representation & 4503599627370495\n")
+    p.push("    if exponentBits == 2047 \{\n")
+    p.push("        if significand != 0 \{ return \"nan\" \}\n")
+    p.push("        if representation < 0 \{ return \"-inf\" \}\n")
+    p.push("        return \"inf\"\n")
+    p.push("    \}\n")
+    p.push("    var binaryExponent = -1074\n")
+    p.push("    if exponentBits != 0 \{\n")
+    p.push("        significand += 4503599627370496\n")
+    p.push("        binaryExponent = exponentBits - 1075\n")
+    p.push("    \}\n")
+    p.push("    var digits: [int] = []\n")
+    p.push("    while significand > 0 \{\n")
+    p.push("        digits.push(significand % 10)\n")
+    p.push("        significand /= 10\n")
+    p.push("    \}\n")
+    p.push("    if digits.len() == 0 \{ digits.push(0) \}\n")
+    p.push("    var decimalScale = 0\n")
+    p.push("    if binaryExponent < 0 \{\n")
+    p.push("        decimalScale = 0 - binaryExponent\n")
+    p.push("        for i in 0..decimalScale \{ string_scale_digits(digits, 5) \}\n")
+    p.push("    \} else \{\n")
+    p.push("        for i in 0..binaryExponent \{ string_scale_digits(digits, 2) \}\n")
+    p.push("    \}\n")
+    p.push("    // Skip discarded low digits and carry into the retained integer.\n")
+    p.push("    var dropped = decimalScale - decimals\n")
+    p.push("    if dropped < 0 \{ dropped = 0 \}\n")
+    p.push("    var carry = 0\n")
+    p.push("    if dropped > 0 and dropped <= digits.len() \{\n")
+    p.push("        if digits[dropped - 1] >= 5 \{ carry = 1 \}\n")
+    p.push("    \}\n")
+    p.push("    var rounded: [int] = []\n")
+    p.push("    var position = dropped\n")
+    p.push("    while position < digits.len() \{\n")
+    p.push("        let digitValue = digits[position] + carry\n")
+    p.push("        rounded.push(digitValue % 10)\n")
+    p.push("        carry = digitValue / 10\n")
+    p.push("        position += 1\n")
+    p.push("    \}\n")
+    p.push("    if carry > 0 \{ rounded.push(carry) \}\n")
+    p.push("    if rounded.len() == 0 \{ rounded.push(0) \}\n")
+    p.push("    var parts: [str] = []\n")
+    p.push("    if representation < 0 \{ parts.push(\"-\") \}\n")
+    p.push("    var padding = decimals - decimalScale\n")
+    p.push("    if padding < 0 \{ padding = 0 \}\n")
+    p.push("    let outputDigits = rounded.len() + padding\n")
+    p.push("    if outputDigits <= decimals \{\n")
+    p.push("        parts.push(\"0.\")\n")
+    p.push("        parts.push(\"0\".repeat(decimals - outputDigits))\n")
+    p.push("    \}\n")
+    p.push("    position = rounded.len()\n")
+    p.push("    while position > 0 \{\n")
+    p.push("        position -= 1\n")
+    p.push("        parts.push(chr(48 + rounded[position]))\n")
+    p.push("        if position + padding == decimals and decimals > 0 \{ parts.push(\".\") \}\n")
+    p.push("    \}\n")
+    p.push("    parts.push(\"0\".repeat(padding))\n")
+    p.push("    return parts.join()\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_7() -> str {
     var p: [str] = []
     p.push("// Threads.\n")
     p.push("//\n")
@@ -12412,9 +13933,13 @@ fn __emb_3() -> str {
 }
 fn embedded_name(i: int) -> str {
     if i == 0 { return "std/bytes.zeph" }
-    if i == 1 { return "std/list.zeph" }
-    if i == 2 { return "std/math.zeph" }
-    if i == 3 { return "std/thread.zeph" }
+    if i == 1 { return "std/io.zeph" }
+    if i == 2 { return "std/list.zeph" }
+    if i == 3 { return "std/math.zeph" }
+    if i == 4 { return "std/math_core.zeph" }
+    if i == 5 { return "std/random.zeph" }
+    if i == 6 { return "std/string.zeph" }
+    if i == 7 { return "std/thread.zeph" }
     return ""
 }
 fn embedded_src(i: int) -> str {
@@ -12422,6 +13947,10 @@ fn embedded_src(i: int) -> str {
     if i == 1 { return __emb_1() }
     if i == 2 { return __emb_2() }
     if i == 3 { return __emb_3() }
+    if i == 4 { return __emb_4() }
+    if i == 5 { return __emb_5() }
+    if i == 6 { return __emb_6() }
+    if i == 7 { return __emb_7() }
     return ""
 }
 // <<<EMBED
@@ -13260,6 +14789,24 @@ fn wexpr(e: Node) {
     let k = e.k
     if k == N_INT or k == N_BOOL {
         wconst(e.ival)
+        return
+    }
+    if k == N_IFEXPR {
+        wexpr(e.kids[0])
+        wtruth()
+        wc.push(4)                           // if
+        wc.push(126)                         // result i64
+        g_wnest += 1
+        wexpr(e.kids[1])
+        wc.push(5)                           // else
+        wexpr(e.kids[2])
+        g_wnest -= 1
+        wc.push(11)                          // end
+        return
+    }
+    if k == N_LETEXPR {
+        wstmt(e.kids[0])
+        wexpr(e.kids[1])
         return
     }
     if k == N_FLOAT {
@@ -14367,11 +15914,11 @@ fn wstmt(s: Node) {
         return
     }
     if k == N_BRK {
-        wbr(g_wbrk[g_wbrk.len() - 1])
+        wbr(g_wbrk[g_wbrk.len() - 1 - s.ival])
         return
     }
     if k == N_CONT {
-        wbr(g_wcont[g_wcont.len() - 1])
+        wbr(g_wcont[g_wcont.len() - 1 - s.ival])
         return
     }
     if k == N_INLINE {
@@ -14914,6 +16461,7 @@ if d_in == "" and d_version {
     hoist_consts(prog, firstUserNode)
     desugar_extern(prog)
     desugar_oop(prog)
+    lower_defers(prog)
     check(prog)
     g_file = basename(d_in)
     fold_globals(prog)

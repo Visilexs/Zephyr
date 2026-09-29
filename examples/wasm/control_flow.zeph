@@ -1,0 +1,51 @@
+// match, if-expressions, for over str/list pairs, step ranges, labeled loops, defer
+enum Color { Red, Green, Blue }
+fn describe(c: Color) -> str {
+    match c {
+        Red { return "warm" }
+        Color.Green, Blue { return "cool" }
+    }
+}
+print(describe(Color.Red))
+print(describe(Color.Blue))
+let c = Color.Green
+let name = match c {
+    Color.Red { "red" }
+    Green { "green" }
+    else { "other" }
+}
+print(name)
+fn grade(score: int) -> str {
+    return match score {
+        90..101 { "A" }
+        80..90 { "B" }
+        else { "C" }
+    }
+}
+print(grade(95))
+print(grade(12))
+let x = 7
+print(if x > 5 { "big" } else { "small" })
+let y = if x > 10 { 1 } else if x > 5 { 2 } else { 3 }
+print(y)
+print(if x % 2 == 0 { x / 2 } else { 3.5 })
+var codes = 0
+for ch in "abc" { codes += ch }
+print(codes)
+for i, v in [5, 6] { print(i * 10 + v) }
+for i in 10..0 step -3 { print(i) }
+outer: for i in 0..5 {
+    for j in 0..5 {
+        if j == 2 { continue outer }
+        if i == 3 { break outer }
+        print(i * 10 + j)
+    }
+}
+fn work(n: int) -> int {
+    defer print(n)
+    defer { print(0) }
+    if n > 5 { return n * 2 }
+    return n
+}
+print(work(9))
+print(work(2))
