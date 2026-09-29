@@ -3446,6 +3446,10 @@ fn optimizerNote(text: str) {
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
     if textStartsWith(functionDefinition.name, "runtime") or functionDefinition.hasEnvironment { return false }
+    if containsBaselineVectorCandidate(functionDefinition.body) {
+        optimizerNote("function {functionDefinition.name}: baseline (holds an AVX2 kernel loop)")
+        return false
+    }
     let label = functionCodeLabel(functionDefinition.label)
     if not lowerFunctionRegion(functionIndex) or not compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex)) {
         optimizerNote("function {functionDefinition.name}: baseline ({optimizerBailReason})")
@@ -3462,10 +3466,52 @@ fn isLoopStatement(statement: Node) -> bool {
 
 // A range loop the baseline may turn into an AVX2 kernel (tryFill, tryReduce,
 // tryScaledVectorAddition all want a one-assignment body): leave it to them.
+// The same shape checks tryFill, tryReduce and tryScaledVectorAddition make
+// before they commit to emitting their kernel.
 fn baselineVectorCandidate(statement: Node) -> bool {
     if statement.nodeKind != nodeRangeLoop { return false }
     let body = statement.children[2]
-    return body.children.len() == 1 and body.children[0].nodeKind == nodeAssign
+    if body.children.len() != 1 or body.children[0].nodeKind != nodeAssign { return false }
+    let loopSlot = statement.slot
+    let assignment = body.children[0]
+    let target = assignment.children[0]
+    let value = assignment.children[1]
+    // fill: L[i] = leaf
+    if target.nodeKind == nodeIndex and target.children[0].nodeKind == nodeIdentifier {
+        let index = target.children[1]
+        if index.nodeKind == nodeIdentifier and index.auxiliary == identifierKindLocal and index.slot == loopSlot and isLeaf(value) and not usesLocal(value, loopSlot) { return true }
+    }
+    if value.nodeKind != nodeBinary or value.operator != tokenPlus or not expressionEquals(value.children[0], target) { return false }
+    let product = value.children[1]
+    if product.nodeKind != nodeBinary or product.operator != tokenStar { return false }
+    // reduction: acc = acc + L[i] * i (either order)
+    if target.nodeKind == nodeIdentifier and typeKinds[target.typeIndex] == kindInteger {
+        var element = product.children[0]
+        var factor = product.children[1]
+        if product.children[1].nodeKind == nodeIndex {
+            element = product.children[1]
+            factor = product.children[0]
+        }
+        if element.nodeKind != nodeIndex or factor.nodeKind != nodeIdentifier { return false }
+        if factor.auxiliary != identifierKindLocal or factor.slot != loopSlot { return false }
+        if element.children[0].nodeKind != nodeIdentifier or typeKinds[element.typeIndex] != kindInteger { return false }
+        let elementIndex = element.children[1]
+        return elementIndex.nodeKind == nodeIdentifier and elementIndex.auxiliary == identifierKindLocal and elementIndex.slot == loopSlot
+    }
+    // AXPY: C[a + j] += S * B[b + j] over two distinct int lists
+    if target.nodeKind != nodeIndex or target.children[0].nodeKind != nodeIdentifier or typeKinds[target.typeIndex] != kindInteger { return false }
+    if scaledVectorInvariantIndex(target.children[1], loopSlot) < 0 { return false }
+    var scalarFactor = product.children[0]
+    var sourceElement = product.children[1]
+    if product.children[0].nodeKind == nodeIndex and product.children[1].nodeKind != nodeIndex {
+        scalarFactor = product.children[1]
+        sourceElement = product.children[0]
+    }
+    if sourceElement.nodeKind != nodeIndex or sourceElement.children[0].nodeKind != nodeIdentifier or typeKinds[sourceElement.typeIndex] != kindInteger { return false }
+    if scaledVectorInvariantIndex(sourceElement.children[1], loopSlot) < 0 or usesLocal(scalarFactor, loopSlot) { return false }
+    let targetList = target.children[0]
+    let sourceList = sourceElement.children[0]
+    return not (targetList.auxiliary == sourceList.auxiliary and targetList.slot == sourceList.slot)
 }
 
 fn containsBaselineVectorCandidate(node: Node) -> bool {
