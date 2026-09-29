@@ -150,7 +150,8 @@ empty map literal and, like `[]`, needs an annotation to supply its type.
 Reading a missing key panics; use `.has(k)` to test first. Methods: `.len()`,
 `.has(k)`, `.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
 `for k in m.keys()`. Iteration order is unspecified. Maps are open-addressed
-and grow at 70% load, so insert/lookup are amortized O(1).
+and rehash at 50% occupied slots (including tombstones), so insert/lookup
+are amortized O(1).
 
 ### 3.0.2 Modules
 
@@ -456,7 +457,7 @@ runtime does not count or trace them (see the caution below).
 
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
-| `load64(a)` / `load8(a)` | int → int | Read 8 / 1 bytes at address `a`. |
+| `load64(a)` / `load32(a)` / `load16(a)` / `load8(a)` | int → int | Read 8 / 4 / 2 / 1 bytes at address `a`; narrower reads zero-extend. |
 | `store64(a, v)` / `store32(a, v)` / `store8(a, v)` | int, int → void | Write 8 / 4 / 1 bytes. |
 | `addr(x)` | any → int | Address of a `str`, list, struct, or **function** value. A function yields its `{code, env}` closure cell — the handle a native callback thunk needs. |
 | `stackptr()` | → int | Current stack pointer (`rsp`). |

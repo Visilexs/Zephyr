@@ -1,0 +1,8 @@
+// Float negation must flip the sign bit, as native code does: 0.0 - x
+// turns -0.0 into +0.0. Values come from calls so nothing constant-folds.
+fn zero() -> float { return 0.0 }
+fn half() -> float { return 0.5 }
+print(bits(-zero()))
+print(-half())
+let nz = -zero()
+print(bits(-nz))

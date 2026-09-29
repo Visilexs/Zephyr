@@ -1,0 +1,100 @@
+// Compute -> R8_UINT 3D storage image -> staging buffer -> numeric check.
+// The voxel volume the tracer will read is exactly this shape, so this is the
+// piece that has to be proven before a renderer is built on it.
+// Headless. Build the GLSL with glslangValidator, not zspv.
+import "vk/gfx.zeph"
+
+// Deliberately not multiples of the shader's 4x4x4 workgroup, so the bounds
+// check in the shader is actually exercised on all three axes.
+let W = 67
+let H = 33
+let D = 19
+
+var layers: [str] = []
+for arg in args() {
+    if arg == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
+}
+
+var g = Gfx.make("zephyr-volume", layers, 0, 0)
+print("gpu: {g.gpu_name()}")
+
+let count_out = vk_output(8)
+vkGetPhysicalDeviceQueueFamilyProperties(g.phys, count_out.addr(), 0)
+let queue_props = vk_output(count_out.get32(0) * VkQueueFamilyProperties_sizeof)
+vkGetPhysicalDeviceQueueFamilyProperties(g.phys, count_out.addr(), queue_props.addr())
+let queue_flags = queue_props.get32(g.qfam * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
+assert((queue_flags & VK_QUEUE_COMPUTE_BIT) != 0, "selected queue does not support compute")
+vk_free_output(queue_props)
+vk_free_output(count_out)
+
+let limit = g.max_image_dimension_3d()
+print("maxImageDimension3D = {limit}")
+
+let vol = g.storage_image_3d(W, H, D, VK_FORMAT_R8_UINT)
+let descriptors = g.storage_image_set(vol, VK_SHADER_STAGE_COMPUTE_BIT)
+let shader = g.shader("examples/shaders/volume.comp.spv")
+let entry = cbytes("main")
+let layout = g.pipeline_layout([descriptors.layout], 16, VK_SHADER_STAGE_COMPUTE_BIT)
+let pipeline = g.compute_pipeline(shader, layout, entry)
+let sets = u64s([descriptors.set])
+let image = vol.image
+
+// ivec3 in a push constant is 16 bytes: three ints and the vec4 alignment tail.
+var dims = Bytes.new(16)
+dims.put32(0, W)
+dims.put32(4, H)
+dims.put32(8, D)
+let da = dims.addr()
+let pl = layout
+
+g.immediate(fn(cb: int) {
+    image_barrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT)
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, sets.addr(), 0, 0)
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, da)
+    vkCmdDispatch(cb, (W + 3) / 4, (H + 3) / 4, (D + 3) / 4)
+    image_barrier(cb, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
+})
+print("dispatched {(W + 3) / 4} x {(H + 3) / 4} x {(D + 3) / 4} workgroups into {W}x{H}x{D} R8_UINT volume")
+
+let voxels = g.read_volume(image, W, H, D, 1)
+
+// Every voxel is checked, not a sample: a wrong slice stride is invisible if
+// you only look at slice 0, which is the whole risk being retired here.
+var bad = 0
+var first_bad = ""
+for z in 0..D {
+    for y in 0..H {
+        for x in 0..W {
+            let want = (x * 5 + y * 7 + z * 11) % 251
+            let got = voxels.get8((z * H + y) * W + x)
+            if got != want {
+                if bad == 0 { first_bad = "({x},{y},{z}) got {got} want {want}" }
+                bad += 1
+            }
+        }
+    }
+}
+
+// A distinctness check on top: if depth were collapsed, slice 0 and slice D-1
+// would agree. They must not.
+var same = 0
+for y in 0..H {
+    for x in 0..W {
+        if voxels.get8((0 * H + y) * W + x) == voxels.get8(((D - 1) * H + y) * W + x) { same += 1 }
+    }
+}
+
+if bad != 0 {
+    print("FAIL: {bad} of {W * H * D} voxels wrong, first {first_bad}")
+    panic("3D storage image GPU voxels disagree with CPU pattern")
+}
+print("PASS: GPU readback verified {W * H * D} voxels across {D} slices, 0 mismatches")
+print("PASS: slice 0 and slice {D - 1} differ at {W * H - same} of {W * H} texels")
+
+g.destroy_image(vol)
+print("PASS: 3D storage image resources destroyed cleanly")

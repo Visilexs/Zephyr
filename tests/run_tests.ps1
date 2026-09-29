@@ -1,9 +1,8 @@
-# Zephyr test suite. Builds the compiler, then runs positive, negative, and panic tests.
+# Zephyr test suite. Runs positive, negative, and panic tests with zc.exe.
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot
 Set-Location $root
-& .\bootstrap\build.ps1
-if ($LASTEXITCODE -ne 0) { exit 1 }
+if (-not (Test-Path .\zc.exe)) { Write-Host "zc.exe missing" -ForegroundColor Red; exit 1 }
 
 $pass = 0; $fail = 0
 $tmp = Join-Path $env:TEMP "zephyr_tests"
@@ -16,9 +15,16 @@ function Check($name, $ok, $detail) {
 
 function RunSrc($name, $src) {
     $f = Join-Path $tmp "$name.zeph"
+    $exe = Join-Path $tmp "$name.exe"
     Set-Content -Path $f -Value $src -Encoding ascii
-    $out = cmd /c ".\bootstrap\zephyr.exe run `"$f`" 2>&1"
-    return @{ code = $LASTEXITCODE; out = ($out | Out-String).Trim() }
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $out = cmd /c ".\zc.exe --rt `"$f`" `"$exe`" 2>&1"
+    $code = $LASTEXITCODE
+    if (Test-Path $exe) {
+        $out = cmd /c "`"$exe`" 2>&1"
+        $code = $LASTEXITCODE
+    }
+    return @{ code = $code; out = ($out | Out-String).Trim() }
 }
 
 # ---- positive: examples with expected output ----
@@ -28,7 +34,10 @@ $expected = @{
     "shapes"  = "5`n5`nPoint{x: 6, y: 8}`n3`n(0, 0)`n(3, 4)`n(6, 8)"
 }
 foreach ($name in $expected.Keys) {
-    $out = (& .\bootstrap\zephyr.exe run "examples\basics\$name.zeph" | Out-String).Trim() -replace "`r", ""
+    $exe = Join-Path $tmp "$name.exe"
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    & .\zc.exe --rt "examples\basics\$name.zeph" $exe 2>&1 | Out-Null
+    $out = if (Test-Path $exe) { (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
     $want = $expected[$name] -replace "`r", ""
     Check "example:$name" ($out -eq $want) "got: $out"
 }
@@ -38,7 +47,10 @@ $fb = for ($i = 1; $i -le 100; $i++) {
     if ($i % 15 -eq 0) { "FizzBuzz" } elseif ($i % 3 -eq 0) { "Fizz" }
     elseif ($i % 5 -eq 0) { "Buzz" } else { "$i" }
 }
-$out = (& .\bootstrap\zephyr.exe run "examples\basics\fizzbuzz.zeph" | Out-String).Trim() -replace "`r", ""
+$fbExe = Join-Path $tmp "fizzbuzz.exe"
+Remove-Item $fbExe -ErrorAction SilentlyContinue
+& .\zc.exe --rt examples\basics\fizzbuzz.zeph $fbExe 2>&1 | Out-Null
+$out = if (Test-Path $fbExe) { (cmd /c "`"$fbExe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "example:fizzbuzz" ($out -eq (($fb -join "`n"))) "fizzbuzz mismatch"
 
 # ---- language features ----
@@ -120,11 +132,12 @@ for i in 1..101 { sum += i }
 print("sum={sum}")
 '@
 Set-Content -Path "$tmp\rtprog.zeph" -Value $rtsrc -Encoding ascii
-& .\bootstrap\zephyr.exe build "$tmp\rtprog.zeph" -o "$rtdir\rtprog.exe" --rt 2>&1 | Out-Null
+Remove-Item "$rtdir\rtprog.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt "$tmp\rtprog.zeph" "$rtdir\rtprog.exe" 2>&1 | Out-Null
 $rtBuilt = Test-Path "$rtdir\rtprog.exe"
 # run in an isolated dir with NO zephyr_rt.dll present
 $rtOut = if ($rtBuilt) { (cmd /c "`"$rtdir\rtprog.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
-$rtWant = (& .\bootstrap\zephyr.exe run "$tmp\rtprog.zeph" | Out-String).Trim() -replace "`r", ""
+$rtWant = @("runtime in 0? no, in Zephyr", "[1, 4, 9, 16, 25]", "5", "P{x: 7, y: 8}", "15", "50", "8", "1073741824", "sum=5050") -join "`n"
 $noDll = -not (Test-Path "$rtdir\zephyr_rt.dll")
 Check "rt:zephyr-runtime" ($rtBuilt -and $noDll -and $rtOut -eq $rtWant) "built=$rtBuilt noDll=$noDll out=$rtOut"
 
@@ -150,9 +163,24 @@ print(load64(d))
 $exp = @("ABCD","65","68","99","99") -join [Environment]::NewLine
 Check "intrinsics" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
+$r = RunSrc "narrow_loads" @'
+let a = win("VirtualAlloc", 0, 4096, 12288, 4)
+assert(a != 0)
+store64(a, -1)
+assert(load32(a) == 4294967295)
+assert(load16(a) == 65535)
+store32(a + 8, 305419896)
+assert(load32(a + 8) == 305419896)
+assert(load16(a + 8) == 22136)
+store8(a + 16, 200)
+assert(load16(a + 16) == 200)
+print("ok")
+'@
+Check "intrinsics:narrow-loads" ($r.code -eq 0 -and $r.out -eq "ok") "got($($r.code)): $($r.out)"
+
 # ---- ffi_runtime example: I/O + int formatting in pure Zephyr via kernel32 ----
-& .\bootstrap\zephyr.exe build examples\basics\ffi_runtime.zeph -o "$tmp\ffir.exe" | Out-Null
-Copy-Item bootstrap\zephyr_rt.dll "$tmp\zephyr_rt.dll" -Force
+Remove-Item "$tmp\ffir.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt examples\basics\ffi_runtime.zeph "$tmp\ffir.exe" 2>&1 | Out-Null
 $out = (& "$tmp\ffir.exe" | Out-String).Trim() -replace "`r", ""
 $want = "integers formatted and printed by a Zephyr-written runtime:`n0`n42`n-1234567`n1000000000`nsum 1..100 = 5050" -replace "`r", ""
 Check "ffi-runtime" ($out -eq $want) "got: $out"
@@ -207,6 +235,39 @@ foreach ($n in @([long]-7, 7, -100, 100, 0, 9223372036854775807)) {
 }
 $exp += "-3"; $exp += "-1"; $exp += "-3"; $exp += "1"; $exp += "0"
 Check "div-semantics" ($r.code -eq 0 -and $r.out -eq (($exp -join [Environment]::NewLine))) "mismatch"
+
+# ---- a for loop's own variable is not a loop-invariant divisor ----
+# The reciprocal was computed at loop entry from the variable's previous value,
+# so the second run of an inner loop divided by the first run's last divisor.
+$r = RunSrc "divloopvar" @'
+for w in [100, 7] {
+    for d in [3, 7, 4096] { print(w / d) }
+    for d in 3..5 { print(w % d) }
+}
+'@
+$want = @("33","14","0","1","0","2","1","0","1","3") -join [Environment]::NewLine
+Check "div-loop-var" ($r.code -eq 0 -and $r.out -eq $want) "got: $($r.out)"
+
+# ---- maps under insert/remove churn at a steady size ----
+# Removes leave tombstones, and growth used to count live entries only, so a
+# sliding window of keys filled every empty slot and died with "map overflow".
+$r = RunSrc "mapchurn" @'
+var m: [int: int] = [:]
+var s: [str: int] = [:]
+for i in 0..60000 {
+    m[i] = i
+    s["k{i}"] = i
+    if i >= 2300 {
+        m.remove(i - 2300)
+        s.remove("k{i - 2300}")
+    }
+}
+var ok = m.len() == 2300 and s.len() == 2300
+for i in 57700..60000 { ok = ok and m[i] == i and s["k{i}"] == i }
+for i in 0..57700 { ok = ok and not m.has(i) }
+print(ok)
+'@
+Check "map-churn" ($r.code -eq 0 -and $r.out -eq "true") "got($($r.code)): $($r.out)"
 
 # ---- globals + new builtins (io, str utils, args) ----
 $tmpFwd = $tmp -replace "\\", "/"
@@ -270,6 +331,42 @@ foreach ($name in $panics.Keys) {
     $r = RunSrc "panic_$name" $panics[$name]
     Check "panic:$name" ($r.code -eq 1 -and $r.out -match "panic:") "expected panic, got($($r.code)): $($r.out)"
 }
+
+$locatedPanics = @{
+    "index"       = @{ src = "let xs = [1]`nprint(xs[2])"; line = 2 }
+    "division"    = @{ src = "let z = 0`nprint(4 / z)"; line = 2 }
+    "modulo"      = @{ src = "let z = 0`nprint(4 % z)"; line = 2 }
+    "int-parse"   = @{ src = 'print("bad" as int)'; line = 1 }
+    "float-parse" = @{ src = 'print("bad" as float)'; line = 1 }
+    "pop"         = @{ src = "var xs: [int] = []`nprint(xs.pop())"; line = 2 }
+    "assert"      = @{ src = 'assert(false, "broken")'; line = 1 }
+    "explicit"    = @{ src = 'panic("broken")'; line = 1 }
+    "optional"    = @{ src = "let n: int? = none`nprint(n.get())"; line = 2 }
+    "chr"         = @{ src = 'print(chr(256))'; line = 1 }
+    "substring"   = @{ src = 'print("hi".sub(0, 3))'; line = 1 }
+    "map-key"     = @{ src = "let m = [`"a`": 1]`nprint(m[`"b`"])"; line = 2 }
+    "read-file"   = @{ src = 'print(read_file("zephyr-no-such-file-9274"))'; line = 1 }
+    "write-file"  = @{ src = 'write_file("?:", "x")'; line = 1 }
+    "byte"        = @{ src = 'print("a".byte(2))'; line = 1 }
+    "index-store" = @{ src = "var xs = [1]`nxs[3] = 4"; line = 2 }
+}
+foreach ($name in $locatedPanics.Keys) {
+    $case = $locatedPanics[$name]
+    $r = RunSrc "rtloc_$name" $case.src
+    $prefix = "panic: rtloc_${name}.zeph:$($case.line): "
+    Check "panic-location:$name" ($r.code -eq 1 -and $r.out.StartsWith($prefix)) "expected $prefix; got($($r.code)): $($r.out)"
+}
+$r = RunSrc "rtloc_ok" 'print("still running")'
+Check "panic-location:success" ($r.code -eq 0 -and $r.out -eq "still running") "got($($r.code)): $($r.out)"
+
+$rtlocDir = Join-Path $tmp "rtloc_import"
+New-Item -ItemType Directory -Force "$rtlocDir\lib2" | Out-Null
+Set-Content "$rtlocDir\main.zeph" 'import "lib2/sub.zeph"' -Encoding ascii
+Set-Content "$rtlocDir\lib2\sub.zeph" "// first`nlet xs = [1]`nprint(xs[2])" -Encoding ascii
+Remove-Item "$rtlocDir\main.exe" -ErrorAction SilentlyContinue
+$importBuild = (cmd /c ".\zc.exe --rt `"$rtlocDir\main.zeph`" `"$rtlocDir\main.exe`" 2>&1" | Out-String).Trim()
+$importOut = if (Test-Path "$rtlocDir\main.exe") { (cmd /c "`"$rtlocDir\main.exe`" 2>&1" | Out-String).Trim() } else { $importBuild }
+Check "panic-location:import" ($importOut.StartsWith("panic: lib2/sub.zeph:3: ")) "got: $importOut"
 
 # ---- self-hosted stdlib builtins (compiled by zc.exe --rt) ----
 Remove-Item "$tmp\stdlib.exe" -ErrorAction SilentlyContinue
@@ -584,6 +681,51 @@ $modOut = if ($modBuilt) { (cmd /c "`"$moddir\main.exe`" 2>&1" | Out-String).Tri
 $modWant = @("hello, world","49","2","High","3") -join "`n"
 Check "modules-import" ($modBuilt -and $modOut -eq $modWant) "got: $modOut"
 
+# ---- imports reached through different spellings are included once ----
+$canonDir = Join-Path $tmp "canon"
+New-Item -ItemType Directory -Force "$canonDir\engine", "$canonDir\game" | Out-Null
+Set-Content "$canonDir\engine\core.zeph" "fn core_one() -> int { return 41 }" -Encoding ascii
+Set-Content "$canonDir\game\combat.zeph" @'
+import "../engine/core.zeph"
+fn combat_two() -> int { return core_one() + 1 }
+'@ -Encoding ascii
+Set-Content "$canonDir\main.zeph" @'
+import "engine/core.zeph"
+import "./engine/core.zeph"
+import "ENGINE/Core.zeph"
+import "game/combat.zeph"
+print(core_one())
+print(combat_two())
+'@ -Encoding ascii
+Remove-Item "$canonDir\main.exe" -ErrorAction SilentlyContinue
+$canonBuild = (cmd /c ".\zc.exe --rt `"$canonDir\main.zeph`" `"$canonDir\main.exe`" 2>&1" | Out-String).Trim()
+$canonBuilt = Test-Path "$canonDir\main.exe"
+$canonOut = if ($canonBuilt) { (cmd /c "`"$canonDir\main.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { $canonBuild }
+Check "modules-canonical-paths" ($canonBuilt -and $canonOut -eq "41`n42") "got: $canonOut"
+
+# ---- checker diagnostics retain the defining file through imports/generics ----
+$diagDir = Join-Path $tmp "diagnostics"
+New-Item -ItemType Directory -Force $diagDir | Out-Null
+Set-Content "$diagDir\main.zeph" 'import "sub.zeph"' -Encoding ascii
+Set-Content "$diagDir\sub.zeph" "// first`n// second`nlet x: int = `"boom`"" -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:imported-file" ($diag -match 'sub\.zeph:3:' -and $diag -notmatch 'main\.zeph') "got: $diag"
+
+Set-Content "$diagDir\main.zeph" "import `"sub.zeph`"`nprint(bad(1))" -Encoding ascii
+Set-Content "$diagDir\sub.zeph" @'
+// first
+fn bad[T](x: T) -> int {
+    let y: int = "boom"
+    return 0
+}
+'@ -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:generic-imported-file" ($diag -match 'sub\.zeph:3:' -and $diag -notmatch 'main\.zeph') "got: $diag"
+
+Set-Content "$diagDir\main.zeph" "// first`n// second`nlet x: int = `"boom`"" -Encoding ascii
+$diag = (cmd /c ".\zc.exe --rt `"$diagDir\main.zeph`" `"$diagDir\out.exe`" 2>&1" | Out-String).Trim()
+Check "error:main-file" ($diag -match 'main\.zeph:3:') "got: $diag"
+
 # ---- OOP: impl methods, associated functions, interface dynamic dispatch ----
 $oopdir = Join-Path $tmp "oop"
 New-Item -ItemType Directory -Force $oopdir | Out-Null
@@ -669,6 +811,33 @@ $flBuilt = Test-Path "$fldir\f.exe"
 $flOut = if ($flBuilt) { (cmd /c "`"$fldir\f.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 $flWant = @("3.6","1","2.5","0.1","4352464011485697175","4547007122018943789") -join "`n"
 Check "float-forin-and-literals" ($flBuilt -and $flOut -eq $flWant) "got: $flOut"
+
+# ---- unary minus on floats: runtime values, not just literals ----
+# The sign mask was folded from -0.0 as 0.0 - 0.0 = +0.0, so -x compiled to x
+# for every non-literal float while int negation and literals looked fine.
+Set-Content "$fldir\n.zeph" @'
+fn one() -> float { return 1.5 }
+let xs = [2.5]
+let t = one()
+print(-one())
+print(-one() * 2.0)
+print(-t)
+print(-xs[0])
+print(-(t * 2.0))
+let l = [-t, -one()]
+print(l[0] + l[1])
+print(bits(-0.0))
+let z = 0.0
+print(bits(-z))
+print(-7)
+print(bits("-0" as float))
+'@ -Encoding ascii
+Remove-Item "$fldir\n.exe" -ErrorAction SilentlyContinue
+& .\zc.exe --rt "$fldir\n.zeph" "$fldir\n.exe" 2>&1 | Out-Null
+$ngBuilt = Test-Path "$fldir\n.exe"
+$ngOut = if ($ngBuilt) { (cmd /c "`"$fldir\n.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
+$ngWant = @("-1.5","-3","-1.5","-2.5","-3","-3","-9223372036854775808","-9223372036854775808","-7","-9223372036854775808") -join "`n"
+Check "float-unary-minus" ($ngBuilt -and $ngOut -eq $ngWant) "got: $ngOut"
 
 # ---- threads: allocation and GC across several stacks ----
 # Run more than once: a collector that misses another thread's roots fails

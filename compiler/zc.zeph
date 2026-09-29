@@ -212,6 +212,8 @@ let CK_SYSCALL = 36    // Linux: `syscall` instruction, System V argument regist
 let CK_WGROW = 37      // wasm: memory.grow
 let CK_WWRITE = 38     // wasm: host import that takes (fd, ptr, len)
 let CK_WEXIT = 39      // wasm: host import that ends the program
+let CK_LOAD32 = 40
+let CK_LOAD16 = 41
 // cast kinds
 let C_NOP = 0
 let C_TRUNC = 1
@@ -275,6 +277,11 @@ var g_enums: [EDef] = []
 var g_ifaces: [IDef] = []
 var g_fnsigs: [FnSig] = []
 var g_fns: [FDef] = []
+// Keep the first entry when closures or generic instances share a name.
+var g_fn_names: [str: int] = [:]
+var g_struct_names: [str: int] = [:]
+var g_enum_names: [str: int] = [:]
+var g_iface_names: [str: int] = [:]
 // interface vtables to emit: parallel (struct-def index, interface index) pairs
 var g_vt_sd: [int] = []
 var g_vt_if: [int] = []
@@ -378,7 +385,7 @@ fn nnode(k: int, line: int) -> Node {
 }
 
 fn die(line: int, msg: str) {
-    panic("{g_file}:{line}: error: {msg}")
+    rt_panic_str("{g_file}:{line}: error: {msg}")
 }
 
 fn is_digit(c: int) -> bool { return c >= 48 and c <= 57 }
@@ -1438,10 +1445,7 @@ fn type_str(t: int) -> str {
 }
 
 fn find_enum(name: str) -> int {
-    for i in 0..g_enums.len() {
-        if g_enums[i].name == name { return i }
-    }
-    return 0 - 1
+    return g_enum_names.get(name).or(-1)
 }
 
 fn is_num(t: int) -> bool { return ty_kind[t] == K_INT or ty_kind[t] == K_FLOAT }
@@ -1459,17 +1463,11 @@ fn fits(want: int, got: int) -> bool {
 }
 
 fn find_struct(name: str) -> int {
-    for i in 0..g_structs.len() {
-        if g_structs[i].name == name { return i }
-    }
-    return -1
+    return g_struct_names.get(name).or(-1)
 }
 
 fn find_fn(name: str) -> int {
-    for i in 0..g_fns.len() {
-        if g_fns[i].name == name { return i }
-    }
-    return -1
+    return g_fn_names.get(name).or(-1)
 }
 
 fn is_builtin_name(n: str) -> bool {
@@ -1479,7 +1477,7 @@ fn is_builtin_name(n: str) -> bool {
     if n == "chr" or n == "byte" or n == "sub" or n == "join" or n == "bits" { return true }
     if n == "emit" or n == "frombits" or n == "zeros" or n == "assert" { return true }
     if n == "abs" or n == "min" or n == "max" or n == "pow" { return true }
-    if n == "load64" or n == "load8" or n == "store64" or n == "store32" or n == "store8" { return true }
+    if n == "load64" or n == "load32" or n == "load16" or n == "load8" or n == "store64" or n == "store32" or n == "store8" { return true }
     if n == "stackptr" or n == "win" or n == "addr" { return true }
     return false
 }
@@ -1855,6 +1853,9 @@ fn check_method(e: Node) -> int {
                 e.kids = fused
                 e.aux = CK_RTCALL
                 e.name = "rt_map_get_or"
+                if map_keykind(recv.kids[0].kids[0].ty) == 0 and not is_ref(ty_el[ot]) {
+                    e.name = "rt_map_get_or_val"
+                }
                 return ty_el[ot]
             }
             e.aux = CK_OPT_OR
@@ -2031,6 +2032,7 @@ fn check_fnlit(e: Node) -> int {
                     body: e.kids[2], nslots: nslots, line: e.line,
                     tparams: no_tp, node: e, label: "cl__" + (idx as str), has_env: true,
                     pristine: e, prist_ok: false, prist_nslots: 0})
+    if not g_fn_names.has("closure") { g_fn_names["closure"] = idx }
     g_insts.push(idx)
     e.refi = idx
     // Resolve each captured name in the enclosing scope, now that the closure's
@@ -2142,6 +2144,7 @@ fn instantiate(fi: int, names: [str], types: [int]) -> int {
                     body: clone_node(f.body), nslots: 0, line: f.line,
                     tparams: no_tp, node: node, label: f.name + "__" + (idx as str), has_env: false,
                     pristine: node, prist_ok: false, prist_nslots: 0})
+    if not g_fn_names.has(f.name) { g_fn_names[f.name] = idx }
     g_inst_keys.push(key)                        // cache before checking, so a
     g_inst_fis.push(idx)                         // recursive generic terminates
     g_insts.push(idx)
@@ -2313,10 +2316,13 @@ fn check_call(e: Node) -> int {
         return TI_VOID
     }
     // unsafe low-level intrinsics (for the Zephyr runtime)
-    if c.name == "load64" or c.name == "load8" {
+    if c.name == "load64" or c.name == "load32" or c.name == "load16" or c.name == "load8" {
         if nargs != 1 { die(e.line, "{c.name}(addr) takes one int argument") }
         if ty_kind[ce(e.kids[1])] != K_INT { die(e.line, "{c.name} argument must be int") }
-        if c.name == "load64" { e.aux = CK_LOAD64 } else { e.aux = CK_LOAD8 }
+        if c.name == "load64" { e.aux = CK_LOAD64 }
+        else if c.name == "load32" { e.aux = CK_LOAD32 }
+        else if c.name == "load16" { e.aux = CK_LOAD16 }
+        else { e.aux = CK_LOAD8 }
         return TI_INT
     }
     if c.name == "store64" or c.name == "store32" or c.name == "store8" {
@@ -2819,6 +2825,8 @@ fn always_returns(stmts: [Node]) -> bool {
 var g_top_nslots = 0
 var g_rt_top = 0     // top-level statements contributed by runtime.zeph (--rt)
 
+let XRESOLVE_PREFIX = "fn __xresolve"     // generated extern resolvers: never inlined
+
 // Desugar `extern fn` declarations into ordinary Zephyr functions that resolve
 // their target lazily and cache it: one LoadLibraryA per DLL, one
 // GetProcAddress per symbol, then callptr (which already does the full Win64
@@ -2889,13 +2897,16 @@ fn desugar_extern(prog: Node) {
         var arglist = ""
         if params.kids.len() > 0 { arglist = ", " + call.join() }
         src.push("var __xf{j} = 0\n")
+        // first-call resolution, kept out of line (see XRESOLVE_PREFIX): the
+        // wrapper itself inlines to a compare, a rarely-taken call and callptr
+        src.push(XRESOLVE_PREFIX + "{j}() -> int \{\n")
+        src.push("    let f = win(\"GetProcAddress\", __xd{d}(), __xcstr(\"{x.name}\"))\n")
+        src.push("    if f == 0 \{ panic(\"extern: {dllname} has no symbol {x.name}\") \}\n")
+        src.push("    return f\n\}\n")
         src.push("fn {x.name}(" + sig.join() + ")")
         if ret.k != N_NONE { src.push(" -> int") }
         src.push(" \{\n")
-        src.push("    if __xf{j} == 0 \{\n")
-        src.push("        __xf{j} = win(\"GetProcAddress\", __xd{d}(), __xcstr(\"{x.name}\"))\n")
-        src.push("        if __xf{j} == 0 \{ panic(\"extern: {dllname} has no symbol {x.name}\") \}\n")
-        src.push("    \}\n")
+        src.push("    if __xf{j} == 0 \{ __xf{j} = __xresolve{j}() \}\n")
         if ret.k == N_NONE { src.push("    let __r = callptr(__xf{j}" + arglist + ")\n") }
         else if sext { src.push("    return __xsext32(callptr(__xf{j}" + arglist + "))\n") }
         else { src.push("    return callptr(__xf{j}" + arglist + ")\n") }
@@ -2945,10 +2956,7 @@ fn fn_asm_label(name: str) -> str {
 }
 
 fn find_iface(name: str) -> int {
-    for i in 0..g_ifaces.len() {
-        if g_ifaces[i].name == name { return i }
-    }
-    return 0 - 1
+    return g_iface_names.get(name).or(-1)
 }
 fn iface_of(id: int) -> int { return new_type(K_IFACE, 0, id) }
 
@@ -2985,6 +2993,7 @@ fn vtable_index(sd: int, ifc: int) -> int {
 fn check(prog: Node) {
     // pass 0: enum names + members (int-backed, resolved at compile time)
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_ENUMDEF {
             if find_enum(n.name) >= 0 { die(n.line, "duplicate enum '{n.name}'") }
             if find_struct(n.name) >= 0 { die(n.line, "'{n.name}' is already a struct") }
@@ -2996,22 +3005,26 @@ fn check(prog: Node) {
                 members.push(m.name)
             }
             g_enums.push(EDef{name: n.name, members: members, line: n.line})
+            if not g_enum_names.has(n.name) { g_enum_names[n.name] = g_enums.len() - 1 }
             n.refi = g_enums.len() - 1
         }
     }
     // pass 1a: struct names
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF {
             if find_struct(n.name) >= 0 { die(n.line, "duplicate struct '{n.name}'") }
             if find_enum(n.name) >= 0 { die(n.line, "'{n.name}' is already an enum") }
             var fnames: [str] = []
             var ftypes: [int] = []
             g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line})
+            if not g_struct_names.has(n.name) { g_struct_names[n.name] = g_structs.len() - 1 }
             n.refi = g_structs.len() - 1
         }
     }
     // pass 1a.5: interface names + method signatures (self excluded from sigs)
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_INTERFACE {
             if find_iface(n.name) >= 0 { die(n.line, "duplicate interface '{n.name}'") }
             if find_struct(n.name) >= 0 { die(n.line, "'{n.name}' is already a struct") }
@@ -3034,11 +3047,13 @@ fn check(prog: Node) {
                 msigs.push(fn_of(ps, ret))
             }
             g_ifaces.push(IDef{name: n.name, mnames: mnames, msigs: msigs, line: n.line})
+            if not g_iface_names.has(n.name) { g_iface_names[n.name] = g_ifaces.len() - 1 }
             n.refi = g_ifaces.len() - 1
         }
     }
     // pass 1b: struct fields
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF {
             let sd = g_structs[n.refi]
             for f in n.kids {
@@ -3054,6 +3069,7 @@ fn check(prog: Node) {
     }
     // pass 1c: function signatures
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_FN {
             if find_fn(n.name) >= 0 { die(n.line, "duplicate function '{n.name}'") }
             if is_builtin_name(n.name) { die(n.line, "'{n.name}' is a builtin and cannot be redefined") }
@@ -3076,6 +3092,7 @@ fn check(prog: Node) {
                             body: n.kids[2], nslots: 0, line: n.line,
                             tparams: tparams, node: n, label: fn_asm_label(n.name), has_env: false,
                             pristine: n, prist_ok: false, prist_nslots: 0})
+            if not g_fn_names.has(n.name) { g_fn_names[n.name] = g_fns.len() - 1 }
             n.refi = g_fns.len() - 1
         }
     }
@@ -3084,6 +3101,7 @@ fn check(prog: Node) {
     g_is_top = true
     g_at_global = true
     for n in prog.kids {
+        g_file = n.file
         if n.k == N_STRUCTDEF or n.k == N_ENUMDEF or n.k == N_INTERFACE { continue }
         if n.k == N_FN {
             // a generic function is a template: nothing to check until it is
@@ -3099,6 +3117,7 @@ fn check(prog: Node) {
 
 // check one function body with the current type bindings in effect
 fn check_fn_body(f: FDef) {
+    g_file = f.node.file
     env_push()
     for j in 0..f.pnames.len() {
         env_add(f.pnames[j], f.ptypes[j], false, ID_PARAM, j)
@@ -3144,6 +3163,7 @@ fn drain_pending() {
 }
 
 // ---------------- codegen ----------------
+var g_uses_r12 = false
 fn o(s: str) {
     // peephole: "movq rax, xmm0" then "movq xmm0, rax" reloads xmm0 with the
     // value it already holds -- a no-op. Drops the float-result round-trip that
@@ -3151,9 +3171,14 @@ fn o(s: str) {
     if s == "movq xmm0, rax" and g_lines.len() > 0 {
         if g_lines[g_lines.len() - 1] == "  movq rax, xmm0\n" { return }
     }
+    if not g_uses_r12 { g_uses_r12 = line_uses_r12(s) }
     g_lines.push("  " + s + "\n")
 }
-fn raw(s: str) { g_lines.push(s + "\n") }
+fn raw(s: str) {
+    if not g_uses_r12 { g_uses_r12 = line_uses_r12(s) }
+    if s.len() > 3 and s.byte(0) == 114 { asm_predefine(s) }
+    g_lines.push(s + "\n")
+}
 
 // runtime functions keep bare names so they satisfy the codegen's rt_ calls
 fn fn_label(name: str) -> str {
@@ -3174,6 +3199,8 @@ fn add_dstr(s: str) -> int {
     g_dstrs.push(s)
     return g_dstrs.len() - 1
 }
+
+fn panic_site(e: Node) -> str { return "{e.file}:{e.line}: " }
 
 // Float literals used to be materialized with `movabs rax, <bits>` + `movq
 // xmm, rax`: two instructions, a GPR clobbered, and no chance for the SSE
@@ -3207,6 +3234,18 @@ fn rcall(f: str) {
     o("sub rsp, 32")
     o("call " + f)
     o("mov rsp, r12")
+}
+
+// The message is already in rcx; concatenate only after a failure.
+fn panic_message(e: Node) {
+    o("mov rdx, rcx")
+    o("lea rcx, [rip + __s{add_dstr(panic_site(e))}]")
+    rcall("rt_panic_at")
+}
+
+fn panic_literal(e: Node, msg: str) {
+    o("lea rcx, [rip + __s{add_dstr(panic_site(e) + msg)}]")
+    rcall("rt_panic_str")
 }
 
 fn slot_addr(kind: int, idx: int) -> str {
@@ -3324,6 +3363,24 @@ fn inl_borrow_decl(s: Node) -> bool {
     if s.name != "(inlined arg)" { return false }
     if not is_ref(s.ty) { return false }
     return borrow_ok(s.kids[0], false)
+}
+
+// gen_tmp for an operand consumed only by runtime code that runs no user code
+// (map/list primitives): a global can be borrowed too when nothing before
+// the call can run a store or a call, since then nothing can reassign it
+// while the runtime holds it.
+fn gen_tmp_rt(x: Node, safe: bool) -> bool {
+    if safe and x.k == N_ID and x.aux == ID_GLOBAL {
+        g_borrow = true
+        gen_expr(x)
+        return false
+    }
+    return gen_tmp(x, safe)
+}
+
+fn has_fn_arg(e: Node) -> bool {
+    for c in e.kids { if ty_kind[c.ty] == K_FN { return true } }
+    return false
 }
 
 // value -> rax; true when it is an owned temporary the caller must drop
@@ -3722,12 +3779,27 @@ fn float_reg(kind: int, idx: int) -> str {
 // observable order of side effects is preserved.
 var g_inl_fi = 0 - 1        // g_fns index whose slots we allocate from (-1 = top level)
 var g_hoisted: [Node] = []
-var g_inlend: [int] = []    // codegen: label stack for nested N_INLINE ends
+var g_inlend: [int] = []
+var g_inl_subs: [Node] = []   // inl_arg: per-param substitutions    // codegen: label stack for nested N_INLINE ends
+var g_inl_shared: [bool] = [] // pristine still borrows the function's unchanged body
+var g_inl_save = false      // current caller needs a snapshot before its first rewrite
 
+// Only the inline eligibility threshold matters; stop walking large bodies early.
 fn node_count(n: Node) -> int {
     var c = 1
-    for k in n.kids { c += node_count(k) }
+    for k in n.kids {
+        c += node_count(k)
+        if c > 128 { return c }
+    }
     return c
+}
+
+// Closure FDefs share their bodies with literals inside the enclosing AST.
+// They can be rewritten independently, so that AST cannot stay borrowed.
+fn inl_has_closure(n: Node) -> bool {
+    if n.k == N_FNLIT { return true }
+    for kid in n.kids { if inl_has_closure(kid) { return true } }
+    return false
 }
 
 fn inl_slots(n: int) -> int {
@@ -3771,6 +3843,9 @@ fn inl_clone(n: Node, pbase: int, lbase: int, res: int, depth: int) -> Node {
     c.aux = n.aux
     c.refi = n.refi
     c.mut = n.mut
+    if n.k == N_ID and n.aux == ID_PARAM and n.slot < g_inl_subs.len() and g_inl_subs[n.slot].k != N_NONE {
+        return clone_node(g_inl_subs[n.slot])      // argument substituted in place
+    }
     for kid in n.kids { c.kids.push(inl_clone(kid, pbase, lbase, res, depth)) }
     if c.k == N_ID {
         if c.aux == ID_PARAM {
@@ -3817,31 +3892,63 @@ fn inl_mkdecl(slot: int, val: Node, line: int) {
     g_hoisted.push(d)
 }
 
+// Arguments the inlined body may read directly instead of through a fresh
+// local: literals (so `b.put32(4, v)` folds its bounds check), and scalar
+// locals/params of the caller, which nothing inside the body can write. Only
+// when the body never assigns that parameter. Indexed by param slot; N_NONE
+// means "declare a local as usual" (declared with the inliner globals above).
+
+fn inl_arg(f: FDef, pidx: int, arg: Node, slot: int, line: int, subs: [Node]) {
+    var substitute = arg.k == N_INT or arg.k == N_FLOAT or arg.k == N_BOOL
+    if arg.k == N_ID and (arg.aux == ID_LOCAL or arg.aux == ID_PARAM) {
+        let tk = ty_kind[arg.ty]
+        substitute = tk == K_INT or tk == K_FLOAT or tk == K_BOOL
+    }
+    if substitute and not div_assigned_in(f.pristine, ID_PARAM, pidx) {
+        subs.push(arg)
+        return
+    }
+    subs.push(nnode(N_NONE, line))
+    inl_mkdecl(slot, arg, line)
+}
+
 // expand an inlinable call at parent.kids[i]: hoist param decls + inlined
 // body, replace the call with the result temp
 fn expand_call(parent: Node, i: int) {
+    // This is the first content mutation hoisting can make. Snapshot the caller
+    // before changing its slots or arguments, including when it calls itself.
+    if g_inl_save {
+        let caller = g_fns[g_inl_fi]
+        caller.pristine = clone_node(caller.body)
+        g_inl_shared[g_inl_fi] = false
+        g_inl_save = false
+    }
     let call = parent.kids[i]
     let f = g_fns[call.refi]
     let depth = call.ival + 1
     let pbase = inl_slots(f.pnames.len())
     let lbase = inl_slots(f.prist_nslots)
     let res = inl_slots(1)
+    // a local list: an argument's own nested expansion re-enters expand_call
+    var subs = no_nodes()
     var pi = 0
     if call.op == 1 {                       // UFCS receiver is param 0
         let x = try_kid(call.kids[0], 0)
-        inl_mkdecl(pbase + pi, call.kids[0].kids[0], call.line)
+        inl_arg(f, pi, call.kids[0].kids[0], pbase + pi, call.line, subs)
         pi += 1
     }
     for ai in 1..call.kids.len() {
         let x = try_kid(call, ai)
-        inl_mkdecl(pbase + pi, call.kids[ai], call.line)
+        inl_arg(f, pi, call.kids[ai], pbase + pi, call.line, subs)
         pi += 1
     }
     var inl = nnode(N_INLINE, call.line)
     inl.name = f.name
     inl.slot = res
     inl.ty = call.ty
+    g_inl_subs = subs
     for st in f.pristine.kids { inl.kids.push(inl_clone(st, pbase, lbase, res, depth)) }
+    g_inl_subs = no_nodes()
     g_hoisted.push(inl)
     g_inl_hits += 1
     var id = nnode(N_ID, call.line)
@@ -4001,15 +4108,44 @@ fn cf_eval(e: Node) -> Node {
         }
         if a.k == N_FLOAT {
             var c = nnode(N_FLOAT, e.line)
-            c.fval = 0.0 - a.fval
+            // negation is a sign flip, not 0.0 - x: that gives +0.0 for -0.0
+            c.fval = frombits(bits(a.fval) ^ (1 << 63))
             c.ty = TI_FLOAT
             return c
         }
         return nnode(N_NONE, e.line)
     }
+    if e.k == N_NOT {
+        let a = cf_eval(e.kids[0])
+        if a.k != N_BOOL { return nnode(N_NONE, e.line) }
+        var c = nnode(N_BOOL, e.line)
+        c.ival = 1 - a.ival
+        c.ty = TI_BOOL
+        return c
+    }
     if e.k == N_BIN {
         let a = cf_eval(e.kids[0])
         let b = cf_eval(e.kids[1])
+        if a.k == N_BOOL and b.k == N_BOOL and (e.op == T_AND or e.op == T_OR) {
+            var c = nnode(N_BOOL, e.line)
+            if e.op == T_AND { c.ival = a.ival & b.ival } else { c.ival = a.ival | b.ival }
+            c.ty = TI_BOOL
+            return c
+        }
+        if a.k == N_INT and b.k == N_INT and cmp_op(e.op) {
+            let op = e.op
+            var r = false
+            if op == T_EQEQ { r = a.ival == b.ival }
+            else if op == T_NE { r = a.ival != b.ival }
+            else if op == T_LT { r = a.ival < b.ival }
+            else if op == T_LE { r = a.ival <= b.ival }
+            else if op == T_GT { r = a.ival > b.ival }
+            else { r = a.ival >= b.ival }
+            var c = nnode(N_BOOL, e.line)
+            if r { c.ival = 1 }
+            c.ty = TI_BOOL
+            return c
+        }
         if a.k == N_INT and b.k == N_INT {
             var v = 0
             let op = e.op
@@ -4067,9 +4203,44 @@ fn cf_subst(e: Node) {
 // and nothing folded those -- the multiply was recomputed every iteration of
 // the loop it sat in. Runs over every tree, so literal arithmetic written out
 // by hand folds too.
+fn cmp_op(op: int) -> bool {
+    return op == T_EQEQ or op == T_NE or op == T_LT or op == T_LE or op == T_GT or op == T_GE
+}
+
+// overwrite e with src in place (parents keep their reference to e)
+fn node_become(e: Node, src: Node) {
+    e.k = src.k
+    e.op = src.op
+    e.name = src.name
+    e.ival = src.ival
+    e.fval = src.fval
+    e.ty = src.ty
+    e.slot = src.slot
+    e.aux = src.aux
+    e.refi = src.refi
+    e.mut = src.mut
+    e.kids = src.kids
+}
+
 fn cf_fold(e: Node) {
     for i in 0..e.kids.len() { cf_fold(e.kids[i]) }
-    if e.k != N_BIN and e.k != N_NEG and e.k != N_CAST { return }
+    // `and`/`or` with a literal side: true-and-X is X, X-and-true is X (X is
+    // evaluated either way), false-or-X is X, X-or-false is X. The dropped
+    // side is a literal, so no effect is lost.
+    if e.k == N_BIN and (e.op == T_AND or e.op == T_OR) {
+        let unit = e.op == T_AND                 // the neutral literal: true for and
+        let l = e.kids[0]
+        let r = e.kids[1]
+        if l.k == N_BOOL and (l.ival == 1) == unit and r.ty == TI_BOOL {
+            node_become(e, r)
+            return
+        }
+        if r.k == N_BOOL and (r.ival == 1) == unit and l.ty == TI_BOOL {
+            node_become(e, l)
+            return
+        }
+    }
+    if e.k != N_BIN and e.k != N_NEG and e.k != N_CAST and e.k != N_NOT { return }
     let v = cf_eval(e)
     if v.k != N_INT and v.k != N_FLOAT and v.k != N_BOOL { return }
     e.k = v.k
@@ -4127,16 +4298,24 @@ fn fold_globals(prog: Node) {
 }
 
 fn inline_pass(prog: Node) {
-    // capture pristine bodies before anything gets rewritten. Closures are
-    // excluded (only ever called indirectly); generic templates too (their
-    // instantiations are ordinary FDefs and do participate).
+    // Borrow pristine bodies until their first expansion would mutate them.
+    // Functions that never expand need no copy, even when used as callees.
+    // Closures and generic templates are excluded; instantiations participate.
+    bclear(g_inl_shared)
     for i in 0..g_fns.len() {
         let f = g_fns[i]
-        if not f.has_env and f.tparams.len() == 0 and node_count(f.body) <= 128 {
-            f.pristine = clone_node(f.body)
-            f.prist_ok = true
+        var shared = false
+        f.prist_ok = not f.has_env and f.tparams.len() == 0 and node_count(f.body) <= 128 and not starts_with(f.name, "__xresolve")
+        if f.prist_ok {
+            f.pristine = f.body
             f.prist_nslots = f.nslots
+            shared = true
+            if inl_has_closure(f.body) {
+                f.pristine = clone_node(f.body)
+                shared = false
+            }
         }
+        g_inl_shared.push(shared)
     }
     // NOTE: top-level statements are NOT hoisted -- inserting statements into
     // prog.kids would shift the g_rt_top boundary where rt_set_globals is
@@ -4150,6 +4329,7 @@ fn inline_pass(prog: Node) {
             let f = g_fns[i]
             if f.tparams.len() == 0 and dirty[i] {
                 g_inl_fi = i
+                g_inl_save = g_inl_shared[i]
                 g_inl_hits = 0
                 hoist_block(f.body)
                 dirty[i] = g_inl_hits > 0
@@ -4181,6 +4361,7 @@ fn div_present(e: Node) -> bool {
 // identity key of an eligible divisor node, "" if not eligible
 fn div_key(e: Node, d: Node) -> str {
     if e.aux == BC_FLOAT or e.aux == BC_STR { return "" }
+    if div_const_ok(d) { return "" }                 // folded at compile time instead
     if d.k == N_INT and d.ival >= 1 { return "c{d.ival}" }
     if d.k == N_ID and (d.aux == ID_LOCAL or d.aux == ID_PARAM) and ty_kind[d.ty] == K_INT {
         return "v{d.aux}_{d.slot}"
@@ -4260,76 +4441,181 @@ fn emit_div_setup(pair: int, dv: Node) {
 // one independent load of the data pointer plus the element load, which is
 // what a C compiler's register-held base does.
 //
-// "Can't change" means: the variable is not assigned in the loop, and the body
-// makes no real call -- a callee could reassign a global, and a push could
-// reallocate the data block out from under the cached pointer. Builtins that
-// compile to inline instructions (sqrt, len, load/store, abs/min/max) are not
-// real calls and don't disqualify the loop. Caching into stack slots rather
-// than registers means an unrelated call would be harmless anyway.
+// "Can't change" means: the list expression is not reassigned in the loop,
+// and every real call sits where its effects can be caught up with. A callee
+// could reassign a global or push onto (reallocate) any list, so a call is
+// only allowed as the root of a statement (`f(..)`, `x = f(..)`,
+// `let y = f(..)`) with call-free arguments; after such a statement every
+// active hoisted base is reloaded (lb_refresh). Calls anywhere else --
+// conditions, ranges, the middle of an expression -- disqualify the loop, as
+// does a closure. Builtins that compile to inline instructions (sqrt, len,
+// load/store, abs/min/max) and runtime-only helpers that never run user code
+// or touch a list (assert, print, pow, optionals) are not real calls.
+//
+// Bases are list variables (`xs[i]`) or a field of one (`r.xs[i]`); for a
+// field, the loop must not assign that field of any struct of the same type.
 let LB_MAX = 6
 var g_lb_next = 0
 var g_lb_base = 0
 var g_lb_keys: [str] = []
 var g_lb_nodes: [Node] = []
+var g_lb_active: [Node] = []     // list expression of each claimed pair, for lb_refresh
 
 fn lb_dslot(p: int) -> str { return "[rbp - {16 + 8 * (g_lb_base + 2 * p)}]" }
 fn lb_lslot(p: int) -> str { return "[rbp - {16 + 8 * (g_lb_base + 2 * p + 1)}]" }
 
 fn inline_ck(a: int) -> bool {
     if a == CK_SQRT or a == CK_LEN or a == CK_BITS { return true }
-    if a == CK_LOAD64 or a == CK_LOAD8 { return true }
+    if a == CK_LOAD64 or a == CK_LOAD32 or a == CK_LOAD16 or a == CK_LOAD8 { return true }
     if a == CK_STORE64 or a == CK_STORE32 or a == CK_STORE8 { return true }
     if a == CK_STACKPTR or a == CK_ABS or a == CK_MIN or a == CK_MAX { return true }
     return false
 }
 
-// true if the subtree contains anything that could reassign or reallocate a list
-fn lb_unsafe(e: Node) -> bool {
-    if e.k == N_CALL {
-        if not inline_ck(e.aux) { return true }
-    }
+fn lb_harmless(a: int) -> bool {
+    if inline_ck(a) { return true }
+    return a == CK_ASSERT or a == CK_PANIC or a == CK_PRINT or a == CK_POW or a == CK_OPT_HAS or a == CK_OPT_GET or a == CK_OPT_OR
+}
+
+// any real call (or closure) anywhere in the subtree
+fn lb_has_call(e: Node) -> bool {
+    if e.k == N_CALL and not lb_harmless(e.aux) { return true }
     if e.k == N_FNLIT { return true }
-    for c in e.kids { if lb_unsafe(c) { return true } }
+    for c in e.kids { if lb_has_call(c) { return true } }
     return false
 }
 
+// an expression in statement-root position: a call is fine if its own
+// arguments are call-free (it runs last; lb_refresh follows the statement)
+fn lb_root_ok(e: Node) -> bool {
+    if e.k == N_CALL and not lb_harmless(e.aux) {
+        for c in e.kids { if lb_has_call(c) { return false } }
+        return true
+    }
+    return not lb_has_call(e)
+}
+
+// does statement s end with a call that lb_refresh must follow?
+fn lb_root_call(s: Node) -> bool {
+    if s.k == N_EXPRST or s.k == N_DECL { return s.kids.len() > 0 and lb_has_call(s.kids[0]) }
+    if s.k == N_ASSIGN { return lb_has_call(s.kids[1]) }
+    if s.k == N_INLINE { return lb_has_call(s) }
+    return false
+}
+
+// true if the statement list could change a hoisted base behind our back
+fn lb_unsafe(blk: Node) -> bool {
+    for s in blk.kids { if lb_unsafe_stmt(s) { return true } }
+    return false
+}
+
+fn lb_unsafe_stmt(s: Node) -> bool {
+    let k = s.k
+    if k == N_EXPRST { return not lb_root_ok(s.kids[0]) }
+    if k == N_DECL {
+        if s.kids.len() == 0 { return false }
+        return not lb_root_ok(s.kids[0])
+    }
+    if k == N_ASSIGN {
+        if s.kids[0].k == N_ID { return not lb_root_ok(s.kids[1]) }
+        return lb_has_call(s)
+    }
+    if k == N_IF {
+        if lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) { return true }
+        return s.kids[2].k != N_NONE and lb_unsafe(s.kids[2])
+    }
+    if k == N_WHILE { return lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) }
+    if k == N_FORR { return lb_has_call(s.kids[0]) or lb_has_call(s.kids[1]) or lb_unsafe(s.kids[2]) }
+    if k == N_FORIN { return lb_has_call(s.kids[0]) or lb_unsafe(s.kids[1]) }
+    if k == N_INLINE { return lb_unsafe(s) }
+    if k == N_RET { return false }            // leaves the loop: nothing reads a base after it
+    if k == N_IRET {                          // jumps to its N_INLINE's end: refreshed there
+        if s.kids[0].k == N_NONE { return false }
+        return not lb_root_ok(s.kids[0])
+    }
+    return lb_has_call(s)
+}
+
+// loop header parts, evaluated before setup or on every iteration, must not call
+fn lb_header_ok(s: Node) -> bool {
+    if s.k == N_WHILE { return not lb_has_call(s.kids[0]) }
+    if s.k == N_FORR { return not lb_has_call(s.kids[0]) and not lb_has_call(s.kids[1]) }
+    return true
+}
+
+// hoistable list expression: a list variable, or a field of a struct variable
+fn lb_base_ok(v: Node) -> bool {
+    if ty_kind[v.ty] != K_LIST { return false }
+    var b = v
+    if v.k == N_MEMBER {
+        b = v.kids[0]
+        if ty_kind[b.ty] != K_STRUCT { return false }
+    }
+    if b.k != N_ID { return false }
+    return b.aux == ID_LOCAL or b.aux == ID_GLOBAL or b.aux == ID_PARAM
+}
+
+fn lb_key(v: Node) -> str {
+    if v.k == N_MEMBER { return "{v.kids[0].aux}_{v.kids[0].slot}.{v.slot}" }
+    return "{v.aux}_{v.slot}"
+}
+
 fn lb_scan(e: Node) {
-    if e.k == N_INDEX and e.op == 0 and e.kids[0].k == N_ID and ty_kind[e.kids[0].ty] == K_LIST {
+    if e.k == N_INDEX and e.op == 0 and lb_base_ok(e.kids[0]) {
         let v = e.kids[0]
-        if v.aux == ID_LOCAL or v.aux == ID_GLOBAL or v.aux == ID_PARAM {
-            let key = "{v.aux}_{v.slot}"
-            var seen = false
-            for i in 0..g_lb_keys.len() { if g_lb_keys[i] == key { seen = true } }
-            if not seen {
-                g_lb_keys.push(key)
-                g_lb_nodes.push(v)
-            }
+        let key = lb_key(v)
+        var seen = false
+        for i in 0..g_lb_keys.len() { if g_lb_keys[i] == key { seen = true } }
+        if not seen {
+            g_lb_keys.push(key)
+            g_lb_nodes.push(v)
         }
     }
     for c in e.kids { lb_scan(c) }
 }
 
-fn lb_mark(e: Node, aux: int, slot: int, pair: int) {
-    if e.k == N_INDEX and e.op == 0 and e.kids[0].k == N_ID {
-        let v = e.kids[0]
-        if v.aux == aux and v.slot == slot and ty_kind[v.ty] == K_LIST { e.op = pair + 1 }
+fn lb_mark(e: Node, key: str, pair: int) {
+    if e.k == N_INDEX and e.op == 0 and lb_base_ok(e.kids[0]) {
+        if lb_key(e.kids[0]) == key { e.op = pair + 1 }
     }
-    for c in e.kids { lb_mark(c, aux, slot, pair) }
+    for c in e.kids { lb_mark(c, key, pair) }
+}
+
+// is field `slot` of a struct of type `ty` assigned anywhere in the subtree?
+fn lb_field_assigned(e: Node, ty: int, slot: int) -> bool {
+    if e.k == N_ASSIGN {
+        let t = e.kids[0]
+        if t.k == N_MEMBER and t.slot == slot and type_eq(t.kids[0].ty, ty) { return true }
+    }
+    for c in e.kids { if lb_field_assigned(c, ty, slot) { return true } }
+    return false
 }
 
 fn emit_lb_setup(pair: int, v: Node) {
-    gen_leaf("rcx", v)                     // the list object
+    if v.k == N_MEMBER {
+        gen_leaf("rcx", v.kids[0])         // the struct
+        o("mov rcx, [rcx + {8 * v.slot}]") // the list object
+    } else {
+        gen_leaf("rcx", v)                 // the list object
+    }
     o("mov rdx, [rcx]")                    // length
     o("mov " + lb_lslot(pair) + ", rdx")
     o("mov rcx, [rcx + 16]")               // data pointer
     o("mov " + lb_dslot(pair) + ", rcx")
+    while g_lb_active.len() <= pair { g_lb_active.push(v) }
+    g_lb_active[pair] = v
 }
 
-// hoist up to (LB_MAX - g_lb_next) list bases for a loop body; returns how many
+// after a statement that called out: reload every active hoisted base
+fn lb_refresh() {
+    for p in 0..g_lb_next { emit_lb_setup(p, g_lb_active[p]) }
+}
+
+// hoist up to (LB_MAX - g_lb_next) list bases for a loop; returns how many
 // were claimed (the caller releases them after the loop)
-fn lb_promote_loop(body: Node) -> int {
+fn lb_promote_loop(loop_stmt: Node, body: Node) -> int {
     if g_lb_next >= LB_MAX { return 0 }
-    if lb_unsafe(body) { return 0 }
+    if not lb_header_ok(loop_stmt) or lb_unsafe(body) { return 0 }
     sclear(g_lb_keys)
     nclear(g_lb_nodes)
     lb_scan(body)
@@ -4337,8 +4623,15 @@ fn lb_promote_loop(body: Node) -> int {
     var ci = 0
     while ci < g_lb_keys.len() and g_lb_next < LB_MAX {
         let v = g_lb_nodes[ci]
-        if not div_assigned_in(body, v.aux, v.slot) {
-            lb_mark(body, v.aux, v.slot, g_lb_next)
+        var ok = true
+        if v.k == N_MEMBER {
+            let b = v.kids[0]
+            ok = not div_assigned_in(body, b.aux, b.slot) and not lb_field_assigned(body, b.ty, v.slot)
+        } else {
+            ok = not div_assigned_in(body, v.aux, v.slot)
+        }
+        if ok {
+            lb_mark(body, g_lb_keys[ci], g_lb_next)
             emit_lb_setup(g_lb_next, v)
             g_lb_next += 1
             took += 1
@@ -4363,8 +4656,11 @@ fn has_index(e: Node) -> bool {
 }
 
 // promote up to (2 - g_div_next) invariant divisors for a loop body; returns
-// how many pairs were claimed (caller releases them after the loop)
-fn div_promote_loop(body: Node) -> int {
+// how many pairs were claimed (caller releases them after the loop). Invariance
+// is checked over the whole loop statement: a for loop's own variable is
+// written by its header, not its body, and hoisting it read the previous
+// run's last value (every nested `for d in ...` divided by a stale d).
+fn div_promote_loop(body: Node, whole: Node) -> int {
     if g_div_next >= 2 { return 0 }
     sclear(g_dc_keys)
     nclear(g_dc_nodes)
@@ -4374,7 +4670,7 @@ fn div_promote_loop(body: Node) -> int {
     while ci < g_dc_keys.len() and g_div_next < 2 {
         let d = g_dc_nodes[ci]
         var ok = true
-        if d.k == N_ID { ok = not div_assigned_in(body, d.aux, d.slot) }
+        if d.k == N_ID { ok = not div_assigned_in(whole, d.aux, d.slot) }
         if ok {
             div_mark(body, g_dc_keys[ci], g_div_next)
             emit_div_setup(g_div_next, d)
@@ -4384,6 +4680,61 @@ fn div_promote_loop(body: Node) -> int {
         ci += 1
     }
     return took
+}
+
+// A literal divisor 2..2^31-1 needs no zero check and no runtime reciprocal:
+// powers of two become shifts/masks with a sign bias (truncating semantics),
+// the rest use M = floor((2^64-1)/d) computed here. Only rax, rcx, rdx.
+fn div_const_ok(d: Node) -> bool {
+    return d.k == N_INT and d.ival >= 2 and d.ival <= 2147483647
+}
+
+fn gen_div_const(e: Node) {
+    let d = e.kids[1].ival
+    var k = 0
+    while (1 << k) < d { k += 1 }
+    gen_expr(e.kids[0])                   // n -> rax
+    if (1 << k) == d {
+        o("mov rcx, rax")
+        o("sar rcx, 63")
+        o("shr rcx, {64 - k}")            // bias = n < 0 ? d-1 : 0
+        if e.op == T_SLASH {
+            o("add rax, rcx")
+            o("sar rax, {k}")
+        } else {
+            o("add rcx, rax")
+            o("and rcx, {0 - d}")
+            o("sub rax, rcx")
+        }
+        return
+    }
+    // (2^64-1)/d without unsigned ints: 2^64-1 = 2a+1 with a = 2^63-1
+    let a = 9223372036854775807
+    let magic = 2 * (a / d) + (2 * (a % d) + 1) / d
+    let slow = newlabel()
+    let qok = newlabel()
+    let end = newlabel()
+    o("test rax, rax")
+    o("js {lbl(slow)}")
+    o("mov rcx, rax")                     // n
+    o("movabs rdx, {magic}")
+    o("mul rdx")                          // rdx = q0 = mulhi(n, M), q or q-1
+    o("imul rax, rdx, {d}")
+    o("sub rcx, rax")                     // r = n - q0*d
+    o("mov rax, rdx")
+    o("cmp rcx, {d}")
+    o("jb {lbl(qok)}")
+    o("add rax, 1")
+    o("sub rcx, {d}")
+    olabel(qok)
+    if e.op == T_PCT { o("mov rax, rcx") }
+    o("jmp {lbl(end)}")
+    olabel(slow)
+    o("mov rcx, {d}")
+    o("cqo")
+    o("idiv rcx")
+    if e.op == T_PCT { o("mov rax, rdx") }
+    olabel(end)
 }
 
 // q0 = mulhi(n, M) is q or q-1 for any n >= 0 (signed => n < 2^63); one
@@ -4401,12 +4752,7 @@ fn gen_div_fast(e: Node) {
     let sv = scratch_take()
     if sv == "" {
         gen_int_operands(e.kids[0], e.kids[1])
-        let ok0 = newlabel()
-        o("test rcx, rcx")
-        o("jne {lbl(ok0)}")
-        if e.op == T_SLASH { rcall("rt_div_zero") }
-        else { rcall("rt_mod_zero") }
-        olabel(ok0)
+        gen_zero_check(e)
         o("cqo")
         o("idiv rcx")
         if e.op == T_PCT { o("mov rax, rdx") }
@@ -4435,12 +4781,7 @@ fn gen_div_fast(e: Node) {
     o("jmp {lbl(end)}")
     olabel(slow)
     gen_leaf("rcx", e.kids[1])    // divisor is a leaf by construction
-    let ok = newlabel()
-    o("test rcx, rcx")
-    o("jne {lbl(ok)}")
-    if e.op == T_SLASH { rcall("rt_div_zero") }
-    else { rcall("rt_mod_zero") }
-    olabel(ok)
+    gen_zero_check(e)
     o("cqo")
     o("idiv rcx")
     if e.op == T_PCT { o("mov rax, rdx") }
@@ -4451,43 +4792,42 @@ fn gen_div_fast(e: Node) {
 // that never runs -- but inline it still costs fetch/decode bandwidth in the
 // hot loop it sits in (7 instructions per access). Emit only the branch here
 // and park the panic sequence at the end of the function, where it costs
-// nothing. rt_bounds_fail never returns, so nothing jumps back.
+// nothing. The panic routine never returns, so nothing jumps back.
 var g_cold: [str] = []          // deferred out-of-line blocks for this function
 
-fn gen_bounds_check(listreg: str, idxreg: str) {
+// A failed check branches away; the successful path carries no location work.
+fn cold_panic(e: Node, msg: str) {
+    g_cold.push("  lea rcx, [rip + __s{add_dstr(panic_site(e) + msg)}]\n")
+    g_cold.push("  mov r12, rsp\n")
+    g_cold.push("  and rsp, -16\n")
+    g_cold.push("  sub rsp, 32\n")
+    g_cold.push("  call rt_panic_str\n")
+}
+
+fn gen_zero_check(e: Node) {
+    let ok = newlabel()
+    o("test rcx, rcx")
+    o("jne {lbl(ok)}")
+    if e.op == T_SLASH { panic_literal(e, "division by zero") }
+    else { panic_literal(e, "modulo by zero") }
+    olabel(ok)
+}
+
+fn gen_bounds_check(listreg: str, idxreg: str, e: Node) {
     let fail = newlabel()
     o("cmp {idxreg}, [{listreg}]")
     o("jae {lbl(fail)}")
     g_cold.push(".L{fail}:\n")
-    if idxreg == "rax" {
-        g_cold.push("  mov rdx, [{listreg}]\n")
-        g_cold.push("  mov rcx, rax\n")
-    } else {
-        g_cold.push("  mov r8, [rcx]\n")
-        g_cold.push("  mov rcx, {idxreg}\n")
-        g_cold.push("  mov rdx, r8\n")
-    }
-    // the same rsp-alignment dance rcall() emits, spelled out for the cold block
-    g_cold.push("  mov r12, rsp\n")
-    g_cold.push("  and rsp, -16\n")
-    g_cold.push("  sub rsp, 32\n")
-    g_cold.push("  call rt_bounds_fail\n")
-    g_cold.push("  mov rsp, r12\n")
+    cold_panic(e, "index out of bounds")
 }
 
 // bounds check against a cached length in a frame slot (hoisted list base)
-fn gen_bounds_check_slot(lenslot: str, idxreg: str) {
+fn gen_bounds_check_slot(lenslot: str, idxreg: str, e: Node) {
     let fail = newlabel()
     o("cmp {idxreg}, " + lenslot)
     o("jae {lbl(fail)}")
     g_cold.push(".L{fail}:\n")
-    g_cold.push("  mov rdx, " + lenslot + "\n")
-    g_cold.push("  mov rcx, {idxreg}\n")
-    g_cold.push("  mov r12, rsp\n")
-    g_cold.push("  and rsp, -16\n")
-    g_cold.push("  sub rsp, 32\n")
-    g_cold.push("  call rt_bounds_fail\n")
-    g_cold.push("  mov rsp, r12\n")
+    cold_panic(e, "index out of bounds")
 }
 
 // flush the cold blocks collected while generating one function body
@@ -4783,6 +5123,10 @@ fn gen_binop(e: Node) {
         gen_div_fast(e)
         return
     }
+    if (op == T_SLASH or op == T_PCT) and cat != BC_FLOAT and cat != BC_STR and div_const_ok(e.kids[1]) {
+        gen_div_const(e)
+        return
+    }
     // whole subtree is an addressing mode: one lea instead of shift/mov/add
     if op == T_PLUS {
         let m = mem_operand(e)
@@ -4989,12 +5333,7 @@ fn gen_binop(e: Node) {
         return
     }
     if op == T_SLASH or op == T_PCT {
-        let ok = newlabel()
-        o("test rcx, rcx")
-        o("jne {lbl(ok)}")
-        if op == T_SLASH { rcall("rt_div_zero") }
-        else { rcall("rt_mod_zero") }
-        olabel(ok)
+        gen_zero_check(e)
         o("cqo")
         o("idiv rcx")
         if op == T_PCT { o("mov rax, rdx") }
@@ -5055,7 +5394,7 @@ fn tmp_safe(e: Node) -> bool {
     if e.k == N_INT or e.k == N_FLOAT or e.k == N_BOOL { return true }
     if e.k == N_ID { return e.aux != ID_FUNC and not is_ref(e.ty) }
     if e.k == N_CALL {
-        if e.aux != CK_LOAD64 and e.aux != CK_LOAD8 { return false }
+        if e.aux != CK_LOAD64 and e.aux != CK_LOAD32 and e.aux != CK_LOAD16 and e.aux != CK_LOAD8 { return false }
     } else if e.k == N_BIN {
         if e.aux == BC_STR { return false }
     } else if e.k != N_NEG and e.k != N_NOT {
@@ -5179,7 +5518,7 @@ fn gen_into_try(e: Node, dst: str) -> bool {
         return true
     }
     if e.k == N_CALL and e.aux == CK_LOAD64 {
-        let m = mem_operand(e.kids[1])
+        let m = addr_operand_free(e.kids[1])
         if m == "" { return false }
         o("mov " + dst + ", " + m)
         return true
@@ -5267,6 +5606,10 @@ fn cond_ops_ok(cond: Node) -> bool {
 }
 
 fn gen_cond(cond: Node, target: int, jfalse: bool) {
+    if cond.k == N_BOOL {                   // folded condition: jump or fall through
+        if (cond.ival == 0) == jfalse { o("jmp {lbl(target)}") }
+        return
+    }
     // short-circuit and/or lowered directly to branches -- no boolean is ever
     // materialized, so the comparisons inside fuse to cmp/comisd + jcc.
     if cond.k == N_BIN and cond.op == T_AND {
@@ -5398,7 +5741,7 @@ fn gen_index_addr(e: Node) -> str {
     if e.op > 0 {                      // base hoisted out of the enclosing loop
         let p = e.op - 1
         if inreg { ir = iop } else { gen_expr(e.kids[1]) }
-        gen_bounds_check_slot(lb_lslot(p), ir)
+        gen_bounds_check_slot(lb_lslot(p), ir, e)
         o("mov rcx, " + lb_dslot(p))
         g_ia_tmp = 0                   // nothing parked: every caller ends with index_fin_keep
         return ir
@@ -5416,7 +5759,7 @@ fn gen_index_addr(e: Node) -> str {
         g_ia_tmp = 1
         if t { g_ia_tmp = 2 }
     }
-    gen_bounds_check("rcx", ir)
+    gen_bounds_check("rcx", ir, e)
     o("mov rcx, [rcx + 16]")
     return ir
 }
@@ -5498,13 +5841,144 @@ fn mem_operand(e: Node) -> str {
     return "[" + br + " + " + ir + "*{sc}]"
 }
 
+// callptr whose operands are call-free: nothing can run between evaluating
+// one argument and the next, so leaves (literals, variables) need no staging
+// and load straight into their argument register or stack slot at the call.
+fn callptr_direct_ok(e: Node) -> bool {
+    for i in 1..e.kids.len() {
+        if has_call(e.kids[i]) or ty_kind[e.kids[i].ty] == K_FLOAT { return false }
+    }
+    return true
+}
+
+fn gen_callptr_direct(e: Node) {
+    let nargs = e.kids.len() - 2              // kids[0]=callee, kids[1]=target, then args
+    var at: [int] = []                         // per operand: push index, or -1 for a leaf
+    var npushed = 0
+    for i in 1..e.kids.len() {
+        let a = e.kids[i]
+        if is_leaf(a) { at.push(0 - 1) }
+        else {
+            gen_expr(a)
+            o("push rax")
+            at.push(npushed)
+            npushed += 1
+        }
+    }
+    o("mov r12, rsp")
+    o("and rsp, -16")
+    var nstack = 0
+    if nargs > 4 { nstack = nargs - 4 }
+    let pframe = (32 + 8 * nstack + 15) & (0 - 16)
+    o("sub rsp, {pframe}")
+    // operand i (0 = target) as a source, loaded into reg
+    for k in 0..nstack {
+        let i = 5 + k
+        if at[i] < 0 { gen_leaf("rax", e.kids[i + 1]) }
+        else { o("mov rax, [r12 + {8 * (npushed - 1 - at[i])}]") }
+        o("mov [rsp + {32 + 8 * k}], rax")
+    }
+    let ar = ["r10", "rcx", "rdx", "r8", "r9"]
+    var i = 0
+    while i < 5 and i <= nargs {
+        if at[i] < 0 { gen_leaf(ar[i], e.kids[i + 1]) }
+        else { o("mov " + ar[i] + ", [r12 + {8 * (npushed - 1 - at[i])}]") }
+        i += 1
+    }
+    o("call r10")
+    o("mov rsp, r12")
+    if npushed > 0 { o("add rsp, {8 * npushed}") }
+}
+
+// `base + K` / `K + base` / `base - K` with a literal K: the literal folds
+// into the memory operand's displacement. Returns the displacement (0: no
+// split) and leaves the base in g_ad_base.
+var g_ad_base = nnode(N_NONE, 0)
+
+fn addr_disp(e: Node) -> int {
+    if e.k != N_BIN or e.aux == BC_FLOAT or e.aux == BC_STR { return 0 }
+    if e.op == T_PLUS and e.kids[1].k == N_INT and e.kids[1].ival > 0 - 2147483648 and e.kids[1].ival < 2147483647 {
+        g_ad_base = e.kids[0]
+        return e.kids[1].ival
+    }
+    if e.op == T_PLUS and e.kids[0].k == N_INT and e.kids[0].ival > 0 - 2147483648 and e.kids[0].ival < 2147483647 {
+        g_ad_base = e.kids[1]
+        return e.kids[0].ival
+    }
+    if e.op == T_MINUS and e.kids[1].k == N_INT and e.kids[1].ival > 0 - 2147483647 and e.kids[1].ival < 2147483647 {
+        g_ad_base = e.kids[0]
+        return 0 - e.kids[1].ival
+    }
+    return 0
+}
+
+fn disp_str(d: int) -> str {
+    if d < 0 { return " - {0 - d}" }
+    return " + {d}"
+}
+
+// memory operand for an address expression that needs no code at all
+// (register-resident parts plus a literal displacement), or ""
+fn addr_operand_free(e: Node) -> str {
+    let m = mem_operand(e)
+    if m != "" { return m }
+    let d = addr_disp(e)
+    if d == 0 { return "" }
+    let b = g_ad_base
+    let bm = mem_operand(b)
+    if bm != "" { return bm.sub(0, bm.len() - 1) + disp_str(d) + "]" }
+    let br = leaf_reg(b)
+    if br != "" { return "[" + br + disp_str(d) + "]" }
+    return ""
+}
+
+// memory operand for an address expression; may emit code into rax
+fn gen_load_addr(e: Node) -> str {
+    let m = addr_operand_free(e)
+    if m != "" { return m }
+    let d = addr_disp(e)
+    if d != 0 {
+        let b = g_ad_base
+        gen_expr(b)
+        return "[rax" + disp_str(d) + "]"
+    }
+    gen_expr(e)
+    return "[rax]"
+}
+
+// store64/32/8: address then value, value register named by width
+fn gen_store_raw(e: Node, vreg: str) {
+    let m = addr_operand_free(e.kids[1])
+    if m != "" and addr_safe_value(e.kids[2]) {
+        if vreg == "rax" {
+            let vr = leaf_reg(e.kids[2])
+            if vr != "" {                        // register source: no staging at all
+                o("mov " + m + ", " + vr)
+                return
+            }
+        }
+        gen_expr(e.kids[2])
+        o("mov " + m + ", " + vreg)
+        return
+    }
+    var d = addr_disp(e.kids[1])
+    var b = e.kids[1]
+    if d != 0 { b = g_ad_base }
+    gen_expr(b)
+    o("push rax")
+    gen_expr(e.kids[2])
+    o("pop rcx")
+    if d != 0 { o("mov [rcx" + disp_str(d) + "], " + vreg) }
+    else { o("mov [rcx], " + vreg) }
+}
+
 // A folded store computes its address at the point of the store rather than
 // before the value, so the value must not be able to disturb the locals the
 // address reads. No calls means no way to reach them.
 fn addr_safe_value(e: Node) -> bool {
     if e.k == N_CALL {
         let a = e.aux
-        if a != CK_LOAD64 and a != CK_LOAD8 { return false }
+        if a != CK_LOAD64 and a != CK_LOAD32 and a != CK_LOAD16 and a != CK_LOAD8 { return false }
     }
     for i in 0..e.kids.len() {
         if not addr_safe_value(e.kids[i]) { return false }
@@ -5611,7 +6085,7 @@ fn gen_call(e: Node) {
     if k == CK_PANIC {
         let t = gen_tmp(e.kids[1], true)       // borrowed; the process does not come back
         o("mov rcx, rax")
-        rcall("rt_panic_str")
+        panic_message(e)
         return
     }
     if k == CK_SQRT {
@@ -5642,6 +6116,7 @@ fn gen_call(e: Node) {
         let t = gen_tmp(e.kids[0].kids[0], true)
         tmp_hold(t)
         o("mov rcx, rax")
+        o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_list_pop")             // ownership moves out of the list
         tmp_done_keep(t)
         return
@@ -5671,9 +6146,7 @@ fn gen_call(e: Node) {
         let ok = newlabel()
         o("cmp rax, 0")
         o("jne {lbl(ok)}")
-        let msgi = add_dstr("called .get() on a none value")
-        o("lea rcx, [rip + __s{msgi}]")
-        rcall("rt_panic_str")
+        panic_literal(e, "called .get() on a none value")
         olabel(ok)
         o("mov rax, [rax]")
         if is_ref(e.ty) { dup_rax() }
@@ -5756,7 +6229,8 @@ fn gen_call(e: Node) {
             if i == 0 { a = a.kids[0] }
             var safe = true
             for j in (i + 1)..e.kids.len() { if has_call(e.kids[j]) { safe = false } }
-            owned.push(gen_tmp(a, safe))
+            if has_fn_arg(e) { owned.push(gen_tmp(a, safe)) }   // might call back into user code
+            else { owned.push(gen_tmp_rt(a, safe)) }
             o("push rax")
             n += 1
         }
@@ -5810,18 +6284,16 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_ASSERT {
-        gen_expr(e.kids[1])
+        if e.kids[1].k == N_BOOL and e.kids[1].ival == 1 { return }
         let ok = newlabel()
-        o("test rax, rax")
-        o("jne {lbl(ok)}")
+        gen_cond(e.kids[1], ok, false)      // fused compare-and-branch
         if e.kids.len() > 2 {
             gen_expr(e.kids[2])
             o("mov rcx, rax")
+            panic_message(e)
         } else {
-            let msgi = add_dstr("assertion failed")
-            o("lea rcx, [rip + __s{msgi}]")
+            panic_literal(e, "assertion failed")
         }
-        rcall("rt_panic_str")
         olabel(ok)
         return
     }
@@ -5835,6 +6307,7 @@ fn gen_call(e: Node) {
         let t = gen_tmp(e.kids[1], true)
         tmp_hold(t)
         o("mov rcx, rax")
+        o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_read_file")
         tmp_done_keep(t)
         return
@@ -5847,12 +6320,18 @@ fn gen_call(e: Node) {
         o("push rax")
         o("mov rdx, [rsp]")
         o("mov rcx, [rsp + 8]")
+        o("lea r8, [rip + __s{add_dstr(panic_site(e))}]")
         rcall("rt_write_file")
         drop_temps(owned)
         return
     }
     if k == CK_CHR {
         gen_expr(e.kids[1])
+        let fail = newlabel()
+        o("cmp rax, 255")
+        o("ja {lbl(fail)}")
+        g_cold.push(".L{fail}:\n")
+        cold_panic(e, "chr out of range")
         o("mov rcx, rax")
         rcall("rt_chr")
         return
@@ -5866,62 +6345,37 @@ fn gen_call(e: Node) {
         return
     }
     if k == CK_LOAD64 {
-        let m = mem_operand(e.kids[1])
-        if m != "" {
-            o("mov rax, " + m)
-            return
-        }
-        gen_expr(e.kids[1])
-        o("mov rax, [rax]")
+        o("mov rax, " + gen_load_addr(e.kids[1]))
         return
     }
     if k == CK_LOAD8 {
-        let m = mem_operand(e.kids[1])
-        if m != "" {
-            o("movzx eax, byte ptr " + m)
-            return
-        }
-        gen_expr(e.kids[1])
-        o("movzx eax, byte ptr [rax]")
+        o("movzx eax, byte ptr " + gen_load_addr(e.kids[1]))
+        return
+    }
+    if k == CK_LOAD32 or k == CK_LOAD16 {
+        let m = gen_load_addr(e.kids[1])
+        if k == CK_LOAD32 { o("mov eax, dword ptr " + m) }
+        else { o("movzx eax, word ptr " + m) }
         return
     }
     if k == CK_STORE64 {
-        let m = mem_operand(e.kids[1])
-        if m != "" and addr_safe_value(e.kids[2]) {
-            let vr = leaf_reg(e.kids[2])
-            if vr != "" {                        // register source: no staging at all
-                o("mov " + m + ", " + vr)
-                return
-            }
-            gen_expr(e.kids[2])
-            o("mov " + m + ", rax")
-            return
-        }
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], rax")
+        gen_store_raw(e, "rax")
         return
     }
     if k == CK_STORE32 {
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], eax")
+        gen_store_raw(e, "eax")
         return
     }
     if k == CK_STORE8 {
-        gen_expr(e.kids[1])
-        o("push rax")
-        gen_expr(e.kids[2])
-        o("pop rcx")
-        o("mov [rcx], al")
+        gen_store_raw(e, "al")
         return
     }
     if k == CK_STACKPTR {
         o("mov rax, rsp")
+        return
+    }
+    if k == CK_CALLPTR and callptr_direct_ok(e) {
+        gen_callptr_direct(e)
         return
     }
     if k == CK_CALLPTR {
@@ -6032,7 +6486,7 @@ fn gen_call(e: Node) {
         o("push rax")
         gen_expr(e.kids[1])
         o("mov rcx, [rsp]")
-        gen_bounds_check("rcx", "rax")
+        gen_bounds_check("rcx", "rax", e)
         o("movzx eax, byte ptr [rcx + rax + 8]")
         tmp_pop_keep(t)
         return
@@ -6046,6 +6500,15 @@ fn gen_call(e: Node) {
         o("mov r8, rax")
         o("pop rdx")
         o("mov rcx, [rsp]")
+        let fail = newlabel()
+        o("test rdx, rdx")
+        o("js {lbl(fail)}")
+        o("cmp r8, rdx")
+        o("jl {lbl(fail)}")
+        o("cmp r8, [rcx]")
+        o("jg {lbl(fail)}")
+        g_cold.push(".L{fail}:\n")
+        cold_panic(e, "invalid substring")
         rcall("rt_str_sub")
         tmp_pop_keep(t)
         return
@@ -6064,6 +6527,13 @@ fn gen_call(e: Node) {
     if e.op == 1 { cargs.push(e.kids[0].kids[0]) }        // UFCS receiver
     for i in 1..e.kids.len() { cargs.push(e.kids[i]) }
     var ncargs = cargs.len()
+    // Runtime-internal failures with fixed text name their own source line.
+    if f.name == "rt_die" and ncargs == 1 and cargs[0].k == N_STRLIT {
+        if cargs[0].kids.len() == 1 and cargs[0].kids[0].k == N_STRTXT {
+            panic_literal(e, cargs[0].kids[0].name)
+            return
+        }
+    }
     // Arguments are BORROWED (see the ownership contract above is_ref): the
     // callee is handed a reference the caller is already keeping alive, so no
     // count changes hands and the callee drops nothing on the way out. That is
@@ -6294,7 +6764,10 @@ fn gen_expr(e: Node) {
     if e.k == N_NEG {
         gen_expr(e.kids[0])
         if ty_kind[e.ty] == K_FLOAT {
-            o("movabs rcx, {bits(-0.0)}")
+            // Flip the sign bit. The mask is spelled as an int: `bits(-0.0)`
+            // folded -0.0 as 0.0 - 0.0 = +0.0, so the mask was 0 and every
+            // float negation compiled to a no-op.
+            o("movabs rcx, {1 << 63}")
             o("xor rax, rcx")
         } else {
             o("neg rax")
@@ -6325,8 +6798,10 @@ fn gen_expr(e: Node) {
                 o("lea rdx, [rip + __td{e.slot}]")
                 rcall("rt_to_str")
             } else if c == C_S2I {
+                o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
                 rcall("rt_str_to_int")
             } else {
+                o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
                 rcall("rt_str_to_float")
             }
             tmp_done_keep(t)
@@ -6345,9 +6820,11 @@ fn gen_expr(e: Node) {
             rcall("rt_to_str")
         } else if c == C_S2I {
             o("mov rcx, rax")
+            o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
             rcall("rt_str_to_int")
         } else if c == C_S2F {
             o("mov rcx, rax")
+            o("lea rdx, [rip + __s{add_dstr(panic_site(e))}]")
             rcall("rt_str_to_float")
         }
         return
@@ -6361,6 +6838,7 @@ fn gen_expr(e: Node) {
             o("push rax")
             o("mov rdx, [rsp]")        // key
             o("mov rcx, [rsp + 8]")    // map
+            o("lea r8, [rip + __s{add_dstr(panic_site(e))}]")
             rcall(map_getfn(e.kids[0].ty))   // hands back its own +1
             drop_temps(owned)
             return
@@ -6867,7 +7345,7 @@ fn gen_stmt(s: Node, retlabel: int) {
             }
             tmp_pop(bt)
         } else if ty_kind[t.kids[0].ty] == K_MAP {
-            let mt = gen_tmp(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
+            let mt = gen_tmp_rt(t.kids[0], not has_call(t.kids[1]) and not has_call(s.kids[1]))
             o("push rax")                    // map
             gen_expr(t.kids[1])              // key (owned: the map takes it)
             o("push rax")
@@ -6887,7 +7365,7 @@ fn gen_stmt(s: Node, retlabel: int) {
             if iop != "" and not starts_with(iop, "[") { ixr = iop }
             var bt = false
             var pushed = false
-            if is_leaf(t.kids[0]) {          // list is a var: load it last, skip its push/pop
+            if is_leaf(t.kids[0]) or t.op > 0 {   // list is a var (or hoisted): load it last, skip its push/pop
                 if ixr != "rdx" {
                     gen_expr(s.kids[1])      // value -> rax
                 } else {
@@ -6915,10 +7393,10 @@ fn gen_stmt(s: Node, retlabel: int) {
             }
             if t.op > 0 {                       // hoisted base (see lb_promote_loop)
                 let p = t.op - 1
-                gen_bounds_check_slot(lb_lslot(p), ixr)
+                gen_bounds_check_slot(lb_lslot(p), ixr, t)
                 o("mov r8, " + lb_dslot(p))
             } else {
-                gen_bounds_check("rcx", ixr)
+                gen_bounds_check("rcx", ixr, t)
                 o("mov r8, [rcx + 16]")
             }
             if is_ref(t.ty) {
@@ -6930,6 +7408,11 @@ fn gen_stmt(s: Node, retlabel: int) {
             }
             if pushed { tmp_pop(bt) }
         }
+        return
+    }
+    if s.k == N_IF and s.kids[0].k == N_BOOL {   // folded: only the live arm
+        if s.kids[0].ival == 1 { gen_block(s.kids[1], retlabel) }
+        else if s.kids[2].k != N_NONE { gen_block(s.kids[2], retlabel) }
         return
     }
     if s.k == N_IF {
@@ -6948,8 +7431,8 @@ fn gen_stmt(s: Node, retlabel: int) {
     if s.k == N_WHILE {
         let top = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[1])
-        let nlb = lb_promote_loop(s.kids[1])
+        let ndp = div_promote_loop(s.kids[1], s)
+        let nlb = lb_promote_loop(s, s.kids[1])
         olabel(top)
         gen_cond(s.kids[0], end, true)
         g_brk.push(end)
@@ -6970,8 +7453,8 @@ fn gen_stmt(s: Node, retlabel: int) {
         let top = newlabel()
         let cont = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[2])
-        let nlb = lb_promote_loop(s.kids[2])
+        let ndp = div_promote_loop(s.kids[2], s)
+        let nlb = lb_promote_loop(s, s.kids[2])
         let iv = slot_addr(ID_LOCAL, s.slot)     // loop var (may be promoted)
         let hv = slot_addr(ID_LOCAL, s.aux)      // limit (hidden, never promoted)
         gen_expr(s.kids[0])
@@ -7005,7 +7488,7 @@ fn gen_stmt(s: Node, retlabel: int) {
         let top = newlabel()
         let cont = newlabel()
         let end = newlabel()
-        let ndp = div_promote_loop(s.kids[1])
+        let ndp = div_promote_loop(s.kids[1], s)
         let lv = slot_addr(ID_LOCAL, s.aux)      // list ptr (hidden, stays in memory: GC root)
         let xv = slot_addr(ID_LOCAL, s.op)       // index (hidden, never promoted)
         let ev = slot_addr(ID_LOCAL, s.slot)     // element var (may be promoted)
@@ -7053,7 +7536,10 @@ fn gen_stmt(s: Node, retlabel: int) {
         // one store at the end label instead of one per return path
         let iend = newlabel()
         g_inlend.push(iend)
-        for st in s.kids { gen_stmt(st, retlabel) }
+        for st in s.kids {
+            gen_stmt(st, retlabel)
+            if g_lb_next > 0 and lb_root_call(st) { lb_refresh() }
+        }
         let x = g_inlend.pop()
         olabel(iend)
         let fr = float_reg(ID_LOCAL, s.slot)   // only floats get xmm-promoted, so
@@ -7084,12 +7570,10 @@ fn gen_stmt(s: Node, retlabel: int) {
 }
 
 fn gen_block(blk: Node, retlabel: int) {
-    for s in blk.kids { gen_stmt(s, retlabel) }
-}
-
-fn no_lines() -> [str] {
-    var a: [str] = []
-    return a
+    for s in blk.kids {
+        gen_stmt(s, retlabel)
+        if g_lb_next > 0 and lb_root_call(s) { lb_refresh() }
+    }
 }
 
 // does this emitted line mention r12? (byte scan: the C seed, which must be
@@ -7203,11 +7687,15 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
     g_lb_base = spillbase + nspill
     g_lb_next = 0
     let frame = xbase + g_nfpromo + dslots + nspill + lbslots
-    // generate the body into a side buffer first: r12 is only needed by
-    // functions that make a runtime/FFI call (the rsp-alignment dance), and a
-    // leaf function shouldn't pay push/pop r12 on every single call.
-    let outer = g_lines
-    g_lines = no_lines()
+    // Emit the body in place, reserving the optional r12 save. An empty entry
+    // contributes no text and the assembler skips it. Cold panic blocks bypass
+    // o/raw, so only returning paths affect the callee-save decision.
+    raw(label + ":")
+    o("push rbp")
+    o("mov rbp, rsp")
+    let r12_save = g_lines.len()
+    g_lines.push("")
+    g_uses_r12 = false
     // slots are addressed from [rbp-16] down, which assumes the 8 bytes that
     // "push r12" occupies. If it turns out we can skip that push, the space
     // still has to be reserved -- Windows x64 has no red zone, so a slot below
@@ -7292,20 +7780,8 @@ fn gen_fn_body(label: str, nslots: int, nparams: int, stmts: [Node]) {
     }
     for k in 0..g_npromo { o("mov {PROMO_REGS[k]}, [rbp - {16 + 8 * (base + k)}]") }
     for k in 0..g_nfpromo { o("movsd {FPROMO_REGS[k]}, [rbp - {16 + 8 * (xbase + k)}]") }
-    // does the body really use r12? (the out-of-line bounds-failure blocks may,
-    // but they end in a panic that never returns, so they don't count)
-    var uses_r12 = false
-    for i in 0..g_lines.len() {
-        if line_uses_r12(g_lines[i]) { uses_r12 = true }
-    }
-    let body = g_lines
-    g_lines = outer
-    raw(label + ":")
-    o("push rbp")
-    o("mov rbp, rsp")
-    if uses_r12 { o("push r12") }
-    for i in 0..body.len() { g_lines.push(body[i]) }
-    if uses_r12 {
+    if g_uses_r12 {
+        g_lines[r12_save] = "  push r12\n"
         o("lea rsp, [rbp - 8]")
         o("pop r12")
     } else {
@@ -7505,9 +7981,7 @@ fn gen_program(prog: Node) {
 }
 
 // ---------------- assembler ----------------
-// Same design as the C compiler's: encodes exactly the vocabulary our own
-// code generator emits. No bitwise operators in Zephyr, so byte math is done
-// with floor-division arithmetic (two's-complement adjusted).
+// Encodes exactly the vocabulary our own code generator emits.
 let SEC_TEXT = 0
 let SEC_RDATA = 1
 let SEC_BSS = 2
@@ -7526,85 +8000,108 @@ struct Op { kind: int, reg: int, size: int, imm: int, base: int, index: int, sca
 
 var t_bytes: [int] = []
 var r_bytes: [int] = []
+var t_len = 0
+var r_len = 0
 var a_bss = 0
 var a_sect = 0
 var a_syms: [ASym] = []
+var a_symcap = 65536              // slots in a_symhash: a power of two, doubled past half full
 var a_symhash: [int] = []
-for i in 0..65536 { a_symhash.push(0) }
+for i in 0..a_symcap { a_symhash.push(0) }
 var a_fixes: [AFix] = []
 var a_imports: [str] = []
 var a_import_dll: [int] = []      // 0 = zephyr_rt.dll, 1 = kernel32.dll
 var g_trail = 0
 var a_curline = ""
-
-let REG64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+var a_ops: [Op] = []
+for i in 0..3 {
+    a_ops.push(Op{kind: 0, reg: 0, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""})
+}
 
 fn asm_fail(msg: str) { panic("assembler: {msg} | line: {a_curline}") }
 
-fn tb(v: int) { t_bytes.push(v) }
+// Lists own packed byte storage; offsets remain byte counts. Re-read the data
+// pointer after push, which may grow and relocate the list's backing allocation.
+fn tb(v: int) {
+    if (t_len & 7) == 0 { t_bytes.push(0) }
+    store8(load64(addr(t_bytes) + 16) + t_len, v)
+    t_len += 1
+}
+fn rb(v: int) {
+    if (r_len & 7) == 0 { r_bytes.push(0) }
+    store8(load64(addr(r_bytes) + 16) + r_len, v)
+    r_len += 1
+}
 fn tb32(v: int) {
     var x = v
     for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        t_bytes.push(b)
-        x = (x - b) / 256
+        tb(x & 255)
+        x = x >> 8
     }
 }
 fn tb64(v: int) {
     var x = v
     for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        t_bytes.push(b)
-        x = (x - b) / 256
+        tb(x & 255)
+        x = x >> 8
     }
 }
 fn rb32(v: int) {
     var x = v
     for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        r_bytes.push(b)
-        x = (x - b) / 256
+        rb(x & 255)
+        x = x >> 8
     }
 }
 fn rb64(v: int) {
     var x = v
     for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        r_bytes.push(b)
-        x = (x - b) / 256
+        rb(x & 255)
+        x = x >> 8
     }
 }
 
 fn strhash(s: str) -> int {
     var h = 0
-    for i in 0..s.len() { h = (h * 31 + s.byte(i)) % 65536 }
+    for i in 0..s.len() { h = (h * 31 + s.byte(i)) & 1073741823 }
     return h
 }
 
 fn sym_intern(name: str) -> int {
-    var h = strhash(name)
+    var h = strhash(name) & (a_symcap - 1)
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return idx }
-        h = (h + 1) % 65536
+        h = (h + 1) & (a_symcap - 1)
     }
     a_syms.push(ASym{name: name, sect: 0, off: 0, defined: false, predef: false})
     a_symhash[h] = a_syms.len()
+    if a_syms.len() * 2 > a_symcap { sym_grow() }
     return a_syms.len() - 1
 }
 
-// read-only: is `name` a locally defined/pre-scanned label?
+// Double the symbol table and re-slot every symbol. It used to be a fixed
+// 65536 slots, and a program with more labels than that (atoll at M5, 65677)
+// made sym_intern probe a full table forever: the link hung.
+fn sym_grow() {
+    a_symcap = a_symcap * 2
+    var nh: [int] = []
+    for i in 0..a_symcap { nh.push(0) }
+    for k in 0..a_syms.len() {
+        var h = strhash(a_syms[k].name) & (a_symcap - 1)
+        while nh[h] != 0 { h = (h + 1) & (a_symcap - 1) }
+        nh[h] = k + 1
+    }
+    a_symhash = nh
+}
+
+// Read-only: is `name` a locally defined or predeclared runtime label?
 fn sym_is_local(name: str) -> bool {
-    var h = strhash(name)
+    var h = strhash(name) & (a_symcap - 1)
     while a_symhash[h] != 0 {
         let idx = a_symhash[h] - 1
         if a_syms[idx].name == name { return a_syms[idx].predef or a_syms[idx].defined }
-        h = (h + 1) % 65536
+        h = (h + 1) & (a_symcap - 1)
     }
     return false
 }
@@ -7620,56 +8117,126 @@ fn import_intern2(name: str, dll: int) -> int {
 fn import_intern(name: str) -> int { return import_intern2(name, 0) }
 
 fn add_fix(kind: int, sym: int, addend: int) {
-    var off = t_bytes.len()
-    if a_sect == SEC_RDATA { off = r_bytes.len() }
+    var off = t_len
+    if a_sect == SEC_RDATA { off = r_len }
     a_fixes.push(AFix{off: off, sect: a_sect, kind: kind, sym: sym, addend: addend})
 }
 
 fn starts_with(s: str, p: str) -> bool {
-    if s.len() < p.len() { return false }
-    return s.sub(0, p.len()) == p
+    return span_starts(s, 0, s.len(), p)
 }
 
-// returns reg + size*16, or -1
-fn reg_lookup(s: str) -> int {
-    for i in 0..16 {
-        if REG64[i] == s { return i + 64 * 16 }
+// Match within the original line; no temporary prefix/token strings.
+fn span_starts(s: str, lo: int, hi: int, prefix: str) -> bool {
+    if hi - lo < prefix.len() { return false }
+    for i in 0..prefix.len() {
+        if s.byte(lo + i) != prefix.byte(i) { return false }
     }
-    if s == "eax" { return 0 + 32 * 16 }
-    if s == "ecx" { return 1 + 32 * 16 }
-    if s == "edx" { return 2 + 32 * 16 }
-    if s == "ebx" { return 3 + 32 * 16 }
-    if s == "esi" { return 6 + 32 * 16 }
-    if s == "edi" { return 7 + 32 * 16 }
-    if s == "al" { return 0 + 8 * 16 }
-    if s == "cl" { return 1 + 8 * 16 }
-    if s == "dl" { return 2 + 8 * 16 }
+    return true
+}
+
+// Returns reg + size*16, or -1, for exactly the assembler's register vocabulary.
+fn reg_lookup(s: str, lo: int, hi: int) -> int {
+    let n = hi - lo
+    if n < 2 or n > 3 { return -1 }
+    let a = s.byte(lo)
+    let b = s.byte(lo + 1)
+    if n == 2 {
+        if a == 114 and (b == 56 or b == 57) { return b - 48 + 64 * 16 }
+        if b == 108 {
+            if a == 97 { return 8 * 16 }
+            if a == 99 { return 1 + 8 * 16 }
+            if a == 100 { return 2 + 8 * 16 }
+        }
+        return -1
+    }
+    let c = s.byte(lo + 2)
+    if a == 114 and b == 49 and c >= 48 and c <= 53 { return 10 + c - 48 + 64 * 16 }
+    if a != 114 and a != 101 { return -1 }
+    var r = -1
+    if c == 120 {
+        if b == 97 { r = 0 }
+        else if b == 99 { r = 1 }
+        else if b == 100 { r = 2 }
+        else if b == 98 { r = 3 }
+    } else if c == 112 and a == 114 {
+        if b == 115 { r = 4 }
+        else if b == 98 { r = 5 }
+    } else if c == 105 {
+        if b == 115 { r = 6 }
+        else if b == 100 { r = 7 }
+    }
+    if r >= 0 {
+        if a == 114 { return r + 64 * 16 }
+        return r + 32 * 16
+    }
     return -1
 }
 
 fn is_digit_b(c: int) -> bool { return c >= 48 and c <= 57 }
 
-fn parse_operand(text0: str) -> Op {
-    var op = Op{kind: 0, reg: 0, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""}
-    var text = text0
-    while text.len() > 0 and text.byte(0) == 32 { text = text.sub(1, text.len()) }
-    if starts_with(text, "qword ptr ") { text = text.sub(10, text.len()) }
-    else if starts_with(text, "byte ptr ") {
-        op.size = 8
-        text = text.sub(9, text.len())
+// Decimal conversion with the same space/sign rules as str -> int, operating
+// directly on a token span. Accumulation retains the original i64 wraparound.
+fn asm_int(s: str, lo: int, hi: int) -> int {
+    var p = lo
+    while p < hi and s.byte(p) == 32 { p += 1 }
+    var neg = false
+    if p < hi and (s.byte(p) == 43 or s.byte(p) == 45) {
+        neg = s.byte(p) == 45
+        p += 1
     }
-    if text.byte(0) == 91 { // '['
+    let start = p
+    var v = 0
+    while p < hi and is_digit_b(s.byte(p)) {
+        v = v * 10 + s.byte(p) - 48
+        p += 1
+    }
+    if p == start { asm_fail("expected integer") }
+    while p < hi and s.byte(p) == 32 { p += 1 }
+    if p != hi { asm_fail("invalid integer") }
+    if neg { return 0 - v }
+    return v
+}
+
+// Refill one of three reusable operands. Only symbol names need owned strings;
+// register, displacement, and immediate tokens stay spans of the source line.
+fn parse_operand(text: str, lo: int, hi: int, op: Op) {
+    op.kind = 0
+    op.reg = 0
+    op.size = 64
+    op.imm = 0
+    op.base = -1
+    op.index = -1
+    op.scale = 0
+    op.disp = 0
+    op.sym = ""
+    var start = lo
+    while start < hi and text.byte(start) == 32 { start += 1 }
+    if span_starts(text, start, hi, "qword ptr ") { start += 10 }
+    else if span_starts(text, start, hi, "dword ptr ") {
+        op.size = 32
+        start += 10
+    }
+    else if span_starts(text, start, hi, "word ptr ") {
+        op.size = 16
+        start += 9
+    }
+    else if span_starts(text, start, hi, "byte ptr ") {
+        op.size = 8
+        start += 9
+    }
+    if start >= hi { asm_fail("missing operand") }
+    if text.byte(start) == 91 { // '['
         op.kind = OPK_MEM
         var close = -1
-        for i in 0..text.len() {
+        for i in start..hi {
             if text.byte(i) == 93 { close = i }
         }
         if close < 0 { asm_fail("missing ]") }
-        let inner = text.sub(1, close)
-        var p = 0
+        var p = start + 1
         var sign = 1
-        while p < inner.len() {
-            let c = inner.byte(p)
+        while p < close {
+            let c = text.byte(p)
             if c == 32 {
                 p += 1
                 continue
@@ -7685,29 +8252,25 @@ fn parse_operand(text0: str) -> Op {
                 continue
             }
             var q = p
-            while q < inner.len() {
-                let cq = inner.byte(q)
+            var star = -1
+            while q < close {
+                let cq = text.byte(q)
                 if cq == 32 or cq == 43 or cq == 45 { break }
+                if cq == 42 { star = q }
                 q += 1
             }
-            let tkn = inner.sub(p, q)
-            p = q
-            if is_digit_b(tkn.byte(0)) {
-                op.disp += sign * (tkn as int)
-            } else if tkn == "rip" {
+            if is_digit_b(c) {
+                op.disp += sign * asm_int(text, p, q)
+            } else if q - p == 3 and span_starts(text, p, q, "rip") {
                 op.base = -2
             } else {
-                var star = -1
-                for i in 0..tkn.len() {
-                    if tkn.byte(i) == 42 { star = i } // '*'
-                }
                 if star >= 0 {
-                    let r = reg_lookup(tkn.sub(0, star))
+                    let r = reg_lookup(text, p, star)
                     if r < 0 { asm_fail("bad index register") }
                     op.index = r % 16
-                    op.scale = tkn.sub(star + 1, tkn.len()) as int
+                    op.scale = asm_int(text, star + 1, q)
                 } else {
-                    let r = reg_lookup(tkn)
+                    let r = reg_lookup(text, p, q)
                     if r >= 0 {
                         if op.base == -1 { op.base = r % 16 }
                         else {
@@ -7715,35 +8278,35 @@ fn parse_operand(text0: str) -> Op {
                             op.scale = 1
                         }
                     } else {
-                        op.sym = tkn
+                        op.sym = text.sub(p, q)
                     }
                 }
             }
+            p = q
             sign = 1
         }
-        return op
+        return
     }
-    let c0 = text.byte(0)
+    let c0 = text.byte(start)
     if is_digit_b(c0) or c0 == 45 {
         op.kind = OPK_IMM
-        op.imm = text as int
-        return op
+        op.imm = asm_int(text, start, hi)
+        return
     }
-    if starts_with(text, "xmm") {
+    if span_starts(text, start, hi, "xmm") {
         op.kind = OPK_XMM
-        op.reg = text.sub(3, text.len()) as int
-        return op
+        op.reg = asm_int(text, start + 3, hi)
+        return
     }
-    let r = reg_lookup(text)
+    let r = reg_lookup(text, start, hi)
     if r >= 0 {
         op.kind = OPK_REG
         op.reg = r % 16
         op.size = r / 16
-        return op
+        return
     }
     op.kind = OPK_SYM
-    op.sym = text
-    return op
+    op.sym = text.sub(start, hi)
 }
 
 // emit REX + opcodes + modrm/sib/disp; opc2 < 0 means single-byte opcode
@@ -7817,61 +8380,65 @@ fn enc_rr(rexw: int, opc1: int, opc2: int, reg: int, rmreg: int, pfx66: bool, pf
     enc_rm(rexw, opc1, opc2, reg, Op{kind: OPK_REG, reg: rmreg, size: 64, imm: 0, base: -1, index: -1, scale: 0, disp: 0, sym: ""}, pfx66, pfxF2)
 }
 
-fn cc_code(cc: str) -> int {
-    if cc == "e" { return 4 }
-    if cc == "ne" { return 5 }
-    if cc == "l" { return 12 }
-    if cc == "le" { return 14 }
-    if cc == "g" { return 15 }
-    if cc == "ge" { return 13 }
-    if cc == "a" { return 7 }
-    if cc == "ae" { return 3 }
-    if cc == "b" { return 2 }
-    if cc == "be" { return 6 }
-    if cc == "p" { return 10 }
-    if cc == "np" { return 11 }
-    if cc == "s" { return 8 }
-    if cc == "ns" { return 9 }
-    return -1
-}
-
-let ALU_NAMES = ["add", "or", "and", "sub", "xor", "cmp"]
+// ALU mnemonics are 0..5; jcc and setcc add 100 and 200 to the x86 condition code.
+let ASM_MNEMONICS: [str: int] = [
+    "add": 0, "or": 1, "and": 2, "sub": 3, "xor": 4, "cmp": 5,
+    "mov": 6, "push": 7, "pop": 8, "ret": 9, "cqo": 10, "syscall": 11,
+    "movabs": 12, "test": 13, "imul": 14, "idiv": 15, "div": 16, "mul": 17,
+    "neg": 18, "inc": 19, "sar": 20, "shl": 21, "shr": 22, "sal": 23,
+    "movzx": 24, "lea": 25, "jmp": 26, "call": 27, "movq": 28, "movsd": 29,
+    "movapd": 30, "addsd": 31, "subsd": 32, "mulsd": 33, "divsd": 34,
+    "minsd": 35, "maxsd": 36, "sqrtsd": 37, "comisd": 38, "ucomisd": 39,
+    "cvtsi2sd": 40, "cvttsd2si": 41,
+    "je": 104, "jne": 105, "jl": 112, "jle": 114, "jg": 115, "jge": 113,
+    "ja": 107, "jae": 103, "jb": 102, "jbe": 106, "jp": 110, "jnp": 111,
+    "js": 108, "jns": 109,
+    "sete": 204, "setne": 205, "setl": 212, "setle": 214, "setg": 215, "setge": 213,
+    "seta": 207, "setae": 203, "setb": 202, "setbe": 206, "setp": 210, "setnp": 211,
+    "sets": 208, "setns": 209
+]
 let ALU_RM_R = [1, 9, 33, 41, 49, 57]     // 0x01 0x09 0x21 0x29 0x31 0x39
 let ALU_R_RM = [3, 11, 35, 43, 51, 59]
 let ALU_EXT = [0, 1, 4, 5, 6, 7]
+// Minimum operand counts for IDs 0..41; every jcc/setcc takes one. imul's
+// one-, two-, and three-operand forms are selected in asm_ins.
+let ASM_MIN_OPS = [2, 2, 2, 2, 2, 2, 2, 1, 1, 0, 0, 0, 2, 2,
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
 
-fn asm_ins(mn: str, ops: [Op], nops: int) {
-    if mn == "push" {
+// Encode a numeric mnemonic ID; preserve the existing x86 instruction forms.
+fn asm_ins(mn: int, ops: [Op], nops: int) {
+    if mn == 7 { // push
         if ops[0].reg >= 8 { tb(65) }
         tb(80 + ops[0].reg % 8)
         return
     }
-    if mn == "pop" {
+    if mn == 8 { // pop
         if ops[0].reg >= 8 { tb(65) }
         tb(88 + ops[0].reg % 8)
         return
     }
-    if mn == "ret" {
+    if mn == 9 { // ret
         tb(195)
         return
     }
-    if mn == "cqo" {
+    if mn == 10 { // cqo
         tb(72)
         tb(153)
         return
     }
-    if mn == "syscall" {
+    if mn == 11 { // syscall
         tb(15)
         tb(5)
         return
     }
-    if mn == "movabs" {
+    if mn == 12 { // movabs
         tb(64 + 8 + ops[0].reg / 8)
         tb(184 + ops[0].reg % 8)
         tb64(ops[1].imm)
         return
     }
-    if mn == "mov" {
+    if mn == 6 { // mov
         let a = ops[0]
         let b = ops[1]
         if a.kind == OPK_REG and b.kind == OPK_IMM {
@@ -7896,7 +8463,9 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
             return
         }
         if a.kind == OPK_REG and b.kind == OPK_MEM {
-            enc_rm(1, 139, -1, a.reg, b, false, false)
+            var w = 1
+            if a.size == 32 { w = 0 }
+            enc_rm(w, 139, -1, a.reg, b, false, false)
             return
         }
         if a.kind == OPK_MEM and b.kind == OPK_REG {   // store; honor source width
@@ -7913,41 +8482,40 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         asm_fail("mov form")
     }
-    for k in 0..6 {
-        if mn == ALU_NAMES[k] {
-            let a = ops[0]
-            let b = ops[1]
-            var w = 1
-            if a.size == 32 or a.size == 8 { w = 0 }
-            if b.kind == OPK_IMM {
-                var opc = 129
-                if a.size == 8 { opc = 128 }
-                if a.size == 8 { g_trail = 1 } else { g_trail = 4 }
-                enc_rm(w, opc, -1, ALU_EXT[k], a, false, false)
-                if a.size == 8 {
-                    var bb = b.imm % 256
-                    if bb < 0 { bb += 256 }
-                    tb(bb)
-                } else {
-                    tb32(b.imm)
-                }
-                return
+    if mn >= 0 and mn < 6 { // add, or, and, sub, xor, cmp
+        let k = mn
+        let a = ops[0]
+        let b = ops[1]
+        var w = 1
+        if a.size == 32 or a.size == 8 { w = 0 }
+        if b.kind == OPK_IMM {
+            var opc = 129
+            if a.size == 8 { opc = 128 }
+            if a.size == 8 { g_trail = 1 } else { g_trail = 4 }
+            enc_rm(w, opc, -1, ALU_EXT[k], a, false, false)
+            if a.size == 8 {
+                var bb = b.imm % 256
+                if bb < 0 { bb += 256 }
+                tb(bb)
+            } else {
+                tb32(b.imm)
             }
-            if a.kind == OPK_REG and b.kind == OPK_MEM {
-                enc_rm(w, ALU_R_RM[k], -1, a.reg, b, false, false)
-                return
-            }
-            var opc = ALU_RM_R[k]
-            if a.size == 8 { opc = opc - 1 }
-            enc_rm(w, opc, -1, b.reg, a, false, false)
             return
         }
+        if a.kind == OPK_REG and b.kind == OPK_MEM {
+            enc_rm(w, ALU_R_RM[k], -1, a.reg, b, false, false)
+            return
+        }
+        var opc = ALU_RM_R[k]
+        if a.size == 8 { opc = opc - 1 }
+        enc_rm(w, opc, -1, b.reg, a, false, false)
+        return
     }
-    if mn == "test" {
+    if mn == 13 { // test
         enc_rr(1, 133, -1, ops[1].reg, ops[0].reg, false, false)
         return
     }
-    if mn == "imul" {
+    if mn == 14 { // imul
         if nops == 1 {
             enc_rm(1, 247, -1, 5, ops[0], false, false)
             return
@@ -7961,30 +8529,30 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         enc_rm(1, 15, 175, ops[0].reg, ops[1], false, false)
         return
     }
-    if mn == "idiv" {
+    if mn == 15 { // idiv
         enc_rm(1, 247, -1, 7, ops[0], false, false)
         return
     }
-    if mn == "div" {                       // unsigned divide, F7 /6
+    if mn == 16 {                          // div: unsigned divide, F7 /6
         enc_rm(1, 247, -1, 6, ops[0], false, false)
         return
     }
-    if mn == "mul" {                       // unsigned multiply, F7 /4 (rdx:rax = rax * r/m)
+    if mn == 17 {                          // mul: unsigned multiply, F7 /4 (rdx:rax = rax * r/m)
         enc_rm(1, 247, -1, 4, ops[0], false, false)
         return
     }
-    if mn == "neg" {
+    if mn == 18 { // neg
         enc_rm(1, 247, -1, 3, ops[0], false, false)
         return
     }
-    if mn == "inc" {
+    if mn == 19 { // inc
         enc_rm(1, 255, -1, 0, ops[0], false, false)
         return
     }
-    if mn == "sar" or mn == "shl" or mn == "shr" or mn == "sal" {
+    if mn == 20 or mn == 21 or mn == 22 or mn == 23 { // sar, shl, shr, sal
         var ext = 7                             // sar
-        if mn == "shl" or mn == "sal" { ext = 4 }
-        else if mn == "shr" { ext = 5 }
+        if mn == 21 or mn == 23 { ext = 4 }       // shl, sal
+        else if mn == 22 { ext = 5 }             // shr
         if ops[1].kind == OPK_IMM {             // OP r/m64, imm8
             g_trail = 1
             enc_rm(1, 193, -1, ext, ops[0], false, false)
@@ -7996,36 +8564,36 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movzx" {
-        enc_rm(0, 15, 182, ops[0].reg, ops[1], false, false)
+    if mn == 24 { // movzx
+        var opc = 182
+        if ops[1].size == 16 { opc = 183 }
+        enc_rm(0, 15, opc, ops[0].reg, ops[1], false, false)
         return
     }
-    if mn == "lea" {
+    if mn == 25 { // lea
         enc_rm(1, 141, -1, ops[0].reg, ops[1], false, false)
         return
     }
-    if starts_with(mn, "set") {
-        let cc = cc_code(mn.sub(3, mn.len()))
-        if cc < 0 { asm_fail("bad setcc") }
+    if mn >= 200 and mn < 216 { // setcc
+        let cc = mn - 200
         enc_rm(0, 15, 144 + cc, 0, ops[0], false, false)
         return
     }
-    if mn == "jmp" {
+    if mn == 26 { // jmp
         tb(233)
         add_fix(FX_REL32, sym_intern(ops[0].sym), 0)
         tb32(0)
         return
     }
-    if mn.byte(0) == 106 { // 'j' conditional
-        let cc = cc_code(mn.sub(1, mn.len()))
-        if cc < 0 { asm_fail("bad jcc") }
+    if mn >= 100 and mn < 116 { // jcc
+        let cc = mn - 100
         tb(15)
         tb(128 + cc)
         add_fix(FX_REL32, sym_intern(ops[0].sym), 0)
         tb32(0)
         return
     }
-    if mn == "call" {
+    if mn == 27 { // call
         if ops[0].kind == OPK_REG {                // call through a register (fn value)
             enc_rm(0, 255, -1, 2, ops[0], false, false)
             return
@@ -8062,7 +8630,7 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movq" {
+    if mn == 28 { // movq
         if ops[0].kind == OPK_XMM {
             enc_rm(1, 15, 110, ops[0].reg, ops[1], true, false)
         } else {
@@ -8070,7 +8638,7 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movsd" {
+    if mn == 29 { // movsd
         if ops[0].kind == OPK_XMM {
             enc_rm(0, 15, 16, ops[0].reg, ops[1], false, true)   // movsd xmm, xmm/m64  (F2 0F 10)
         } else {
@@ -8078,55 +8646,55 @@ fn asm_ins(mn: str, ops: [Op], nops: int) {
         }
         return
     }
-    if mn == "movapd" {                                          // xmm<-xmm copy, no partial-reg merge
+    if mn == 30 { // movapd: xmm<-xmm copy, no partial-reg merge
         enc_rm(0, 15, 40, ops[0].reg, ops[1], true, false)       // 66 0F 28 /r
         return
     }
-    if mn == "addsd" {
+    if mn == 31 { // addsd
         enc_rm(0, 15, 88, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "subsd" {
+    if mn == 32 { // subsd
         enc_rm(0, 15, 92, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "mulsd" {
+    if mn == 33 { // mulsd
         enc_rm(0, 15, 89, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "divsd" {
+    if mn == 34 { // divsd
         enc_rm(0, 15, 94, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "minsd" {
+    if mn == 35 { // minsd
         enc_rm(0, 15, 93, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "maxsd" {
+    if mn == 36 { // maxsd
         enc_rm(0, 15, 95, ops[0].reg, ops[1], false, true)   // xmm, xmm/m64
         return
     }
-    if mn == "sqrtsd" {
+    if mn == 37 { // sqrtsd
         enc_rr(0, 15, 81, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    if mn == "comisd" {
+    if mn == 38 { // comisd
         enc_rm(0, 15, 47, ops[0].reg, ops[1], true, false)   // xmm, xmm/m64
         return
     }
-    if mn == "ucomisd" {
+    if mn == 39 { // ucomisd
         enc_rr(0, 15, 46, ops[0].reg, ops[1].reg, true, false)
         return
     }
-    if mn == "cvtsi2sd" {
+    if mn == 40 { // cvtsi2sd
         enc_rr(1, 15, 42, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    if mn == "cvttsd2si" {
+    if mn == 41 { // cvttsd2si
         enc_rr(1, 15, 44, ops[0].reg, ops[1].reg, false, true)
         return
     }
-    asm_fail("unknown mnemonic '{mn}'")
+    asm_fail("unknown mnemonic")
 }
 
 fn asm_label(name: str) {
@@ -8134,15 +8702,18 @@ fn asm_label(name: str) {
     if a_syms[si].defined { asm_fail("duplicate label {name}") }
     a_syms[si].defined = true
     a_syms[si].sect = a_sect
-    var off = t_bytes.len()
-    if a_sect == SEC_RDATA { off = r_bytes.len() }
+    var off = t_len
+    if a_sect == SEC_RDATA { off = r_len }
     if a_sect == SEC_BSS { off = a_bss }
     a_syms[si].off = off
 }
 
+// Parse spans of the original emitted line into three reusable operands.
 fn asm_line(line: str) {
     a_curline = line
-    if line.len() == 0 { return }
+    var n = line.len()
+    if n > 0 and line.byte(n - 1) == 10 { n -= 1 }
+    if n == 0 { return }
     if line.byte(0) != 32 { // label or directive
         if line.byte(0) == 46 { // '.'
             if starts_with(line, ".section .rdata") {
@@ -8153,14 +8724,14 @@ fn asm_line(line: str) {
                 a_sect = SEC_BSS
                 return
             }
-            if line == ".text" {
+            if n == 5 and starts_with(line, ".text") {
                 a_sect = SEC_TEXT
                 return
             }
             if starts_with(line, ".balign") {
-                let al = line.sub(8, line.len()) as int
+                let al = asm_int(line, 8, n)
                 if a_sect == SEC_RDATA {
-                    while r_bytes.len() % al != 0 { r_bytes.push(0) }
+                    while r_len % al != 0 { rb(0) }
                 } else if a_sect == SEC_BSS {
                     while a_bss % al != 0 { a_bss += 1 }
                 }
@@ -8168,127 +8739,129 @@ fn asm_line(line: str) {
             }
             if starts_with(line, ".intel_syntax") or starts_with(line, ".globl") { return }
             if starts_with(line, ".zloc ") { // -g: record current .text offset for this source line
-                dbg_off.push(t_bytes.len())
-                dbg_line.push(line.sub(6, line.len()) as int)
+                dbg_off.push(t_len)
+                dbg_line.push(asm_int(line, 6, n))
                 return
             }
-            if line.byte(line.len() - 1) == 58 { // .L label
-                asm_label(line.sub(0, line.len() - 1))
+            if line.byte(n - 1) == 58 { // .L label
+                asm_label(line.sub(0, n - 1))
                 return
             }
             asm_fail("unknown directive")
         }
-        if line.byte(line.len() - 1) != 58 { asm_fail("expected label") }
-        asm_label(line.sub(0, line.len() - 1))
+        if line.byte(n - 1) != 58 { asm_fail("expected label") }
+        asm_label(line.sub(0, n - 1))
         return
     }
-    let p = line.sub(2, line.len())
-    if p.byte(0) == 46 { // data directive
-        if starts_with(p, ".quad ") {
-            let v = p.sub(6, p.len())
-            let c0 = v.byte(0)
+    if line.byte(2) == 46 { // data directive
+        if span_starts(line, 2, n, ".quad ") {
+            let c0 = line.byte(8)
             if is_digit_b(c0) or c0 == 45 {
-                rb64(v as int)
+                rb64(asm_int(line, 8, n))
             } else {
-                add_fix(FX_ABS64, sym_intern(v), 0)
+                add_fix(FX_ABS64, sym_intern(line.sub(8, n)), 0)
                 rb64(0)
             }
             return
         }
-        if starts_with(p, ".byte ") {
-            var q = 6
-            while q < p.len() {
+        if span_starts(line, 2, n, ".byte ") {
+            var q = 8
+            while q < n {
                 var e = q
-                while e < p.len() and p.byte(e) != 44 { e += 1 }
-                let v = p.sub(q, e) as int
-                if a_sect == SEC_TEXT { t_bytes.push(v) } else { r_bytes.push(v) }
+                while e < n and line.byte(e) != 44 { e += 1 }
+                let v = asm_int(line, q, e)
+                if a_sect == SEC_TEXT { tb(v) } else { rb(v) }
                 q = e + 1
             }
             return
         }
-        if starts_with(p, ".space ") {
-            a_bss += p.sub(7, p.len()) as int
+        if span_starts(line, 2, n, ".space ") {
+            a_bss += asm_int(line, 9, n)
             return
         }
         asm_fail("unknown data directive")
     }
     // instruction
-    var sp = 0
-    while sp < p.len() and p.byte(sp) != 32 { sp += 1 }
-    let mn = p.sub(0, sp)
-    var rest = ""
-    if sp < p.len() { rest = p.sub(sp + 1, p.len()) }
-    var ops: [Op] = []
-    var q = 0
-    while q < rest.len() and ops.len() < 3 {
+    var sp = 2
+    while sp < n and line.byte(sp) != 32 { sp += 1 }
+    let name = line.sub(2, sp)
+    let mn = ASM_MNEMONICS.get(name).or(-1)
+    if mn < 0 { asm_fail("unknown mnemonic '{name}'") }
+    var nops = 0
+    var q = sp + 1
+    while q < n and nops < 3 {
         var depth = 0
         var e = q
-        while e < rest.len() {
-            let c = rest.byte(e)
+        while e < n {
+            let c = line.byte(e)
             if c == 91 { depth += 1 }
             if c == 93 { depth -= 1 }
             if c == 44 and depth == 0 { break }
             e += 1
         }
-        var t = rest.sub(q, e)
-        while t.len() > 0 and t.byte(t.len() - 1) == 32 { t = t.sub(0, t.len() - 1) }
-        ops.push(parse_operand(t))
+        var end = e
+        while end > q and line.byte(end - 1) == 32 { end -= 1 }
+        parse_operand(line, q, end, a_ops[nops])
+        nops += 1
         q = e + 1
-        while q < rest.len() and rest.byte(q) == 32 { q += 1 }
+        while q < n and line.byte(q) == 32 { q += 1 }
     }
-    asm_ins(mn, ops, ops.len())
+    var required = 1
+    if mn < 100 { required = ASM_MIN_OPS[mn] }
+    if nops < required { asm_fail("missing operand") }
+    asm_ins(mn, a_ops, nops)
 }
 
 // ---------------- PE writer ----------------
-var pe_out: [int] = []
+var pe_out = ""
+var pe_len = 0
 
-fn pw(v: int) { pe_out.push(v) }
+// The final file size is known before writing its headers. Keep this string
+// rooted while filling its payload, then use the normal checked file writer.
+fn pw(v: int) {
+    store8(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 1
+}
 fn pw2(v: int) {
-    pe_out.push(v % 256)
-    pe_out.push((v / 256) % 256)
+    pw(v & 255)
+    pw((v >> 8) & 255)
 }
 fn pw4(v: int) {
-    var x = v
-    for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        pe_out.push(b)
-        x = (x - b) / 256
-    }
+    store32(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 4
 }
 fn pw8(v: int) {
-    var x = v
-    for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        pe_out.push(b)
-        x = (x - b) / 256
-    }
+    store64(addr(pe_out) + 8 + pe_len, v)
+    pe_len += 8
 }
 fn pw_pad(target: int) {
-    while pe_out.len() < target { pe_out.push(0) }
+    if pe_len < target { pe_len = target }
+}
+// Copy packed section bytes without writing past a partial final word (ELF
+// need not pad its last section to eight bytes).
+fn pw_bytes(buf: [int], n: int) {
+    let src = load64(addr(buf) + 16)
+    let dest = addr(pe_out) + 8 + pe_len
+    var i = 0
+    while i + 8 <= n {
+        store64(dest + i, load64(src + i))
+        i += 8
+    }
+    while i < n {
+        store8(dest + i, load8(src + i))
+        i += 1
+    }
+    pe_len += n
 }
 fn pe_align(v: int, al: int) -> int {
     return ((v + al - 1) / al) * al
 }
 
 fn patch4(buf: [int], off: int, v: int) {
-    var x = v
-    for i in 0..4 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        buf[off + i] = b
-        x = (x - b) / 256
-    }
+    store32(load64(addr(buf) + 16) + off, v)
 }
 fn patch8(buf: [int], off: int, v: int) {
-    var x = v
-    for i in 0..8 {
-        var b = x % 256
-        if b < 0 { b += 256 }
-        buf[off + i] = b
-        x = (x - b) / 256
-    }
+    store64(load64(addr(buf) + 16) + off, v)
 }
 
 // ---------------- imports ----------------
@@ -8304,6 +8877,8 @@ fn dirname(p: str) -> str {
     }
     return ""
 }
+
+fn basename(p: str) -> str { return p.sub(dirname(p).len(), p.len()) }
 
 fn is_abs_path(p: str) -> bool {
     if p.len() == 0 { return false }
@@ -8366,7 +8941,7 @@ fn __emb_rt() -> str {
     p.push("// anything the compiler's dup/drop insertion misses: a start bit marks each\n")
     p.push("// payload address, which is how a conservatively-scanned word is recognised\n")
     p.push("// as a real object pointer. Roots are the machine stack and the globals array.\n")
-    p.push("let HEAP_RESERVE = 1073741824       // 1 GiB of address space (reserved, not committed)\n")
+    p.push("let HEAP_RESERVE = 4294967296       // 4 GiB of address space (reserved, not committed)\n")
     p.push("let COMMIT_STEP = 4194304           // commit 4 MiB at a time\n")
     p.push("let F_MARK = 1\n")
     p.push("let F_FREE = 2\n")
@@ -8868,22 +9443,19 @@ fn __emb_rt() -> str {
     p.push("        rx_drop_child(data)\n")
     p.push("    \} else if kind == 3 \{\n")
     p.push("        let cap = load64(obj + 8)\n")
-    p.push("        let keys = load64(obj + 16)\n")
-    p.push("        let vals = load64(obj + 24)\n")
-    p.push("        let state = load64(obj + 32)\n")
+    p.push("        let slots = load64(obj + 16)\n")
     p.push("        let kref = load64(desc + 8)\n")
     p.push("        let vref = load64(desc + 16)\n")
     p.push("        var i = 0\n")
     p.push("        while i < cap \{\n")
-    p.push("            if load8(state + i) == 1 \{\n")
-    p.push("                if kref == 1 \{ rx_drop_child(load64(keys + i * 8)) \}\n")
-    p.push("                if vref == 1 \{ rx_drop_child(load64(vals + i * 8)) \}\n")
+    p.push("            let slot = slots + i * 24\n")
+    p.push("            if load64(slot) == 1 \{\n")
+    p.push("                if kref == 1 \{ rx_drop_child(load64(slot + 8)) \}\n")
+    p.push("                if vref == 1 \{ rx_drop_child(load64(slot + 16)) \}\n")
     p.push("            \}\n")
     p.push("            i += 1\n")
     p.push("        \}\n")
-    p.push("        rx_drop_child(keys)\n")
-    p.push("        rx_drop_child(vals)\n")
-    p.push("        rx_drop_child(state)\n")
+    p.push("        rx_drop_child(slots)\n")
     p.push("    \}\n")
     p.push("\}\n")
     p.push("\n")
@@ -9278,8 +9850,11 @@ fn __emb_rt() -> str {
     p.push("    return 0\n")
     p.push("\}\n")
     p.push("// ---- hash map ----\n")
-    p.push("// layout: [0]count [8]cap(pow2) [16]keys [24]vals [32]state(bytes) [40]keykind\n")
-    p.push("// state: 0 = empty, 1 = live, 2 = tombstone.  keykind: 0 = by value, 1 = str.\n")
+    p.push("// layout: [0]count [8]cap(pow2) [16]slots [24]keykind [32]tombstones [40]hash shift\n")
+    p.push("// Each 24-byte slot is \{state, key, value\}, touching at most two cache lines.\n")
+    p.push("// state: 0 = empty, 1 = live, 2 = tombstone. keykind: 0 = by value, 1 = str.\n")
+    p.push("// Keeping state beside the key preserves the full integer key domain. Counting\n")
+    p.push("// tombstones toward the load limit guarantees an empty slot ends every probe.\n")
     p.push("// Called by name from the compiler; a map whose keys and values it will not drop.\n")
     p.push("fn rt_map_new(keykind: int) -> int \{\n")
     p.push("    return rt_map_new_d(keykind, 0)\n")
@@ -9293,18 +9868,14 @@ fn __emb_rt() -> str {
     p.push("    let cap = 8\n")
     p.push("    store64(m, 0)\n")
     p.push("    store64(m + 8, cap)\n")
-    p.push("    store64(m + 16, rt_alloc(cap * 8))\n")
-    p.push("    store64(m + 24, rt_alloc(cap * 8))\n")
-    p.push("    store64(m + 32, rt_alloc(cap))\n")
-    p.push("    store64(m + 40, keykind)\n")
+    p.push("    store64(m + 16, rt_alloc(cap * 24))\n")
+    p.push("    store64(m + 24, keykind)\n")
+    p.push("    store64(m + 32, 0)\n")
+    p.push("    store64(m + 40, 61)               // high 3 bits of a 64-bit multiplicative hash\n")
     p.push("    return m\n")
     p.push("\}\n")
     p.push("fn rx_hash_int(k: int) -> int \{\n")
-    p.push("    var h = k * 1000003\n")
-    p.push("    h = h ^ (h >> 31)\n")
-    p.push("    h = h * 2654435761\n")
-    p.push("    h = h ^ (h >> 29)\n")
-    p.push("    return h & 9223372036854775807\n")
+    p.push("    return k * -7046029254386353131    // 64-bit golden ratio; callers take high bits\n")
     p.push("\}\n")
     p.push("fn rx_hash_str(s: int) -> int \{\n")
     p.push("    let n = load64(s)\n")
@@ -9318,143 +9889,140 @@ fn __emb_rt() -> str {
     p.push("    return h & 9223372036854775807\n")
     p.push("\}\n")
     p.push("fn rx_map_hash(m: int, k: int) -> int \{\n")
-    p.push("    if load64(m + 40) == 1 \{ return rx_hash_str(k) \}\n")
-    p.push("    return rx_hash_int(k)\n")
+    p.push("    if load64(m + 24) == 1 \{ return rx_hash_str(k) \}\n")
+    p.push("    return rx_hash_int(k) >> load64(m + 40)\n")
     p.push("\}\n")
     p.push("fn rx_key_eq(m: int, a: int, b: int) -> int \{\n")
-    p.push("    if load64(m + 40) == 1 \{ return rt_str_eq(a, b) \}\n")
+    p.push("    if load64(m + 24) == 1 \{ return rt_str_eq(a, b) \}\n")
     p.push("    if a == b \{ return 1 \}\n")
     p.push("    return 0\n")
     p.push("\}\n")
     p.push("// slot holding k, or -1\n")
     p.push("fn rx_map_lookup(m: int, k: int) -> int \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let keys = load64(m + 16)\n")
-    p.push("    let state = load64(m + 32)\n")
+    p.push("    let slots = load64(m + 16)\n")
     p.push("    var i = rx_map_hash(m, k) & (cap - 1)\n")
-    p.push("    var probes = 0\n")
-    p.push("    while probes < cap \{\n")
-    p.push("        let st = load8(state + i)\n")
+    p.push("    while true \{\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        let st = load64(slot)\n")
     p.push("        if st == 0 \{ return 0 - 1 \}\n")
-    p.push("        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 \{ return i \}\n")
+    p.push("        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 \{ return i \}\n")
     p.push("        i = (i + 1) & (cap - 1)\n")
-    p.push("        probes += 1\n")
     p.push("    \}\n")
     p.push("    return 0 - 1\n")
     p.push("\}\n")
     p.push("fn rx_map_insert(m: int, k: int, v: int) \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let keys = load64(m + 16)\n")
-    p.push("    let vals = load64(m + 24)\n")
-    p.push("    let state = load64(m + 32)\n")
+    p.push("    let slots = load64(m + 16)\n")
     p.push("    var i = rx_map_hash(m, k) & (cap - 1)\n")
     p.push("    var tomb = 0 - 1\n")
-    p.push("    var probes = 0\n")
-    p.push("    while probes < cap \{\n")
-    p.push("        let st = load8(state + i)\n")
-    p.push("        if st == 1 and rx_key_eq(m, load64(keys + i * 8), k) == 1 \{\n")
-    p.push("            if rx_vref(m) == 1 \{ rx_assign(vals + i * 8, v) \}   // update in place\n")
-    p.push("            else \{ store64(vals + i * 8, v) \}\n")
+    p.push("    while true \{\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        let st = load64(slot)\n")
+    p.push("        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 \{\n")
+    p.push("            if rx_vref(m) == 1 \{ rx_assign(slot + 16, v) \}   // update in place\n")
+    p.push("            else \{ store64(slot + 16, v) \}\n")
     p.push("            if rx_kref(m) == 1 \{ rx_drop(k) \}                    // the old key stays\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        if st == 2 and tomb < 0 \{ tomb = i \}\n")
     p.push("        if st == 0 \{\n")
-    p.push("            var slot = i\n")
-    p.push("            if tomb >= 0 \{ slot = tomb \}\n")
-    p.push("            store64(keys + slot * 8, k)\n")
-    p.push("            store64(vals + slot * 8, v)\n")
-    p.push("            store8(state + slot, 1)\n")
+    p.push("            var dest = slot\n")
+    p.push("            if tomb >= 0 \{\n")
+    p.push("                dest = slots + tomb * 24\n")
+    p.push("                store64(m + 32, load64(m + 32) - 1)\n")
+    p.push("            \}\n")
+    p.push("            store64(dest + 8, k)\n")
+    p.push("            store64(dest + 16, v)\n")
+    p.push("            store64(dest, 1)\n")
     p.push("            store64(m, load64(m) + 1)\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        i = (i + 1) & (cap - 1)\n")
-    p.push("        probes += 1\n")
     p.push("    \}\n")
-    p.push("    rt_die(\"map overflow\")\n")
     p.push("\}\n")
-    p.push("fn rx_map_grow(m: int) \{\n")
+    p.push("// Move every live entry into a fresh buffer, dropping tombstones, not references.\n")
+    p.push("fn rx_map_rehash(m: int, ncap: int) \{\n")
     p.push("    let oldcap = load64(m + 8)\n")
-    p.push("    let oldkeys = load64(m + 16)\n")
-    p.push("    let oldvals = load64(m + 24)\n")
-    p.push("    let oldstate = load64(m + 32)\n")
-    p.push("    let ncap = oldcap * 2\n")
+    p.push("    let oldslots = load64(m + 16)\n")
+    p.push("    // Allocate before changing the header; the collector still sees the old buffer.\n")
+    p.push("    let slots = rt_alloc(ncap * 24)\n")
     p.push("    store64(m + 8, ncap)\n")
-    p.push("    store64(m + 16, rt_alloc(ncap * 8))\n")
-    p.push("    store64(m + 24, rt_alloc(ncap * 8))\n")
-    p.push("    store64(m + 32, rt_alloc(ncap))       // fresh pages are zero = all empty\n")
+    p.push("    store64(m + 16, slots)              // zeroed = all empty\n")
     p.push("    store64(m, 0)\n")
-    p.push("    let isint = load64(m + 40) == 0\n")
+    p.push("    store64(m + 32, 0)\n")
+    p.push("    var shift = 64\n")
+    p.push("    var n = ncap\n")
+    p.push("    while n > 1 \{\n")
+    p.push("        shift -= 1\n")
+    p.push("        n = n >> 1\n")
+    p.push("    \}\n")
+    p.push("    store64(m + 40, shift)\n")
+    p.push("    let isint = load64(m + 24) == 0\n")
     p.push("    var i = 0\n")
     p.push("    while i < oldcap \{\n")
-    p.push("        if load8(oldstate + i) == 1 \{\n")
-    p.push("            if isint \{ rx_iinsert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) \}\n")
-    p.push("            else \{ rx_map_insert(m, load64(oldkeys + i * 8), load64(oldvals + i * 8)) \}\n")
+    p.push("        let slot = oldslots + i * 24\n")
+    p.push("        if load64(slot) == 1 \{\n")
+    p.push("            if isint \{ rx_iinsert(m, load64(slot + 8), load64(slot + 16)) \}\n")
+    p.push("            else \{ rx_map_insert(m, load64(slot + 8), load64(slot + 16)) \}\n")
     p.push("        \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
-    p.push("    // The entries moved, not their counts: only the old arrays themselves die.\n")
-    p.push("    rx_drop(oldkeys)\n")
-    p.push("    rx_drop(oldvals)\n")
-    p.push("    rx_drop(oldstate)\n")
+    p.push("    rx_drop(oldslots)\n")
     p.push("\}\n")
     p.push("// ---- int-key fast paths: hash and == inlined, no call per probe ----\n")
     p.push("fn rx_ilookup(m: int, k: int) -> int \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let keys = load64(m + 16)\n")
-    p.push("    let state = load64(m + 32)\n")
-    p.push("    var h = k * 1000003\n")
-    p.push("    h = h ^ (h >> 31)\n")
-    p.push("    h = h * 2654435761\n")
-    p.push("    h = h ^ (h >> 29)\n")
-    p.push("    var i = h & 9223372036854775807 & (cap - 1)\n")
-    p.push("    var probes = 0\n")
-    p.push("    while probes < cap \{\n")
-    p.push("        let st = load8(state + i)\n")
+    p.push("    let slots = load64(m + 16)\n")
+    p.push("    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)\n")
+    p.push("    while true \{\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        let st = load64(slot)\n")
     p.push("        if st == 0 \{ return 0 - 1 \}\n")
-    p.push("        if st == 1 and load64(keys + i * 8) == k \{ return i \}\n")
+    p.push("        if st == 1 and load64(slot + 8) == k \{ return i \}\n")
     p.push("        i = (i + 1) & (cap - 1)\n")
-    p.push("        probes += 1\n")
     p.push("    \}\n")
     p.push("    return 0 - 1\n")
     p.push("\}\n")
     p.push("fn rx_iinsert(m: int, k: int, v: int) \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let keys = load64(m + 16)\n")
-    p.push("    let vals = load64(m + 24)\n")
-    p.push("    let state = load64(m + 32)\n")
-    p.push("    var h = k * 1000003\n")
-    p.push("    h = h ^ (h >> 31)\n")
-    p.push("    h = h * 2654435761\n")
-    p.push("    h = h ^ (h >> 29)\n")
-    p.push("    var i = h & 9223372036854775807 & (cap - 1)\n")
+    p.push("    let slots = load64(m + 16)\n")
+    p.push("    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)\n")
     p.push("    var tomb = 0 - 1\n")
-    p.push("    var probes = 0\n")
-    p.push("    while probes < cap \{\n")
-    p.push("        let st = load8(state + i)\n")
-    p.push("        if st == 1 and load64(keys + i * 8) == k \{\n")
-    p.push("            if rx_vref(m) == 1 \{ rx_assign(vals + i * 8, v) \}\n")
-    p.push("            else \{ store64(vals + i * 8, v) \}\n")
+    p.push("    while true \{\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        let st = load64(slot)\n")
+    p.push("        if st == 1 and load64(slot + 8) == k \{\n")
+    p.push("            if rx_vref(m) == 1 \{ rx_assign(slot + 16, v) \}\n")
+    p.push("            else \{ store64(slot + 16, v) \}\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        if st == 2 and tomb < 0 \{ tomb = i \}\n")
     p.push("        if st == 0 \{\n")
-    p.push("            var slot = i\n")
-    p.push("            if tomb >= 0 \{ slot = tomb \}\n")
-    p.push("            store64(keys + slot * 8, k)\n")
-    p.push("            store64(vals + slot * 8, v)\n")
-    p.push("            store8(state + slot, 1)\n")
+    p.push("            var dest = slot\n")
+    p.push("            if tomb >= 0 \{\n")
+    p.push("                dest = slots + tomb * 24\n")
+    p.push("                store64(m + 32, load64(m + 32) - 1)\n")
+    p.push("            \}\n")
+    p.push("            store64(dest + 8, k)\n")
+    p.push("            store64(dest + 16, v)\n")
+    p.push("            store64(dest, 1)\n")
     p.push("            store64(m, load64(m) + 1)\n")
     p.push("            return\n")
     p.push("        \}\n")
     p.push("        i = (i + 1) & (cap - 1)\n")
-    p.push("        probes += 1\n")
     p.push("    \}\n")
-    p.push("    rt_die(\"map overflow\")\n")
     p.push("\}\n")
     p.push("fn rt_map_set(m: int, k: int, v: int) \{\n")
-    p.push("    if (load64(m) + 1) * 10 >= load64(m + 8) * 7 \{ rx_map_grow(m) \}   // grow at 70%\n")
-    p.push("    if load64(m + 40) == 0 \{\n")
+    p.push("    // Rehash at 50% of slots in use, tombstones included. Double when the live\n")
+    p.push("    // entries alone would fill over 25%; otherwise it is mostly tombstones, and\n")
+    p.push("    // rebuilding at the same size clears them.\n")
+    p.push("    let cap = load64(m + 8)\n")
+    p.push("    if (load64(m) + load64(m + 32) + 1) * 2 >= cap \{\n")
+    p.push("        if (load64(m) + 1) * 4 >= cap \{ rx_map_rehash(m, cap * 2) \}\n")
+    p.push("        else \{ rx_map_rehash(m, cap) \}\n")
+    p.push("    \}\n")
+    p.push("    if load64(m + 24) == 0 \{\n")
     p.push("        rx_iinsert(m, k, v)\n")
     p.push("        return\n")
     p.push("    \}\n")
@@ -9467,7 +10035,7 @@ fn __emb_rt() -> str {
     p.push("fn rt_map_get(m: int, k: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    if i < 0 \{ rt_die(\"map key not found\") \}\n")
-    p.push("    let v = load64(load64(m + 24) + i * 8)\n")
+    p.push("    let v = load64(load64(m + 16) + i * 24 + 16)\n")
     p.push("    if rx_vref(m) == 1 \{ let d = rx_dup(v) \}\n")
     p.push("    return v\n")
     p.push("\}\n")
@@ -9475,20 +10043,26 @@ fn __emb_rt() -> str {
     p.push("fn rt_map_get_or(m: int, k: int, d: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    var v = d\n")
-    p.push("    if i >= 0 \{ v = load64(load64(m + 24) + i * 8) \}\n")
+    p.push("    if i >= 0 \{ v = load64(load64(m + 16) + i * 24 + 16) \}\n")
     p.push("    if rx_vref(m) == 1 \{ let d = rx_dup(v) \}\n")
     p.push("    return v\n")
     p.push("\}\n")
+    p.push("// The compiler selects this when neither keys nor values need reference handling.\n")
+    p.push("fn rt_map_get_or_val(m: int, k: int, d: int) -> int \{\n")
+    p.push("    let i = rx_ilookup(m, k)\n")
+    p.push("    if i < 0 \{ return d \}\n")
+    p.push("    return load64(load64(m + 16) + i * 24 + 16)\n")
+    p.push("\}\n")
     p.push("// dispatch: int-keyed maps take the inlined fast path\n")
     p.push("fn rx_lookup(m: int, k: int) -> int \{\n")
-    p.push("    if load64(m + 40) == 0 \{ return rx_ilookup(m, k) \}\n")
+    p.push("    if load64(m + 24) == 0 \{ return rx_ilookup(m, k) \}\n")
     p.push("    return rx_map_lookup(m, k)\n")
     p.push("\}\n")
     p.push("// safe lookup: returns an optional cell (0 = none)\n")
     p.push("fn rt_map_get_opt(m: int, k: int) -> int \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    if i < 0 \{ return 0 \}\n")
-    p.push("    let v = load64(load64(m + 24) + i * 8)\n")
+    p.push("    let v = load64(load64(m + 16) + i * 24 + 16)\n")
     p.push("    var cell = 0\n")
     p.push("    if rx_vref(m) == 1 \{\n")
     p.push("        cell = rt_alloc_d(8, __d_box_ref)\n")
@@ -9506,35 +10080,50 @@ fn __emb_rt() -> str {
     p.push("fn rt_map_remove(m: int, k: int) \{\n")
     p.push("    let i = rx_lookup(m, k)\n")
     p.push("    if i < 0 \{ return \}\n")
-    p.push("    store8(load64(m + 32) + i, 2)         // tombstone\n")
+    p.push("    let slot = load64(m + 16) + i * 24\n")
+    p.push("    store64(slot, 2)                     // tombstone\n")
     p.push("    store64(m, load64(m) - 1)\n")
-    p.push("    if rx_kref(m) == 1 \{ rx_drop(load64(load64(m + 16) + i * 8)) \}\n")
-    p.push("    if rx_vref(m) == 1 \{ rx_drop(load64(load64(m + 24) + i * 8)) \}\n")
+    p.push("    store64(m + 32, load64(m + 32) + 1)\n")
+    p.push("    if rx_kref(m) == 1 \{ rx_drop(load64(slot + 8)) \}\n")
+    p.push("    if rx_vref(m) == 1 \{ rx_drop(load64(slot + 16)) \}\n")
+    p.push("    // The conservative collector must not retain deleted keys or values.\n")
+    p.push("    store64(slot + 8, 0)\n")
+    p.push("    store64(slot + 16, 0)\n")
     p.push("\}\n")
     p.push("fn rt_map_keys(m: int) -> int \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let keys = load64(m + 16)\n")
-    p.push("    let state = load64(m + 32)\n")
+    p.push("    let slots = load64(m + 16)\n")
+    p.push("    let kref = rx_kref(m)\n")
     p.push("    var ld = __d_list_val\n")
-    p.push("    if rx_kref(m) == 1 \{ ld = __d_list_ref \}\n")
+    p.push("    if kref == 1 \{ ld = __d_list_ref \}\n")
     p.push("    let out = rt_list_new_d(0, ld)\n")
     p.push("    var i = 0\n")
     p.push("    while i < cap \{\n")
-    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, rx_dup(load64(keys + i * 8))) \}\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        if load64(slot) == 1 \{\n")
+    p.push("            let k = load64(slot + 8)\n")
+    p.push("            if kref == 1 \{ let d = rx_dup(k) \}\n")
+    p.push("            rt_list_push(out, k)\n")
+    p.push("        \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
     p.push("    return out\n")
     p.push("\}\n")
     p.push("fn rt_map_values(m: int) -> int \{\n")
     p.push("    let cap = load64(m + 8)\n")
-    p.push("    let vals = load64(m + 24)\n")
-    p.push("    let state = load64(m + 32)\n")
+    p.push("    let slots = load64(m + 16)\n")
+    p.push("    let vref = rx_vref(m)\n")
     p.push("    var ld = __d_list_val\n")
-    p.push("    if rx_vref(m) == 1 \{ ld = __d_list_ref \}\n")
+    p.push("    if vref == 1 \{ ld = __d_list_ref \}\n")
     p.push("    let out = rt_list_new_d(0, ld)\n")
     p.push("    var i = 0\n")
     p.push("    while i < cap \{\n")
-    p.push("        if load8(state + i) == 1 \{ rt_list_push(out, rx_dup(load64(vals + i * 8))) \}\n")
+    p.push("        let slot = slots + i * 24\n")
+    p.push("        if load64(slot) == 1 \{\n")
+    p.push("            let v = load64(slot + 16)\n")
+    p.push("            if vref == 1 \{ let d = rx_dup(v) \}\n")
+    p.push("            rt_list_push(out, v)\n")
+    p.push("        \}\n")
     p.push("        i += 1\n")
     p.push("    \}\n")
     p.push("    return out\n")
@@ -9995,7 +10584,7 @@ fn __emb_rt() -> str {
     p.push("    \}\n")
     p.push("    while i < n and load8(s + 8 + i) == 32 \{ i += 1 \}\n")
     p.push("    if not any or i != n \{ rt_die(\"cannot convert to float\") \}\n")
-    p.push("    if neg \{ val = 0.0 - val \}\n")
+    p.push("    if neg \{ val = -val \}                  // not 0.0 - val: \"-0\" must parse as -0.0\n")
     p.push("    return bits(val)\n")
     p.push("\}\n")
     p.push("\n")
@@ -10252,22 +10841,21 @@ fn __emb_rt() -> str {
     p.push("        let ktd = load64(td + 8)\n")
     p.push("        let vtd = load64(td + 16)\n")
     p.push("        let cap = load64(v + 8)\n")
-    p.push("        let keys = load64(v + 16)\n")
-    p.push("        let vals = load64(v + 24)\n")
-    p.push("        let state = load64(v + 32)\n")
+    p.push("        let slots = load64(v + 16)\n")
     p.push("        rx_sb_byte(123)\n")
     p.push("        var shown = 0\n")
     p.push("        var i = 0\n")
     p.push("        while i < cap \{\n")
-    p.push("            if load8(state + i) == 1 \{\n")
+    p.push("            let slot = slots + i * 24\n")
+    p.push("            if load64(slot) == 1 \{\n")
     p.push("                if shown > 0 \{\n")
     p.push("                    rx_sb_byte(44)\n")
     p.push("                    rx_sb_byte(32)\n")
     p.push("                \}\n")
-    p.push("                rx_fmt_val(load64(keys + i * 8), ktd, 1)\n")
+    p.push("                rx_fmt_val(load64(slot + 8), ktd, 1)\n")
     p.push("                rx_sb_byte(58)\n")
     p.push("                rx_sb_byte(32)\n")
-    p.push("                rx_fmt_val(load64(vals + i * 8), vtd, 1)\n")
+    p.push("                rx_fmt_val(load64(slot + 16), vtd, 1)\n")
     p.push("                shown += 1\n")
     p.push("            \}\n")
     p.push("            i += 1\n")
@@ -11470,6 +12058,21 @@ fn path_exists(path: str) -> bool {
     return (attr & 4294967295) != 4294967295
 }
 
+// Compare disk imports by absolute Windows path, regardless of spelling.
+fn canon_key(path: str) -> str {
+    let buf = zeros(path.len() / 8 + 2)
+    let data = load64(addr(buf) + 16)
+    for i in 0..path.len() { store8(data + i, path.byte(i)) }
+    store8(data + path.len(), 0)
+    let out = zeros(33)                        // 264 bytes for a 260-byte path
+    let dest = load64(addr(out) + 16)
+    let n = win("GetFullPathNameA", data, 260, dest, 0)
+    if n == 0 or n >= 260 { return path.lower() }   // too long: n is the size it needed
+    var key = ""
+    for i in 0..n { key = key + chr(load8(dest + i)) }
+    return key.lower()
+}
+
 // splice each `import "path"` in place with that file's declarations.
 // Each path is included once, so diamonds and cycles terminate.
 fn expand_imports(prog: Node, basedir: str) -> Node {
@@ -11477,7 +12080,9 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
     for n in prog.kids {
         if n.k == N_IMPORT {
             var path = n.name
+            var display = basename(n.name)
             if not is_abs_path(path) {
+                display = dirname(n.file) + n.name
                 path = basedir + n.name
                 // Fall back to the compiler's own directory, then to lib/
                 // beneath it, so `import "std/list.zeph"` or `import
@@ -11485,8 +12090,10 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
                 if not path_exists(path) and g_exedir != "" {
                     if path_exists(g_exedir + n.name) {
                         path = g_exedir + n.name
+                        display = n.name
                     } else if path_exists(g_exedir + "lib/" + n.name) {
                         path = g_exedir + "lib/" + n.name
+                        display = "lib/" + n.name
                     }
                 }
             }
@@ -11494,23 +12101,28 @@ fn expand_imports(prog: Node, basedir: str) -> Node {
             var ei = 0 - 1
             if not path_exists(path) {
                 ei = embed_match(n.name)
-                if ei >= 0 { path = "embed:" + embedded_name(ei) }
+                if ei >= 0 {
+                    path = "embed:" + embedded_name(ei)
+                    display = "lib/" + embedded_name(ei)
+                }
             }
+            var key = path
+            if ei < 0 { key = canon_key(path) }
             var seen = false
             for i in 0..g_imported.len() {
-                if g_imported[i] == path { seen = true }
+                if g_imported[i] == key { seen = true }
             }
             if not seen {
-                g_imported.push(path)
+                g_imported.push(key)
                 let prev = g_file
                 if ei >= 0 {
-                    g_file = embedded_name(ei) + " (embedded)"
+                    g_file = display
                     let inner = parse(lex_src(embedded_src(ei), 1))
                     let expanded = expand_imports(inner, "")
                     g_file = prev
                     for i in 0..expanded.kids.len() { out.push(expanded.kids[i]) }
                 } else {
-                    g_file = path
+                    g_file = display
                     let inner = parse(lex_src(read_file(path), 1))
                     let expanded = expand_imports(inner, dirname(path))
                     g_file = prev
@@ -11529,7 +12141,7 @@ let IMAGE_BASE = 5368709120  // 0x140000000
 
 fn write_pe(path: str) {
     let rt_mode = sym_is_local("rt_alloc")   // Zephyr runtime linked: kernel32-only
-    let entry_off = t_bytes.len()
+    let entry_off = t_len
     a_sect = SEC_TEXT
     if rt_mode {
         tb(72)                               // sub rsp, 40
@@ -11606,10 +12218,10 @@ fn write_pe(path: str) {
     let idata_size = pe_align(no, 16)
 
     let text_rva = 4096
-    let text_size = t_bytes.len()
+    let text_size = t_len
     let rdata_rva = pe_align(text_rva + text_size, 4096)
     let data_off = idata_size
-    let rdata_size = idata_size + r_bytes.len()
+    let rdata_size = idata_size + r_len
     let bss_rva = pe_align(rdata_rva + rdata_size, 4096)
     var image_size = pe_align(bss_rva, 4096)
     if a_bss > 0 { image_size = pe_align(bss_rva + a_bss, 4096) }
@@ -11641,6 +12253,7 @@ fn write_pe(path: str) {
     let text_raw = hdrs_size
     let rdata_raw = text_raw + pe_align(text_size, 512)
     let file_size = rdata_raw + pe_align(rdata_size, 512)
+    pe_out = chr(0).repeat(file_size)
 
     // DOS header
     pw(77)
@@ -11737,7 +12350,7 @@ fn write_pe(path: str) {
         pw4(schr[i])
     }
     pw_pad(text_raw)
-    for i in 0..t_bytes.len() { pe_out.push(t_bytes[i]) }
+    pw_bytes(t_bytes, t_len)
     pw_pad(rdata_raw)
     // import descriptor table: one entry per used DLL, then a null entry
     for gi in 0..ndll {
@@ -11767,7 +12380,7 @@ fn write_pe(path: str) {
         let nm = a_imports[i]
         for j in 0..nm.len() { pw(nm.byte(j)) }
         pw(0)
-        if (pe_out.len() - rdata_raw) % 2 == 1 { pw(0) }
+        if (pe_len - rdata_raw) % 2 == 1 { pw(0) }
     }
     for gi in 0..ndll {
         let dn = DLLNAMES[dmap[gi]]
@@ -11775,12 +12388,10 @@ fn write_pe(path: str) {
         pw(0)
     }
     pw_pad(rdata_raw + idata_size)
-    for i in 0..r_bytes.len() { pe_out.push(r_bytes[i]) }
+    pw_bytes(r_bytes, r_len)
     pw_pad(file_size)
 
-    var parts: [str] = []
-    for i in 0..pe_out.len() { parts.push(chr(pe_out[i])) }
-    write_file(path, parts.join())
+    write_file(path, pe_out)
 }
 
 // ---------------- ELF writer (--linux) ----------------
@@ -11794,13 +12405,13 @@ let ELF_BASE = 4194304   // 0x400000
 fn ew8(v: int) {
     var x = v
     for i in 0..8 {
-        pe_out.push(x % 256)
+        pw(x % 256)
         x = x / 256
     }
 }
 
 fn write_elf(path: str) {
-    let entry_off = t_bytes.len()
+    let entry_off = t_len
     a_sect = SEC_TEXT
     tb(232)                              // call zephyr_main
     add_fix(FX_REL32, sym_intern("zephyr_main"), 0)
@@ -11813,10 +12424,11 @@ fn write_elf(path: str) {
     tb(5)
 
     let text_rva = 4096
-    let text_size = t_bytes.len()
+    let text_size = t_len
     let rdata_rva = pe_align(text_rva + text_size, 4096)
-    let rdata_size = r_bytes.len()
+    let rdata_size = r_len
     let bss_rva = pe_align(rdata_rva + rdata_size, 4096)
+    pe_out = chr(0).repeat(rdata_rva + rdata_size)
 
     for i in 0..a_fixes.len() {
         let fx = a_fixes[i]
@@ -11878,41 +12490,26 @@ fn write_elf(path: str) {
     ew8(4096)
 
     pw_pad(text_rva)
-    for i in 0..t_bytes.len() { pe_out.push(t_bytes[i]) }
+    pw_bytes(t_bytes, t_len)
     pw_pad(rdata_rva)
-    for i in 0..r_bytes.len() { pe_out.push(r_bytes[i]) }
+    pw_bytes(r_bytes, r_len)
 
-    var parts: [str] = []
-    for i in 0..pe_out.len() { parts.push(chr(pe_out[i])) }
-    write_file(path, parts.join())
+    write_file(path, pe_out)
 }
 
 fn is_label_char(c: int) -> bool {
     return c == 95 or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57)
 }
 
-// mark every defined label so `call rt_X` can pick local-vs-import
-fn asm_prescan() {
-    for i in 0..g_lines.len() {
-        var line = g_lines[i]
-        if line.len() > 0 and line.byte(line.len() - 1) == 10 {
-            line = line.sub(0, line.len() - 1)
-        }
-        let n = line.len()
-        if n < 2 { continue }
-        let c0 = line.byte(0)
-        if c0 == 32 or c0 == 46 { continue }         // instruction or directive
-        if line.byte(n - 1) != 58 { continue }       // must end with ':'
-        var ok = c0 == 95 or (c0 >= 65 and c0 <= 90) or (c0 >= 97 and c0 <= 122)
-        var k = 1
-        while k < n - 1 and ok {
-            if not is_label_char(line.byte(k)) { ok = false }
-            k += 1
-        }
-        if not ok { continue }
-        let si = sym_intern(line.sub(0, n - 1))
-        a_syms[si].predef = true
+// Only rt_* calls distinguish forward local definitions from DLL imports.
+// Record those labels during emission instead of scanning every assembly line.
+fn asm_predefine(line: str) {
+    let n = line.len()
+    if not starts_with(line, "rt_") or line.byte(n - 1) != 58 { return }
+    for i in 3..n - 1 {
+        if not is_label_char(line.byte(i)) { return }
     }
+    a_syms[sym_intern(line.sub(0, n - 1))].predef = true
 }
 
 // ---- .zdbg sidecar (little-endian) ----
@@ -12370,11 +12967,10 @@ fn wexpr(e: Node) {
     }
     if k == N_NEG {
         if e.ty == TI_FLOAT {
-            wconst(0)
-            wc.push(191)                     // f64.reinterpret_i64
+            // f64.neg flips the sign bit; 0.0 - x would turn -0.0 into +0.0
             wexpr(e.kids[0])
-            wc.push(191)
-            wc.push(161)                     // f64.sub
+            wc.push(191)                     // f64.reinterpret_i64
+            wc.push(154)                     // f64.neg
             wc.push(189)                     // i64.reinterpret_f64
             return
         }
@@ -13091,6 +13687,19 @@ fn wcall(e: Node) {
         wu(wc, 0)
         return
     }
+    if k == CK_LOAD32 or k == CK_LOAD16 {
+        wexpr(e.kids[1])
+        wtruth()
+        if k == CK_LOAD32 {
+            wc.push(53)                      // i64.load32_u
+            wu(wc, 2)
+        } else {
+            wc.push(51)                      // i64.load16_u
+            wu(wc, 1)
+        }
+        wu(wc, 0)
+        return
+    }
     if k == CK_STORE64 or k == CK_STORE32 or k == CK_STORE8 {
         wexpr(e.kids[1])
         wtruth()
@@ -13790,10 +14399,11 @@ fn write_wasm(path: str) {
     wserialise(path)
 }
 
+// Fill one counted byte string instead of allocating a string for every byte.
 fn wserialise(path: str) {
-    var parts: [str] = []
-    for i in 0..w_out.len() { parts.push(chr(w_out[i])) }
-    write_file(path, parts.join())
+    let data = chr(0).repeat(w_out.len())
+    for i in 0..w_out.len() { store8(addr(data) + 8 + i, w_out[i]) }
+    write_file(path, data)
 }
 
 fn assemble_and_link(path: str) {
@@ -13802,13 +14412,8 @@ fn assemble_and_link(path: str) {
         return
     }
     a_sect = SEC_TEXT
-    asm_prescan()
     for i in 0..g_lines.len() {
-        var line = g_lines[i]
-        if line.len() > 0 and line.byte(line.len() - 1) == 10 {
-            line = line.sub(0, line.len() - 1)
-        }
-        asm_line(line)
+        asm_line(g_lines[i])
     }
     if g_linux { write_elf(path) } else { write_pe(path) }
     if g_debug and not g_linux { write_zdbg(path + ".zdbg") }
@@ -13841,22 +14446,22 @@ if d_in == "" and d_version {
     if d_in == "" or d_out == "" {
         panic("usage: zc [--rt] [--version] <input.zeph> <output.exe|output.s>")
     }
-    g_file = d_in
+    g_file = basename(d_in)
     g_exedir = exe_dir()
     var prog = parse(lex_src(read_file(d_in), 1))
     prog = expand_imports(prog, dirname(d_in))
-    g_file = d_in
+    g_file = basename(d_in)
     if d_rt {
         // prepend the Zephyr runtime so rt_* resolve locally (kernel32-only
         // output). A runtime.zeph next to the compiler, then one in the current
         // directory, overrides the copy embedded in the binary.
         var rtsrc = ""
         if g_exedir != "" and path_exists(g_exedir + "compiler/runtime.zeph") {
-            g_file = g_exedir + "compiler/runtime.zeph"
-            rtsrc = read_file(g_file)
+            g_file = "compiler/runtime.zeph"
+            rtsrc = read_file(g_exedir + "compiler/runtime.zeph")
         } else if g_exedir != "" and path_exists(g_exedir + "runtime.zeph") {
-            g_file = g_exedir + "runtime.zeph"
-            rtsrc = read_file(g_file)
+            g_file = "runtime.zeph"
+            rtsrc = read_file(g_exedir + "runtime.zeph")
         } else if path_exists("runtime.zeph") {
             g_file = "runtime.zeph"
             rtsrc = read_file("runtime.zeph")
@@ -13874,8 +14479,25 @@ if d_in == "" and d_version {
             var ospath = g_exedir + osname
             if not path_exists(ospath) { ospath = osname }
             if not path_exists(ospath) { panic("this target needs " + osname + " next to zc.exe") }
-            g_file = ospath
+            g_file = osname
             rtsrc = read_file(ospath) + rtsrc
+        }
+        if not g_wasm {
+            // The runtime source stays untouched on disk; only failure branches
+            // of helpers reached from native code receive the caller's site.
+            rtsrc = rtsrc.replace("fn rt_str_to_int(s: int) -> int \{", "fn rt_str_to_int(s: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_str_to_float(s: int) -> int \{", "fn rt_str_to_float(s: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_list_pop(l: int) -> int \{", "fn rt_list_pop(l: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_map_get(m: int, k: int) -> int \{", "fn rt_map_get(m: int, k: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_read_file(path: int) -> int \{", "fn rt_read_file(path: int, site: str) -> int \{")
+            rtsrc = rtsrc.replace("fn rt_write_file(path: int, data: int) \{", "fn rt_write_file(path: int, data: int, site: str) \{")
+            rtsrc = rtsrc.replace("rt_die(\"cannot convert to int\")", "rt_die(site + \"cannot convert to int\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot convert to float\")", "rt_die(site + \"cannot convert to float\")")
+            rtsrc = rtsrc.replace("rt_die(\"pop from empty list\")", "rt_die(site + \"pop from empty list\")")
+            rtsrc = rtsrc.replace("rt_die(\"map key not found\")", "rt_die(site + \"map key not found\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot read file\")", "rt_die(site + \"cannot read file\")")
+            rtsrc = rtsrc.replace("rt_die(\"cannot write file\")", "rt_die(site + \"cannot write file\")")
+            rtsrc += "\nfn rt_panic_at(site: str, msg: str) \{ rt_die(site + msg) \}\n"
         }
         let rtprog = parse(lex_src(rtsrc, 1))
         var merged: [Node] = []
@@ -13886,13 +14508,15 @@ if d_in == "" and d_version {
         }
         for i in 0..prog.kids.len() { merged.push(prog.kids[i]) }
         prog.kids = merged
-        g_file = d_in
+        g_file = basename(d_in)
     }
     desugar_extern(prog)
     desugar_oop(prog)
     check(prog)
+    g_file = basename(d_in)
     fold_globals(prog)
     inline_pass(prog)
+    cf_fold_all(prog)                       // fold what inlined literal args exposed
     let is_s = d_out.len() > 2 and d_out.sub(d_out.len() - 2, d_out.len()) == ".s"
     // -g only affects native exe output; keep .zloc markers out of .s (gcc path)
     g_main_file = d_in

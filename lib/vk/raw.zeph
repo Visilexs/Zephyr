@@ -9,6 +9,22 @@
 // required for extensions (debug messenger, surfaces) -- not needed yet.
 
 import "vk/consts.zeph"
+import "std/bytes.zeph"
+
+// Off-heap scratch for native output only; the caller must free it after its last use.
+fn vk_output(n: int) -> Bytes {
+    assert(n > 0, "vk_output: size must be positive")
+    let p = win("VirtualAlloc", 0, n, 12288, 4)
+    assert(p != 0, "vk_output: VirtualAlloc failed")
+    let mem: [int] = []
+    return Bytes{mem: mem, p: p, n: n}
+}
+
+// Release only scratch obtained from vk_output; no references may be used afterward.
+fn vk_free_output(b: Bytes) {
+    let freed = win("VirtualFree", b.addr(), 0, 32768)
+    assert(freed != 0, "vk_free_output: VirtualFree failed")
+}
 
 fn vkcheck(r: int, what: str) {
     // externs declared `-> i32` already sign-extend, so r is a true VkResult
@@ -33,6 +49,7 @@ extern fn vkDestroyInstance(instance: int, pAllocator: int) from "vulkan-1.dll"
 // ---- physical device ----
 extern fn vkEnumeratePhysicalDevices(instance: int, pCount: int, pDevices: int) -> i32 from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceProperties(physicalDevice: int, pProperties: int) from "vulkan-1.dll"
+extern fn vkGetPhysicalDeviceFormatProperties(physicalDevice: int, format: int, pFormatProperties: int) from "vulkan-1.dll"
 extern fn vkGetPhysicalDeviceFeatures(physicalDevice: int, pFeatures: int) from "vulkan-1.dll"
 // core since 1.1; only called when the loader reports >= 1.2 (see gfx.zeph)
 extern fn vkGetPhysicalDeviceFeatures2(physicalDevice: int, pFeatures: int) from "vulkan-1.dll"
@@ -78,15 +95,22 @@ extern fn vkDestroyPipeline(device: int, pipeline: int, pAllocator: int) from "v
 // ---- commands ----
 extern fn vkCreateCommandPool(device: int, pCreateInfo: int, pAllocator: int, pCommandPool: int) -> i32 from "vulkan-1.dll"
 extern fn vkDestroyCommandPool(device: int, commandPool: int, pAllocator: int) from "vulkan-1.dll"
+extern fn vkCreateQueryPool(device: int, pCreateInfo: int, pAllocator: int, pQueryPool: int) -> i32 from "vulkan-1.dll"
+extern fn vkDestroyQueryPool(device: int, queryPool: int, pAllocator: int) from "vulkan-1.dll"
+extern fn vkGetQueryPoolResults(device: int, queryPool: int, firstQuery: int, queryCount: int, dataSize: int, pData: int, stride: int, flags: int) -> i32 from "vulkan-1.dll"
 extern fn vkAllocateCommandBuffers(device: int, pAllocateInfo: int, pCommandBuffers: int) -> i32 from "vulkan-1.dll"
 extern fn vkFreeCommandBuffers(device: int, commandPool: int, commandBufferCount: int, pCommandBuffers: int) from "vulkan-1.dll"
 extern fn vkBeginCommandBuffer(commandBuffer: int, pBeginInfo: int) -> i32 from "vulkan-1.dll"
 extern fn vkEndCommandBuffer(commandBuffer: int) -> i32 from "vulkan-1.dll"
+extern fn vkCmdResetQueryPool(commandBuffer: int, queryPool: int, firstQuery: int, queryCount: int) from "vulkan-1.dll"
+extern fn vkCmdWriteTimestamp(commandBuffer: int, pipelineStage: int, queryPool: int, query: int) from "vulkan-1.dll"
 extern fn vkCmdBeginRenderPass(commandBuffer: int, pRenderPassBegin: int, contents: int) from "vulkan-1.dll"
 extern fn vkCmdEndRenderPass(commandBuffer: int) from "vulkan-1.dll"
 extern fn vkCmdBindPipeline(commandBuffer: int, pipelineBindPoint: int, pipeline: int) from "vulkan-1.dll"
 extern fn vkCmdDraw(commandBuffer: int, vertexCount: int, instanceCount: int, firstVertex: int, firstInstance: int) from "vulkan-1.dll"
 extern fn vkCmdCopyImageToBuffer(commandBuffer: int, srcImage: int, srcImageLayout: int, dstBuffer: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
+extern fn vkCmdCopyBufferToImage(commandBuffer: int, srcBuffer: int, dstImage: int, dstImageLayout: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
+extern fn vkCmdBlitImage(commandBuffer: int, srcImage: int, srcImageLayout: int, dstImage: int, dstImageLayout: int, regionCount: int, pRegions: int, filter: int) from "vulkan-1.dll"
 extern fn vkCmdPipelineBarrier(commandBuffer: int, srcStageMask: int, dstStageMask: int, dependencyFlags: int, memoryBarrierCount: int, pMemoryBarriers: int, bufferMemoryBarrierCount: int, pBufferMemoryBarriers: int, imageMemoryBarrierCount: int, pImageMemoryBarriers: int) from "vulkan-1.dll"
 
 // ---- submit / sync ----
@@ -120,6 +144,16 @@ extern fn vkAllocateDescriptorSets(device: int, pAllocateInfo: int, pDescriptorS
 extern fn vkUpdateDescriptorSets(device: int, descriptorWriteCount: int, pDescriptorWrites: int, descriptorCopyCount: int, pDescriptorCopies: int) from "vulkan-1.dll"
 extern fn vkCmdBindDescriptorSets(commandBuffer: int, pipelineBindPoint: int, layout: int, firstSet: int, descriptorSetCount: int, pDescriptorSets: int, dynamicOffsetCount: int, pDynamicOffsets: int) from "vulkan-1.dll"
 extern fn vkCmdCopyBuffer(commandBuffer: int, srcBuffer: int, dstBuffer: int, regionCount: int, pRegions: int) from "vulkan-1.dll"
+
+// ---- raster: samplers, indexed + indirect draws ----
+// (no vkCmdSetDepthBias: its float arguments travel in XMM registers, which the
+// int-only FFI can't fill -- set depth bias statically in the rasterization state)
+extern fn vkCreateSampler(device: int, pCreateInfo: int, pAllocator: int, pSampler: int) -> i32 from "vulkan-1.dll"
+extern fn vkDestroySampler(device: int, sampler: int, pAllocator: int) from "vulkan-1.dll"
+extern fn vkCmdBindIndexBuffer(commandBuffer: int, buffer: int, offset: int, indexType: int) from "vulkan-1.dll"
+extern fn vkCmdDrawIndexed(commandBuffer: int, indexCount: int, instanceCount: int, firstIndex: int, vertexOffset: int, firstInstance: int) from "vulkan-1.dll"
+extern fn vkCmdDrawIndirect(commandBuffer: int, buffer: int, offset: int, drawCount: int, stride: int) from "vulkan-1.dll"
+extern fn vkCmdFillBuffer(commandBuffer: int, dstBuffer: int, dstOffset: int, size: int, data: int) from "vulkan-1.dll"
 
 // ---- WSI: surface + swapchain ----
 // The Windows loader exports these directly, so GetProcAddress resolves them
