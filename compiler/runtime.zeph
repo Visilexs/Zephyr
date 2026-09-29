@@ -39,6 +39,7 @@ var __fl = 0         // array of NCLASS+1 list heads (off-heap)
 var __flbig = 0      // blocks larger than 1 KiB
 var __gc_at = 8388608    // collect once the bump pointer reaches this absolute address
 var __live = 0       // bytes surviving the last collection
+var __gc_growth = 1  // headroom before the next collection, in multiples of __live
 var __groots = 0     // globals array (roots)
 var __ngroots = 0
 var __wl = 0         // mark worklist
@@ -82,6 +83,7 @@ fn rx_free_push(obj: int, size: int) {
 }
 
 fn rx_heap_init() {
+    rx_thr_init()                                     // the collector's scratch pages; rt_lock no longer does this first
     __fl = win("VirtualAlloc", 0, 4096, 12288, 4)     // (NCLASS+1) heads, off-heap
     if __fl == 0 { rt_die("out of memory") }
     rx_desc_init()
@@ -179,17 +181,22 @@ fn rx_thr_init() {
 }
 
 // Allocation is only locked once a second thread exists, so single-threaded
-// programs pay nothing. A thread is registered before it is resumed, and
-// registration touches the registry rather than the heap, so a racing
-// allocator on the main thread cannot corrupt anything.
-// Unconditional: testing __nthr at lock time and again at unlock time can
-// disagree if a thread is spawned in between, and leaving a critical section
-// that was never entered corrupts it.
+// programs pay nothing: the two kernel32 calls per allocation and per release
+// were a fifth of a zc self-compile. A thread is registered before it is
+// resumed, and registration touches the registry rather than the heap, so a
+// racing allocator on the main thread cannot corrupt anything.
+// Testing __nthr at both ends agrees, because leaving a critical section that
+// was never entered corrupts it: __nthr only grows (registry slots are reused,
+// never removed), and it leaves 0 only when the main thread -- then the only
+// thread -- registers its first worker in rt_thread_add, which is never inside
+// an rt_lock .. rt_unlock region. Whatever rt_lock saw, its rt_unlock sees too.
 fn rt_lock() {
+    if __nthr == 0 { return }
     rx_thr_init()
     let a = win("EnterCriticalSection", __lock)
 }
 fn rt_unlock() {
+    if __nthr == 0 { return }
     let a = win("LeaveCriticalSection", __lock)
 }
 
@@ -661,7 +668,21 @@ fn rx_alloc_body(size: int) -> int {
         // whose garbage dies immediately): it collects a little more often to
         // keep the peak low, and each such collection is cheap precisely because
         // little is live. A larger floor traded ~8 MiB of extra peak for no time.
-        var headroom = __live
+        //
+        // Under reference counting most collections find nothing: counting has
+        // already freed the acyclic garbage. A zc self-compile ran six, each
+        // leaving 88-95% of the heap live, and they cost 14% of the run (the
+        // last, over 191 MB live, took 80 ms). So a collection that leaves
+        // under a quarter of the heap free doubles the growth allowed before
+        // the next one, up to 4x live. One that frees more -- cyclic garbage,
+        // or a fragmented heap worth coalescing -- resets it to 1x.
+        let extent = __hbump - __hbase
+        if (extent - __live) * 4 < extent {
+            if __gc_growth < 4 { __gc_growth = __gc_growth * 2 }
+        } else {
+            __gc_growth = 1
+        }
+        var headroom = __live * __gc_growth
         if headroom < 262144 { headroom = 262144 }
         __gc_at = __hbump + headroom
         let b = rx_take_free(need)

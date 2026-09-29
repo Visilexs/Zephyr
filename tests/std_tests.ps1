@@ -1,6 +1,10 @@
 # Standard-library regression tests. Run from any directory.
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot)
+# A redirected stdin is written with the console's input encoding, and a UTF-8
+# console (code page 65001) makes .NET prepend a byte-order mark the programs
+# under test would read as input.
+try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 $pass = 0
 $fail = 0
 $tempRoot = Join-Path $env:TEMP ('zephyr std ' + [guid]::NewGuid().ToString('N'))

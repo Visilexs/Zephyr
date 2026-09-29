@@ -39,21 +39,21 @@ Ryzen 7 9800X3D, Windows x86-64, gcc 16.1, rustc 1.98.1:
 
 | Area | Zephyr | C `-O2` | Rust `-O` | |
 |------|-------:|--------:|----------:|---|
-| integer SIMD (matmul) | **43 ms** | 73 | 70 | wins both |
-| rasterization (cube) | **7 ms** | 9 | 11 | wins both |
-| bignum (pi) | **56 ms** | 85 | 94 | wins both |
-| allocation churn (strings) | **154 ms** | 175 | 166 | wins both |
-| sorting | **89 ms** | 299 | 45 | 3.4× faster than C |
-| hash map | **47 ms** | 29 | 71 | 1.5× faster than Rust |
-| recursion (fib) | 21 ms | 10 | 20 | ties Rust |
-| float compute (mandel) | 98 ms | 91 | 92 | 1.07× |
-| fluid / neighbours (liquid) | 2,906 ms | 2,249 | 2,557 | 1.3× |
+| integer SIMD (matmul) | **40 ms** | 73 | 70 | wins both |
+| rasterization (cube) | **7 ms** | 9 | 10 | wins both |
+| bignum (pi) | **57 ms** | 86 | 92 | wins both |
+| allocation churn (strings) | **133 ms** | 174 | 156 | wins both |
+| sorting | **90 ms** | 298 | 43 | 3.3× faster than C |
+| hash map | **38 ms** | 32 | 71 | 1.9× faster than Rust |
+| recursion (fib) | 20 ms | 10 | 20 | ties Rust |
+| float compute (mandel) | 97 ms | 89 | 91 | 1.07× |
+| fluid / neighbours (liquid) | 2,925 ms | 2,269 | 2,527 | 1.3× |
 
 The sorting win is a branchless-partition introsort (the pdqsort technique)
 against C's `qsort`. The allocation win is a single-allocation string builder
 against per-format heap strings. Peak memory is the lowest of the three on every
-row but the hash map, and every row compiles faster than with gcc or rustc:
-124–153 ms, against 157–212 ms for gcc and 212–706 ms for rustc. Measured
+row but the hash map, and every row compiles about twice as fast as with gcc or
+rustc: 75–83 ms, against 153–196 ms for gcc and 188–387 ms for rustc. Measured
 2026-09-29.
 
 **The optimizer.** Function inliner, register promotion of loop-hot locals into
@@ -75,7 +75,8 @@ identical. This is what `libdivide` does by hand. It alone flipped the pi
 benchmark from losing to C (93 ms) to winning (68 ms).
 
 **Fast compiler.** `zc` compiles itself — `compiler/zc.zeph`, 18,000 lines with
-the embedded runtime and standard library — to a 5 MB executable in about 1.1 s.
+the embedded runtime and standard library — to a 5 MB executable in about 0.7 s,
+peaking at 180 MB.
 
 **Readable.** `and`/`or`/`not` rather than symbol soup, string interpolation
 (`"hello {name}"`), no semicolons, `let` versus `var`.
