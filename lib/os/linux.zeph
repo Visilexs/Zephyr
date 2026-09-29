@@ -27,8 +27,8 @@ fn linuxFailed(result: int) -> bool {
     return result < 0 and result > 0 - 4096
 }
 
-fn linuxMapMemory(address: int, count: int, protection: int, flags: int) -> int {
-    let result = syscall(systemCallMapMemory, address, count, protection, flags, 0 - 1, 0)
+fn linuxMapMemory(address: int, byteCount: int, protection: int, flags: int) -> int {
+    let result = syscall(systemCallMapMemory, address, byteCount, protection, flags, 0 - 1, 0)
     if linuxFailed(result) { return 0 }
     return result
 }
@@ -37,24 +37,24 @@ fn linuxMapMemory(address: int, count: int, protection: int, flags: int) -> int 
 
 // MEM_RESERVE=0x2000 MEM_COMMIT=0x1000. A reserve maps memoryProtectionNone address space
 // (Linux overcommits, so this costs nothing); a later commit just mprotects it.
-fn kernel32VirtualAlloc(base: int, count: int, flags: int, protectionArgument: int) -> int {
+fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgument: int) -> int {
     var protection = memoryProtectionReadWrite
     if protectionArgument == 64 { protection = 7 } // PAGE_EXECUTE_READWRITE
     let wantCommit = (flags & 4096) != 0
     let wantReserve = (flags & 8192) != 0
     if wantReserve and not wantCommit {
-        return linuxMapMemory(base, count, memoryProtectionNone, mapAnonymousPrivate + mapNoReservation)
+        return linuxMapMemory(base, byteCount, memoryProtectionNone, mapAnonymousPrivate + mapNoReservation)
     }
     if wantCommit and base != 0 {
-        let result = syscall(systemCallProtectMemory, base, count, protection)
+        let result = syscall(systemCallProtectMemory, base, byteCount, protection)
         if linuxFailed(result) { return 0 }
         return base
     }
     // Keep allocation size in a preceding page for MEM_RELEASE (size == 0).
-    if count <= 0 or count > 9223372036854771711 { return 0 }
-    let mappingAddress = linuxMapMemory(0, count + 4096, protection, mapAnonymousPrivate)
+    if byteCount <= 0 or byteCount > 9223372036854771711 { return 0 }
+    let mappingAddress = linuxMapMemory(0, byteCount + 4096, protection, mapAnonymousPrivate)
     if mappingAddress == 0 { return 0 }
-    store64(mappingAddress, count + 4096)
+    store64(mappingAddress, byteCount + 4096)
     return mappingAddress + 4096
 }
 
@@ -76,52 +76,52 @@ fn kernel32GetStdHandle(which: int) -> int {
     return 2
 }
 
-fn kernel32WriteFile(handle: int, pointer: int, count: int, pwritten: int, outputValue: int) -> int {
-    var done = 0
-    while done < count {
-        let result = syscall(systemCallWrite, handle, pointer + done, count - done)
+fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCountAddress: int, overlapped: int) -> int {
+    var bytesWritten = 0
+    while bytesWritten < byteCount {
+        let result = syscall(systemCallWrite, handle, bytesAddress + bytesWritten, byteCount - bytesWritten)
         if result <= 0 {
-            if pwritten != 0 { store64(pwritten, done) }
+            if writtenCountAddress != 0 { store64(writtenCountAddress, bytesWritten) }
             return 0
         }
-        done += result
+        bytesWritten += result
     }
-    if pwritten != 0 { store64(pwritten, done) }
+    if writtenCountAddress != 0 { store64(writtenCountAddress, bytesWritten) }
     return 1
 }
 
-fn kernel32ReadFile(handle: int, buffer: int, count: int, pread: int, outputValue: int) -> int {
-    let result = syscall(systemCallRead, handle, buffer, count)
+fn kernel32ReadFile(handle: int, buffer: int, byteCount: int, readCountAddress: int, overlapped: int) -> int {
+    let result = syscall(systemCallRead, handle, buffer, byteCount)
     if result < 0 {
-        if pread != 0 { store64(pread, 0) }
+        if readCountAddress != 0 { store64(readCountAddress, 0) }
         return 0
     }
-    if pread != 0 { store64(pread, result) }
+    if readCountAddress != 0 { store64(readCountAddress, result) }
     return 1
 }
 
-fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, sourceAddress: int, displacement: int, flags: int, templateHandle: int) -> int {
-    var oflags = 0                       // O_RDONLY
+fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, securityAttributes: int, creationDisposition: int, flags: int, templateHandle: int) -> int {
+    var openFlags = 0                       // O_RDONLY
     var mode = 0
     if (access & 1073741824) != 0 {      // GENERIC_WRITE
-        oflags = 1                       // O_WRONLY
+        openFlags = 1                       // O_WRONLY
         mode = 420                       // 0644
     }
-    if (access & 4) != 0 { oflags = 1025  // O_WRONLY | O_APPEND
+    if (access & 4) != 0 { openFlags = 1025  // O_WRONLY | O_APPEND
         mode = 420
     }
-    if displacement == 1 { oflags = oflags | 192 } // CREATE_NEW: O_CREAT | O_EXCL
-    if displacement == 2 { oflags = oflags | 576 } // CREATE_ALWAYS: O_CREAT | O_TRUNC
-    if displacement == 4 { oflags = oflags | 64 }  // OPEN_ALWAYS: O_CREAT
-    if displacement == 5 { oflags = oflags | 512 } // TRUNCATE_EXISTING
-    let fileDescriptor = syscall(systemCallOpen, cStringPointer, oflags, mode)
+    if creationDisposition == 1 { openFlags = openFlags | 192 } // CREATE_NEW: O_CREAT | O_EXCL
+    if creationDisposition == 2 { openFlags = openFlags | 576 } // CREATE_ALWAYS: O_CREAT | O_TRUNC
+    if creationDisposition == 4 { openFlags = openFlags | 64 }  // OPEN_ALWAYS: O_CREAT
+    if creationDisposition == 5 { openFlags = openFlags | 512 } // TRUNCATE_EXISTING
+    let fileDescriptor = syscall(systemCallOpen, cStringPointer, openFlags, mode)
     if fileDescriptor < 0 { return 0 - 1 }
     return fileDescriptor
 }
 
-fn kernel32GetFileSize(handle: int, phigh: int) -> int {
+fn kernel32GetFileSize(handle: int, highSizeAddress: int) -> int {
     let size = syscall(systemCallSeekFile, handle, 0, 2)      // SEEK_END
-    let back = syscall(systemCallSeekFile, handle, 0, 0)      // SEEK_SET
+    let rewindResult = syscall(systemCallSeekFile, handle, 0, 0)      // SEEK_SET
     if size < 0 { return 0 }
     return size
 }
@@ -210,15 +210,15 @@ fn kernel32GetFullPathNameA(path: int, capacity: int, destination: int, filePart
 
 fn kernel32GetModuleFileNameA(module: int, buffer: int, capacity: int) -> int {
     if linuxScratch == 0 { linuxScratch = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate) }
-    let address = linuxProcSelfPath(linuxScratch)
-    store8(address, 101)           // e
-    store8(address + 1, 120)       // x
-    store8(address + 2, 101)       // e
-    store8(address + 3, 0)
-    let count = syscall(89, linuxScratch, buffer, capacity - 1)     // readlink
-    if count < 0 { return 0 }
-    store8(buffer + count, 0)
-    return count
+    let suffixAddress = linuxProcSelfPath(linuxScratch)
+    store8(suffixAddress, 101)           // e
+    store8(suffixAddress + 1, 120)       // x
+    store8(suffixAddress + 2, 101)       // e
+    store8(suffixAddress + 3, 0)
+    let pathLength = syscall(89, linuxScratch, buffer, capacity - 1)     // readlink
+    if pathLength < 0 { return 0 }
+    store8(buffer + pathLength, 0)
+    return pathLength
 }
 
 fn kernel32ExitProcess(code: int) -> int {
@@ -247,44 +247,44 @@ fn linuxProcSelfPath(destination: int) -> int {
 }
 
 fn linuxProcMapsPath(destination: int) -> int {
-    let address = linuxProcSelfPath(destination)
-    store8(address, 109)           // m
-    store8(address + 1, 97)        // a
-    store8(address + 2, 112)       // p
-    store8(address + 3, 115)       // s
-    store8(address + 4, 0)
+    let suffixAddress = linuxProcSelfPath(destination)
+    store8(suffixAddress, 109)           // m
+    store8(suffixAddress + 1, 97)        // a
+    store8(suffixAddress + 2, 112)       // p
+    store8(suffixAddress + 3, 115)       // s
+    store8(suffixAddress + 4, 0)
     return destination
 }
 
 fn linuxProcCommandLinePath(destination: int) -> int {
-    let address = linuxProcSelfPath(destination)
-    store8(address, 99)            // c
-    store8(address + 1, 109)       // m
-    store8(address + 2, 100)       // d
-    store8(address + 3, 108)       // l
-    store8(address + 4, 105)       // i
-    store8(address + 5, 110)       // n
-    store8(address + 6, 101)       // e
-    store8(address + 7, 0)
+    let suffixAddress = linuxProcSelfPath(destination)
+    store8(suffixAddress, 99)            // c
+    store8(suffixAddress + 1, 109)       // m
+    store8(suffixAddress + 2, 100)       // d
+    store8(suffixAddress + 3, 108)       // l
+    store8(suffixAddress + 4, 105)       // i
+    store8(suffixAddress + 5, 110)       // n
+    store8(suffixAddress + 6, 101)       // e
+    store8(suffixAddress + 7, 0)
     return destination
 }
 
 // Reads a whole file into a fresh off-heap buffer; returns the byte count and
 // leaves the bytes at `buf`. /proc files report size 0, so this just reads
 // until EOF or the buffer is full.
-fn linuxReadWholeFile(cpath: int, buffer: int, capacity: int) -> int {
-    let fileDescriptor = syscall(systemCallOpen, cpath, 0, 0)
+fn linuxReadWholeFile(path: int, buffer: int, capacity: int) -> int {
+    let fileDescriptor = syscall(systemCallOpen, path, 0, 0)
     if fileDescriptor < 0 { return 0 }
-    var got = 0
+    var bytesRead = 0
     var going = true
     while going {
-        let result = syscall(systemCallRead, fileDescriptor, buffer + got, capacity - 1 - got)
-        if result <= 0 { going = false } else { got += result }
-        if got >= capacity - 1 { going = false }
+        let result = syscall(systemCallRead, fileDescriptor, buffer + bytesRead, capacity - 1 - bytesRead)
+        if result <= 0 { going = false } else { bytesRead += result }
+        if bytesRead >= capacity - 1 { going = false }
     }
-    let character = syscall(systemCallClose, fileDescriptor)
-    store8(buffer + got, 0)
-    return got
+    let closeResult = syscall(systemCallClose, fileDescriptor)
+    store8(buffer + bytesRead, 0)
+    return bytesRead
 }
 
 // ---- command line ----
@@ -300,11 +300,11 @@ fn kernel32GetCommandLineA() -> int {
     let page = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
     if page == 0 { return 0 }
     let path = linuxProcCommandLinePath(page + 4096)
-    let count = linuxReadWholeFile(path, page, 4096)
-    for i in 0..count {
+    let byteCount = linuxReadWholeFile(path, page, 4096)
+    for i in 0..byteCount {
         if load8(page + i) == 0 { store8(page + i, 32) }
     }
-    store8(page + count, 0)
+    store8(page + byteCount, 0)
     linuxCommandLine = page
     return page
 }
@@ -320,11 +320,11 @@ fn linuxHexadecimalAt(buffer: int, position: int) -> int {
     var going = true
     while going {
         let character = load8(buffer + index)
-        var descriptor = 0 - 1
-        if character >= 48 and character <= 57 { descriptor = character - 48 }
-        else if character >= 97 and character <= 102 { descriptor = character - 87 }
-        if descriptor < 0 { going = false } else {
-            value = value * 16 + descriptor
+        var hexDigit = 0 - 1
+        if character >= 48 and character <= 57 { hexDigit = character - 48 }
+        else if character >= 97 and character <= 102 { hexDigit = character - 87 }
+        if hexDigit < 0 { going = false } else {
+            value = value * 16 + hexDigit
             index += 1
         }
     }
@@ -347,36 +347,36 @@ fn linuxFindStack() {
     let page = linuxMapMemory(0, 262144, memoryProtectionReadWrite, mapAnonymousPrivate)
     if page == 0 { return }
     let path = linuxProcMapsPath(page + 258048)
-    let count = linuxReadWholeFile(path, page, 258048)
-    var linestart = 0
+    let byteCount = linuxReadWholeFile(path, page, 258048)
+    var lineStart = 0
     var index = 0
-    while index <= count {
+    while index <= byteCount {
         let character = load8(page + index)
-        if character == 10 or index == count {
+        if character == 10 or index == byteCount {
             // a "[stack]" tag anywhere in the line identifies the region
-            var otherIndex = linestart
+            var otherIndex = lineStart
             var tagged = false
             while otherIndex + 6 < index {
                 if load8(page + otherIndex) == 91 and linuxIsStackTag(page + otherIndex) { tagged = true }
                 otherIndex += 1
             }
             if tagged {
-                linuxStackLowerBound = linuxHexadecimalAt(page, linestart)
-                var key = linestart
-                while load8(page + key) != 45 { key += 1 }
-                linuxStackUpperBound = linuxHexadecimalAt(page, key + 1)
+                linuxStackLowerBound = linuxHexadecimalAt(page, lineStart)
+                var dashIndex = lineStart
+                while load8(page + dashIndex) != 45 { dashIndex += 1 }
+                linuxStackUpperBound = linuxHexadecimalAt(page, dashIndex + 1)
             }
-            linestart = index + 1
+            lineStart = index + 1
         }
         index += 1
     }
 }
 
-fn kernel32GetCurrentThreadStackLimits(lowerBound: int, upperBound: int) -> int {
+fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: int) -> int {
     let threadRecord = linuxCurrentThread()
     if threadRecord != 0 {
-        store64(lowerBound, load64(threadRecord + 8) + 4096)
-        store64(upperBound, load64(threadRecord + 40))
+        store64(lowLimitAddress, load64(threadRecord + 8) + 4096)
+        store64(highLimitAddress, load64(threadRecord + 40))
         return 0
     }
     if linuxStackUpperBound == 0 { linuxFindStack() }
@@ -384,8 +384,8 @@ fn kernel32GetCurrentThreadStackLimits(lowerBound: int, upperBound: int) -> int 
         // no maps, no roots we can trust -- better to stop than to collect blind
         let result = syscall(systemCallExitGroup, 70)
     }
-    store64(lowerBound, linuxStackLowerBound)
-    store64(upperBound, linuxStackUpperBound)
+    store64(lowLimitAddress, linuxStackLowerBound)
+    store64(highLimitAddress, linuxStackUpperBound)
     return 0
 }
 

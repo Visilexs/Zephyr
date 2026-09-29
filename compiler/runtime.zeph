@@ -117,12 +117,12 @@ fn runtimeGrowHeap(endAddress: int) {
 }
 
 fn runtimePushMarkWorklist(object: int) {
-    let need = (runtimeWorklistCount + 1) * 8
-    if need > runtimeWorklistCommittedBytes {
-        let want = ((need + runtimeCommitStep - 1) / runtimeCommitStep) * runtimeCommitStep
-        if want > runtimeHeapReserve >> 3 { runtimeFail("out of memory (mark worklist)") }
-        runtimeCommitMemory(runtimeMarkWorklist, want)
-        runtimeWorklistCommittedBytes = want
+    let requiredBytes = (runtimeWorklistCount + 1) * 8
+    if requiredBytes > runtimeWorklistCommittedBytes {
+        let commitBytes = ((requiredBytes + runtimeCommitStep - 1) / runtimeCommitStep) * runtimeCommitStep
+        if commitBytes > runtimeHeapReserve >> 3 { runtimeFail("out of memory (mark worklist)") }
+        runtimeCommitMemory(runtimeMarkWorklist, commitBytes)
+        runtimeWorklistCommittedBytes = commitBytes
     }
     store64(runtimeMarkWorklist + runtimeWorklistCount * 8, object)
     runtimeWorklistCount += 1
@@ -141,12 +141,12 @@ fn runtimeTryMarkObject(candidate: int) {
     if candidate < runtimeHeapBaseAddress { return }
     if candidate >= runtimeHeapBumpAddress { return }
     if (candidate & 7) != 0 { return }
-    let index = (candidate - runtimeHeapBaseAddress) >> 3
-    if runtimeGetBitmapBit(runtimeObjectStartBitmap, index) == 0 { return }     // not an object payload
-    if runtimeGetBitmapBit(runtimeObjectMarkBitmap, index) == 1 { return }      // already marked
+    let bitIndex = (candidate - runtimeHeapBaseAddress) >> 3
+    if runtimeGetBitmapBit(runtimeObjectStartBitmap, bitIndex) == 0 { return }     // not an object payload
+    if runtimeGetBitmapBit(runtimeObjectMarkBitmap, bitIndex) == 1 { return }      // already marked
     let objectHeader = load64(candidate - 8)
     if (objectHeader & runtimeHeapFlagFree) != 0 { return }
-    runtimeSetBitmapBit(runtimeObjectMarkBitmap, index)
+    runtimeSetBitmapBit(runtimeObjectMarkBitmap, bitIndex)
     runtimePushMarkWorklist(candidate)
 }
 
@@ -210,54 +210,54 @@ fn runtimeUnlockHeap() {
 fn runtimeRegisterThread(handle: int, threadId: int) -> int {
     runtimeInitializeThreadRegistry()
     let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
-    var indexLocal = -1
+    var slotIndex = -1
     var index = 0
     while index < runtimeRegisteredThreadCount {
         if load64(runtimeThreadRecords + index * 32) == 0 {
-            indexLocal = index
+            slotIndex = index
             index = runtimeRegisteredThreadCount
         } else {
             index += 1
         }
     }
-    if indexLocal < 0 {
+    if slotIndex < 0 {
         if runtimeRegisteredThreadCount >= runtimeMaximumThreadCount {
             let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
             panic("thread: more than 64 live threads")
         }
-        indexLocal = runtimeRegisteredThreadCount
+        slotIndex = runtimeRegisteredThreadCount
         runtimeRegisteredThreadCount += 1
     }
-    let slot = runtimeThreadRecords + indexLocal * 32
+    let slot = runtimeThreadRecords + slotIndex * 32
     store64(slot, handle)
     store64(slot + 8, 0)
     store64(slot + 16, threadId)
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
-    return indexLocal
+    return slotIndex
 }
 
 // called by the new thread as its first act: publish where its stack lives
 fn runtimeMarkThreadReady() {
     runtimeInitializeThreadRegistry()
-    let leftValue0 = win("EnterCriticalSection", runtimeHeapLockAddress)
-    let lowerBound = runtimeCollectorScratchAddress + 64          // private to registration, which holds the lock
-    let upperBound = lowerBound + 8
-    let gradientIndex = win("GetCurrentThreadStackLimits", lowerBound, upperBound)
-    let entryAddress = win("GetCurrentThreadId")
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    let lowLimitAddress = runtimeCollectorScratchAddress + 64          // private to registration, which holds the lock
+    let highLimitAddress = lowLimitAddress + 8
+    let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)
+    let currentThreadId = win("GetCurrentThreadId")
     var index = 0
     while index < runtimeRegisteredThreadCount {
-        if load64(runtimeThreadRecords + index * 32 + 16) == entryAddress { store64(runtimeThreadRecords + index * 32 + 8, load64(upperBound)) }
+        if load64(runtimeThreadRecords + index * 32 + 16) == currentThreadId { store64(runtimeThreadRecords + index * 32 + 8, load64(highLimitAddress)) }
         index += 1
     }
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
 
 fn runtimeMarkThreadDone() {
-    let entryAddress = win("GetCurrentThreadId")
+    let currentThreadId = win("GetCurrentThreadId")
     let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
     var index = 0
     while index < runtimeRegisteredThreadCount {
-        if load64(runtimeThreadRecords + index * 32 + 16) == entryAddress {
+        if load64(runtimeThreadRecords + index * 32 + 16) == currentThreadId {
             store64(runtimeThreadRecords + index * 32 + 8, 0)     // no stack: the collector skips it
             store64(runtimeThreadRecords + index * 32, 0)         // no handle: the slot is reusable
         }
@@ -271,11 +271,11 @@ fn runtimeMarkThreadDone() {
 // the only reference to an object past a region already visited.
 fn runtimeScanThreadRoots() {
     if runtimeRegisteredThreadCount == 0 { return }
-    let entryAddress = win("GetCurrentThreadId")
+    let currentThreadId = win("GetCurrentThreadId")
     var index = 0
     while index < runtimeRegisteredThreadCount {
         let slot = runtimeThreadRecords + index * 32
-        if load64(slot + 16) != entryAddress and load64(slot + 8) != 0 {
+        if load64(slot + 16) != currentThreadId and load64(slot + 8) != 0 {
             let suspendResult = win("SuspendThread", load64(slot))
         }
         index += 1
@@ -283,15 +283,15 @@ fn runtimeScanThreadRoots() {
     index = 0
     while index < runtimeRegisteredThreadCount {
         let slot = runtimeThreadRecords + index * 32
-        let base = load64(slot + 8)
-        if load64(slot + 16) != entryAddress and base != 0 {
+        let stackBase = load64(slot + 8)
+        if load64(slot + 16) != currentThreadId and stackBase != 0 {
             store32(runtimeThreadContextAddress + 48, 1048587)                  // ContextFlags = CONTEXT_FULL
-            let ok = win("GetThreadContext", load64(slot), runtimeThreadContextAddress)
-            if ok != 0 {
+            let gotContext = win("GetThreadContext", load64(slot), runtimeThreadContextAddress)
+            if gotContext != 0 {
                 // Rax..R15 live at 0x78..0xF8 in the x64 CONTEXT; scanning that
                 // span covers the registers a value could be sitting in.
                 runtimeScanRootRange(runtimeThreadContextAddress + 120, runtimeThreadContextAddress + 248)
-                runtimeScanRootRange(load64(runtimeThreadContextAddress + 152), base)  // Rsp .. stack base
+                runtimeScanRootRange(load64(runtimeThreadContextAddress + 152), stackBase)  // Rsp .. stack base
             }
         }
         index += 1
@@ -299,7 +299,7 @@ fn runtimeScanThreadRoots() {
     index = 0
     while index < runtimeRegisteredThreadCount {
         let slot = runtimeThreadRecords + index * 32
-        if load64(slot + 16) != entryAddress and load64(slot + 8) != 0 {
+        if load64(slot + 16) != currentThreadId and load64(slot + 8) != 0 {
             let resumeResult = win("ResumeThread", load64(slot))
         }
         index += 1
@@ -320,10 +320,10 @@ fn runtimeCollectGarbage() {
     runtimeWorklistCount = 0
     // roots: globals, then the machine stack (current rsp .. stack base)
     if runtimeGlobalRootCount > 0 { runtimeScanRootRange(runtimeGlobalRootsAddress, runtimeGlobalRootsAddress + runtimeGlobalRootCount * 8) }
-    let lowerBound = runtimeCollectorScratchAddress
-    let upperBound = lowerBound + 8
-    let ignored = win("GetCurrentThreadStackLimits", lowerBound, upperBound)   // returns VOID
-    runtimeScanRootRange(stackptr(), load64(upperBound))
+    let lowLimitAddress = runtimeCollectorScratchAddress
+    let highLimitAddress = lowLimitAddress + 8
+    let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)   // returns VOID
+    runtimeScanRootRange(stackptr(), load64(highLimitAddress))
     runtimeScanThreadRoots()
     // trace
     while runtimeWorklistCount > 0 {
@@ -362,38 +362,38 @@ fn runtimeCollectGarbage() {
     // split path already re-sets the bit for any remainder it carves off, so
     // the two stay consistent.
     var object = runtimeHeapBaseAddress + runtimeObjectHeaderBytes
-    var run = 0                                      // payload of the open run, 0 if none
-    var runsz = 0
+    var runStart = 0                                      // payload of the open run, 0 if none
+    var runSize = 0
     while object < runtimeHeapBumpAddress {
         let objectHeader = load64(object - 8)
         let size = objectHeader & (0 - 8)
-        let indexLocal = (object - runtimeHeapBaseAddress) >> 3
-        if runtimeGetBitmapBit(runtimeObjectMarkBitmap, indexLocal) == 0 {
+        let bitIndex = (object - runtimeHeapBaseAddress) >> 3
+        if runtimeGetBitmapBit(runtimeObjectMarkBitmap, bitIndex) == 0 {
             // Unreachable but not yet freed: under reference counting that is
             // either a cycle or a missed drop. Counted so it can be reported.
             if (objectHeader & runtimeHeapFlagFree) == 0 { runtimeUnreleasedObjectCount += 1 }
-            if run == 0 {
-                run = object
-                runsz = size
+            if runStart == 0 {
+                runStart = object
+                runSize = size
             } else {
-                runtimeClearBitmapBit(runtimeObjectStartBitmap, indexLocal)            // no longer an object start
-                runsz = runsz + runtimeObjectHeaderBytes + size
+                runtimeClearBitmapBit(runtimeObjectStartBitmap, bitIndex)            // no longer an object start
+                runSize = runSize + runtimeObjectHeaderBytes + size
             }
         } else {
-            if run != 0 {
-                store64(run - 8, runsz | runtimeHeapFlagFree)
-                runtimePushFreeBlock(run, runsz)
-                run = 0
-                runsz = 0
+            if runStart != 0 {
+                store64(runStart - 8, runSize | runtimeHeapFlagFree)
+                runtimePushFreeBlock(runStart, runSize)
+                runStart = 0
+                runSize = 0
             }
             store64(object - 8, size)                   // clear mark/free flags
             runtimeLiveHeapBytes += size + runtimeObjectHeaderBytes
         }
         object = object + runtimeObjectHeaderBytes + size
     }
-    if run != 0 {
-        store64(run - 8, runsz | runtimeHeapFlagFree)
-        runtimePushFreeBlock(run, runsz)
+    if runStart != 0 {
+        store64(runStart - 8, runSize | runtimeHeapFlagFree)
+        runtimePushFreeBlock(runStart, runSize)
     }
 }
 
@@ -414,16 +414,16 @@ fn runtimeRetainReference(value: int) -> int {
 // self-build, and the old value is very often 0 (a slot's first store) or a
 // string literal outside the heap, where the whole job is one compare.
 fn runtimeAssignReference(address: int, value: int) {
-    let old = load64(address)
+    let oldValue = load64(address)
     store64(address, value)
-    if old >= runtimeHeapBaseAddress and old < runtimeHeapBumpAddress {
-        let referenceCount = load64(old - 24)
+    if oldValue >= runtimeHeapBaseAddress and oldValue < runtimeHeapBumpAddress {
+        let referenceCount = load64(oldValue - 24)
         if referenceCount > 1 {
-            store64(old - 24, referenceCount - 1)
+            store64(oldValue - 24, referenceCount - 1)
         } else {
             if referenceCount < 1 { runtimeFail("reference count underflow") }
-            store64(old - 24, 0)
-            runtimeReleaseObject(old)
+            store64(oldValue - 24, 0)
+            runtimeReleaseObject(oldValue)
         }
     }
 }
@@ -457,10 +457,10 @@ fn runtimeReleaseReference(value: int) {
 // 80% of all counting work -- to free something only 2.5% of the time. The
 // compiler emits the slot offsets as a static table instead, so a return costs
 // one call and a loop, with runtimeReleaseReference's body inlined here.
-fn runtimeReleaseFrameSlots(framePointer: int, table: int, slotCount: int) {
+fn runtimeReleaseFrameSlots(framePointer: int, slotOffsetTable: int, slotCount: int) {
     var index = 0
     while index < slotCount {
-        let value = load64(framePointer - load64(table + index * 8))
+        let value = load64(framePointer - load64(slotOffsetTable + index * 8))
         if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress {
             let referenceCount = load64(value - 24)
             if referenceCount > 1 {
@@ -604,16 +604,16 @@ fn runtimeTakeFreeBlock(need: int) -> int {
     var current = runtimeLargeFreeBlocks
     while current != 0 {
         let size = load64(current - 8) & (0 - 8)
-        let nextValue = load64(current)
+        let nextBlock = load64(current)
         if size >= need {
-            if previous == 0 { runtimeLargeFreeBlocks = nextValue } else { store64(previous, nextValue) }
+            if previous == 0 { runtimeLargeFreeBlocks = nextBlock } else { store64(previous, nextBlock) }
             if size >= need + runtimeObjectHeaderBytes + 8 {                // split off the tail
-                let rest = size - need - runtimeObjectHeaderBytes
+                let remainderSize = size - need - runtimeObjectHeaderBytes
                 store64(current - 8, need)
-                let byteCount = current + need + runtimeObjectHeaderBytes            // payload of the remainder
-                store64(byteCount - 8, rest | runtimeHeapFlagFree)
-                runtimeSetBitmapBit(runtimeObjectStartBitmap, (byteCount - runtimeHeapBaseAddress) >> 3)
-                runtimePushFreeBlock(byteCount, rest)
+                let remainderAddress = current + need + runtimeObjectHeaderBytes            // payload of the remainder
+                store64(remainderAddress - 8, remainderSize | runtimeHeapFlagFree)
+                runtimeSetBitmapBit(runtimeObjectStartBitmap, (remainderAddress - runtimeHeapBaseAddress) >> 3)
+                runtimePushFreeBlock(remainderAddress, remainderSize)
             } else {
                 store64(current - 8, size)
             }
@@ -621,7 +621,7 @@ fn runtimeTakeFreeBlock(need: int) -> int {
             return current
         }
         previous = current
-        current = nextValue
+        current = nextBlock
     }
     return 0
 }
@@ -726,25 +726,25 @@ fn runtimeCopyMemory(destination: int, source: int, byteCount: int) {
 
 // ---- strings ----  (a str value is a pointer to {i64 len; bytes})
 fn runtimeAllocateString(stringLength: int) -> int {
-    let address = runtimeAllocateObject(8 + stringLength)
-    store64(address, stringLength)
-    return address
+    let stringAddress = runtimeAllocateObject(8 + stringLength)
+    store64(stringAddress, stringLength)
+    return stringAddress
 }
 
 fn runtimeConcatenateStrings(leftStringAddress: int, rightStringAddress: int) -> int {
-    let leftAddress = load64(leftStringAddress)
-    let leftBase = load64(rightStringAddress)
-    let text = runtimeAllocateString(leftAddress + leftBase)
-    runtimeCopyMemory(text + 8, leftStringAddress + 8, leftAddress)
-    runtimeCopyMemory(text + 8 + leftAddress, rightStringAddress + 8, leftBase)
+    let leftLength = load64(leftStringAddress)
+    let rightLength = load64(rightStringAddress)
+    let text = runtimeAllocateString(leftLength + rightLength)
+    runtimeCopyMemory(text + 8, leftStringAddress + 8, leftLength)
+    runtimeCopyMemory(text + 8 + leftLength, rightStringAddress + 8, rightLength)
     return text
 }
 
 fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int {
-    let leftAddress = load64(leftStringAddress)
-    if leftAddress != load64(rightStringAddress) { return 0 }
+    let leftLength = load64(leftStringAddress)
+    if leftLength != load64(rightStringAddress) { return 0 }
     var index = 0
-    while index < leftAddress {
+    while index < leftLength {
         if load8(leftStringAddress + 8 + index) != load8(rightStringAddress + 8 + index) { return 0 }
         index += 1
     }
@@ -752,26 +752,26 @@ fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int {
 }
 
 fn runtimeCompareStrings(leftStringAddress: int, rightStringAddress: int) -> int {
-    let leftAddress = load64(leftStringAddress)
-    let leftBase = load64(rightStringAddress)
-    var count = leftAddress
-    if leftBase < count { count = leftBase }
+    let leftLength = load64(leftStringAddress)
+    let rightLength = load64(rightStringAddress)
+    var sharedLength = leftLength
+    if rightLength < sharedLength { sharedLength = rightLength }
     var index = 0
-    while index < count {
-        let callAddress = load8(leftStringAddress + 8 + index)
-        let commandBuffer = load8(rightStringAddress + 8 + index)
-        if callAddress < commandBuffer { return 0 - 1 }
-        if callAddress > commandBuffer { return 1 }
+    while index < sharedLength {
+        let leftByte = load8(leftStringAddress + 8 + index)
+        let rightByte = load8(rightStringAddress + 8 + index)
+        if leftByte < rightByte { return 0 - 1 }
+        if leftByte > rightByte { return 1 }
         index += 1
     }
-    if leftAddress < leftBase { return 0 - 1 }
-    if leftAddress > leftBase { return 1 }
+    if leftLength < rightLength { return 0 - 1 }
+    if leftLength > rightLength { return 1 }
     return 0
 }
 
 fn runtimeSubstringValue(stringAddress: int, lowerBound: int, upperBound: int) -> int {
-    let count = load64(stringAddress)
-    if lowerBound < 0 or upperBound < lowerBound or upperBound > count { runtimeFail("invalid substring") }
+    let stringLength = load64(stringAddress)
+    if lowerBound < 0 or upperBound < lowerBound or upperBound > stringLength { runtimeFail("invalid substring") }
     let result = runtimeAllocateString(upperBound - lowerBound)
     runtimeCopyMemory(result + 8, stringAddress + 8 + lowerBound, upperBound - lowerBound)
     return result
@@ -807,11 +807,11 @@ fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
         if (magnitude > 1.0) == (exponent > 0.0) { return infinity }
         return 0.0
     }
-    var whole = runtimeFloatAbsoluteCore(exponent) >= 9007199254740992.0     // every float this large is even
-    var odd = false
-    if not whole and ((exponent as int) as float) == exponent {
-        whole = true
-        odd = (exponent as int) & 1 == 1
+    var exponentIsWhole = runtimeFloatAbsoluteCore(exponent) >= 9007199254740992.0     // every float this large is even
+    var exponentIsOdd = false
+    if not exponentIsWhole and ((exponent as int) as float) == exponent {
+        exponentIsWhole = true
+        exponentIsOdd = (exponent as int) & 1 == 1
         if runtimeFloatAbsoluteCore(exponent) < 2147483648.0 {
             var remaining = exponent as int
             var factor = base
@@ -830,7 +830,7 @@ fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
     }
     var magnitudeBase = base
     if base < 0.0 {
-        if not whole { return frombits((2047 << 52) | (1 << 51)) }
+        if not exponentIsWhole { return frombits((2047 << 52) | (1 << 51)) }
         magnitudeBase = 0.0 - base
     }
     if magnitudeBase == 0.0 {
@@ -838,7 +838,7 @@ fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
         return 0.0
     }
     let result = runtimeFloatExponentialCore(exponent * runtimeFloatNaturalLogCore(magnitudeBase))
-    if base < 0.0 and odd { return 0.0 - result }
+    if base < 0.0 and exponentIsOdd { return 0.0 - result }
     return result
 }
 
@@ -847,22 +847,22 @@ fn runtimeFloatExponentialCore(value: float) -> float {
     if value < 0.0 - 745.2 { return 0.0 }
     if value > 709.782712893384 { return frombits(2047 << 52) }
     let scaled = value / 0.6931471805599453
-    var count = 0
-    if scaled >= 0.0 { count = (scaled + 0.5) as int }
-    else { count = 0 - ((0.5 - scaled) as int) }
-    if count > 1023 { count = 1023 }
-    let functionCount = count as float
-    let result = (value - functionCount * 0.6931471803691238) - functionCount * 0.00000000019082149292705877
+    var binaryExponent = 0
+    if scaled >= 0.0 { binaryExponent = (scaled + 0.5) as int }
+    else { binaryExponent = 0 - ((0.5 - scaled) as int) }
+    if binaryExponent > 1023 { binaryExponent = 1023 }
+    let binaryExponentFloat = binaryExponent as float
+    let reducedArgument = (value - binaryExponentFloat * 0.6931471803691238) - binaryExponentFloat * 0.00000000019082149292705877
     var term = 1.0
     var sum = 1.0
     var index = 1
     while index < 15 {
-        term = term * result / (index as float)
+        term = term * reducedArgument / (index as float)
         sum += term
         index += 1
     }
-    if count < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + count + 1022) << 52) }
-    return sum * frombits((1023 + count) << 52)
+    if binaryExponent < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + binaryExponent + 1022) << 52) }
+    return sum * frombits((1023 + binaryExponent) << 52)
 }
 
 fn runtimeFloatNaturalLogCore(value: float) -> float {
@@ -900,14 +900,14 @@ fn runtimeIntegerPower(base: int, exponent: int) -> int {
 }
 
 fn runtimeStringIndexOf(stringAddress: int, substring: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     let substringLength = load64(substring)
     if substringLength == 0 { return 0 }
     var index = 0
-    while index + substringLength <= count {
-        var otherIndex = 0
-        while otherIndex < substringLength and load8(stringAddress + 8 + index + otherIndex) == load8(substring + 8 + otherIndex) { otherIndex += 1 }
-        if otherIndex == substringLength { return index }
+    while index + substringLength <= stringLength {
+        var matchedByteCount = 0
+        while matchedByteCount < substringLength and load8(stringAddress + 8 + index + matchedByteCount) == load8(substring + 8 + matchedByteCount) { matchedByteCount += 1 }
+        if matchedByteCount == substringLength { return index }
         index += 1
     }
     return 0 - 1
@@ -917,34 +917,34 @@ fn runtimeStringContains(stringAddress: int, substring: int) -> int {
     return 0
 }
 fn runtimeStringStartsWith(stringAddress: int, prefix: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     let prefixLength = load64(prefix)
-    if prefixLength > count { return 0 }
-    var otherIndex = 0
-    while otherIndex < prefixLength {
-        if load8(stringAddress + 8 + otherIndex) != load8(prefix + 8 + otherIndex) { return 0 }
-        otherIndex += 1
+    if prefixLength > stringLength { return 0 }
+    var index = 0
+    while index < prefixLength {
+        if load8(stringAddress + 8 + index) != load8(prefix + 8 + index) { return 0 }
+        index += 1
     }
     return 1
 }
 fn runtimeStringEndsWith(stringAddress: int, suffix: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     let suffixLength = load64(suffix)
-    if suffixLength > count { return 0 }
-    var otherIndex = 0
-    while otherIndex < suffixLength {
-        if load8(stringAddress + 8 + count - suffixLength + otherIndex) != load8(suffix + 8 + otherIndex) { return 0 }
-        otherIndex += 1
+    if suffixLength > stringLength { return 0 }
+    var index = 0
+    while index < suffixLength {
+        if load8(stringAddress + 8 + stringLength - suffixLength + index) != load8(suffix + 8 + index) { return 0 }
+        index += 1
     }
     return 1
 }
 fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     let separatorLength = load64(separator)
     let output = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
     if separatorLength == 0 {
         var index = 0
-        while index < count {
+        while index < stringLength {
             let piece = runtimeAllocateString(1)
             store8(piece + 8, load8(stringAddress + 8 + index))
             runtimeListPush(output, piece)
@@ -954,10 +954,10 @@ fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
     }
     var start = 0
     var index = 0
-    while index + separatorLength <= count {
-        var otherIndex = 0
-        while otherIndex < separatorLength and load8(stringAddress + 8 + index + otherIndex) == load8(separator + 8 + otherIndex) { otherIndex += 1 }
-        if otherIndex == separatorLength {
+    while index + separatorLength <= stringLength {
+        var matchedByteCount = 0
+        while matchedByteCount < separatorLength and load8(stringAddress + 8 + index + matchedByteCount) == load8(separator + 8 + matchedByteCount) { matchedByteCount += 1 }
+        if matchedByteCount == separatorLength {
             runtimeListPush(output, runtimeSubstringValue(stringAddress, start, index))
             index += separatorLength
             start = index
@@ -965,36 +965,36 @@ fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
             index += 1
         }
     }
-    runtimeListPush(output, runtimeSubstringValue(stringAddress, start, count))
+    runtimeListPush(output, runtimeSubstringValue(stringAddress, start, stringLength))
     return output
 }
-fn runtimeStringReplace(stringAddress: int, old: int, replacement: int) -> int {
-    let count = load64(stringAddress)
-    let matchedLength = load64(old)
-    if matchedLength == 0 { return stringAddress }
+fn runtimeStringReplace(stringAddress: int, searchText: int, replacement: int) -> int {
+    let stringLength = load64(stringAddress)
+    let searchLength = load64(searchText)
+    if searchLength == 0 { return stringAddress }
     var output = runtimeAllocateString(0)
     var start = 0
     var index = 0
-    while index + matchedLength <= count {
-        var otherIndex = 0
-        while otherIndex < matchedLength and load8(stringAddress + 8 + index + otherIndex) == load8(old + 8 + otherIndex) { otherIndex += 1 }
-        if otherIndex == matchedLength {
+    while index + searchLength <= stringLength {
+        var matchedByteCount = 0
+        while matchedByteCount < searchLength and load8(stringAddress + 8 + index + matchedByteCount) == load8(searchText + 8 + matchedByteCount) { matchedByteCount += 1 }
+        if matchedByteCount == searchLength {
             output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, index))
             output = runtimeConcatenateStrings(output, replacement)
-            index += matchedLength
+            index += searchLength
             start = index
         } else {
             index += 1
         }
     }
-    output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, count))
+    output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, stringLength))
     return output
 }
 fn runtimeUppercaseString(stringAddress: int) -> int {
-    let count = load64(stringAddress)
-    let result = runtimeAllocateString(count)
+    let stringLength = load64(stringAddress)
+    let result = runtimeAllocateString(stringLength)
     var index = 0
-    while index < count {
+    while index < stringLength {
         var character = load8(stringAddress + 8 + index)
         if character >= 97 and character <= 122 { character -= 32 }
         store8(result + 8 + index, character)
@@ -1003,10 +1003,10 @@ fn runtimeUppercaseString(stringAddress: int) -> int {
     return result
 }
 fn runtimeLowercaseString(stringAddress: int) -> int {
-    let count = load64(stringAddress)
-    let result = runtimeAllocateString(count)
+    let stringLength = load64(stringAddress)
+    let result = runtimeAllocateString(stringLength)
     var index = 0
-    while index < count {
+    while index < stringLength {
         var character = load8(stringAddress + 8 + index)
         if character >= 65 and character <= 90 { character += 32 }
         store8(result + 8 + index, character)
@@ -1019,10 +1019,10 @@ fn runtimeIsWhitespaceByte(character: int) -> int {
     return 0
 }
 fn runtimeStringTrim(stringAddress: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     var lowerBound = 0
-    while lowerBound < count and runtimeIsWhitespaceByte(load8(stringAddress + 8 + lowerBound)) == 1 { lowerBound += 1 }
-    var upperBound = count
+    while lowerBound < stringLength and runtimeIsWhitespaceByte(load8(stringAddress + 8 + lowerBound)) == 1 { lowerBound += 1 }
+    var upperBound = stringLength
     while upperBound > lowerBound and runtimeIsWhitespaceByte(load8(stringAddress + 8 + upperBound - 1)) == 1 { upperBound -= 1 }
     return runtimeSubstringValue(stringAddress, lowerBound, upperBound)
 }
@@ -1073,24 +1073,24 @@ fn runtimeMapNew(keyKind: int) -> int {
 fn runtimeNewDescribedMap(keyKind: int, descriptor: int) -> int {
     var shapeDescriptor = descriptor
     if shapeDescriptor == 0 { shapeDescriptor = runtimeValueMapDescriptor }     // the buffers still have to go when the map does
-    let mapValue = runtimeAllocateDescribedObject(48, shapeDescriptor)
+    let mapAddress = runtimeAllocateDescribedObject(48, shapeDescriptor)
     let capacity = 8
-    store64(mapValue, 0)
-    store64(mapValue + 8, capacity)
-    store64(mapValue + 16, runtimeAllocateObject(capacity * 24))
-    store64(mapValue + 24, keyKind)
-    store64(mapValue + 32, 0)
-    store64(mapValue + 40, 61)               // high 3 bits of a 64-bit multiplicative hash
-    return mapValue
+    store64(mapAddress, 0)
+    store64(mapAddress + 8, capacity)
+    store64(mapAddress + 16, runtimeAllocateObject(capacity * 24))
+    store64(mapAddress + 24, keyKind)
+    store64(mapAddress + 32, 0)
+    store64(mapAddress + 40, 61)               // high 3 bits of a 64-bit multiplicative hash
+    return mapAddress
 }
 fn runtimeHashInteger(key: int) -> int {
     return key * -7046029254386353131    // 64-bit golden ratio; callers take high bits
 }
 fn runtimeHashString(stringAddress: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     var hashValue = 2166136261
     var index = 0
-    while index < count {
+    while index < stringLength {
         hashValue = hashValue ^ load8(stringAddress + 8 + index)
         hashValue = hashValue * 16777619
         index += 1
@@ -1126,11 +1126,11 @@ fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> i
         let count = load64(leftValue)
         if count != load64(rightValue) { return 0 }
         let elementTypeDescriptor = load64(typeDescriptor + 8)
-        let dataAlpha = load64(leftValue + 16)
-        let dataBlue = load64(rightValue + 16)
+        let leftData = load64(leftValue + 16)
+        let rightData = load64(rightValue + 16)
         var index = 0
         while index < count {
-            if runtimeValueEquals(load64(dataAlpha + index * 8), load64(dataBlue + index * 8), elementTypeDescriptor) == 0 { return 0 }
+            if runtimeValueEquals(load64(leftData + index * 8), load64(rightData + index * 8), elementTypeDescriptor) == 0 { return 0 }
             index += 1
         }
         return 1
@@ -1180,9 +1180,9 @@ fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> i
         while index < capacity {
             let slot = slots + index * 24
             if load64(slot) == 1 {
-                let found = runtimeFindMapEntry(rightValue, load64(slot + 8))
-                if found < 0 { return 0 }
-                if runtimeValueEquals(load64(slot + 16), load64(load64(rightValue + 16) + found * 24 + 16), valueTypeDescriptor) == 0 { return 0 }
+                let foundIndex = runtimeFindMapEntry(rightValue, load64(slot + 8))
+                if foundIndex < 0 { return 0 }
+                if runtimeValueEquals(load64(slot + 16), load64(load64(rightValue + 16) + foundIndex * 24 + 16), valueTypeDescriptor) == 0 { return 0 }
             }
             index += 1
         }
@@ -1249,9 +1249,9 @@ fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
     var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
     while true {
         let slot = slots + index * 24
-        let sourceType = load64(slot)
-        if sourceType == 0 { return 0 - 1 }
-        if sourceType == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
+        let slotState = load64(slot)
+        if slotState == 0 { return 0 - 1 }
+        if slotState == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
         index = (index + 1) & (capacity - 1)
     }
     return 0 - 1
@@ -1260,21 +1260,21 @@ fn runtimeInsertGenericMapEntry(mapAddress: int, key: int, value: int) {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
     var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
-    var tomb = 0 - 1
+    var tombstoneIndex = 0 - 1
     while true {
         let slot = slots + index * 24
-        let sourceType = load64(slot)
-        if sourceType == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 {
+        let slotState = load64(slot)
+        if slotState == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 {
             if runtimeMapValueIsReference(mapAddress) == 1 { runtimeAssignReference(slot + 16, value) }   // update in place
             else { store64(slot + 16, value) }
             if runtimeMapKeyIsReference(mapAddress) == 1 { runtimeReleaseReference(key) }                    // the old key stays
             return
         }
-        if sourceType == 2 and tomb < 0 { tomb = index }
-        if sourceType == 0 {
+        if slotState == 2 and tombstoneIndex < 0 { tombstoneIndex = index }
+        if slotState == 0 {
             var destination = slot
-            if tomb >= 0 {
-                destination = slots + tomb * 24
+            if tombstoneIndex >= 0 {
+                destination = slots + tombstoneIndex * 24
                 store64(mapAddress + 32, load64(mapAddress + 32) - 1)
             }
             store64(destination + 8, key)
@@ -1288,32 +1288,32 @@ fn runtimeInsertGenericMapEntry(mapAddress: int, key: int, value: int) {
 }
 // Move every live entry into a fresh buffer, dropping tombstones, not references.
 fn runtimeMapRehash(mapAddress: int, newCapacity: int) {
-    let oldcap = load64(mapAddress + 8)
-    let oldslots = load64(mapAddress + 16)
+    let oldCapacity = load64(mapAddress + 8)
+    let oldSlots = load64(mapAddress + 16)
     // Allocate before changing the header; the collector still sees the old buffer.
-    let slots = runtimeAllocateObject(newCapacity * 24)
+    let newSlots = runtimeAllocateObject(newCapacity * 24)
     store64(mapAddress + 8, newCapacity)
-    store64(mapAddress + 16, slots)              // zeroed = all empty
+    store64(mapAddress + 16, newSlots)              // zeroed = all empty
     store64(mapAddress, 0)
     store64(mapAddress + 32, 0)
     var shift = 64
-    var count = newCapacity
-    while count > 1 {
+    var shiftedCapacity = newCapacity
+    while shiftedCapacity > 1 {
         shift -= 1
-        count = count >> 1
+        shiftedCapacity = shiftedCapacity >> 1
     }
     store64(mapAddress + 40, shift)
     let isInteger = load64(mapAddress + 24) == 0
     var index = 0
-    while index < oldcap {
-        let slot = oldslots + index * 24
+    while index < oldCapacity {
+        let slot = oldSlots + index * 24
         if load64(slot) == 1 {
             if isInteger { runtimeIntegerMapInsert(mapAddress, load64(slot + 8), load64(slot + 16)) }
             else { runtimeInsertGenericMapEntry(mapAddress, load64(slot + 8), load64(slot + 16)) }
         }
         index += 1
     }
-    runtimeReleaseReference(oldslots)
+    runtimeReleaseReference(oldSlots)
 }
 // ---- int-key fast paths: hash and == inlined, no call per probe ----
 fn runtimeIntegerMapLookup(mapAddress: int, key: int) -> int {
@@ -1322,9 +1322,9 @@ fn runtimeIntegerMapLookup(mapAddress: int, key: int) -> int {
     var index = ((key * -7046029254386353131) >> load64(mapAddress + 40)) & (capacity - 1)
     while true {
         let slot = slots + index * 24
-        let sourceType = load64(slot)
-        if sourceType == 0 { return 0 - 1 }
-        if sourceType == 1 and load64(slot + 8) == key { return index }
+        let slotState = load64(slot)
+        if slotState == 0 { return 0 - 1 }
+        if slotState == 1 and load64(slot + 8) == key { return index }
         index = (index + 1) & (capacity - 1)
     }
     return 0 - 1
@@ -1333,20 +1333,20 @@ fn runtimeIntegerMapInsert(mapAddress: int, key: int, value: int) {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
     var index = ((key * -7046029254386353131) >> load64(mapAddress + 40)) & (capacity - 1)
-    var tomb = 0 - 1
+    var tombstoneIndex = 0 - 1
     while true {
         let slot = slots + index * 24
-        let sourceType = load64(slot)
-        if sourceType == 1 and load64(slot + 8) == key {
+        let slotState = load64(slot)
+        if slotState == 1 and load64(slot + 8) == key {
             if runtimeMapValueIsReference(mapAddress) == 1 { runtimeAssignReference(slot + 16, value) }
             else { store64(slot + 16, value) }
             return
         }
-        if sourceType == 2 and tomb < 0 { tomb = index }
-        if sourceType == 0 {
+        if slotState == 2 and tombstoneIndex < 0 { tombstoneIndex = index }
+        if slotState == 0 {
             var destination = slot
-            if tomb >= 0 {
-                destination = slots + tomb * 24
+            if tombstoneIndex >= 0 {
+                destination = slots + tombstoneIndex * 24
                 store64(mapAddress + 32, load64(mapAddress + 32) - 1)
             }
             store64(destination + 8, key)
@@ -1389,7 +1389,7 @@ fn runtimeMapGetOrReference(mapAddress: int, key: int, fallbackValue: int) -> in
     let index = runtimeFindMapEntry(mapAddress, key)
     var value = fallbackValue
     if index >= 0 { value = load64(load64(mapAddress + 16) + index * 24 + 16) }
-    if runtimeMapValueIsReference(mapAddress) == 1 { let fallbackValue = runtimeRetainReference(value) }
+    if runtimeMapValueIsReference(mapAddress) == 1 { let retainResult = runtimeRetainReference(value) }
     return value
 }
 // The compiler selects this when neither keys nor values need reference handling.
@@ -1438,16 +1438,16 @@ fn runtimeMapRemove(mapAddress: int, key: int) {
 fn runtimeMapKeys(mapAddress: int) -> int {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
-    let mapKeyIsReferenceLocal = runtimeMapKeyIsReference(mapAddress)
-    var dataAddress = runtimeValueListDescriptor
-    if mapKeyIsReferenceLocal == 1 { dataAddress = runtimeReferenceListDescriptor }
-    let output = runtimeNewDescribedList(0, dataAddress)
+    let keyIsReference = runtimeMapKeyIsReference(mapAddress)
+    var listDescriptor = runtimeValueListDescriptor
+    if keyIsReference == 1 { listDescriptor = runtimeReferenceListDescriptor }
+    let output = runtimeNewDescribedList(0, listDescriptor)
     var index = 0
     while index < capacity {
         let slot = slots + index * 24
         if load64(slot) == 1 {
             let key = load64(slot + 8)
-            if mapKeyIsReferenceLocal == 1 { let retainedKey = runtimeRetainReference(key) }
+            if keyIsReference == 1 { let retainedKey = runtimeRetainReference(key) }
             runtimeListPush(output, key)
         }
         index += 1
@@ -1457,16 +1457,16 @@ fn runtimeMapKeys(mapAddress: int) -> int {
 fn runtimeMapValues(mapAddress: int) -> int {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
-    let mapValueIsReferenceLocal = runtimeMapValueIsReference(mapAddress)
-    var dataAddress = runtimeValueListDescriptor
-    if mapValueIsReferenceLocal == 1 { dataAddress = runtimeReferenceListDescriptor }
-    let output = runtimeNewDescribedList(0, dataAddress)
+    let valueIsReference = runtimeMapValueIsReference(mapAddress)
+    var listDescriptor = runtimeValueListDescriptor
+    if valueIsReference == 1 { listDescriptor = runtimeReferenceListDescriptor }
+    let output = runtimeNewDescribedList(0, listDescriptor)
     var index = 0
     while index < capacity {
         let slot = slots + index * 24
         if load64(slot) == 1 {
             let value = load64(slot + 16)
-            if mapValueIsReferenceLocal == 1 { let retainedValue = runtimeRetainReference(value) }
+            if valueIsReference == 1 { let retainedValue = runtimeRetainReference(value) }
             runtimeListPush(output, value)
         }
         index += 1
@@ -1480,10 +1480,10 @@ fn runtimeMapValues(mapAddress: int) -> int {
 fn runtimeCompareValuesByKind(kind: int, leftValue: int, rightValue: int) -> int {
     if kind == 1 { return runtimeCompareStrings(leftValue, rightValue) }
     if kind == 2 {
-        let value = frombits(leftValue)
-        let otherValue = frombits(rightValue)
-        if value < otherValue { return 0 - 1 }
-        if value > otherValue { return 1 }
+        let leftFloat = frombits(leftValue)
+        let rightFloat = frombits(rightValue)
+        if leftFloat < rightFloat { return 0 - 1 }
+        if leftFloat > rightFloat { return 1 }
         return 0
     }
     if leftValue < rightValue { return 0 - 1 }
@@ -1499,19 +1499,19 @@ fn runtimeSiftHeap(data: int, count: int, start: int, kind: int) {
             going = false
             continue
         }
-        var big = root
-        if runtimeCompareValuesByKind(kind, load64(data + big * 8), load64(data + child * 8)) < 0 { big = child }
+        var largestIndex = root
+        if runtimeCompareValuesByKind(kind, load64(data + largestIndex * 8), load64(data + child * 8)) < 0 { largestIndex = child }
         if child + 1 < count {
-            if runtimeCompareValuesByKind(kind, load64(data + big * 8), load64(data + child * 8 + 8)) < 0 { big = child + 1 }
+            if runtimeCompareValuesByKind(kind, load64(data + largestIndex * 8), load64(data + child * 8 + 8)) < 0 { largestIndex = child + 1 }
         }
-        if big == root {
+        if largestIndex == root {
             going = false
             continue
         }
         let savedValue = load64(data + root * 8)
-        store64(data + root * 8, load64(data + big * 8))
-        store64(data + big * 8, savedValue)
-        root = big
+        store64(data + root * 8, load64(data + largestIndex * 8))
+        store64(data + largestIndex * 8, savedValue)
+        root = largestIndex
     }
 }
 fn runtimeSwapSortElements(data: int, index: int, otherIndex: int) {
@@ -1522,30 +1522,30 @@ fn runtimeSwapSortElements(data: int, index: int, otherIndex: int) {
 // heapsort restricted to [lo, hi] -- the introsort depth-limit fallback that
 // keeps the worst case O(n log n).
 fn runtimeHeapSortRange(data: int, lowerBound: int, upperBound: int, kind: int) {
-    let base = data + lowerBound * 8
-    let count = upperBound - lowerBound + 1
-    var index = count / 2 - 1
+    let rangeAddress = data + lowerBound * 8
+    let rangeLength = upperBound - lowerBound + 1
+    var index = rangeLength / 2 - 1
     while index >= 0 {
-        runtimeSiftHeap(base, count, index, kind)
+        runtimeSiftHeap(rangeAddress, rangeLength, index, kind)
         index -= 1
     }
-    var heapEnd = count - 1
+    var heapEnd = rangeLength - 1
     while heapEnd > 0 {
-        let savedValue = load64(base)
-        store64(base, load64(base + heapEnd * 8))
-        store64(base + heapEnd * 8, savedValue)
-        runtimeSiftHeap(base, heapEnd, 0, kind)
+        let savedValue = load64(rangeAddress)
+        store64(rangeAddress, load64(rangeAddress + heapEnd * 8))
+        store64(rangeAddress + heapEnd * 8, savedValue)
+        runtimeSiftHeap(rangeAddress, heapEnd, 0, kind)
         heapEnd -= 1
     }
 }
 // median-of-three Hoare partition; pivot is an element value so it always
 // terminates. Returns the split index j: [lo, j] and [j+1, hi].
 fn runtimePartition(data: int, lowerBound: int, upperBound: int, kind: int) -> int {
-    let mid = lowerBound + (upperBound - lowerBound) / 2
-    if runtimeCompareValuesByKind(kind, load64(data + mid * 8), load64(data + lowerBound * 8)) < 0 { runtimeSwapSortElements(data, lowerBound, mid) }
+    let middleIndex = lowerBound + (upperBound - lowerBound) / 2
+    if runtimeCompareValuesByKind(kind, load64(data + middleIndex * 8), load64(data + lowerBound * 8)) < 0 { runtimeSwapSortElements(data, lowerBound, middleIndex) }
     if runtimeCompareValuesByKind(kind, load64(data + upperBound * 8), load64(data + lowerBound * 8)) < 0 { runtimeSwapSortElements(data, lowerBound, upperBound) }
-    if runtimeCompareValuesByKind(kind, load64(data + upperBound * 8), load64(data + mid * 8)) < 0 { runtimeSwapSortElements(data, mid, upperBound) }
-    let pivot = load64(data + mid * 8)
+    if runtimeCompareValuesByKind(kind, load64(data + upperBound * 8), load64(data + middleIndex * 8)) < 0 { runtimeSwapSortElements(data, middleIndex, upperBound) }
+    let pivot = load64(data + middleIndex * 8)
     var index = lowerBound - 1
     var otherIndex = upperBound + 1
     var result = 0
@@ -1566,10 +1566,10 @@ fn runtimePartition(data: int, lowerBound: int, upperBound: int, kind: int) -> i
 }
 // introsort: quicksort, recursing into the smaller partition and looping on the
 // larger (stack depth O(log n)); drop to heapsort when recursion gets too deep.
-fn runtimeIntrospectiveSort(data: int, initialLowerBound: int, initialUpperBound: int, depth0: int, kind: int) {
+fn runtimeIntrospectiveSort(data: int, initialLowerBound: int, initialUpperBound: int, initialDepth: int, kind: int) {
     var lowerBound = initialLowerBound
     var upperBound = initialUpperBound
-    var depth = depth0
+    var depth = initialDepth
     while upperBound - lowerBound > 16 {
         if depth <= 0 {
             runtimeHeapSortRange(data, lowerBound, upperBound, kind)
@@ -1610,33 +1610,33 @@ fn runtimeInsertionSort(data: int, lowerBound: int, upperBound: int, kind: int) 
 // `<`/`>` on loaded values instead of a call to runtimeCompareValuesByKind per compare. The
 // call overhead dominates a generic sort, so this is the path that matters. ----
 fn runtimeHeapSortIntegerRange(data: int, lowerBound: int, upperBound: int) {
-    let base = data + lowerBound * 8
-    let count = upperBound - lowerBound + 1
-    var index = count / 2 - 1
+    let rangeAddress = data + lowerBound * 8
+    let rangeLength = upperBound - lowerBound + 1
+    var index = rangeLength / 2 - 1
     while index >= 0 {
         var root = index
         var going = true
         while going {
             let child = 2 * root + 1
-            if child >= count {
+            if child >= rangeLength {
                 going = false
             } else {
-                var big = root
-                if load64(base + big * 8) < load64(base + child * 8) { big = child }
-                if child + 1 < count and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
-                if big == root {
+                var largestIndex = root
+                if load64(rangeAddress + largestIndex * 8) < load64(rangeAddress + child * 8) { largestIndex = child }
+                if child + 1 < rangeLength and load64(rangeAddress + largestIndex * 8) < load64(rangeAddress + child * 8 + 8) { largestIndex = child + 1 }
+                if largestIndex == root {
                     going = false
                 } else {
-                    runtimeSwapSortElements(base, root, big)
-                    root = big
+                    runtimeSwapSortElements(rangeAddress, root, largestIndex)
+                    root = largestIndex
                 }
             }
         }
         index -= 1
     }
-    var heapEnd = count - 1
+    var heapEnd = rangeLength - 1
     while heapEnd > 0 {
-        runtimeSwapSortElements(base, 0, heapEnd)
+        runtimeSwapSortElements(rangeAddress, 0, heapEnd)
         var root = 0
         var going = true
         while going {
@@ -1644,14 +1644,14 @@ fn runtimeHeapSortIntegerRange(data: int, lowerBound: int, upperBound: int) {
             if child >= heapEnd {
                 going = false
             } else {
-                var big = root
-                if load64(base + big * 8) < load64(base + child * 8) { big = child }
-                if child + 1 < heapEnd and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
-                if big == root {
+                var largestIndex = root
+                if load64(rangeAddress + largestIndex * 8) < load64(rangeAddress + child * 8) { largestIndex = child }
+                if child + 1 < heapEnd and load64(rangeAddress + largestIndex * 8) < load64(rangeAddress + child * 8 + 8) { largestIndex = child + 1 }
+                if largestIndex == root {
                     going = false
                 } else {
-                    runtimeSwapSortElements(base, root, big)
-                    root = big
+                    runtimeSwapSortElements(rangeAddress, root, largestIndex)
+                    root = largestIndex
                 }
             }
         }
@@ -1667,11 +1667,11 @@ fn runtimeHeapSortIntegerRange(data: int, lowerBound: int, upperBound: int) {
 // is where a classic Hoare scan loses half its time. Returns w with the pivot
 // fixed at a[w]: [lo, w-1] < pivot, [w+1, hi] >= pivot.
 fn runtimePartitionInteger(data: int, lowerBound: int, upperBound: int) -> int {
-    let mid = lowerBound + (upperBound - lowerBound) / 2
-    if load64(data + mid * 8) < load64(data + lowerBound * 8) { runtimeSwapSortElements(data, lowerBound, mid) }
+    let middleIndex = lowerBound + (upperBound - lowerBound) / 2
+    if load64(data + middleIndex * 8) < load64(data + lowerBound * 8) { runtimeSwapSortElements(data, lowerBound, middleIndex) }
     if load64(data + upperBound * 8) < load64(data + lowerBound * 8) { runtimeSwapSortElements(data, lowerBound, upperBound) }
-    if load64(data + upperBound * 8) < load64(data + mid * 8) { runtimeSwapSortElements(data, mid, upperBound) }
-    runtimeSwapSortElements(data, mid, upperBound)               // park the median at hi
+    if load64(data + upperBound * 8) < load64(data + middleIndex * 8) { runtimeSwapSortElements(data, middleIndex, upperBound) }
+    runtimeSwapSortElements(data, middleIndex, upperBound)               // park the median at hi
     let pivotValue = load64(data + upperBound * 8)
     var writeIndex = lowerBound
     var readIndex = lowerBound
@@ -1687,10 +1687,10 @@ fn runtimePartitionInteger(data: int, lowerBound: int, upperBound: int) -> int {
     runtimeSwapSortElements(data, writeIndex, upperBound)                 // pivot into its final slot
     return writeIndex
 }
-fn runtimeIntrospectiveSortIntegers(data: int, initialLowerBound: int, initialUpperBound: int, depth0: int) {
+fn runtimeIntrospectiveSortIntegers(data: int, initialLowerBound: int, initialUpperBound: int, initialDepth: int) {
     var lowerBound = initialLowerBound
     var upperBound = initialUpperBound
-    var depth = depth0
+    var depth = initialDepth
     while upperBound - lowerBound > 24 {
         if depth <= 0 {
             runtimeHeapSortIntegerRange(data, lowerBound, upperBound)
@@ -1701,13 +1701,13 @@ fn runtimeIntrospectiveSortIntegers(data: int, initialLowerBound: int, initialUp
         // skip the run of pivot-equal elements after w: with many duplicates
         // (or an all-equal range) this is what keeps the right side shrinking
         let pivotValue = load64(data + pivotIndex * 8)
-        var rightLength = pivotIndex + 1
-        while rightLength <= upperBound and load64(data + rightLength * 8) == pivotValue { rightLength += 1 }
-        if pivotIndex - lowerBound < upperBound - rightLength {
+        var rightStart = pivotIndex + 1
+        while rightStart <= upperBound and load64(data + rightStart * 8) == pivotValue { rightStart += 1 }
+        if pivotIndex - lowerBound < upperBound - rightStart {
             runtimeIntrospectiveSortIntegers(data, lowerBound, pivotIndex - 1, depth)
-            lowerBound = rightLength
+            lowerBound = rightStart
         } else {
-            runtimeIntrospectiveSortIntegers(data, rightLength, upperBound, depth)
+            runtimeIntrospectiveSortIntegers(data, rightStart, upperBound, depth)
             upperBound = pivotIndex - 1
         }
     }
@@ -1817,9 +1817,9 @@ fn runtimeJoinStringList(listAddress: int) -> int {
     index = 0
     while index < count {
         let part = load64(data + index * 8)
-        let leftPointer = load64(part)
-        runtimeCopyMemory(result + 8 + offset, part + 8, leftPointer)
-        offset += leftPointer
+        let partLength = load64(part)
+        runtimeCopyMemory(result + 8 + offset, part + 8, partLength)
+        offset += partLength
         index += 1
     }
     return result
@@ -1846,47 +1846,47 @@ fn runtimeJoinStringListWithSeparator(listAddress: int, separator: int) -> int {
             offset += separatorLength
         }
         let part = load64(data + index * 8)
-        let leftPointer = load64(part)
-        runtimeCopyMemory(result + 8 + offset, part + 8, leftPointer)
-        offset += leftPointer
+        let partLength = load64(part)
+        runtimeCopyMemory(result + 8 + offset, part + 8, partLength)
+        offset += partLength
         index += 1
     }
     return result
 }
 
 fn runtimeStringToInteger(stringAddress: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     var index = 0
-    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
-    var negate = false
-    if index < count and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
-        if load8(stringAddress + 8 + index) == 45 { negate = true }
+    while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    var isNegative = false
+    if index < stringLength and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
+        if load8(stringAddress + 8 + index) == 45 { isNegative = true }
         index += 1
     }
     var value = 0
-    var any = false
-    while index < count {
+    var sawDigit = false
+    while index < stringLength {
         let character = load8(stringAddress + 8 + index)
         if character < 48 or character > 57 { break }
         value = value * 10 + (character - 48)
-        any = true
+        sawDigit = true
         index += 1
     }
-    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
-    if not any or index != count { runtimeFail("cannot convert to int") }
-    if negate { return 0 - value }
+    while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    if not sawDigit or index != stringLength { runtimeFail("cannot convert to int") }
+    if isNegative { return 0 - value }
     return value
 }
 
 // decimal float parser (sign, integer part, fraction; no exponent yet).
 // returns the IEEE-754 bit pattern, which is what a float value is.
 fn runtimeStringToFloat(stringAddress: int) -> int {
-    let count = load64(stringAddress)
+    let stringLength = load64(stringAddress)
     var index = 0
-    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
-    var negate = false
-    if index < count and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
-        if load8(stringAddress + 8 + index) == 45 { negate = true }
+    while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    var isNegative = false
+    if index < stringLength and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
+        if load8(stringAddress + 8 + index) == 45 { isNegative = true }
         index += 1
     }
     // Collect every digit into an integer mantissa and count the fractional
@@ -1898,9 +1898,9 @@ fn runtimeStringToFloat(stringAddress: int) -> int {
     var mantissa = 0
     var mantissaDigitCount = 0                                     // digits kept in mant
     var fractionalDigitCount = 0                                      // fractional digits
-    var extra = 0                                  // integer digits dropped
-    var any = false
-    while index < count and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
+    var droppedDigitCount = 0                                  // integer digits dropped
+    var sawDigit = false
+    while index < stringLength and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
         let integerDigit = load8(stringAddress + 8 + index) - 48
         if mantissa == 0 and integerDigit == 0 {
             // a leading zero carries no information; spending mantissa budget on
@@ -1909,14 +1909,14 @@ fn runtimeStringToFloat(stringAddress: int) -> int {
             mantissa = mantissa * 10 + integerDigit
             mantissaDigitCount += 1
         } else {
-            extra += 1                             // too big for exact mantissa
+            droppedDigitCount += 1                             // too big for exact mantissa
         }
-        any = true
+        sawDigit = true
         index += 1
     }
-    if index < count and load8(stringAddress + 8 + index) == 46 {          // '.'
+    if index < stringLength and load8(stringAddress + 8 + index) == 46 {          // '.'
         index += 1
-        while index < count and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
+        while index < stringLength and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
             let fractionDigit = load8(stringAddress + 8 + index) - 48
             if mantissa == 0 and fractionDigit == 0 {
                 fractionalDigitCount += 1                             // shifts the value, adds no digit
@@ -1925,33 +1925,33 @@ fn runtimeStringToFloat(stringAddress: int) -> int {
                 mantissaDigitCount += 1
                 fractionalDigitCount += 1
             }
-            any = true
+            sawDigit = true
             index += 1
         }
     }
     // optional exponent: e/E, a sign, digits
     var exponent = 0
-    if any and index < count and (load8(stringAddress + 8 + index) == 101 or load8(stringAddress + 8 + index) == 69) {
-        var otherIndex = index + 1
+    if sawDigit and index < stringLength and (load8(stringAddress + 8 + index) == 101 or load8(stringAddress + 8 + index) == 69) {
+        var exponentIndex = index + 1
         var exponentNegative = false
-        if otherIndex < count and (load8(stringAddress + 8 + otherIndex) == 43 or load8(stringAddress + 8 + otherIndex) == 45) {
-            if load8(stringAddress + 8 + otherIndex) == 45 { exponentNegative = true }
-            otherIndex += 1
+        if exponentIndex < stringLength and (load8(stringAddress + 8 + exponentIndex) == 43 or load8(stringAddress + 8 + exponentIndex) == 45) {
+            if load8(stringAddress + 8 + exponentIndex) == 45 { exponentNegative = true }
+            exponentIndex += 1
         }
-        if otherIndex < count and load8(stringAddress + 8 + otherIndex) >= 48 and load8(stringAddress + 8 + otherIndex) <= 57 {
-            while otherIndex < count and load8(stringAddress + 8 + otherIndex) >= 48 and load8(stringAddress + 8 + otherIndex) <= 57 {
-                if exponent < 100000 { exponent = exponent * 10 + load8(stringAddress + 8 + otherIndex) - 48 }
-                otherIndex += 1
+        if exponentIndex < stringLength and load8(stringAddress + 8 + exponentIndex) >= 48 and load8(stringAddress + 8 + exponentIndex) <= 57 {
+            while exponentIndex < stringLength and load8(stringAddress + 8 + exponentIndex) >= 48 and load8(stringAddress + 8 + exponentIndex) <= 57 {
+                if exponent < 100000 { exponent = exponent * 10 + load8(stringAddress + 8 + exponentIndex) - 48 }
+                exponentIndex += 1
             }
             if exponentNegative { exponent = 0 - exponent }
-            index = otherIndex
+            index = exponentIndex
         }
     }
     // One multiply or divide by an exact power of ten (10^22 and below are
     // exact) rounds once, landing on strtod's answer. Larger scales go in
     // exact 10^22 steps and may be off by an ulp.
     var value = mantissa as float
-    var scale = extra - fractionalDigitCount + exponent
+    var scale = droppedDigitCount - fractionalDigitCount + exponent
     while scale > 22 {
         value = value * 10000000000000000000000.0
         scale -= 22
@@ -1970,9 +1970,9 @@ fn runtimeStringToFloat(stringAddress: int) -> int {
     }
     if scale > 0 { value = value * power }
     if scale < 0 { value = value / power }
-    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
-    if not any or index != count { runtimeFail("cannot convert to float") }
-    if negate { value = -value }                  // not 0.0 - val: "-0" must parse as -0.0
+    while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    if not sawDigit or index != stringLength { runtimeFail("cannot convert to float") }
+    if isNegative { value = -value }                  // not 0.0 - val: "-0" must parse as -0.0
     return bits(value)
 }
 
@@ -1986,14 +1986,14 @@ fn runtimeListNew(initialLength: int) -> int {
 fn runtimeNewDescribedList(initialLength: int, descriptor: int) -> int {
     var shapeDescriptor = descriptor
     if shapeDescriptor == 0 { shapeDescriptor = runtimeValueListDescriptor }    // the data buffer still has to go when the list does
-    let listValue = runtimeAllocateDescribedObject(24, shapeDescriptor)
+    let listAddress = runtimeAllocateDescribedObject(24, shapeDescriptor)
     var capacity = initialLength
     if capacity < 4 { capacity = 4 }
     let data = runtimeAllocateObject(capacity * 8)
-    store64(listValue, initialLength)
-    store64(listValue + 8, capacity)
-    store64(listValue + 16, data)
-    return listValue
+    store64(listAddress, initialLength)
+    store64(listAddress + 8, capacity)
+    store64(listAddress + 16, data)
+    return listAddress
 }
 
 fn runtimeListPush(listAddress: int, value: int) {
@@ -2001,12 +2001,12 @@ fn runtimeListPush(listAddress: int, value: int) {
     let capacity = load64(listAddress + 8)
     if count == capacity {
         let newCapacity = capacity * 2
-        let expandedData = runtimeAllocateObject(newCapacity * 8)
-        let outputDimension = load64(listAddress + 16)
-        runtimeCopyMemory(expandedData, outputDimension, count * 8)
+        let newData = runtimeAllocateObject(newCapacity * 8)
+        let oldData = load64(listAddress + 16)
+        runtimeCopyMemory(newData, oldData, count * 8)
         store64(listAddress + 8, newCapacity)
-        store64(listAddress + 16, expandedData)
-        runtimeReleaseReference(outputDimension)                       // the cell was the buffer's only holder
+        store64(listAddress + 16, newData)
+        runtimeReleaseReference(oldData)                       // the cell was the buffer's only holder
     }
     store64(load64(listAddress + 16) + count * 8, value)
     store64(listAddress, count + 1)
@@ -2024,13 +2024,13 @@ fn runtimeListPop(listAddress: int) -> int {
 // stored as its 32-bit pattern and enters Zephyr as a float (a double):
 // runtimeWidenFloat32Bits on the way out, runtimeNarrowFloat32Bits (round to nearest even) on the way in.
 fn runtimeNewPackedList(elementCount: int, width: int) -> int {
-    let listValue = runtimeAllocateDescribedObject(24, runtimeValueListDescriptor)
+    let listAddress = runtimeAllocateDescribedObject(24, runtimeValueListDescriptor)
     var capacity = elementCount
     if capacity < 4 { capacity = 4 }
-    store64(listValue, elementCount)
-    store64(listValue + 8, capacity)
-    store64(listValue + 16, runtimeAllocateObject(capacity * width))
-    return listValue
+    store64(listAddress, elementCount)
+    store64(listAddress + 8, capacity)
+    store64(listAddress + 16, runtimeAllocateObject(capacity * width))
+    return listAddress
 }
 
 fn runtimeFailPackedAccess(site: str, message: str) {
@@ -2112,12 +2112,12 @@ fn runtimePackedPush(listAddress: int, value: int, width: int) {
     let capacity = load64(listAddress + 8)
     if count == capacity {
         let newCapacity = capacity * 2
-        let expandedData = runtimeAllocateObject(newCapacity * width)
-        let outputDimension = load64(listAddress + 16)
-        runtimeCopyMemory(expandedData, outputDimension, count * width)
+        let newData = runtimeAllocateObject(newCapacity * width)
+        let oldData = load64(listAddress + 16)
+        runtimeCopyMemory(newData, oldData, count * width)
         store64(listAddress + 8, newCapacity)
-        store64(listAddress + 16, expandedData)
-        runtimeReleaseReference(outputDimension)
+        store64(listAddress + 16, newData)
+        runtimeReleaseReference(oldData)
     }
     store64(listAddress, count + 1)
     runtimePackedStore(listAddress, count, value, width)
@@ -2142,13 +2142,13 @@ fn runtimeF32Pop(listAddress: int, site: str) -> int { return runtimePackedPop(l
 // [int] as [u8] (low 8 bits), [float] as [f32]
 fn runtimePackedFromList(source: int, width: int) -> int {
     let count = load64(source)
-    let listValue = runtimeNewPackedList(count, width)
+    let packedList = runtimeNewPackedList(count, width)
     var index = 0
     while index < count {
-        runtimePackedStore(listValue, index, load64(load64(source + 16) + index * 8), width)
+        runtimePackedStore(packedList, index, load64(load64(source + 16) + index * 8), width)
         index += 1
     }
-    return listValue
+    return packedList
 }
 fn runtimeU8FromList(source: int) -> int { return runtimePackedFromList(source, 1) }
 fn runtimeF32FromList(source: int) -> int { return runtimePackedFromList(source, 4) }
@@ -2156,27 +2156,27 @@ fn runtimeF32FromList(source: int) -> int { return runtimePackedFromList(source,
 // [u8] as [int], [f32] as [float]
 fn runtimePackedToList(source: int, width: int) -> int {
     let count = load64(source)
-    let listValue = runtimeListNew(count)
+    let listAddress = runtimeListNew(count)
     var index = 0
     while index < count {
-        store64(load64(listValue + 16) + index * 8, runtimePackedLoad(source, index, width))
+        store64(load64(listAddress + 16) + index * 8, runtimePackedLoad(source, index, width))
         index += 1
     }
-    return listValue
+    return listAddress
 }
 fn runtimeU8ToList(source: int) -> int { return runtimePackedToList(source, 1) }
 fn runtimeF32ToList(source: int) -> int { return runtimePackedToList(source, 4) }
 
 fn runtimeU8FromString(stringAddress: int) -> int {
-    let count = load64(stringAddress)
-    let listValue = runtimeNewPackedList(count, 1)
-    runtimeCopyMemory(load64(listValue + 16), stringAddress + 8, count)
-    return listValue
+    let stringLength = load64(stringAddress)
+    let packedList = runtimeNewPackedList(stringLength, 1)
+    runtimeCopyMemory(load64(packedList + 16), stringAddress + 8, stringLength)
+    return packedList
 }
 fn runtimeU8ToString(listAddress: int) -> int {
-    let count = load64(listAddress)
-    let text = runtimeAllocateString(count)
-    runtimeCopyMemory(text + 8, load64(listAddress + 16), count)
+    let byteCount = load64(listAddress)
+    let text = runtimeAllocateString(byteCount)
+    runtimeCopyMemory(text + 8, load64(listAddress + 16), byteCount)
     return text
 }
 
@@ -2184,9 +2184,9 @@ fn runtimeU8ToString(listAddress: int) -> int {
 var runtimeOutputScratchAddress = 0
 var runtimeStandardOutputHandle = 0
 
-fn runtimeWriteOutputBytes(fileDescriptor: int, pointer: int, byteCount: int) {
+fn runtimeWriteOutputBytes(fileHandle: int, bytesAddress: int, byteCount: int) {
     if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
-    let result = win("WriteFile", fileDescriptor, pointer, byteCount, runtimeOutputScratchAddress, 0)
+    let result = win("WriteFile", fileHandle, bytesAddress, byteCount, runtimeOutputScratchAddress, 0)
 }
 
 fn runtimeGetStandardOutputHandle() -> int {
@@ -2248,44 +2248,44 @@ fn runtimeGetStringBuilder() -> int {
     // in favour of initialising from runtimeInitializeHeap alone.
     if runtimeMainStringBuilder == 0 { runtimeInitializeStringBuilders() }
     if runtimeRegisteredThreadCount == 0 { return runtimeMainStringBuilder }
-    var address = win("TlsGetValue", runtimeStringBuilderThreadLocalIndex)
-    if address == 0 {
-        address = win("VirtualAlloc", 0, 64, 12288, 4)
-        store64(address, win("VirtualAlloc", 0, 65536, 12288, 4))
-        store64(address + 8, 0)
-        store64(address + 16, 65536)
-        let result = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, address)
+    var builderAddress = win("TlsGetValue", runtimeStringBuilderThreadLocalIndex)
+    if builderAddress == 0 {
+        builderAddress = win("VirtualAlloc", 0, 64, 12288, 4)
+        store64(builderAddress, win("VirtualAlloc", 0, 65536, 12288, 4))
+        store64(builderAddress + 8, 0)
+        store64(builderAddress + 16, 65536)
+        let result = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, builderAddress)
     }
-    return address
+    return builderAddress
 }
 
-fn runtimeEnsureStringBuilderCapacity(address: int, extra: int) {
-    let current = load64(address + 8)
-    let capacity = load64(address + 16)
-    if current + extra <= capacity { return }
+fn runtimeEnsureStringBuilderCapacity(builderAddress: int, extra: int) {
+    let usedLength = load64(builderAddress + 8)
+    let capacity = load64(builderAddress + 16)
+    if usedLength + extra <= capacity { return }
     var newCapacity = capacity * 2
     if newCapacity < 65536 { newCapacity = 65536 }
-    while newCapacity < current + extra { newCapacity = newCapacity * 2 }
+    while newCapacity < usedLength + extra { newCapacity = newCapacity * 2 }
     // VirtualAlloc, not runtimeAllocateObject: the builder must not itself allocate on the
     // GC heap, or formatting could trigger a collection mid-interpolation.
-    let byteCount = win("VirtualAlloc", 0, newCapacity, 12288, 4)
-    runtimeCopyMemory(byteCount, load64(address), current)
-    store64(address, byteCount)
-    store64(address + 16, newCapacity)
+    let newBuffer = win("VirtualAlloc", 0, newCapacity, 12288, 4)
+    runtimeCopyMemory(newBuffer, load64(builderAddress), usedLength)
+    store64(builderAddress, newBuffer)
+    store64(builderAddress + 16, newCapacity)
 }
 
 fn runtimeAppendStringBuilderByte(character: int) {
-    let address = runtimeGetStringBuilder()
-    runtimeEnsureStringBuilderCapacity(address, 1)
-    store8(load64(address) + load64(address + 8), character)
-    store64(address + 8, load64(address + 8) + 1)
+    let builderAddress = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(builderAddress, 1)
+    store8(load64(builderAddress) + load64(builderAddress + 8), character)
+    store64(builderAddress + 8, load64(builderAddress + 8) + 1)
 }
 
-fn runtimeAppendStringBuilderBytes(pointer: int, byteCount: int) {
-    let address = runtimeGetStringBuilder()
-    runtimeEnsureStringBuilderCapacity(address, byteCount)
-    runtimeCopyMemory(load64(address) + load64(address + 8), pointer, byteCount)
-    store64(address + 8, load64(address + 8) + byteCount)
+fn runtimeAppendStringBuilderBytes(bytesAddress: int, byteCount: int) {
+    let builderAddress = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(builderAddress, byteCount)
+    runtimeCopyMemory(load64(builderAddress) + load64(builderAddress + 8), bytesAddress, byteCount)
+    store64(builderAddress + 8, load64(builderAddress + 8) + byteCount)
 }
 
 fn runtimeAppendStringBuilderInteger(value: int) {
@@ -2293,30 +2293,30 @@ fn runtimeAppendStringBuilderInteger(value: int) {
         runtimeAppendStringBuilderByte(48)
         return
     }
-    let negate = value < 0
+    let isNegative = value < 0
     // work in the non-positive domain so i64 MIN never overflows a negate
     var remainingValue = value
     if remainingValue > 0 { remainingValue = 0 - remainingValue }
-    var digits = 0
+    var digitCount = 0
     var remainingDigits = remainingValue
     while remainingDigits < 0 {
-        digits += 1
+        digitCount += 1
         remainingDigits = remainingDigits / 10
     }
-    var total = digits
-    if negate { total += 1 }
-    let address = runtimeGetStringBuilder()
-    runtimeEnsureStringBuilderCapacity(address, total)
-    let buffer = load64(address)
-    let current = load64(address + 8)
-    var position = current + total - 1
+    var total = digitCount
+    if isNegative { total += 1 }
+    let builderAddress = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(builderAddress, total)
+    let buffer = load64(builderAddress)
+    let usedLength = load64(builderAddress + 8)
+    var position = usedLength + total - 1
     while remainingValue < 0 {
         store8(buffer + position, 48 - remainingValue % 10)      // x%10 is <= 0, so -(x%10) is the digit
         position -= 1
         remainingValue = remainingValue / 10
     }
-    if negate { store8(buffer + current, 45) }
-    store64(address + 8, current + total)
+    if isNegative { store8(buffer + usedLength, 45) }
+    store64(builderAddress + 8, usedLength + total)
 }
 
 // td kinds: 0 int, 1 float, 2 bool, 3 str, 4 list, 5 struct
@@ -2361,24 +2361,24 @@ fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation
         }
         runtimeAppendStringBuilderByte(93)
     } else if kind == 5 {
-        let name = load64(typeDescriptor + 8)
-        let functionCount = load64(typeDescriptor + 16)
-        let isTuple = load8(name) == 40     // tuples are structs named "(int, str)"
+        let structName = load64(typeDescriptor + 8)
+        let structFieldCount = load64(typeDescriptor + 16)
+        let isTuple = load8(structName) == 40     // tuples are structs named "(int, str)"
         if isTuple { runtimeAppendStringBuilderByte(40) }
         else {
-            runtimeAppendStringBuilderBytes(name, runtimeCStringLength(name))
+            runtimeAppendStringBuilderBytes(structName, runtimeCStringLength(structName))
             runtimeAppendStringBuilderByte(123)
         }
         var fieldIndex = 0
-        while fieldIndex < functionCount {
+        while fieldIndex < structFieldCount {
             if fieldIndex > 0 {
                 runtimeAppendStringBuilderByte(44)
                 runtimeAppendStringBuilderByte(32)
             }
-            let fname = load64(typeDescriptor + 24 + fieldIndex * 16)
+            let fieldName = load64(typeDescriptor + 24 + fieldIndex * 16)
             let fieldDescriptor = load64(typeDescriptor + 32 + fieldIndex * 16)
             if not isTuple {
-                runtimeAppendStringBuilderBytes(fname, runtimeCStringLength(fname))
+                runtimeAppendStringBuilderBytes(fieldName, runtimeCStringLength(fieldName))
                 runtimeAppendStringBuilderByte(58)
                 runtimeAppendStringBuilderByte(32)
             }
@@ -2440,8 +2440,8 @@ fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation
         if value < 0 or value >= memberCount {
             runtimeAppendStringBuilderInteger(value)
         } else {
-            let nameptr = load64(typeDescriptor + 16 + value * 8)
-            runtimeAppendStringBuilderBytes(nameptr, runtimeCStringLength(nameptr))
+            let memberName = load64(typeDescriptor + 16 + value * 8)
+            runtimeAppendStringBuilderBytes(memberName, runtimeCStringLength(memberName))
         }
     } else if kind == 10 or kind == 11 {  // packed list: [u8] or [f32]
         var width = 1
@@ -2490,10 +2490,10 @@ fn runtimeFormatLargeIntegerFloat(inputValue: float) {
         binaryExponent += 1
     }
     var decimalDigits: [int] = []
-    var integerDigits = scaledValue as int
-    while integerDigits > 0 {
-        decimalDigits.push(integerDigits % 10)
-        integerDigits = integerDigits / 10
+    var remainingInteger = scaledValue as int
+    while remainingInteger > 0 {
+        decimalDigits.push(remainingInteger % 10)
+        remainingInteger = remainingInteger / 10
     }
     if decimalDigits.len() == 0 { decimalDigits.push(0) }
     var index = 0
@@ -2501,9 +2501,9 @@ fn runtimeFormatLargeIntegerFloat(inputValue: float) {
         var carry = 0
         var otherIndex = 0
         while otherIndex < decimalDigits.len() {
-            let value = decimalDigits[otherIndex] * 2 + carry
-            decimalDigits[otherIndex] = value % 10
-            carry = value / 10
+            let doubledDigit = decimalDigits[otherIndex] * 2 + carry
+            decimalDigits[otherIndex] = doubledDigit % 10
+            carry = doubledDigit / 10
             otherIndex += 1
         }
         while carry > 0 {
@@ -2527,62 +2527,62 @@ fn runtimeAppendStringBuilderFloat(bitPattern: int) {
         runtimeAppendStringBuilderByte(110)
         return
     }
-    var otherValue = value
-    if otherValue < 0.0 {
+    var magnitude = value
+    if magnitude < 0.0 {
         runtimeAppendStringBuilderByte(45)                   // '-'
-        otherValue = 0.0 - otherValue
+        magnitude = 0.0 - magnitude
     }
     let infinity = frombits(9218868437227405312)   // 0x7FF0000000000000
-    if otherValue == infinity {
+    if magnitude == infinity {
         runtimeAppendStringBuilderByte(105)
         runtimeAppendStringBuilderByte(110)
         runtimeAppendStringBuilderByte(102)
         return
     }
-    if otherValue >= 9223372036854775808.0 {      // integer part too large for i64
-        runtimeFormatLargeIntegerFloat(otherValue)
+    if magnitude >= 9223372036854775808.0 {      // integer part too large for i64
+        runtimeFormatLargeIntegerFloat(magnitude)
         return
     }
-    var internetAddress = otherValue as int
-    var fraction = otherValue - (internetAddress as float)
-    var destinationIndex = 0                            // integer-part digit count
-    var temporary = internetAddress
-    while temporary > 0 {
-        temporary = temporary / 10
-        destinationIndex += 1
+    var integerPart = magnitude as int
+    var fraction = magnitude - (integerPart as float)
+    var integerDigitCount = 0                            // integer-part digit count
+    var remainingInteger = integerPart
+    while remainingInteger > 0 {
+        remainingInteger = remainingInteger / 10
+        integerDigitCount += 1
     }
-    var fractionCount = 15 - destinationIndex                   // ~15 significant figures total (like %.15g)
-    if fractionCount < 1 { fractionCount = 1 }
-    if fractionCount > 16 { fractionCount = 16 }
-    var fileDescriptor = 0
+    var fractionDigitCount = 15 - integerDigitCount                   // ~15 significant figures total (like %.15g)
+    if fractionDigitCount < 1 { fractionDigitCount = 1 }
+    if fractionDigitCount > 16 { fractionDigitCount = 16 }
+    var fractionDigits = 0
     var fractionRemainder = fraction
     var index = 0
-    while index < fractionCount {
+    while index < fractionDigitCount {
         fractionRemainder = fractionRemainder * 10.0
         let digitValue = fractionRemainder as int
-        fileDescriptor = fileDescriptor * 10 + digitValue
+        fractionDigits = fractionDigits * 10 + digitValue
         fractionRemainder = fractionRemainder - (digitValue as float)
         index += 1
     }
     fractionRemainder = fractionRemainder * 10.0                          // round on the next digit
-    if (fractionRemainder as int) >= 5 { fileDescriptor = fileDescriptor + 1 }
-    let capacity = runtimeIntegerPowerOfTen(fractionCount)
-    if fileDescriptor >= capacity {                        // carry rounded past the fraction
-        fileDescriptor = fileDescriptor - capacity
-        internetAddress = internetAddress + 1
+    if (fractionRemainder as int) >= 5 { fractionDigits = fractionDigits + 1 }
+    let fractionLimit = runtimeIntegerPowerOfTen(fractionDigitCount)
+    if fractionDigits >= fractionLimit {                        // carry rounded past the fraction
+        fractionDigits = fractionDigits - fractionLimit
+        integerPart = integerPart + 1
     }
-    runtimeAppendStringBuilderInteger(internetAddress)
-    if fileDescriptor == 0 { return }                 // no fractional part (matches %g)
+    runtimeAppendStringBuilderInteger(integerPart)
+    if fractionDigits == 0 { return }                 // no fractional part (matches %g)
     runtimeAppendStringBuilderByte(46)                        // '.'
-    var last = fractionCount - 1
-    var remainingFraction = fileDescriptor
-    while last > 0 and remainingFraction % 10 == 0 {      // trim trailing zeros
+    var lastDigitIndex = fractionDigitCount - 1
+    var remainingFraction = fractionDigits
+    while lastDigitIndex > 0 and remainingFraction % 10 == 0 {      // trim trailing zeros
         remainingFraction = remainingFraction / 10
-        last -= 1
+        lastDigitIndex -= 1
     }
     var digitIndex = 0
-    while digitIndex <= last {                     // emit MSD-first, keeping leading zeros
-        let digit = (fileDescriptor / runtimeIntegerPowerOfTen(fractionCount - 1 - digitIndex)) % 10
+    while digitIndex <= lastDigitIndex {                     // emit MSD-first, keeping leading zeros
+        let digit = (fractionDigits / runtimeIntegerPowerOfTen(fractionDigitCount - 1 - digitIndex)) % 10
         runtimeAppendStringBuilderByte(48 + digit)
         digitIndex += 1
     }
@@ -2596,13 +2596,13 @@ fn runtimeCStringLength(address: int) -> int {
 
 // ---- runtime entry points the code generator calls ----
 fn runtimeFormatTypedValue(value: int, typeDescriptor: int) -> int {
-    let address = runtimeGetStringBuilder()
-    let mark = load64(address + 8)
+    let builderAddress = runtimeGetStringBuilder()
+    let mark = load64(builderAddress + 8)
     runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
-    let outputLength = load64(address + 8) - mark
+    let outputLength = load64(builderAddress + 8) - mark
     let text = runtimeAllocateString(outputLength)
-    runtimeCopyMemory(text + 8, load64(address) + mark, outputLength)
-    store64(address + 8, mark)
+    runtimeCopyMemory(text + 8, load64(builderAddress) + mark, outputLength)
+    store64(builderAddress + 8, mark)
     return text
 }
 
@@ -2612,11 +2612,11 @@ fn runtimePrintTypedValue(value: int, typeDescriptor: int) {
         runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), addr("\n") + 8, 1)
         return
     }
-    let address = runtimeGetStringBuilder()
-    let mark = load64(address + 8)
+    let builderAddress = runtimeGetStringBuilder()
+    let mark = load64(builderAddress + 8)
     runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
-    runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), load64(address) + mark, load64(address + 8) - mark)
-    store64(address + 8, mark)
+    runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), load64(builderAddress) + mark, load64(builderAddress + 8) - mark)
+    store64(builderAddress + 8, mark)
     runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), addr("\n") + 8, 1)
 }
 
@@ -2634,32 +2634,32 @@ fn runtimeAppendInterpolationValue(value: int, typeDescriptor: int) {
     runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
 }
 fn runtimeEndStringInterpolation(mark: int) -> int {
-    let address = runtimeGetStringBuilder()
-    let outputLength = load64(address + 8) - mark
+    let builderAddress = runtimeGetStringBuilder()
+    let outputLength = load64(builderAddress + 8) - mark
     let text = runtimeAllocateString(outputLength)
-    runtimeCopyMemory(text + 8, load64(address) + mark, outputLength)
-    store64(address + 8, mark)
+    runtimeCopyMemory(text + 8, load64(builderAddress) + mark, outputLength)
+    store64(builderAddress + 8, mark)
     return text
 }
 
 // ---- command-line args ----
 fn runtimeArguments() -> int {
-    let classIndex = win("GetCommandLineA")       // LPSTR
-    let listValue = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
+    let commandLine = win("GetCommandLineA")       // LPSTR
+    let argumentList = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
     var index = 0
     var going = true
     while going {
-        while load8(classIndex + index) == 32 or load8(classIndex + index) == 9 { index += 1 }
-        if load8(classIndex + index) == 0 {
+        while load8(commandLine + index) == 32 or load8(commandLine + index) == 9 { index += 1 }
+        if load8(commandLine + index) == 0 {
             going = false
         } else {
             let start = index
             var quoted = false
             let buffer = runtimeAllocateObject(2048)
-            var bestLocal = 0
+            var argumentLength = 0
             var scanning = true
             while scanning {
-                let character = load8(classIndex + index)
+                let character = load8(commandLine + index)
                 if character == 0 { scanning = false }
                 else if character == 34 {
                     if quoted { quoted = false } else { quoted = true }
@@ -2667,26 +2667,26 @@ fn runtimeArguments() -> int {
                 } else if (character == 32 or character == 9) and not quoted {
                     scanning = false
                 } else {
-                    store8(buffer + bestLocal, character)
-                    bestLocal += 1
+                    store8(buffer + argumentLength, character)
+                    argumentLength += 1
                     index += 1
                 }
             }
-            let text = runtimeAllocateString(bestLocal)
-            runtimeCopyMemory(text + 8, buffer, bestLocal)
-            runtimeListPush(listValue, text)
+            let argument = runtimeAllocateString(argumentLength)
+            runtimeCopyMemory(argument + 8, buffer, argumentLength)
+            runtimeListPush(argumentList, argument)
         }
     }
-    return listValue
+    return argumentList
 }
 
 // null-terminated copy of a str's bytes into fresh memory, for the Win32 *A apis
 fn runtimeAllocateCString(stringAddress: int) -> int {
-    let count = load64(stringAddress)
-    let address = runtimeAllocateObject(count + 1)
-    runtimeCopyMemory(address, stringAddress + 8, count)
-    store8(address + count, 0)
-    return address
+    let stringLength = load64(stringAddress)
+    let cStringAddress = runtimeAllocateObject(stringLength + 1)
+    runtimeCopyMemory(cStringAddress, stringAddress + 8, stringLength)
+    store8(cStringAddress + stringLength, 0)
+    return cStringAddress
 }
 
 // runtimeReadFile(path) -> str with the whole file
@@ -2698,12 +2698,12 @@ fn runtimeReadFile(path: int) -> int {
     let size = win("GetFileSize", handle, 0)
     let text = runtimeAllocateString(size)
     if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
-    var got = 0
-    while got < size {
-        let result = win("ReadFile", handle, text + 8 + got, size - got, runtimeOutputScratchAddress, 0)
-        let count = load64(runtimeOutputScratchAddress) & 4294967295
-        if result == 0 or count == 0 { got = size }
-        else { got += count }
+    var bytesRead = 0
+    while bytesRead < size {
+        let result = win("ReadFile", handle, text + 8 + bytesRead, size - bytesRead, runtimeOutputScratchAddress, 0)
+        let chunkByteCount = load64(runtimeOutputScratchAddress) & 4294967295
+        if result == 0 or chunkByteCount == 0 { bytesRead = size }
+        else { bytesRead += chunkByteCount }
     }
     let closeResult = win("CloseHandle", handle)
     return text

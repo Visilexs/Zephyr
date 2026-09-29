@@ -42,27 +42,27 @@ var wasmRegionCount = 0
 
 fn wasmInitialize() {
     if wasmSmallAllocationPointer != 0 { return }
-    let base = load64(wasmHeap)
-    wasmMemoryEnd = base
-    wasmRegionTable = base                 // carve the region table out by hand: calling
-    wasmSmallAllocationPointer = base + 16 * wasmMaximumRegions // kernel32VirtualAlloc here would recurse
-    let ok = wasmEnsure(wasmSmallAllocationPointer)
+    let heapBase = load64(wasmHeap)
+    wasmMemoryEnd = heapBase
+    wasmRegionTable = heapBase                 // carve the region table out by hand: calling
+    wasmSmallAllocationPointer = heapBase + 16 * wasmMaximumRegions // kernel32VirtualAlloc here would recurse
+    let memoryEnsured = wasmEnsure(wasmSmallAllocationPointer)
 }
 
-fn wasmRegionAdd(at: int, size: int) {
+fn wasmRegionAdd(regionStart: int, size: int) {
     if wasmRegionCount >= wasmMaximumRegions { return }
-    store64(wasmRegionTable + 16 * wasmRegionCount, at)
-    store64(wasmRegionTable + 16 * wasmRegionCount + 8, at + size)
+    store64(wasmRegionTable + 16 * wasmRegionCount, regionStart)
+    store64(wasmRegionTable + 16 * wasmRegionCount + 8, regionStart + size)
     wasmRegionCount += 1
 }
 
 // the end of the reserved region containing `base`, or 0 if it is in none
-fn wasmRegionEnd(base: int) -> int {
+fn wasmRegionEnd(address: int) -> int {
     var index = 0
     while index < wasmRegionCount {
-        let lowerBound = load64(wasmRegionTable + 16 * index)
-        let upperBound = load64(wasmRegionTable + 16 * index + 8)
-        if base >= lowerBound and base < upperBound { return upperBound }
+        let regionStart = load64(wasmRegionTable + 16 * index)
+        let regionEnd = load64(wasmRegionTable + 16 * index + 8)
+        if address >= regionStart and address < regionEnd { return regionEnd }
         index += 1
     }
     return 0
@@ -81,39 +81,39 @@ fn wasmEnsure(need: int) -> bool {
 // MEM_RESERVE=0x2000, MEM_COMMIT=0x1000. Reserving takes address space without
 // growing memory, which is exactly what a wasm heap wants: the GC reserves a
 // large region up front and only ever touches the part it has committed.
-fn kernel32VirtualAlloc(base: int, count: int, flags: int, protectionArgument: int) -> int {
+fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgument: int) -> int {
     wasmInitialize()
     let wantCommit = (flags & 4096) != 0
     let wantReserve = (flags & 8192) != 0
     if wantReserve and not wantCommit {
-        let want = count >> wasmRegionShift
+        let want = byteCount >> wasmRegionShift
         if wasmReservedHeap == 0 {
             // the first reserve is the heap: park it above a window sized for
             // the bitmaps and worklist that runtimeInitializeHeap asks for next
             wasmSmallAllocationBase = load64(wasmHeap) + wasmOutsideHeap
             wasmReservedHeap = wasmSmallAllocationBase + (want >> 3)
-            let at = wasmReservedHeap
+            let allocationAddress = wasmReservedHeap
             wasmReservedHeap = wasmReservedHeap + want
-            wasmRegionAdd(at, want)
-            return at
+            wasmRegionAdd(allocationAddress, want)
+            return allocationAddress
         }
-        let at = wasmSmallAllocationBase
-        if at + want > load64(wasmHeap) + wasmOutsideHeap + (wasmReservedHeap - wasmSmallAllocationBase) { return 0 }
+        let allocationAddress = wasmSmallAllocationBase
+        if allocationAddress + want > load64(wasmHeap) + wasmOutsideHeap + (wasmReservedHeap - wasmSmallAllocationBase) { return 0 }
         wasmSmallAllocationBase = wasmSmallAllocationBase + want
-        wasmRegionAdd(at, want)
-        return at
+        wasmRegionAdd(allocationAddress, want)
+        return allocationAddress
     }
     if wantCommit and base != 0 {
-        let end = wasmRegionEnd(base)
-        if end != 0 and base + count > end { return 0 }
-        if not wasmEnsure(base + count) { return 0 }
+        let regionEnd = wasmRegionEnd(base)
+        if regionEnd != 0 and base + byteCount > regionEnd { return 0 }
+        if not wasmEnsure(base + byteCount) { return 0 }
         return base
     }
-    let at = wasmSmallAllocationPointer
-    if at + count > load64(wasmHeap) + wasmOutsideHeap { return 0 }
-    wasmSmallAllocationPointer = wasmSmallAllocationPointer + count
-    if not wasmEnsure(at + count) { return 0 }
-    return at
+    let allocationAddress = wasmSmallAllocationPointer
+    if allocationAddress + byteCount > load64(wasmHeap) + wasmOutsideHeap { return 0 }
+    wasmSmallAllocationPointer = wasmSmallAllocationPointer + byteCount
+    if not wasmEnsure(allocationAddress + byteCount) { return 0 }
+    return allocationAddress
 }
 
 // ---- console ----
@@ -125,9 +125,9 @@ fn kernel32GetStdHandle(which: int) -> int {
     return 1
 }
 
-fn kernel32WriteFile(handle: int, pointer: int, count: int, pwritten: int, outputValue: int) -> int {
-    hostwrite(handle, pointer, count)
-    if pwritten != 0 { store64(pwritten, count) }
+fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCountAddress: int, overlapped: int) -> int {
+    hostwrite(handle, bytesAddress, byteCount)
+    if writtenCountAddress != 0 { store64(writtenCountAddress, byteCount) }
     return 1
 }
 
@@ -140,11 +140,11 @@ fn kernel32ExitProcess(code: int) -> int {
 //
 // ponytail: no filesystem. read_file/write_file panic rather than silently
 // returning nothing; wire them to host imports if a wasm build ever needs them.
-fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, sourceAddress: int, displacement: int, flags: int, templateHandle: int) -> int {
+fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, securityAttributes: int, creationDisposition: int, flags: int, templateHandle: int) -> int {
     return 0 - 1
 }
-fn kernel32GetFileSize(handle: int, phigh: int) -> int { return 0 }
-fn kernel32ReadFile(handle: int, buffer: int, count: int, pread: int, outputValue: int) -> int { return 0 }
+fn kernel32GetFileSize(handle: int, highSizeAddress: int) -> int { return 0 }
+fn kernel32ReadFile(handle: int, buffer: int, byteCount: int, readCountAddress: int, overlapped: int) -> int { return 0 }
 fn kernel32CloseHandle(handle: int) -> int { return 1 }
 fn kernel32GetFileAttributesA(cStringPointer: int) -> int { return 4294967295 }
 fn kernel32GetModuleFileNameA(module: int, buffer: int, capacity: int) -> int { return 0 }
@@ -163,9 +163,9 @@ fn kernel32GetCommandLineA() -> int {
 //
 // The shadow stack occupies a fixed window below the heap, and Zephyr frames
 // live in it, so the conservative scan works here exactly as it does natively.
-fn kernel32GetCurrentThreadStackLimits(lowerBound: int, upperBound: int) -> int {
-    store64(lowerBound, load64(wasmStackBottom))
-    store64(upperBound, load64(wasmStackTop))
+fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: int) -> int {
+    store64(lowLimitAddress, load64(wasmStackBottom))
+    store64(highLimitAddress, load64(wasmStackTop))
     return 0
 }
 
