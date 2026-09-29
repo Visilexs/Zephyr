@@ -1,0 +1,149 @@
+// Spike 1 - GC pause latency under a voxel-renderer allocation pattern.
+//
+// The question: the collector is stop-the-world conservative mark-sweep with no
+// pin and no disable. A 60fps frame budget is 16.67ms. Nothing in the repo says
+// what a collection costs, so this measures it under two live-set shapes:
+//
+//   A. volume on the GC heap  - 6,291,456 voxels as [int] = 50MB live
+//   B. volume off-heap        - VirtualAlloc, so the GC only walks frame junk
+//
+// Both run the same per-frame allocation churn. If A's tail is bad and B's is
+// not, the port rule is simply "the volume lives off-heap".
+
+fn now(buf: int) -> int {
+    win("QueryPerformanceCounter", buf)
+    return load64(buf)
+}
+
+// Stands in for a frame that builds per-frame lists (entity uniform arrays,
+// the nearest-lights scan, and so on). Returns a value so nothing is optimised away.
+fn frame_garbage(blocks: int) -> int {
+    var sink = 0
+    for i in 0..blocks {
+        let xs = zeros(256)
+        xs[0] = i
+        xs[255] = i
+        sink = sink + xs[0] + xs[255]
+    }
+    return sink
+}
+
+// Same loop count and roughly the same work, but touching no heap at all.
+fn frame_work(blocks: int) -> int {
+    var sink = 0
+    for i in 0..blocks {
+        var acc = i
+        for j in 0..256 { acc = acc + j }
+        sink = sink + acc
+    }
+    return sink
+}
+
+fn pct(times: [int], p: int) -> int {
+    let i = times.len() * p / 100
+    if i >= times.len() { return times[times.len() - 1] }
+    return times[i]
+}
+
+fn report(label: str, times: [int], allocated_mb: int) {
+    // Sorting mutates, so the caller must be done with frame order by now.
+    times.sort()
+    let n = times.len()
+    var sum = 0
+    for i in 0..n { sum = sum + times[i] }
+
+    var over1 = 0
+    var over3 = 0
+    var over16 = 0
+    for i in 0..n {
+        if times[i] > 1000 { over1 = over1 + 1 }
+        if times[i] > 3000 { over3 = over3 + 1 }
+        if times[i] > 16670 { over16 = over16 + 1 }
+    }
+
+    print("")
+    print("=== {label} ===")
+    print("  frames        {n}, allocated ~{allocated_mb} MB total")
+    print("  mean          {sum / n} us")
+    print("  median        {pct(times, 50)} us")
+    print("  p99           {pct(times, 99)} us")
+    print("  max           {times[n - 1]} us")
+    print("  2nd/3rd max   {times[n - 2]} us / {times[n - 3]} us")
+    print("  frames >1ms   {over1}")
+    print("  frames >3ms   {over3}")
+    print("  frames >16ms  {over16}   (a dropped frame at 60fps)")
+}
+
+// ---------------------------------------------------------------- setup
+
+let buf = win("VirtualAlloc", 0, 4096, 12288, 4)
+assert(buf != 0, "VirtualAlloc for the timer buffer failed")
+
+win("QueryPerformanceFrequency", buf)
+let freq = load64(buf)
+assert(freq > 0, "QueryPerformanceFrequency returned 0")
+print("qpc frequency = {freq} Hz")
+
+let FRAMES = 3000
+let BLOCKS = 100          // ~100 * 2KB = ~200KB of garbage per frame
+
+// A 256x96x256 volume, the same shape as the C# renderer.
+let VOX = 6291456
+
+// ---------------------------------------------------------------- scenario A
+
+print("")
+print("building 50MB GC-heap live set ...")
+var volume = zeros(VOX)
+// Touch it so the pages are really committed and the object is really live.
+for i in 0..4096 { volume[i * 1535] = i }
+
+var times_a = zeros(FRAMES)
+for f in 0..FRAMES {
+    let t0 = now(buf)
+    let s = frame_garbage(BLOCKS)
+    let t1 = now(buf)
+    times_a[f] = (t1 - t0) * 1000000 / freq
+    if s < 0 { print("unreachable {s}") }
+}
+// Keep the volume live across the whole measured loop.
+print("live-set check: volume[1535] = {volume[1535]}, len = {volume.len()}")
+
+// ---------------------------------------------------------------- scenario B
+
+// Drop the GC-heap volume and put it off-heap instead: 1 byte per voxel.
+volume = zeros(1)
+let offheap = win("VirtualAlloc", 0, VOX, 12288, 4)
+assert(offheap != 0, "VirtualAlloc for the off-heap volume failed")
+for i in 0..4096 { store8(offheap + i * 1535, i % 256) }
+
+var times_b = zeros(FRAMES)
+for f in 0..FRAMES {
+    let t0 = now(buf)
+    let s = frame_garbage(BLOCKS)
+    let t1 = now(buf)
+    times_b[f] = (t1 - t0) * 1000000 / freq
+    if s < 0 { print("unreachable {s}") }
+}
+print("off-heap check: byte at +1535 = {load8(offheap + 1535)}")
+
+// ---------------------------------------------------------------- scenario C
+
+// Control: identical loop shape, zero allocation. Whatever spikes survive here
+// are the OS scheduler, not the collector - without this the GC gets blamed for
+// the machine's own jitter.
+var times_c = zeros(FRAMES)
+for f in 0..FRAMES {
+    let t0 = now(buf)
+    let s = frame_work(BLOCKS)
+    let t1 = now(buf)
+    times_c[f] = (t1 - t0) * 1000000 / freq
+    if s < 0 { print("unreachable {s}") }
+}
+
+// ---------------------------------------------------------------- results
+
+let mb = FRAMES * BLOCKS * 2048 / 1048576
+report("A: 50MB volume ON the GC heap", times_a, mb)
+report("B: volume OFF-heap (VirtualAlloc)", times_b, mb)
+report("C: control, ZERO allocation (OS noise floor)", times_c, 0)

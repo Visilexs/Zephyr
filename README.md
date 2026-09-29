@@ -24,7 +24,7 @@ print(b.dist(a))                    // same call, method syntax
 **Memory safe, without collector pauses.** No pointers, no manual memory, no
 null. Memory is reclaimed by reference counting the compiler inserts; every
 index is bounds-checked and every variable is initialized at creation. Nothing
-stops for a collection: the worst-case pause under heavy churn is 29 µs, against
+stops for a collection: the worst frame under heavy churn is under 65 µs, against
 ~4 ms for the tracing collector it replaced. See
 [reference counting](#reference-counting).
 
@@ -34,37 +34,27 @@ conversion is written out: `n as str`, `"3.14" as float`.
 
 **Native performance.** `bench\run_suite.ps1` runs each workload as the same
 algorithm in Zephyr, C (`gcc -O2`) and Rust (`rustc -O`), and checks the output
-checksums match across all three before reporting a number. Best-of-7 on a Zen5
-desktop, Windows x86-64:
+checksums match across all three before reporting a number. Best of at least 7 runs on a
+Ryzen 7 9800X3D, Windows x86-64, gcc 16.1, rustc 1.98.1:
 
 | Area | Zephyr | C `-O2` | Rust `-O` | |
 |------|-------:|--------:|----------:|---|
-| integer SIMD (matmul) | **42 ms** | 72 | 70 | wins both |
-| rasterization (cube) | **8 ms** | 10 | 11 | wins both |
-| bignum (pi) | **66 ms** | 84 | 91 | wins both |
-| allocation churn (strings) | **132 ms** | 172 | 148 | wins both |
-| sorting | **139 ms** | 276 | 43 | 2× faster than C |
-| recursion (fib) | 21 ms | 12 | 21 | ties Rust |
-| hash map | 83 ms | 32 | 69 | ties Rust |
-| float compute (mandel) | 109 ms | 88 | 90 | 1.2× |
+| integer SIMD (matmul) | **43 ms** | 73 | 70 | wins both |
+| rasterization (cube) | **7 ms** | 9 | 11 | wins both |
+| bignum (pi) | **56 ms** | 85 | 94 | wins both |
+| allocation churn (strings) | **154 ms** | 175 | 166 | wins both |
+| sorting | **89 ms** | 299 | 45 | 3.4× faster than C |
+| hash map | **47 ms** | 29 | 71 | 1.5× faster than Rust |
+| recursion (fib) | 21 ms | 10 | 20 | ties Rust |
+| float compute (mandel) | 98 ms | 91 | 92 | 1.07× |
+| fluid / neighbours (liquid) | 2,906 ms | 2,249 | 2,557 | 1.3× |
 
 The sorting win is a branchless-partition introsort (the pdqsort technique)
 against C's `qsort`. The allocation win is a single-allocation string builder
-against per-format heap strings. Peak memory is the lowest of the three on most
-rows, and every row compiles about 10× faster than gcc or rustc.
-
-That Zephyr column predates reference counting. The C and Rust columns are
-unaffected. Re-running each benchmark against both compilers, same machine,
-same checksums:
-
-| | fib | matmul | mandel | sort | strings | hashmap | cube | pi | liquid |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| counting vs collector | 0.85× | 1.10× | 0.95× | 1.04× | 1.15× | 1.20× | 1.23× | 1.10× | 1.05× |
-
-Median about 1.1×. The allocation row pays the most, so its win over Rust is now
-inside the noise; the rest of the table stands. Peak memory on that row drops
-from 14 MB to 3 MB. The compiler itself, the heaviest Zephyr program there is,
-runs at 1.36× its collector-era self.
+against per-format heap strings. Peak memory is the lowest of the three on every
+row but the hash map, and every row compiles faster than with gcc or rustc:
+124–153 ms, against 157–212 ms for gcc and 212–706 ms for rustc. Measured
+2026-09-29.
 
 **The optimizer.** Function inliner, register promotion of loop-hot locals into
 callee-saved registers (integers into GPRs, floats into `xmm6`–`xmm11`), an
@@ -84,8 +74,8 @@ each div/mod site runs `mulhi` plus a conditional fixup, about 2× faster than
 identical. This is what `libdivide` does by hand. It alone flipped the pi
 benchmark from losing to C (93 ms) to winning (68 ms).
 
-**Fast compiler.** Lex, parse and typecheck run 10,000 lines in ~18 ms; build
-time is dominated by the ~0.2 s assemble/link step.
+**Fast compiler.** `zc` compiles itself — `compiler/zc.zeph`, 18,000 lines with
+the embedded runtime and standard library — to a 5 MB executable in about 1.1 s.
 
 **Readable.** `and`/`or`/`not` rather than symbol soup, string interpolation
 (`"hello {name}"`), no semicolons, `let` versus `var`.
@@ -231,8 +221,10 @@ owns a count, and a function releases its locals on the way out — so retain an
 release never appear in source. Nothing is deferred, so freeing spreads through
 the program instead of pooling into a pause.
 
-- 29 µs worst-case frame over 3,000 frames, 50 MB live, 585 MB churned
-  (`spikes/gc_pause.zeph`), no frame over 1 ms. The tracing collector spiked to
+- 26–63 µs worst frame over 3,000 frames (three runs; p99 18 µs), 50 MB live,
+  585 MB churned (`bench/gc_pause.zeph`), no frame over 1 ms. The allocation-free
+  control loop in the same program peaks as high as 167 µs, so the worst frame is
+  at the machine's own jitter. The tracing collector spiked to
   ~4 ms on the same workload, which drops frames.
 - A 300k-iteration churn loop with a four-object live set peaks at 4 MB, and at
   4 MB again with the collector stubbed out. Counting does all the reclaiming.
