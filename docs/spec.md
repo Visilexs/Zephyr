@@ -75,16 +75,17 @@ EBNF; `NL` is one or more newline terminators.
 ```ebnf
 program    = { toplevel } ;
 toplevel   = fndecl | structdecl | enumdecl | impldecl | ifacedecl
-           | externdecl | import | stmt ;
+           | externdecl | import | typealias | stmt ;
+typealias  = "type" ID "=" type ;
 externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
              [ "->" type ] "from" STRING ;                    (* §3.6, native DLL import *)
 
 fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
              "(" [ param { "," param } ] ")" [ "->" type ] block ;
-param      = ID ":" type | "self" ;                           (* self only in impl/interface *)
-structdecl = "struct" ID "{" { ID ":" type [ "," ] } "}" ;
+param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
+structdecl = "struct" ID "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
 enumdecl   = "enum" ID "{" ID { "," ID } "}" ;
-impldecl   = "impl" ID "{" { fndecl } "}" ;                   (* methods on a struct *)
+impldecl   = "impl" ID "{" { fndecl } "}" ;                   (* methods on a struct or enum *)
 ifacedecl  = "interface" ID "{" { fnsig } "}" ;               (* method signatures *)
 fnsig      = "fn" ID "(" [ param { "," param } ] ")" [ "->" type ] ;
 import     = "import" STRING ;
@@ -96,7 +97,7 @@ basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
            | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ; (* function value *)
 
 block      = "{" { stmt } "}" ;
-stmt       = decl | assign | ifstmt | while | for | match | defer | return
+stmt       = decl | assign | ifstmt | while | for | match | defer | return | fndecl
            | "break" [ ID ] | "continue" [ ID ] | expr ;
 decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr ;
 assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" | "%="
@@ -173,6 +174,25 @@ to their ordinal at compile time, so an enum value is just an `int` at
 runtime and costs nothing. Enums support `==`/`!=` (only against the *same*
 enum — comparing two different enum types is a type error), `as int` (the
 ordinal) and `as str` (the member name). `print` shows the member name.
+
+`n as Color` converts an int back to a member and panics if `n` is not a
+member's ordinal. `Color.all()` is the list of members in order and
+`Color.count` their number. An `impl Color { ... }` block adds methods and
+associated functions to an enum exactly as to a struct (§3.0.6).
+
+### 3.0.0 Type aliases and struct defaults
+
+`type Name = T` at the top level gives an existing type a second name; the
+two are the same type and mix freely. Aliases may refer to other aliases,
+but not in a cycle.
+
+    type Grid = [[int]]
+
+A struct field may declare a default, `width: int = 800`, used when a
+literal leaves the field out. An optional field with no default defaults to
+`none`. Any other field a literal leaves out is an error. Defaults are
+evaluated each time a literal uses them, under the same naming rule as
+default parameters (§3.4).
 
 ### 3.0.1 Maps
 
@@ -410,6 +430,17 @@ are shared: a call resolves builtins first, then declared functions.
 
 Method syntax is universal function call syntax: `a.f(b)` is exactly
 `f(a, b)` for any declared function `f` whose first parameter accepts `a`.
+
+A parameter may declare a default, `greeting: str = "Hello"`; a call may then
+leave it out. Once one parameter has a default, every later one must too. The
+default is evaluated at each call that uses it. It may use globals, consts and
+functions but not the other parameters, and a call site where one of the names
+it uses is a local variable is an error (rename the local).
+
+A `fn` declared inside a function body is a local function: it is a closure
+(§3.0.3) bound to a `let` of that name, so it captures by value and is visible
+from its declaration to the end of the block. Local functions cannot be
+generic or take default parameters.
 
 ### 3.4.1 Control flow
 

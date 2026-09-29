@@ -332,6 +332,11 @@ $errors = @{
     "step-zero"            = "for i in 0..3 step 0 { print(i) }"
     "if-let-not-optional"  = "let v = 5`nif let w = v { print(w) }"
     "labeled-break-exits"  = "fn g() -> int {`n inner: while true {`n  for i in 0..2 { break inner }`n }`n}"
+    "struct-missing-field" = "struct P { x: int`n y: int }`nlet p = P{x: 1}"
+    "default-param-order"  = "fn f(a: int = 1, b: int) -> int { return a + b }"
+    "alias-cycle"          = "type A = B`ntype B = A`nlet v: A = 1"
+    "enum-cast-from-str"   = "enum C { A }`nlet c = `"A`" as C"
+    "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
     $r = RunSrc "err_$name" $errors[$name]
@@ -345,6 +350,7 @@ $panics = @{
     "bad-parse"   = 'let n = "abc" as int'
     "empty-pop"   = "var xs: [int] = []`nprint(xs.pop())"
     "user-panic"  = 'panic("boom")'
+    "enum-range"  = "enum C { A, B }`nlet n = 5`nprint(n as C)"
 }
 foreach ($name in $panics.Keys) {
     $r = RunSrc "panic_$name" $panics[$name]
@@ -1124,6 +1130,60 @@ print("")
 '@
 $exp = @("warm cool green", "ABC", "big 2 3.5", "found at 2", "missing", "7", "294 ann=30", "10 7 4 1 0 4 8 ", "00 01 10 11 20 21 ", "first cleanup [18]", "first cleanup []", "b0 d0 d1 b2 d2") -join [Environment]::NewLine
 Check "lang-control-flow" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: types ----
+$r = RunSrc "lang_types" @'
+type Grid = [[int]]
+type Name = str
+struct Config {
+    width: int = 800
+    height: int = 600
+    title: str = "untitled"
+    tags: [str] = []
+    parent: Config?
+}
+let base = Config{title: "main"}
+print("{base.width}x{base.height} {base.title} {base.tags.len()} {base.parent == none}")
+let child = Config{width: 3, parent: base}
+print("{child.width} {child.title} {child.parent != none}")
+let g: Grid = [[1, 2], [3]]
+let who: Name = "zeph"
+print("{g} {who}")
+enum Color { Red, Green, Blue }
+impl Color {
+    fn label(self) -> str {
+        return match self {
+            Red { "warm red" }
+            Green { "leafy green" }
+            Blue { "deep blue" }
+        }
+    }
+    fn from_name(name: str) -> Color {
+        if name == "green" { return Color.Green }
+        return Color.Red
+    }
+}
+print(Color.Blue.label())
+print(Color.from_name("green").label())
+print(Color.count)
+for c in Color.all() { emit("{c} ") }
+print("")
+print(2 as Color)
+fn greet(name: str, greeting: str = "Hello", times: int = 1) -> str {
+    return "{greeting}, {name}".repeat(times)
+}
+print(greet("Ann"))
+print(greet("Bo", "Hi"))
+print(greet("Cy", "Yo! ", 2))
+print("x".greet())
+fn outer(base: int) -> int {
+    fn double(n: int) -> int { return n * 2 + base }
+    return double(10)
+}
+print(outer(1))
+'@
+$exp = @("800x600 main 0 true", "3 untitled true", "[[1, 2], [3]] zeph", "deep blue", "leafy green", "3", "Red Green Blue ", "Blue", "Hello, Ann", "Hi, Bo", "Yo! , CyYo! , Cy", "Hello, x", "21") -join [Environment]::NewLine
+Check "lang-types" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

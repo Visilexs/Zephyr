@@ -143,7 +143,8 @@ let N_MATCHEXPR = 53 // match as a value (parse only)
 let N_ARM = 54       // one match arm: kids = [body, patterns...]; mut = the else arm
 let N_FOR2 = 55      // for a, b in xs (parse only): name = a; kids = [xs, body, N_TYNAME b]
 let N_IFLET = 56     // if let name = optional (parse only): kids = [optional, then, else or N_NONE]
-let N_DEFER = 57     // defer block (parse only; lowered before checking): kids = [block]    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
+let N_DEFER = 57     // defer block (parse only; lowered before checking): kids = [block]
+let N_TYALIAS = 58   // type Name = T (top level): kids = [type]    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
 
 // ---------------- type kinds & table ----------------
 let K_INT = 0
@@ -265,7 +266,7 @@ struct Node {
     file: str    // source file this node was parsed from (for -g debug info)
 }
 struct VarInfo { name: str, ty: int, mut: bool, kind: int, idx: int, isConst: bool }
-struct SDef { name: str, fnames: [str], ftypes: [int], line: int }
+struct SDef { name: str, fnames: [str], ftypes: [int], line: int, defaults: [Node] }
 struct EDef { name: str, members: [str], line: int }
 // an interface: method names + their signatures (K_FN types, self excluded)
 struct IDef { name: str, mnames: [str], msigs: [int], line: int }
@@ -297,6 +298,8 @@ var g_pending_label = 0         // set by `name:` for the loop that follows
 var g_loop_labels: [str] = []   // checker: labels of the enclosing loops, innermost last
 var g_lower_count = 0           // numbers the hidden names of each desugaring apart
 var g_holes_checked = false     // lower_snippet: holes are already type-checked
+var g_alias_names: [str: Node] = [:]   // type Name = T
+var g_alias_depth = 0
 // checker
 var g_structs: [SDef] = []
 var g_enums: [EDef] = []
@@ -1064,6 +1067,12 @@ fn p_fn() -> Node {
             } else {
                 let b = expect(T_COLON, "':'")
                 p.kids.push(p_type())
+                if at(T_ASSIGN) {                // greeting: str = "hello"
+                    let equals = pnext()
+                    p.kids.push(p_expr(1))
+                } else if params.kids.len() > 0 and params.kids[params.kids.len() - 1].kids.len() > 1 {
+                    die(pn.line, "parameter '{pn.s}' needs a default value, since an earlier parameter has one")
+                }
             }
             params.kids.push(p)
             if at(T_COMMA) { let c = pnext() }
@@ -1245,6 +1254,10 @@ fn p_structdef() -> Node {
         var f = nnode(N_FIELDDEF, fnm.line)
         f.name = fnm.s
         f.kids.push(p_type())
+        if at(T_ASSIGN) {                        // width: int = 800
+            let equals = pnext()
+            f.kids.push(p_expr(1))
+        }
         n.kids.push(f)
         if at(T_COMMA) { let c = pnext() }
         skip_nl()
@@ -1585,8 +1598,26 @@ fn p_stmt() -> Node {
         if at(T_IDENT) { n.name = pnext().s }       // break outer
         return n
     }
-    if t.t == T_FN or t.t == T_STRUCT {
-        die(t.line, "'{TOKNAMES[t.t]}' declarations are only allowed at the top level")
+    if t.t == T_FN and P_toks[P_pos + 1].t == T_IDENT {
+        // a nested function is a closure bound to its name: it sees the
+        // enclosing variables (by value, like any closure)
+        let inner = p_fn()
+        if inner.kids[3].kids.len() > 0 { die(t.line, "a nested function cannot be generic; declare it at the top level") }
+        var literal = nnode(N_FNLIT, t.line)
+        for p in inner.kids[0].kids {
+            if p.kids.len() > 1 { die(p.line, "a nested function's parameters cannot have default values") }
+        }
+        literal.kids.push(inner.kids[0])
+        literal.kids.push(inner.kids[1])
+        literal.kids.push(inner.kids[2])
+        var binding = nnode(N_DECL, t.line)
+        binding.name = inner.name
+        binding.kids.push(literal)
+        binding.kids.push(nnode(N_NONE, t.line))
+        return binding
+    }
+    if t.t == T_STRUCT {
+        die(t.line, "'struct' declarations are only allowed at the top level")
     }
     let e = p_expr(1)
     let nx = peek()
@@ -1934,6 +1965,14 @@ fn parse(toks: [Tok]) -> Node {
         else if at(T_INTERFACE) { prog.kids.push(p_interface()) }
         else if at(T_EXTERN) { prog.kids.push(p_extern()) }
         else if at(T_IMPORT) { prog.kids.push(p_import()) }
+        else if at(T_IDENT) and peek().s == "type" and P_toks[P_pos + 1].t == T_IDENT and P_toks[P_pos + 2].t == T_ASSIGN {
+            let typeWord = pnext()               // type Grid = [[int]]
+            var alias = nnode(N_TYALIAS, typeWord.line)
+            alias.name = pnext().s
+            let equals = pnext()
+            alias.kids.push(p_type())
+            prog.kids.push(alias)
+        }
         else { prog.kids.push(p_stmt()) }
         terminator()
     }
@@ -2096,6 +2135,13 @@ fn resolve_type(te: Node) -> int {
     while b >= 0 {
         if g_tbind_names[b] == n { return g_tbind_types[b] }
         b -= 1
+    }
+    if g_alias_names.has(n) {
+        g_alias_depth += 1
+        if g_alias_depth > 50 { die(te.line, "type alias '{n}' refers to itself") }
+        let aliased = resolve_type(g_alias_names[n])
+        g_alias_depth -= 1
+        return aliased
     }
     let ed = find_enum(n)
     if ed >= 0 { return enum_of(ed) }
@@ -2271,11 +2317,24 @@ fn check_method(e: Node) -> int {
     // associated function: `Type.func(args)` -- the receiver is a struct type
     // name, not a value, so no `self` is passed.
     let recv = c.kids[0]
-    if recv.k == N_ID and env_find(recv.name) < 0 and find_struct(recv.name) >= 0 {
+    if recv.k == N_ID and env_find(recv.name) < 0 and find_enum(recv.name) >= 0 and c.name == "all" and find_fn(recv.name + ".all") < 0 {
+        if e.kids.len() != 1 { die(e.line, "{recv.name}.all() takes no arguments") }
+        var members = nnode(N_LIST, e.line)     // every member, in declaration order
+        for name in g_enums[find_enum(recv.name)].members {
+            var member = nnode(N_MEMBER, e.line)
+            member.name = name
+            member.kids.push(name_node(recv.name, e.line))
+            members.kids.push(member)
+        }
+        node_become(e, members)
+        return ce_inner(e)
+    }
+    if recv.k == N_ID and env_find(recv.name) < 0 and (find_struct(recv.name) >= 0 or find_enum(recv.name) >= 0) {
         let mname = recv.name + "." + c.name
         let fi = find_fn(mname)
         if fi < 0 { die(e.line, "'{recv.name}' has no associated function '{c.name}'") }
         let f = g_fns[fi]
+        fill_defaults(e, f.node, e.kids.len() - 1)
         let nargs = e.kids.len() - 1
         if nargs != f.ptypes.len() { die(e.line, "'{mname}' expects {f.ptypes.len()} argument(s), got {nargs}") }
         for i in 0..nargs {
@@ -2288,7 +2347,7 @@ fn check_method(e: Node) -> int {
         return f.ret
     }
     let ot = ce(c.kids[0])
-    let nargs = e.kids.len() - 1
+    var nargs = e.kids.len() - 1
     if ty_kind[ot] == K_STRUCT {
         let sd = g_structs[ty_sd[ot]]
         for i in 0..sd.fnames.len() {
@@ -2316,11 +2375,13 @@ fn check_method(e: Node) -> int {
         die(e.line, "interface '{idf.name}' has no method '{c.name}'")
     }
     // A method defined in an `impl` block shadows any builtin method name (len,
-    // push, contains, ...) for that struct type.
-    if ty_kind[ot] == K_STRUCT {
-        let mi = find_fn(g_structs[ty_sd[ot]].name + "." + c.name)
+    // push, contains, ...) for that struct or enum type.
+    if ty_kind[ot] == K_STRUCT or ty_kind[ot] == K_ENUM {
+        let mi = find_fn(type_str(ot) + "." + c.name)
         if mi >= 0 {
             let f = g_fns[mi]
+            fill_defaults(e, f.node, nargs + 1)
+            nargs = e.kids.len() - 1
             if nargs + 1 != f.ptypes.len() {
                 die(e.line, "'{f.name}' expects {f.ptypes.len()} argument(s), got {nargs + 1}")
             }
@@ -2524,10 +2585,12 @@ fn check_method(e: Node) -> int {
     // Method lookup: a type-scoped method (`Struct.f` from an impl block) wins;
     // otherwise fall back to plain UFCS -- obj.f(a) == f(obj, a).
     var fi = 0 - 1
-    if ty_kind[ot] == K_STRUCT { fi = find_fn(g_structs[ty_sd[ot]].name + "." + c.name) }
+    if ty_kind[ot] == K_STRUCT or ty_kind[ot] == K_ENUM { fi = find_fn(type_str(ot) + "." + c.name) }
     if fi < 0 { fi = find_fn(c.name) }
     if fi < 0 { die(e.line, "unknown method or function '{c.name}'") }
     let f = g_fns[fi]
+    fill_defaults(e, f.node, nargs + 1)
+    nargs = e.kids.len() - 1
     if f.tparams.len() > 0 {
         let r = check_generic_call(e, fi, c.kids[0])
         e.op = 1
@@ -3023,17 +3086,49 @@ fn check_call(e: Node) -> int {
     let fi = find_fn(c.name)
     if fi < 0 { die(e.line, "unknown function '{c.name}'") }
     let f = g_fns[fi]
+    fill_defaults(e, f.node, nargs)
+    let givenArgs = e.kids.len() - 1
     if f.tparams.len() > 0 { return check_generic_call(e, fi, nnode(N_NONE, e.line)) }
-    if nargs != f.ptypes.len() {
+    if givenArgs != f.ptypes.len() {
         die(e.line, "'{f.name}' expects {f.ptypes.len()} argument(s), got {nargs}")
     }
-    for i in 0..nargs {
+    for i in 0..givenArgs {
         let x = ce_expect(e.kids[i + 1], f.ptypes[i])
         e.kids[i + 1] = coerce(e.kids[i + 1], f.ptypes[i], "argument {i + 1}")
     }
     e.aux = CK_USER
     e.refi = fi
     return f.ret
+}
+
+// Append copies of the default values of the trailing parameters a call left
+// out. `given` counts the arguments supplied, including any method receiver.
+fn fill_defaults(e: Node, fnNode: Node, given: int) {
+    if fnNode.k != N_FN { return }
+    let params = fnNode.kids[0].kids
+    var i = given
+    while i < params.len() and params[i].kids.len() > 1 {
+        e.kids.push(default_copy(params[i].kids[1], e.line))
+        i += 1
+    }
+}
+
+// A default is checked where it is used, so a name in it must not be a local there:
+// it would silently mean the caller's variable instead of the global it names.
+fn default_copy(value: Node, useLine: int) -> Node {
+    default_names_global(value, useLine)
+    return clone_node(value)
+}
+
+fn default_names_global(value: Node, useLine: int) {
+    if value.k == N_ID {
+        let h = env_find(value.name)
+        if h >= 0 and env_get(h).kind != ID_GLOBAL {
+            die(useLine, "a default value here uses '{value.name}', which is a local variable at this call; rename the local")
+        }
+    }
+    if value.k == N_FNLIT { return }
+    for kid in value.kids { default_names_global(kid, useLine) }
 }
 
 fn ce_inner(e: Node) -> int {
@@ -3169,9 +3264,6 @@ fn ce_inner(e: Node) -> int {
         let si = find_struct(e.name)
         if si < 0 { die(e.line, "unknown struct '{e.name}'") }
         let sd = g_structs[si]
-        if e.kids.len() != sd.fnames.len() {
-            die(e.line, "struct '{sd.name}' has {sd.fnames.len()} field(s), literal provides {e.kids.len()}")
-        }
         var seen: [bool] = []
         for i in 0..sd.fnames.len() { seen.push(false) }
         for f in e.kids {
@@ -3183,8 +3275,24 @@ fn ce_inner(e: Node) -> int {
             if seen[idx] { die(f.line, "duplicate field '{f.name}'") }
             seen[idx] = true
             f.slot = idx
-            let x = ce(f.kids[0])
+            let x = ce_expect(f.kids[0], sd.ftypes[idx])
             f.kids[0] = coerce(f.kids[0], sd.ftypes[idx], "struct field")
+        }
+        // a field left out takes its declared default, or none if optional
+        for j in 0..sd.fnames.len() {
+            if not seen[j] {
+                var fill = nnode(N_NONELIT, e.line)
+                if sd.defaults[j].k != N_NONE { fill = default_copy(sd.defaults[j], e.line) }
+                else if ty_kind[sd.ftypes[j]] != K_OPT {
+                    die(e.line, "struct '{sd.name}' literal is missing field '{sd.fnames[j]}' (it has no default)")
+                }
+                var init = nnode(N_FIELDINIT, e.line)
+                init.name = sd.fnames[j]
+                init.slot = j
+                let y = ce_expect(fill, sd.ftypes[j])
+                init.kids.push(coerce(fill, sd.ftypes[j], "default of field '{sd.fnames[j]}'"))
+                e.kids.push(init)
+            }
         }
         e.refi = si
         return struct_of(si)
@@ -3201,8 +3309,16 @@ fn ce_inner(e: Node) -> int {
     }
     if e.k == N_BIN { return check_bin(e) }
     if e.k == N_CAST {
+        if e.mut {                            // compiler-made retyping: already decided
+            let inner = ce(e.kids[0])
+            return e.ty
+        }
         let from = ce(e.kids[0])
         let to = resolve_type(e.kids[1])
+        if ty_kind[from] == K_INT and ty_kind[to] == K_ENUM {
+            lower_enum_from_int(e, to)
+            return ce_inner(e)
+        }
         let f = ty_kind[from]
         let t = ty_kind[to]
         var cast = -1
@@ -3245,6 +3361,12 @@ fn ce_inner(e: Node) -> int {
                         while e.kids.len() > 0 { let drop = e.kids.pop() }
                         return enum_of(ei)
                     }
+                }
+                if e.name == "count" {             // Color.count: how many members
+                    e.k = N_INT
+                    e.ival = ed.members.len()
+                    while e.kids.len() > 0 { let dropped = e.kids.pop() }
+                    return TI_INT
                 }
                 die(e.line, "enum '{ed.name}' has no member '{e.name}'")
             }
@@ -3791,6 +3913,51 @@ fn lower_for(s: Node, iterableType: int) {
     node_become(s, lowered)
 }
 
+// n as Color: the int, checked to be a member's ordinal
+//   let hidden = n; assert(0 <= hidden and hidden < count, "..."); hidden
+fn lower_enum_from_int(e: Node, enumType: int) {
+    let ed = g_enums[ty_sd[enumType]]
+    let line = e.line
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_ordinal"
+    var decl = nnode(N_DECL, line)
+    decl.name = hidden
+    decl.op = DECL_PRECHECKED
+    decl.kids.push(e.kids[0])
+    decl.kids.push(nnode(N_NONE, line))
+    var zero = nnode(N_INT, line)
+    var count = nnode(N_INT, line)
+    count.ival = ed.members.len()
+    let inRange = binary_node(T_AND, binary_node(T_GE, name_node(hidden, line), zero, line),
+                              binary_node(T_LT, name_node(hidden, line), count, line), line)
+    var message = nnode(N_STRLIT, line)
+    var valuePart = nnode(N_INTERP, line)
+    valuePart.kids.push(name_node(hidden, line))
+    message.kids.push(valuePart)
+    var textPart = nnode(N_STRTXT, line)
+    textPart.name = " is not a {ed.name} (its members are 0 to {ed.members.len() - 1})"
+    message.kids.push(textPart)
+    var check = nnode(N_CALL, line)
+    check.kids.push(name_node("assert", line))
+    check.kids.push(inRange)
+    check.kids.push(message)
+    var checkStatement = nnode(N_EXPRST, line)
+    checkStatement.kids.push(check)
+    var retyped = nnode(N_CAST, line)         // same bits, now typed as the enum
+    retyped.mut = true
+    retyped.aux = C_NOP
+    retyped.ty = enumType
+    retyped.kids.push(name_node(hidden, line))
+    retyped.kids.push(nnode(N_NONE, line))
+    var checked = nnode(N_LETEXPR, line)
+    checked.kids.push(checkStatement)
+    checked.kids.push(retyped)
+    var result = nnode(N_LETEXPR, line)
+    result.kids.push(decl)
+    result.kids.push(checked)
+    node_become(e, result)
+}
+
 // ---- defer ----
 // `defer X` runs X whenever control leaves the enclosing block: at its end and
 // before every return, break or continue that exits it, later defers first. It
@@ -4114,15 +4281,29 @@ fn check(prog: Node) {
             n.refi = g_enums.len() - 1
         }
     }
+    // pass 0.5: type aliases (resolved lazily, so they may name later types)
+    var withoutAliases: [Node] = []
+    for n in prog.kids {
+        g_file = n.file
+        if n.k == N_TYALIAS {
+            if g_alias_names.has(n.name) { die(n.line, "duplicate type alias '{n.name}'") }
+            g_alias_names[n.name] = n.kids[0]
+        } else {
+            withoutAliases.push(n)
+        }
+    }
+    prog.kids = withoutAliases
     // pass 1a: struct names
     for n in prog.kids {
         g_file = n.file
         if n.k == N_STRUCTDEF {
             if find_struct(n.name) >= 0 { die(n.line, "duplicate struct '{n.name}'") }
+            if g_alias_names.has(n.name) { die(n.line, "'{n.name}' is already a type alias") }
             if find_enum(n.name) >= 0 { die(n.line, "'{n.name}' is already an enum") }
             var fnames: [str] = []
             var ftypes: [int] = []
-            g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line})
+            var defaults: [Node] = []
+            g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line, defaults: defaults})
             if not g_struct_names.has(n.name) { g_struct_names[n.name] = g_structs.len() - 1 }
             n.refi = g_structs.len() - 1
         }
@@ -4169,6 +4350,8 @@ fn check(prog: Node) {
                 }
                 sd.fnames.push(f.name)
                 sd.ftypes.push(resolve_type(f.kids[0]))
+                if f.kids.len() > 1 { sd.defaults.push(f.kids[1]) }       // field: T = default
+                else { sd.defaults.push(nnode(N_NONE, f.line)) }
             }
         }
     }
@@ -4207,7 +4390,7 @@ fn check(prog: Node) {
     g_at_global = true
     for n in prog.kids {
         g_file = n.file
-        if n.k == N_STRUCTDEF or n.k == N_ENUMDEF or n.k == N_INTERFACE { continue }
+        if n.k == N_STRUCTDEF or n.k == N_ENUMDEF or n.k == N_INTERFACE or n.k == N_TYALIAS { continue }
         if n.k == N_FN {
             // a generic function is a template: nothing to check until it is
             // instantiated with concrete types
