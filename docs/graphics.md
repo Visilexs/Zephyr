@@ -39,12 +39,12 @@ let x  = pt.get32(0)
 let y  = pt.get32(4)
 ```
 
-`Bytes.new(n)` allocates; `.addr()` is the address to hand to native code;
+`Bytes.new(size)` allocates; `.addr()` is the address to hand to native code;
 `.put8/16/32/64`, `.get8/16/32/64`, `.putf32/getf32` read and write fields;
-`.put_cstr/put_str/get_str` handle strings. Free helpers: `cbytes(s)`
-(a NUL-terminated C string), `u32s([…])`/`u64s([…])` (packed integer arrays),
-`pack([Bytes…])` (concatenate struct builders into an array), and `f32_bits`/
-`f32_from` (double ↔ 32-bit-float bit patterns, for the int-only FFI).
+`.putCString/putString/getString` handle strings. Free helpers: `cString(text)`
+(a NUL-terminated C string), `uint32Array([…])`/`uint64Array([…])` (packed integer arrays),
+`pack([Bytes…])` (concatenate struct builders into an array), and `float32Bits`/
+`float32FromBits` (double ↔ 32-bit-float bit patterns, for the int-only FFI).
 
 > One rule that matters: a buffer the OS or GPU **writes into** across time (a
 > swapchain image, a cursor `POINT` read every frame) must be `VirtualAlloc`'d,
@@ -75,9 +75,9 @@ Five files, imported through `vk/gfx.zeph`:
 `DescSet{layout, pool, set}`.
 
 **Lifecycle**
-- `Gfx.init(appname, layers) -> Gfx` — headless (no window).
-- `Gfx.init_windowed(appname, layers, wnd) -> Gfx` — with a surface to present into.
-- `g.gpu_name() -> str`, `g.shutdown()`.
+- `Gfx.init(applicationName, layers) -> Gfx` — headless (no window).
+- `Gfx.initWindowed(applicationName, layers, window) -> Gfx` — with a surface to present into.
+- `g.gpuName() -> str`, `g.shutdown()`.
 
 Pass `["VK_LAYER_KHRONOS_validation"]` as `layers` to turn on the validation
 layers — the demos wire this to a `--validate` flag, and it is worth running:
@@ -86,36 +86,36 @@ it caught two real bugs in the compute port (a storage buffer that needed
 mismatch).
 
 **Buffers & memory**
-- `g.buffer(size, usage, memflags) -> GpuBuffer`, `g.destroy_buffer(b)`.
-- `g.read_buffer(b, n) -> Bytes` — map and copy back to the CPU.
-- `g.alloc(size, typebits, flags)` / `g.find_mem_type(bits, flags)` — lower-level helpers.
+- `g.buffer(size, usage, memflags) -> GpuBuffer`, `g.destroyBuffer(gpuBuffer)`.
+- `g.readBuffer(gpuBuffer, byteCount) -> Bytes` — map and copy back to the CPU.
+- `g.allocate(size, memoryTypeBits, flags)` / `g.findMemoryType(allowedTypeBits, flags)` — lower-level helpers.
 
 **Shaders & pipelines**
 - `g.shader(path) -> int` — load a compiled `.spv` into a shader module.
-- `g.pipeline_layout(setlayouts, push_size, push_stages) -> int`.
-- `g.compute_pipeline(shader, layout, entry) -> int`.
-- `g.storage_set(buffers, stages) -> DescSet` — a descriptor set binding a list
+- `g.pipelineLayout(setLayouts, pushConstantSize, pushConstantStages) -> int`.
+- `g.computePipeline(shader, layout, entry) -> int`.
+- `g.storageBufferSet(buffers, stages) -> DescSet` — a descriptor set binding a list
   of storage buffers at bindings 0…n-1 (the shape almost every compute pass
-  wants); `g.destroy_desc_set(d)`.
+  wants); `g.destroyDescriptorSet(descriptorSet)`.
 
 Graphics pipelines are built with the `structs.zeph` builders directly
 (`VkGraphicsPipelineCreateInfo.new()…`) — see `examples/graphics` and the
 `triangle`/`window` samples.
 
 **Rendering**
-- `g.surface_format() -> int`.
-- `g.swapchain(format, renderpass, old) -> Swapchain`, `g.destroy_swapchain(s)`,
-  `g.rebuild(s, renderpass) -> Swapchain?` (on resize; `none` while minimised).
-- `g.frame(s, rec) -> bool` — acquire, record and present one frame; `rec` is a
+- `g.surfaceFormat() -> int`.
+- `g.swapchain(format, renderPass, oldSwapchain) -> Swapchain`, `g.destroySwapchain(swapchain)`,
+  `g.rebuild(swapchain, renderPass) -> Swapchain?` (on resize; `none` while minimised).
+- `g.frame(swapchain, recordCommands) -> bool` — acquire, record and present one frame; `recordCommands` is a
   callback `fn(cmdbuf: int, imageIndex: int)`. Returns `false` when the
   swapchain is out of date (resized) so you can `rebuild`.
-- `g.target(w, h, renderpass) -> Target` / `g.destroy_target(t)` — an offscreen
-  render target; `g.readback(t) -> Bytes` pulls the pixels back.
-- `g.immediate(rec)` — record and submit a one-shot command buffer;
+- `g.target(width, height, renderPass) -> Target` / `g.destroyTarget(target)` — an offscreen
+  render target; `g.readback(target) -> Bytes` pulls the pixels back.
+- `g.immediate(recordCommands)` — record and submit a one-shot command buffer;
   `rec` is `fn(cmdbuf: int)`.
 - `g.fence(signalled)`, `g.semaphore()`.
 
-Free helper: `write_bmp(path, px, w, h)` writes a `Bytes` pixel buffer to a BMP
+Free helper: `writeBmp(path, pixels, width, height)` writes a `Bytes` pixel buffer to a BMP
 (how the headless samples save their output).
 
 ## Shaders

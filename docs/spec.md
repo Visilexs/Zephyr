@@ -716,7 +716,7 @@ running it.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sortBy(cmp)` from `std/list.zeph`. |
+| `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sortBy(items, compare)` from `std/list.zeph`. |
 
 `contains`, `indexOf`, `reverse`, `slice` and `count` are **not** builtins —
 they are generic library functions in `std/list.zeph` (§3.0.5), called with
@@ -726,14 +726,14 @@ method syntax once imported: `xs.contains(3)`.
 Everything else lives in `std/math.zeph`, written in ordinary Zephyr for a
 runtime with no libm: `fexp`, `fln`, `fsin`, `fcos`, `ftan` and the reciprocals
 `fcsc`, `fsec`, `fcot`; the inverses `fatan`, `fasin`, `facos`, `facot`,
-`fasec`, `facsc`; `sinh`, `cosh`, `tanh`; the gudermannian `gd` and `gd_inv`;
+`fasec`, `facsc`; `sinh`, `cosh`, `tanh`; the gudermannian `gd` and `gdInverse`;
 `gamma`, `lgamma` and `digamma`; a `d_`-prefixed analytic derivative for each;
-and `integrate` / `integrate_p` for definite integrals by adaptive Simpson.
-Constants `PI`, `TWO_PI`, `HALF_PI`, `LN2`, `NAN` and `INF` come with it.
+and `integrate` / `integrateWithParameter` for definite integrals by adaptive Simpson.
+Constants `pi`, `twoPi`, `halfPi`, `ln2`, `nan` and `infinity` come with it.
 
 Two conventions worth knowing before you use them. Arguments outside a
-function's domain yield `NAN`, as `sqrt(-1.0)` already does, so test results
-with `is_nan(x)` rather than comparing against a sentinel. And `facot` is the
+function's domain yield `nan`, as `sqrt(-1.0)` already does, so test results
+with `isNan(x)` rather than comparing against a sentinel. And `facot` is the
 continuous branch with range `(0, pi)` — the calculus convention — not the
 `atan(1/x)` one that jumps at the origin.
 
@@ -897,10 +897,10 @@ Threads are available on Windows and Linux x86-64 through `lib/std/thread.zeph`
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
-| `thread_spawn(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
+| `spawnThread(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
 | `t.join()` | `Thread` → void | Block until the thread finishes. |
-| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
-| `cpu_count()` | → int | Logical processor count. |
+| `parallelFor(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
+| `cpuCount()` | → int | Logical processor count. |
 
 The worker argument is an `int` — a worker index or a raw buffer address — and
 never a heap reference. Either reason alone is sufficient: it travels through

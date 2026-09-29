@@ -96,7 +96,7 @@ output.
 pure Zephyr call the OS and the GPU. On top of it the repo ships a Vulkan
 wrapper (`lib/vk`, with a Zephyr→SPIR-V shader compiler in `tools/zspv.zeph`),
 an immediate-mode GUI toolkit (`lib/ui`), and threads (`lib/std/thread.zeph`,
-`parallel_for`). `examples/graphics` drives all of it, from a software particle
+`parallelFor`). `examples/graphics` drives all of it, from a software particle
 rasterizer to a real-time geodesic-ray-traced black hole. See
 [docs/graphics.md](docs/graphics.md).
 

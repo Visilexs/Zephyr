@@ -102,7 +102,7 @@ against `zc.exe`'s directory, so nesting an example deeper does not change them.
   syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Threads run on
   Windows and Linux. Not on wasm: files, closures, interfaces and threads.
   wasm frames live in a shadow stack in linear memory so the conservative GC can
-  scan them — see the memory-map comment above `write_wasm` in `zc.zeph`.
+  scan them — see the memory-map comment above `writeWasm` in `zc.zeph`.
 - One name, one function — **no overloading** (generics cover the real cases).
 - Editor tooling lives outside this repo: an IntelliJ plugin (`../zephyr-idea-plugin`)
   and a VS Code extension + LSP (`../zephyr-vscode`).
