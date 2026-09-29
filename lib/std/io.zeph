@@ -1,0 +1,157 @@
+// Typed kernel32 wrappers. Linux builds route these calls through os/linux.zeph.
+// env and run currently panic explicitly on Linux. Paths/names reject NUL bytes.
+import "bytes.zeph"
+
+fn io_cstring(value: str) -> Bytes {
+    for i in 0..value.len() { assert(value.byte(i) != 0, "io: embedded NUL") }
+    return cbytes(value)
+}
+
+// Reads one byte at a time so successive calls never consume the next line.
+fn read_line() -> str? {
+    let inputHandle = win("GetStdHandle", -10)
+    let buffer = Bytes.new(8)
+    let countBuffer = Bytes.new(8)
+    var pieces: [str] = []
+    while true {
+        let success = win("ReadFile", inputHandle, buffer.addr(), 1, countBuffer.addr(), 0)
+        // A closed anonymous pipe reports ERROR_BROKEN_PIPE rather than success.
+        if success == 0 {
+            assert(win("GetLastError") == 109, "read_line: ReadFile failed")
+            countBuffer.put32(0, 0)
+        }
+        if countBuffer.get32(0) == 0 {
+            if pieces.len() == 0 { return none }
+            break
+        }
+        let byteValue = buffer.get8(0)
+        if byteValue == 10 { break }
+        pieces.push(chr(byteValue))
+    }
+    if pieces.len() > 0 and pieces[pieces.len() - 1] == chr(13) { pieces.pop() }
+    return pieces.join()
+}
+
+// Write all bytes, handling short writes. The caller owns and closes the handle.
+fn io_write(handle: int, data: str) {
+    let buffer = cbytes(data)
+    let countBuffer = Bytes.new(8)
+    var written = 0
+    while written < data.len() {
+        let requested = min(data.len() - written, 2147483647)
+        let success = win("WriteFile", handle, buffer.at(written), requested, countBuffer.addr(), 0)
+        let amount = countBuffer.get32(0)
+        assert(success != 0 and amount > 0 and amount <= requested, "io: WriteFile failed")
+        written += amount
+    }
+}
+
+fn eprint(s: str) { io_write(win("GetStdHandle", -12), s + "\n") }
+fn exit(code: int) { let ignored = win("ExitProcess", code) }
+
+// FILE_APPEND_DATA + OPEN_ALWAYS makes each write append, without truncating.
+fn append_file(path: str, data: str) {
+    let filename = io_cstring(path)
+    let handle = win("CreateFileA", filename.addr(), 4, 7, 0, 4, 128, 0)
+    assert(handle != -1, "append_file: cannot open file")
+    io_write(handle, data)
+    let closed = win("CloseHandle", handle)
+    assert(closed != 0, "append_file: close failed")
+}
+
+fn file_exists(path: str) -> bool {
+    let filename = io_cstring(path)
+    let attributes = win("GetFileAttributesA", filename.addr())
+    return (attributes & 4294967295) != 4294967295
+}
+
+fn delete_file(path: str) -> bool {
+    let filename = io_cstring(path)
+    return win("DeleteFileA", filename.addr()) != 0
+}
+
+// Enumerates immediate entry names in OS order, excluding dot entries.
+fn list_dir(path: str) -> [str] {
+    let directory = io_cstring(path)
+    let attributes = win("GetFileAttributesA", directory.addr()) & 4294967295
+    assert(attributes != 4294967295 and (attributes & 16) != 0, "list_dir: not a directory")
+    let pattern = io_cstring(path + "/*")
+    let entry = Bytes.new(320)
+    var names: [str] = []
+    let handle = win("FindFirstFileA", pattern.addr(), entry.addr())
+    if handle == -1 {
+        assert(win("GetLastError") == 18 or win("GetLastError") == 2, "list_dir: enumeration failed")
+        return names
+    }
+    var more = true
+    while more {
+        var length = 0
+        while length < 260 and entry.get8(44 + length) != 0 { length += 1 }
+        let name = entry.get_str(44, length)
+        if name != "." and name != ".." { names.push(name) }
+        more = win("FindNextFileA", handle, entry.addr()) != 0
+    }
+    let lastError = win("GetLastError")
+    let closed = win("FindClose", handle)
+    assert(lastError == 18 and closed != 0, "list_dir: enumeration failed")
+    return names
+}
+
+// Preserve the distinction between an absent variable and a present empty value.
+fn env(name: str) -> str? {
+    let variable = io_cstring(name)
+    var capacity = 256
+    while true {
+        let buffer = Bytes.new(capacity)
+        let cleared = win("SetLastError", 0)
+        let length = win("GetEnvironmentVariableA", variable.addr(), buffer.addr(), capacity)
+        if length == 0 {
+            if win("GetLastError") == 203 { return none }
+            assert(win("GetLastError") == 0, "env: lookup failed")
+            return ""
+        }
+        if length < capacity { return buffer.get_str(0, length) }
+        capacity = length
+    }
+    return none
+}
+
+fn now_ms() -> int { return win("GetTickCount64") }
+
+// Divide first, retaining the fractional tick count without overflowing ticks*1e9.
+fn now_ns() -> int {
+    let counter = Bytes.new(8)
+    let frequency = Bytes.new(8)
+    assert(win("QueryPerformanceFrequency", frequency.addr()) != 0, "now_ns: no performance frequency")
+    assert(win("QueryPerformanceCounter", counter.addr()) != 0, "now_ns: no performance counter")
+    let ticks = counter.get64(0)
+    let ticksPerSecond = frequency.get64(0)
+    assert(ticksPerSecond > 0, "now_ns: invalid frequency")
+    let remainder = ticks % ticksPerSecond
+    var fraction = 0
+    if ticksPerSecond <= 9223372036 { fraction = remainder * 1000000000 / ticksPerSecond }
+    else { fraction = ((remainder as float) * 1000000000.0 / (ticksPerSecond as float)) as int }
+    return (ticks / ticksPerSecond) * 1000000000 + fraction
+}
+
+fn sleep_ms(ms: int) {
+    assert(ms >= 0 and ms < 4294967295, "sleep_ms: duration out of range")
+    let ignored = win("Sleep", ms)
+}
+
+// Windows command line, no implicit shell; pass cmd.exe /c for shell commands.
+fn run(command: str) -> int {
+    let commandBuffer = io_cstring(command)
+    let startup = Bytes.new(104)
+    startup.put32(0, 104)
+    let process = Bytes.new(24)
+    let created = win("CreateProcessA", 0, commandBuffer.addr(), 0, 0, 0, 0, 0, 0, startup.addr(), process.addr())
+    assert(created != 0, "run: CreateProcess failed")
+    let threadClosed = win("CloseHandle", process.get64(8))
+    let waitResult = win("WaitForSingleObject", process.get64(0), 4294967295)
+    let result = Bytes.new(8)
+    let success = win("GetExitCodeProcess", process.get64(0), result.addr())
+    let processClosed = win("CloseHandle", process.get64(0))
+    assert(threadClosed != 0 and waitResult == 0 and success != 0 and processClosed != 0, "run: wait failed")
+    return result.get32(0)
+}
