@@ -644,6 +644,7 @@ running it.
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
 | `print(v)` | any → void | formats like §5, appends newline |
+| `print(a, b, ...)` | any... → void | prints `"{a} {b} ..."`: each value formatted as in interpolation, separated by spaces; `print()` prints an empty line |
 | `panic(m)` | str → (no return) | §6 |
 | `sqrt(x)`  | float → float | int argument widens |
 | `l.len()`  | [T] or str → int | |
@@ -656,6 +657,7 @@ running it.
 | `s.byte(i)`| str, int → int | byte value 0..255, bounds-checked |
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
+| `l.join(sep)` | [str], str → str | concatenation with `sep` between elements |
 | `args()`   | → [str] | process arguments, `args()[0]` is the program |
 | `read_file(p)` | str → str | whole file; panics if unreadable |
 | `write_file(p, d)` | str, str → void | create/overwrite; panics on failure |
@@ -664,6 +666,7 @@ running it.
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |
 | `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 (integer division of 1 by `b^-e`) |
+| `pow(b, e)` | float or int, float or int → float | when either operand is a float: exact repeated squaring for whole exponents (below 2^31), `e^(e·ln b)` otherwise; a negative base with a fractional exponent is NaN |
 
 **String methods** (all byte-oriented, half-open ranges):
 

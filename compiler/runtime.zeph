@@ -764,6 +764,107 @@ fn rt_chr(c: int) -> int {
 }
 
 // ---- stdlib: string / list / math helpers ----
+// pow() with a float operand: exact repeated squaring for whole exponents below
+// 2^31, e^(y ln x) otherwise. Bits in and out. rx_fexp / rx_fln are the
+// algorithms of std/math_core.zeph's fexp / fln, which stay usable without --rt.
+fn rt_fpow(baseBits: int, exponentBits: int) -> int {
+    return bits(rx_fpow(frombits(baseBits), frombits(exponentBits)))
+}
+
+fn rx_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rx_fpow(base: float, exponent: float) -> float {
+    if exponent == 0.0 or base == 1.0 { return 1.0 }
+    if base != base or exponent != exponent { return base + exponent }   // nan
+    let infinity = frombits(2047 << 52)
+    if rx_fabs(exponent) == infinity {
+        let magnitude = rx_fabs(base)
+        if magnitude == 1.0 { return 1.0 }
+        if (magnitude > 1.0) == (exponent > 0.0) { return infinity }
+        return 0.0
+    }
+    var whole = rx_fabs(exponent) >= 9007199254740992.0     // every float this large is even
+    var odd = false
+    if not whole and ((exponent as int) as float) == exponent {
+        whole = true
+        odd = (exponent as int) & 1 == 1
+        if rx_fabs(exponent) < 2147483648.0 {
+            var remaining = exponent as int
+            var factor = base
+            if remaining < 0 {
+                remaining = 0 - remaining
+                factor = 1.0 / base
+            }
+            var result = 1.0
+            while remaining > 0 {
+                if remaining & 1 == 1 { result = result * factor }
+                factor = factor * factor
+                remaining = remaining >> 1
+            }
+            return result
+        }
+    }
+    var magnitudeBase = base
+    if base < 0.0 {
+        if not whole { return frombits((2047 << 52) | (1 << 51)) }
+        magnitudeBase = 0.0 - base
+    }
+    if magnitudeBase == 0.0 {
+        if exponent < 0.0 { return infinity }
+        return 0.0
+    }
+    let result = rx_fexp(exponent * rx_fln(magnitudeBase))
+    if base < 0.0 and odd { return 0.0 - result }
+    return result
+}
+
+fn rx_fexp(x: float) -> float {
+    if x != x { return x }
+    if x < 0.0 - 745.2 { return 0.0 }
+    if x > 709.782712893384 { return frombits(2047 << 52) }
+    let scaled = x / 0.6931471805599453
+    var n = 0
+    if scaled >= 0.0 { n = (scaled + 0.5) as int }
+    else { n = 0 - ((0.5 - scaled) as int) }
+    if n > 1023 { n = 1023 }
+    let nf = n as float
+    let r = (x - nf * 0.6931471803691238) - nf * 0.00000000019082149292705877
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 15 {
+        term = term * r / (i as float)
+        sum += term
+        i += 1
+    }
+    if n < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52) }
+    return sum * frombits((1023 + n) << 52)
+}
+
+fn rx_fln(x: float) -> float {
+    if x < 0.0 { return frombits((2047 << 52) | (1 << 51)) }
+    if x == 0.0 { return 0.0 - frombits(2047 << 52) }
+    if x != x or x == frombits(2047 << 52) { return x }
+    if x < frombits(1 << 52) { return rx_fln(x * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
+    let b = bits(x)
+    let e = ((b >> 52) & 2047) - 1023
+    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
+    let t = (m - 1.0) / (m + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var i = 1
+    while i < 20 {
+        term = term * t2
+        sum += term / ((2 * i + 1) as float)
+        i += 1
+    }
+    return (e as float) * 0.6931471805599453 + 2.0 * sum
+}
+
 fn rt_ipow(base: int, exp: int) -> int {
     if exp < 0 { return 0 }
     var r = 1
@@ -1694,6 +1795,35 @@ fn rt_join(l: int) -> int {
     var off = 0
     i = 0
     while i < n {
+        let part = load64(data + i * 8)
+        let pl = load64(part)
+        rx_mcopy(r + 8 + off, part + 8, pl)
+        off += pl
+        i += 1
+    }
+    return r
+}
+
+// xs.join(separator)
+fn rt_join_sep(l: int, separator: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    let separatorLength = load64(separator)
+    var total = 0
+    var i = 0
+    while i < n {
+        total += load64(load64(data + i * 8))
+        i += 1
+    }
+    if n > 1 { total += separatorLength * (n - 1) }
+    let r = rx_str_alloc(total)
+    var off = 0
+    i = 0
+    while i < n {
+        if i > 0 {
+            rx_mcopy(r + 8 + off, separator + 8, separatorLength)
+            off += separatorLength
+        }
         let part = load64(data + i * 8)
         let pl = load64(part)
         rx_mcopy(r + 8 + off, part + 8, pl)

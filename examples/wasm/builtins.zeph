@@ -1,0 +1,9 @@
+// multi-value print, join(sep), float pow
+print("x =", 5, [1, 2], "done")
+print()
+print(["a", "b", "c"].join(", "))
+print(pow(2.0, 0.5))
+print(pow(1.5, 3))
+print(pow(-2.0, 3))
+print(pow(4, 0.5))
+print(pow(3, 4))

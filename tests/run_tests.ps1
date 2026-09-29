@@ -363,6 +363,8 @@ $errors = @{
     "packed-bad-cast"      = "let b = [1.5] as [u8]"
     "f32-list-key"         = "var m: [[f32]: int] = [:]"
     "packed-no-implicit"   = "var b: [u8] = []`nlet c: [int] = b"
+    "pow-str"              = "print(pow(`"a`", 2))"
+    "join-int-separator"   = "print([`"a`"].join(1))"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -1479,6 +1481,22 @@ print(zeroed)
 '@
 $exp = @("[72, 105, 44]", "4", "Hi!!", "[90, 101, 112, 104] 407", "[eph", "[91, 101, 112, 104]", "[0.100000001490116, 2.5, -1, inf, 0]", "false", "0.100000001490116", "2.5", "[3.14159274101257]", "true", "0", "3", "0: 3.14159274101257", "19199", "[0, 0, 0]") -join [Environment]::NewLine
 Check "lang-packed-lists" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- builtins: multi-value print, join(sep), float pow ----
+$r = RunSrc "lang_builtins4" @'
+print("x =", 5, [1, 2], "done")
+print()
+print(["a", "b", "c"].join(", "))
+let empty: [str] = []
+print("[{empty.join("+")}]")
+print(pow(2.0, 0.5))
+print(pow(1.5, 3))
+print(pow(-2.0, 3))
+print(pow(-8.0, 1.0 / 3.0))
+print(pow(4, 0.5))
+'@
+$exp = @("x = 5 [1, 2] done", "", "a, b, c", "[]", "1.41421356237309", "3.375", "-8", "nan", "2") -join [Environment]::NewLine
+Check "lang-builtins4" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

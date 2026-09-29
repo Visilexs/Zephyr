@@ -2244,8 +2244,8 @@ fn packed_value_type(t: int) -> int {
 }
 fn packed_family(t: int) -> str { return type_str(ty_el[t]) }
 
-// turn e into a runtime call on an already-checked receiver and arguments
-fn packed_call(e: Node, rtName: str, receiver: Node, extra: [Node], resultType: int) -> int {
+// turn e into a call of runtime function rtName on an already-checked receiver and arguments
+fn runtime_call(e: Node, rtName: str, receiver: Node, extra: [Node], resultType: int) -> int {
     var member = nnode(N_MEMBER, e.line)
     member.name = rtName
     member.ty = receiver.ty
@@ -2999,13 +2999,13 @@ fn check_method(e: Node) -> int {
             let pushed = ce_expect(e.kids[1], packed_value_type(ot))
             var extra: [Node] = []
             extra.push(coerce(e.kids[1], packed_value_type(ot), "argument 1"))
-            return packed_call(e, "rt_{packed_family(ot)}_push", c.kids[0], extra, TI_VOID)
+            return runtime_call(e, "rt_{packed_family(ot)}_push", c.kids[0], extra, TI_VOID)
         }
         if c.name == "pop" {
             if nargs != 0 { die(e.line, ".pop() takes no arguments") }
             var extra: [Node] = []
             extra.push(site_literal(e))
-            return packed_call(e, "rt_{packed_family(ot)}_pop", c.kids[0], extra, packed_value_type(ot))
+            return runtime_call(e, "rt_{packed_family(ot)}_pop", c.kids[0], extra, packed_value_type(ot))
         }
         if find_fn(c.name) < 0 {
             die(e.line, "{type_str(ot)} has no method '{c.name}' (a packed list has len, push and pop; convert with 'as [{type_str(packed_value_type(ot))}]' for more)")
@@ -3145,7 +3145,13 @@ fn check_method(e: Node) -> int {
     if c.name == "join" {
         if ty_kind[ot] != K_LIST { die(e.line, ".join() needs a [str], got {type_str(ot)}") }
         if ty_kind[ty_el[ot]] != K_STR { die(e.line, ".join() needs a [str], got {type_str(ot)}") }
-        if nargs != 0 { die(e.line, ".join() takes no arguments") }
+        if nargs == 1 {                        // xs.join(", ")
+            if ty_kind[ce(e.kids[1])] != K_STR { die(e.line, ".join(separator) needs a str separator") }
+            e.aux = CK_RTCALL
+            e.name = "rt_join_sep"
+            return TI_STR
+        }
+        if nargs != 0 { die(e.line, ".join() takes no arguments, or a separator") }
         e.aux = CK_JOIN
         return TI_STR
     }
@@ -3562,7 +3568,27 @@ fn check_call(e: Node) -> int {
     if c.k != N_ID { return check_indirect(e, ce(c)) }   // any expression of fn type
     var nargs = e.kids.len() - 1
     if c.name == "print" {
-        if nargs != 1 { die(e.line, "print(value) takes exactly one argument") }
+        if nargs != 1 {                      // print(a, b) prints "{a} {b}"; print() an empty line
+            var line = nnode(N_STRLIT, e.line)
+            if nargs == 0 {
+                var nothing = nnode(N_STRTXT, e.line)
+                line.kids.push(nothing)
+            }
+            for i in 1..e.kids.len() {
+                if i > 1 {
+                    var space = nnode(N_STRTXT, e.line)
+                    space.name = " "
+                    line.kids.push(space)
+                }
+                var part = nnode(N_INTERP, e.line)
+                part.kids.push(e.kids[i])
+                line.kids.push(part)
+            }
+            var printArgs: [Node] = []
+            printArgs.push(c)
+            printArgs.push(line)
+            e.kids = printArgs
+        }
         let t = ce(e.kids[1])
         if ty_kind[t] == K_VOID { die(e.line, "cannot print a void expression") }
         if ty_kind[t] == K_IFACE { die(e.line, "cannot print an interface value; call one of its methods") }
@@ -3617,8 +3643,17 @@ fn check_call(e: Node) -> int {
         return TI_INT
     }
     if c.name == "pow" {
-        if nargs != 2 { die(e.line, "pow(base, exp) takes two int arguments") }
-        if ty_kind[ce(e.kids[1])] != K_INT or ty_kind[ce(e.kids[2])] != K_INT { die(e.line, "pow(base, exp) takes two int") }
+        if nargs != 2 { die(e.line, "pow(base, exponent) takes two arguments") }
+        let baseType = ce(e.kids[1])
+        let exponentType = ce(e.kids[2])
+        if not is_num(baseType) or not is_num(exponentType) {
+            die(e.line, "pow(base, exponent) takes numbers, got {type_str(baseType)} and {type_str(exponentType)}")
+        }
+        if ty_kind[baseType] == K_FLOAT or ty_kind[exponentType] == K_FLOAT {
+            var extra: [Node] = []
+            extra.push(coerce(e.kids[2], TI_FLOAT, "pow exponent"))
+            return runtime_call(e, "rt_fpow", coerce(e.kids[1], TI_FLOAT, "pow base"), extra, TI_FLOAT)
+        }
         e.aux = CK_POW
         return TI_INT
     }
@@ -4049,16 +4084,16 @@ fn ce_inner(e: Node) -> int {
                 return to
             }
             if is_packed(to) and ty_kind[from] == K_LIST and type_eq(ty_el[from], packed_value_type(to)) {
-                return packed_call(e, "rt_{packed_family(to)}_from_list", e.kids[0], noExtra, to)
+                return runtime_call(e, "rt_{packed_family(to)}_from_list", e.kids[0], noExtra, to)
             }
             if is_packed(from) and ty_kind[to] == K_LIST and type_eq(ty_el[to], packed_value_type(from)) {
-                return packed_call(e, "rt_{packed_family(from)}_to_list", e.kids[0], noExtra, to)
+                return runtime_call(e, "rt_{packed_family(from)}_to_list", e.kids[0], noExtra, to)
             }
             if ty_kind[from] == K_STR and is_packed(to) and ty_kind[ty_el[to]] == K_U8 {
-                return packed_call(e, "rt_u8_from_str", e.kids[0], noExtra, to)
+                return runtime_call(e, "rt_u8_from_str", e.kids[0], noExtra, to)
             }
             if is_packed(from) and ty_kind[ty_el[from]] == K_U8 and ty_kind[to] == K_STR {
-                return packed_call(e, "rt_u8_to_str", e.kids[0], noExtra, to)
+                return runtime_call(e, "rt_u8_to_str", e.kids[0], noExtra, to)
             }
             die(e.line, "no conversion from {type_str(from)} to {type_str(to)}")
         }
@@ -4096,7 +4131,7 @@ fn ce_inner(e: Node) -> int {
             var extra: [Node] = []
             extra.push(e.kids[1])
             extra.push(site_literal(e))
-            return packed_call(e, "rt_{packed_family(ot)}_get", e.kids[0], extra, packed_value_type(ot))
+            return runtime_call(e, "rt_{packed_family(ot)}_get", e.kids[0], extra, packed_value_type(ot))
         }
         return ty_el[ot]
     }
@@ -4183,7 +4218,7 @@ fn ce_expect(e: Node, want: int) -> int {
         literal.kids = e.kids
         let checked = ce_expect(literal, plainType)
         var noExtra: [Node] = []
-        return packed_call(e, "rt_{packed_family(want)}_from_list", coerce(literal, plainType, "list"), noExtra, want)
+        return runtime_call(e, "rt_{packed_family(want)}_from_list", coerce(literal, plainType, "list"), noExtra, want)
     }
     if e.k == N_LIST and e.kids.len() > 0 and ty_kind[want] == K_LIST {
         let el = ty_el[want]
@@ -11873,6 +11908,107 @@ fn __emb_rt() -> str {
     p.push("\}\n")
     p.push("\n")
     p.push("// ---- stdlib: string / list / math helpers ----\n")
+    p.push("// pow() with a float operand: exact repeated squaring for whole exponents below\n")
+    p.push("// 2^31, e^(y ln x) otherwise. Bits in and out. rx_fexp / rx_fln are the\n")
+    p.push("// algorithms of std/math_core.zeph's fexp / fln, which stay usable without --rt.\n")
+    p.push("fn rt_fpow(baseBits: int, exponentBits: int) -> int \{\n")
+    p.push("    return bits(rx_fpow(frombits(baseBits), frombits(exponentBits)))\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_fabs(x: float) -> float \{\n")
+    p.push("    if x < 0.0 \{ return 0.0 - x \}\n")
+    p.push("    return x\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_fpow(base: float, exponent: float) -> float \{\n")
+    p.push("    if exponent == 0.0 or base == 1.0 \{ return 1.0 \}\n")
+    p.push("    if base != base or exponent != exponent \{ return base + exponent \}   // nan\n")
+    p.push("    let infinity = frombits(2047 << 52)\n")
+    p.push("    if rx_fabs(exponent) == infinity \{\n")
+    p.push("        let magnitude = rx_fabs(base)\n")
+    p.push("        if magnitude == 1.0 \{ return 1.0 \}\n")
+    p.push("        if (magnitude > 1.0) == (exponent > 0.0) \{ return infinity \}\n")
+    p.push("        return 0.0\n")
+    p.push("    \}\n")
+    p.push("    var whole = rx_fabs(exponent) >= 9007199254740992.0     // every float this large is even\n")
+    p.push("    var odd = false\n")
+    p.push("    if not whole and ((exponent as int) as float) == exponent \{\n")
+    p.push("        whole = true\n")
+    p.push("        odd = (exponent as int) & 1 == 1\n")
+    p.push("        if rx_fabs(exponent) < 2147483648.0 \{\n")
+    p.push("            var remaining = exponent as int\n")
+    p.push("            var factor = base\n")
+    p.push("            if remaining < 0 \{\n")
+    p.push("                remaining = 0 - remaining\n")
+    p.push("                factor = 1.0 / base\n")
+    p.push("            \}\n")
+    p.push("            var result = 1.0\n")
+    p.push("            while remaining > 0 \{\n")
+    p.push("                if remaining & 1 == 1 \{ result = result * factor \}\n")
+    p.push("                factor = factor * factor\n")
+    p.push("                remaining = remaining >> 1\n")
+    p.push("            \}\n")
+    p.push("            return result\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    var magnitudeBase = base\n")
+    p.push("    if base < 0.0 \{\n")
+    p.push("        if not whole \{ return frombits((2047 << 52) | (1 << 51)) \}\n")
+    p.push("        magnitudeBase = 0.0 - base\n")
+    p.push("    \}\n")
+    p.push("    if magnitudeBase == 0.0 \{\n")
+    p.push("        if exponent < 0.0 \{ return infinity \}\n")
+    p.push("        return 0.0\n")
+    p.push("    \}\n")
+    p.push("    let result = rx_fexp(exponent * rx_fln(magnitudeBase))\n")
+    p.push("    if base < 0.0 and odd \{ return 0.0 - result \}\n")
+    p.push("    return result\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_fexp(x: float) -> float \{\n")
+    p.push("    if x != x \{ return x \}\n")
+    p.push("    if x < 0.0 - 745.2 \{ return 0.0 \}\n")
+    p.push("    if x > 709.782712893384 \{ return frombits(2047 << 52) \}\n")
+    p.push("    let scaled = x / 0.6931471805599453\n")
+    p.push("    var n = 0\n")
+    p.push("    if scaled >= 0.0 \{ n = (scaled + 0.5) as int \}\n")
+    p.push("    else \{ n = 0 - ((0.5 - scaled) as int) \}\n")
+    p.push("    if n > 1023 \{ n = 1023 \}\n")
+    p.push("    let nf = n as float\n")
+    p.push("    let r = (x - nf * 0.6931471803691238) - nf * 0.00000000019082149292705877\n")
+    p.push("    var term = 1.0\n")
+    p.push("    var sum = 1.0\n")
+    p.push("    var i = 1\n")
+    p.push("    while i < 15 \{\n")
+    p.push("        term = term * r / (i as float)\n")
+    p.push("        sum += term\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    if n < 0 - 1022 \{ return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52) \}\n")
+    p.push("    return sum * frombits((1023 + n) << 52)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_fln(x: float) -> float \{\n")
+    p.push("    if x < 0.0 \{ return frombits((2047 << 52) | (1 << 51)) \}\n")
+    p.push("    if x == 0.0 \{ return 0.0 - frombits(2047 << 52) \}\n")
+    p.push("    if x != x or x == frombits(2047 << 52) \{ return x \}\n")
+    p.push("    if x < frombits(1 << 52) \{ return rx_fln(x * 4503599627370496.0) - 52.0 * 0.6931471805599453 \}\n")
+    p.push("    let b = bits(x)\n")
+    p.push("    let e = ((b >> 52) & 2047) - 1023\n")
+    p.push("    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))\n")
+    p.push("    let t = (m - 1.0) / (m + 1.0)\n")
+    p.push("    let t2 = t * t\n")
+    p.push("    var term = t\n")
+    p.push("    var sum = t\n")
+    p.push("    var i = 1\n")
+    p.push("    while i < 20 \{\n")
+    p.push("        term = term * t2\n")
+    p.push("        sum += term / ((2 * i + 1) as float)\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    return (e as float) * 0.6931471805599453 + 2.0 * sum\n")
+    p.push("\}\n")
+    p.push("\n")
     p.push("fn rt_ipow(base: int, exp: int) -> int \{\n")
     p.push("    if exp < 0 \{ return 0 \}\n")
     p.push("    var r = 1\n")
@@ -12803,6 +12939,35 @@ fn __emb_rt() -> str {
     p.push("    var off = 0\n")
     p.push("    i = 0\n")
     p.push("    while i < n \{\n")
+    p.push("        let part = load64(data + i * 8)\n")
+    p.push("        let pl = load64(part)\n")
+    p.push("        rx_mcopy(r + 8 + off, part + 8, pl)\n")
+    p.push("        off += pl\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    return r\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// xs.join(separator)\n")
+    p.push("fn rt_join_sep(l: int, separator: int) -> int \{\n")
+    p.push("    let n = load64(l)\n")
+    p.push("    let data = load64(l + 16)\n")
+    p.push("    let separatorLength = load64(separator)\n")
+    p.push("    var total = 0\n")
+    p.push("    var i = 0\n")
+    p.push("    while i < n \{\n")
+    p.push("        total += load64(load64(data + i * 8))\n")
+    p.push("        i += 1\n")
+    p.push("    \}\n")
+    p.push("    if n > 1 \{ total += separatorLength * (n - 1) \}\n")
+    p.push("    let r = rx_str_alloc(total)\n")
+    p.push("    var off = 0\n")
+    p.push("    i = 0\n")
+    p.push("    while i < n \{\n")
+    p.push("        if i > 0 \{\n")
+    p.push("            rx_mcopy(r + 8 + off, separator + 8, separatorLength)\n")
+    p.push("            off += separatorLength\n")
+    p.push("        \}\n")
     p.push("        let part = load64(data + i * 8)\n")
     p.push("        let pl = load64(part)\n")
     p.push("        rx_mcopy(r + 8 + off, part + 8, pl)\n")
