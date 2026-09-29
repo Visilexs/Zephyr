@@ -18776,16 +18776,30 @@ fn streamAssembledLines() {
     assemblyLines = noLines
 }
 
+var assemblyListingEnabled = false    // --asm: write <output>.s, the assembly text before it is assembled
+var symbolMapEnabled = false    // --map: write <output>.map, "rva name" per code symbol (for profilers)
+
+fn writeSymbolMap(path: str) {
+    var text = ""
+    for symbol in assemblySymbols {
+        if symbol.section != sectionText or not symbol.defined or symbol.name.len() == 0 or symbol.name.byte(0) == '.' { continue }
+        text += "{4096 + symbol.offset} {symbol.name}\n"
+    }
+    writeFile(path, text)
+}
+
 fn assembleAndLink(path: str) {
     if wasmTargetEnabled {
         writeWasm(path)
         return
     }
     currentAssemblySection = sectionText
+    if assemblyListingEnabled { writeFile(path + ".s", assemblyLines.join()) }
     for i in 0..assemblyLines.len() {
         assembleLine(assemblyLines[i])
     }
     if linuxTargetEnabled { writeElf(path) } else { writePe(path) }
+    if symbolMapEnabled and not linuxTargetEnabled { writeSymbolMap(path + ".map") }
     if debugEnabled and not linuxTargetEnabled { writeDebugSymbols(path + ".zdbg") }
 }
 
@@ -18821,6 +18835,8 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
     else if argument == "-O2" { optimizerEnabled = true }
     else if argument == "--opt-report" { optimizerReport = true }
+    else if argument == "--map" { symbolMapEnabled = true }
+    else if argument == "--asm" { assemblyListingEnabled = true }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true
         includeRuntime = true
