@@ -393,6 +393,7 @@ var floatSpillDepth = 0            // float spill-stack depth: intermediates liv
 // rsi/rdi are callee-saved on Win64 and free here: the only other user is
 // tryFill's rep-stosq kernel, which saves and restores rdi itself.
 let promotionRegisters = ["rbx", "r13", "r14", "r15", "rsi", "rdi"]
+let collectorSpillRegisters = ["rbx", "r13", "r14", "r15", "rsi", "rdi", "r12"]   // every callee-saved GPR
 // callee-saved xmm regs (Win64: xmm6-15 non-volatile) for hot FLOAT locals.
 // Non-volatile => promoted floats survive calls, including FFI. xmm2-5 stay
 // free for generateFloatExpression's spill stack.
@@ -10111,7 +10112,7 @@ fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, stateme
     // entry (the setjmp trick), so any promoted caller value is inside the
     // scanned stack region for the duration of the collection.
     var spillCount = 0
-    if label == "runtimeCollectGarbage" { spillCount = 6 }
+    if label == "runtimeCollectGarbage" { spillCount = 7 }          // promotionRegisters, then r12 (the -O2 tier allocates it)
     let spillSlotBase = divisionScratchBase + divisionSlotCount
     var listBoundsSlotCount = 0
     for statement in statements {
@@ -10134,7 +10135,7 @@ fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, stateme
     // still has to be reserved -- Windows x64 has no red zone, so a slot below
     // rsp would be clobbered by any call or interrupt.
     emitInstruction("sub rsp, {8 * (frameSlotCount + 1)}")
-    for k in 0..spillCount { emitInstruction("mov [rbp - {16 + 8 * (spillSlotBase + k)}], {promotionRegisters[k]}") }
+    for k in 0..spillCount { emitInstruction("mov [rbp - {16 + 8 * (spillSlotBase + k)}], {collectorSpillRegisters[k]}") }
     for k in 0..registerPromotionCount { emitInstruction("mov [rbp - {16 + 8 * (registerSaveBase + k)}], {promotionRegisters[k]}") }
     for k in 0..floatPromotionCount { emitInstruction("movsd [rbp - {16 + 8 * (floatSaveBase + k)}], {floatPromotionRegisters[k]}") }
     if currentUsesRegisterCall {

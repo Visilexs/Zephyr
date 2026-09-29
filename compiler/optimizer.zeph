@@ -100,6 +100,7 @@ let irLoadRaw8 = 68
 let irStoreRaw64 = 69            // store64(a + immediate, b) and friends
 let irStoreRaw32 = 70
 let irStoreRaw8 = 71
+let irSymbolAddress = 72         // lea of regionSymbols[immediate]
 let irLoadByte = 64              // zero-extended byte [a + b + 8]: a string's bytes (strings never change)
 // terminators
 let irJump = 100                // successors[0]
@@ -164,7 +165,7 @@ var regionParentSlotCount = 0
 var regionParentParameterCount = 0
 var regionParentRegisterCall = false
 var regionFrameValue = 0 - 1               // the parent frame pointer (outlined loops)
-var windowsCallSymbols: [str] = []    // irCall with immediate -1 - i calls windowsCallSymbols[i] (Win64 ABI)
+var regionSymbols: [str] = []        // irSymbolAddress immediate i, or irCall immediate -1 - i (a Win64 import)
 var regionGlobalsInMemory = false          // a callee may read or write globals: keep them in memory
 var regionBreakTargets: [int] = []
 var regionContinueTargets: [int] = []
@@ -175,6 +176,14 @@ var regionReturnBlock = 0
 var regionReturnVariable = 0 - 1
 var regionReturnType = 4
 var parameterValues: [int] = []
+
+// ---- ownership: a fresh reference carries one count the region must hand on or drop ----
+var pendingTemporaries: [int] = []         // fresh values the current statement has yet to consume or release
+var ownedLocalSlots: [int: bool] = [:]     // reference locals that own their value
+var ownedScopes: [[int]] = []              // per open block: the owned variables it declared, in order
+var regionLoopScopeDepths: [int] = []      // parallel to regionBreakTargets: ownedScopes.len() at the loop
+var regionLoopTemporaryMarks: [int] = []   // parallel to regionBreakTargets: pendingTemporaries.len() at the loop
+var irFromGlobal: [bool] = []              // a global's value: runtime primitives never reassign a global
 
 fn optimizerBail(reason: str) {
     if not optimizerBailed {
@@ -191,6 +200,7 @@ fn resetIr() {
     irImmediates = [0]
     irBlockOf = [0]
     irBorrowed = [false]
+    irFromGlobal = [false]
     irReferenceArguments = [0]
     irUseCounts = [0]
     var noLists: [[int]] = []
@@ -243,6 +253,16 @@ fn resetIr() {
     regionReturnVariable = 0 - 1
     var noParameters: [int] = []
     parameterValues = noParameters
+    var noPending: [int] = []
+    pendingTemporaries = noPending
+    var noOwnedSlots: [int: bool] = [:]
+    ownedLocalSlots = noOwnedSlots
+    var noScopes: [[int]] = []
+    ownedScopes = noScopes
+    var noScopeDepths: [int] = []
+    regionLoopScopeDepths = noScopeDepths
+    var noTemporaryMarks: [int] = []
+    regionLoopTemporaryMarks = noTemporaryMarks
 }
 
 fn newBlock() -> int {
@@ -273,6 +293,7 @@ fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], imm
     irImmediates.push(immediate)
     irBlockOf.push(block)
     irBorrowed.push(false)
+    irFromGlobal.push(false)
     irReferenceArguments.push(0)
     irUseCounts.push(0)
     let value = irOpcodes.len() - 1
@@ -439,7 +460,10 @@ fn loadVariableHome(variable: int, block: int) -> int {
     if kind == identifierKindGlobal {
         if valueClass == classFloat { value = addInstruction(block, irFloatLoadGlobal, classFloat, noOperands, index) }
         else { value = addInstruction(block, irLoadGlobal, classInteger, noOperands, index) }
-        if variableIsReference[variable] { irBorrowed[value] = true }     // a callee may reassign the global
+        if variableIsReference[variable] {
+            irBorrowed[value] = true              // a callee may reassign the global
+            irFromGlobal[value] = true
+        }
     } else if kind == identifierKindTemporary or (regionIsFunction and kind == identifierKindLocal) {
         if valueClass == classFloat { value = addInstruction(block, irFloatConstant, classFloat, noOperands, 0) }
         else { value = addInstruction(block, irConstant, classInteger, noOperands, 0) }
@@ -553,14 +577,18 @@ fn assignVariable(target: Node, value: int) {
         optimizerBail("reference store to a parent slot")
         return
     }
-    writeVariableValue(variable, value)
+    storeVariable(variable, value, false)
 }
 
 fn lowerBlock(block: Node) {
+    var noVariables: [int] = []
+    ownedScopes.push(noVariables)
     for statement in block.children {
         if optimizerBailed { return }
         lowerStatement(statement)
     }
+    if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
+    let closedScope = ownedScopes.pop()
 }
 
 fn lowerExpression(expression: Node) -> int {
@@ -606,10 +634,10 @@ fn lowerExpression(expression: Node) -> int {
         sealBlock(thenBlock)
         sealBlock(elseBlock)
         currentIrBlock = thenBlock
-        writeVariableValue(result, lowerExpression(expression.children[1]))
+        lowerBranchValue(result, expression.children[1])
         jumpTo(joinBlock)
         currentIrBlock = elseBlock
-        writeVariableValue(result, lowerExpression(expression.children[2]))
+        lowerBranchValue(result, expression.children[2])
         jumpTo(joinBlock)
         sealBlock(joinBlock)
         currentIrBlock = joinBlock
@@ -632,8 +660,39 @@ fn lowerExpression(expression: Node) -> int {
         return value
     }
     if kind == nodeCall { return lowerCall(expression) }
+    if kind == nodeStructLiteral { return lowerStructLiteral(expression) }
     optimizerBail("expression kind {kind}")
     return 0
+}
+
+fn symbolAddress(symbol: str) -> int {
+    regionSymbols.push(symbol)
+    return emitIr0(irSymbolAddress, classInteger, regionSymbols.len() - 1)
+}
+
+// a fresh object: the fields' counts move into it
+fn lowerStructLiteral(expression: Node) -> int {
+    let structDefinition = structDefinitions[expression.referenceIndex]
+    let descriptor = symbolAddress("__dt{slotShapeDescriptor(structDefinition.fieldTypes)}")
+    let object = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(8 * structDefinition.fieldNames.len()), descriptor]))
+    for fieldInitializer in expression.children {
+        let value = lowerExpression(fieldInitializer.children[0])
+        if optimizerBailed { return 0 }
+        if isReferenceType(structDefinition.fieldTypes[fieldInitializer.slot]) { takeOwnership(value) }
+        if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, object, value, 8 * fieldInitializer.slot) }
+        else { let stored = emitIr2(irStore, classInteger, object, value, 8 * fieldInitializer.slot) }
+    }
+    return object
+}
+
+fn lowerBranchValue(result: int, branch: Node) {
+    let mark = pendingTemporaries.len()
+    writeVariableValue(result, lowerExpression(branch))
+    if isReferenceType(branch.typeIndex) and pendingTemporaries.len() > mark {
+        optimizerBail("fresh reference in a conditional branch")
+        return
+    }
+    releaseTemporariesFrom(mark)
 }
 
 fn lowerBinary(expression: Node) -> int {
@@ -648,7 +707,9 @@ fn lowerBinary(expression: Node) -> int {
         sealBlock(rightBlock)
         sealBlock(shortBlock)
         currentIrBlock = rightBlock
+        let rightMark = pendingTemporaries.len()
         writeVariableValue(result, lowerExpression(expression.children[1]))
+        releaseTemporariesFrom(rightMark)
         jumpTo(joinBlock)
         currentIrBlock = shortBlock
         if operator == tokenAnd { writeVariableValue(result, integerConstant(0)) }
@@ -684,18 +745,20 @@ fn lowerBinary(expression: Node) -> int {
     return emitIr2(opcode, classInteger, left, right, 0)
 }
 
-// runtime functions that only read their arguments: borrowed references may be
-// passed to them and stay live across them
-fn isReadOnlyRuntimeFunction(name: str) -> bool {
-    return name == "runtimeStringsEqual" or name == "runtimeCompareStrings"
+// runtime functions that release no count and write no existing object (at
+// most a fresh one, or a count): borrowed references stay valid across them,
+// and loads need not be redone after them
+fn keepsHeapIntact(name: str) -> bool {
+    if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
+    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject"
 }
 
-fn callOnlyReads(instruction: int) -> bool {
+fn callKeepsHeapIntact(instruction: int) -> bool {
     let functionIndex = irImmediates[instruction]
-    return functionIndex >= 0 and isReadOnlyRuntimeFunction(functionDefinitions[functionIndex].name)
+    return functionIndex >= 0 and keepsHeapIntact(functionDefinitions[functionIndex].name)
 }
 
-fn lowerReadOnlyRuntimeCall(name: str, operands: [int]) -> int {
+fn lowerRuntimeCall(name: str, operands: [int]) -> int {
     if not functionNameIndices.has(name) {
         optimizerBail("no {name}")
         return 0
@@ -705,23 +768,174 @@ fn lowerReadOnlyRuntimeCall(name: str, operands: [int]) -> int {
     return result
 }
 
-// str == != < <= > >=: the runtime compares; concatenation allocates and stays with the baseline
+fn emitRetain(value: int) -> int { return lowerRuntimeCall("runtimeRetainReference", [value]) }   // returns its argument, now owned
+
+fn emitRelease(value: int) {
+    let released = lowerRuntimeCall("runtimeReleaseReference", [value])
+}
+
+// a fresh (+1) value: the statement must consume it or release it
+fn ownedTemporary(value: int) -> int {
+    pendingTemporaries.push(value)
+    return value
+}
+
+fn isPendingTemporary(value: int) -> bool {
+    for pending in pendingTemporaries {
+        if pending == value { return true }
+    }
+    return false
+}
+
+// a count for a value about to be stored where it is owned: a pending
+// temporary hands its own over, anything else is retained
+fn takeOwnership(value: int) {
+    var remaining: [int] = []
+    var found = false
+    for pending in pendingTemporaries {
+        if pending == value and not found { found = true }
+        else { remaining.push(pending) }
+    }
+    pendingTemporaries = remaining
+    if not found { let retained = emitRetain(value) }
+}
+
+// drop the temporaries made since `mark`: the statement or branch is over
+fn releaseTemporariesFrom(mark: int) {
+    while pendingTemporaries.len() > mark {
+        let value = pendingTemporaries.pop()
+        if not blockTerminated[currentIrBlock] { emitRelease(value) }
+    }
+}
+
+// an early exit leaves them: release on this path only, the others still hold them
+fn releaseTemporariesOnExit(mark: int) {
+    var index = pendingTemporaries.len() - 1
+    while index >= mark {
+        emitRelease(pendingTemporaries[index])
+        index -= 1
+    }
+}
+
+fn releaseScopesFrom(depth: int) {
+    var scopeIndex = ownedScopes.len() - 1
+    while scopeIndex >= depth {
+        let variables = ownedScopes[scopeIndex]
+        var index = variables.len() - 1
+        while index >= 0 {
+            emitRelease(readVariableValue(variables[index]))
+            index -= 1
+        }
+        scopeIndex -= 1
+    }
+}
+
+fn isOwnedVariable(variable: int) -> bool {
+    return variableHomeKind[variable] == identifierKindLocal and ownedLocalSlots.has(variableHomeIndex[variable])
+}
+
+// a local or parameter takes a value: an owned local holds a count of its own
+// and drops the one it held before
+fn storeVariable(variable: int, value: int, isDeclaration: bool) {
+    if isOwnedVariable(variable) {
+        if ownedScopes.len() == 0 {
+            optimizerBail("owned local outside a block")
+            return
+        }
+        takeOwnership(value)
+        if isDeclaration {
+            declareVariable(variable, value)
+            ownedScopes[ownedScopes.len() - 1].push(variable)
+        } else {
+            let previous = readVariableValue(variable)
+            writeVariableValue(variable, value)
+            emitRelease(previous)
+        }
+        return
+    }
+    if isPendingTemporary(value) {
+        optimizerBail("fresh value into a borrowed variable")
+        return
+    }
+    if variableIsReference[variable] and variableHomeKind[variable] == identifierKindParameter {
+        optimizerBail("reference parameter reassigned")
+        return
+    }
+    if isDeclaration { declareVariable(variable, value) } else { writeVariableValue(variable, value) }
+}
+
+// Which reference locals own their value: those ever given a fresh one, or a
+// copy of an owned one (a borrowed alias could outlive the count it leans on).
+// Returns whether it marked any; run to a fixpoint.
+fn markOwnedLocals(node: Node) -> bool {
+    var changed = false
+    var slot = 0 - 1
+    var source = node
+    if node.nodeKind == nodeDeclaration and node.auxiliary == identifierKindLocal and isReferenceType(node.typeIndex) {
+        slot = node.slot
+        source = node.children[0]
+    }
+    if node.nodeKind == nodeAssign and node.children[0].nodeKind == nodeIdentifier and node.children[0].auxiliary == identifierKindLocal and isReferenceType(node.children[0].typeIndex) {
+        slot = node.children[0].slot
+        source = node.children[1]
+    }
+    if slot >= 0 and not ownedLocalSlots.has(slot) and needsOwnedHome(source) {
+        ownedLocalSlots[slot] = true
+        changed = true
+    }
+    for child in node.children {
+        if markOwnedLocals(child) { changed = true }
+    }
+    return changed
+}
+
+// borrowed sources: parameters, literals, globals, borrowed locals, and loads
+// (which the allocator keeps clear of any call that could free them)
+fn needsOwnedHome(value: Node) -> bool {
+    let kind = value.nodeKind
+    if kind == nodeIdentifier { return value.auxiliary == identifierKindLocal and ownedLocalSlots.has(value.slot) }
+    return not (isPlainLiteral(value) or kind == nodeNoneLiteral or kind == nodeMember or kind == nodeIndex)
+}
+
+fn findOwnedLocals(root: Node) {
+    var changed = true
+    while changed { changed = markOwnedLocals(root) }
+}
+
+// Borrowed reference arguments get a count for the call: the callee may free
+// the container they came from. Runtime primitives that call no user code
+// never reassign a global, so a global's value may go as it is.
+fn pinArguments(operands: [int], arguments: [Node], globalsStay: bool) -> [int] {
+    var pinned: [int] = []
+    for i in 0..operands.len() {
+        var value = operands[i]
+        if irBorrowed[value] and isReferenceType(arguments[i].typeIndex) and not (globalsStay and irFromGlobal[value]) {
+            value = emitRetain(value)
+            pinned.push(value)
+            operands[i] = value
+        }
+    }
+    return pinned
+}
+
+// str == != < <= > >=: the runtime compares; + concatenates into a fresh string
 fn lowerStringComparison(expression: Node) -> int {
     let operator = expression.operator
     let condition = conditionForToken(operator)
-    if condition < 0 or expression.slot > 0 {
+    if (condition < 0 and operator != tokenPlus) or expression.slot > 0 {
         optimizerBail("string operator")
         return 0
     }
     let left = lowerExpression(expression.children[0])
     let right = lowerExpression(expression.children[1])
     if optimizerBailed { return 0 }
+    if operator == tokenPlus { return ownedTemporary(lowerRuntimeCall("runtimeConcatenateStrings", [left, right])) }
     if operator == tokenEquals or operator == tokenNotEquals {
-        let equal = lowerReadOnlyRuntimeCall("runtimeStringsEqual", [left, right])
+        let equal = lowerRuntimeCall("runtimeStringsEqual", [left, right])
         if operator == tokenEquals { return equal }
         return emitIr2(irBitXor, classInteger, equal, integerConstant(1), 0)
     }
-    let order = lowerReadOnlyRuntimeCall("runtimeCompareStrings", [left, right])
+    let order = lowerRuntimeCall("runtimeCompareStrings", [left, right])
     return emitIr2(irCompare, classInteger, order, integerConstant(0), condition)
 }
 
@@ -845,9 +1059,52 @@ fn lowerCall(expression: Node) -> int {
             if irClasses[argument] == classFloat { argument = emitIr1(irBitsFromFloat, classInteger, argument, 0) }
             operands.push(argument)
         }
-        windowsCallSymbols.push(windowsImportSymbol(expression.children[1].children[0].name))
-        let result = emitIr(irCall, classInteger, operands, 0 - windowsCallSymbols.len())
+        regionSymbols.push(windowsImportSymbol(expression.children[1].children[0].name))
+        let result = emitIr(irCall, classInteger, operands, 0 - regionSymbols.len())
         irReferenceArguments[result] = 0
+        return result
+    }
+    if callKind == callKindPush {
+        let list = lowerExpression(expression.children[0].children[0])
+        var value = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        if isReferenceType(expression.children[1].typeIndex) { takeOwnership(value) }   // the list keeps the count
+        if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+        let pushed = lowerRuntimeCall("runtimeListPush", [list, value])
+        return 0
+    }
+    if callKind == callKindSubstring {
+        let text = lowerExpression(expression.children[0].children[0])
+        let lower = lowerExpression(expression.children[1])
+        let upper = lowerExpression(expression.children[2])
+        if optimizerBailed { return 0 }
+        let invalid = panicStringIndex(expression, "invalid substring")
+        let length = emitIr1(irListLength, classInteger, text, 0)
+        let upperChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, length, integerConstant(1), 0), upper, invalid)   // 0 <= upper <= length
+        let lowerChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, upper, integerConstant(1), 0), lower, invalid)   // 0 <= lower <= upper
+        return ownedTemporary(lowerRuntimeCall("runtimeSubstringValue", [text, lower, upper]))
+    }
+    if callKind == callKindRuntimeCall {         // a method the runtime implements: every argument borrowed
+        if not functionNameIndices.has(expression.name) {
+            optimizerBail("no {expression.name}")
+            return 0
+        }
+        var operands: [int] = []
+        var arguments: [Node] = []
+        for i in 0..expression.children.len() {
+            var argument = expression.children[i]
+            if i == 0 { argument = argument.children[0] }
+            var value = lowerExpression(argument)
+            if optimizerBailed { return 0 }
+            if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+            operands.push(value)
+            arguments.push(argument)
+        }
+        let pinned = pinArguments(operands, arguments, not hasFunctionArgument(expression))
+        let result = emitIr(irCall, classInteger, operands, functionNameIndices[expression.name])
+        for value in pinned { emitRelease(value) }
+        if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
+        if isReferenceType(expression.typeIndex) { return ownedTemporary(result) }
         return result
     }
     if callKind == callKindByte {
@@ -899,10 +1156,6 @@ fn lowerCall(expression: Node) -> int {
         optimizerBail("call to {functionDefinition.name}")
         return 0
     }
-    if isReferenceType(functionDefinition.returnType) {
-        optimizerBail("call returning a reference")
-        return 0
-    }
     var operands: [int] = []
     var referenceMask = 0
     for i in 0..callArguments.len() {
@@ -916,15 +1169,19 @@ fn lowerCall(expression: Node) -> int {
         optimizerBail("too many arguments")
         return 0
     }
+    let pinned = pinArguments(operands, callArguments, false)
     let result = emitIr(irCall, classInteger, operands, expression.referenceIndex)
     irReferenceArguments[result] = referenceMask
+    for value in pinned { emitRelease(value) }
     if typeKinds[functionDefinition.returnType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
+    if isReferenceType(functionDefinition.returnType) { return ownedTemporary(result) }
     return result
 }
 
 // branch to trueBlock or falseBlock; compares fuse into the branch
 fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
     if optimizerBailed { return }
+    let mark = pendingTemporaries.len()
     let kind = condition.nodeKind
     if kind == nodeBoolean {
         if condition.integerValue == 1 { jumpTo(trueBlock) } else { jumpTo(falseBlock) }
@@ -948,6 +1205,7 @@ fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
         let right = lowerExpression(condition.children[1])
         if optimizerBailed { return }
         ensureOpenBlock()
+        releaseTemporariesFrom(mark)
         var opcode = irBranchCompare
         if condition.auxiliary == binaryCategoryFloat { opcode = irBranchFloatCompare }
         terminate(opcode, [left, right], conditionForToken(condition.operator), [trueBlock, falseBlock])
@@ -956,18 +1214,40 @@ fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
     let value = lowerExpression(condition)
     if optimizerBailed { return }
     ensureOpenBlock()
+    releaseTemporariesFrom(mark)
     terminate(irBranch, [value], 0, [trueBlock, falseBlock])
 }
 
 fn lowerStatement(statement: Node) {
     if optimizerBailed { return }
+    let mark = pendingTemporaries.len()
+    lowerStatementKind(statement)
+    if optimizerBailed { return }
+    releaseTemporariesFrom(mark)
+}
+
+fn pushLoopTargets(breakTarget: int, continueTarget: int) {
+    regionBreakTargets.push(breakTarget)
+    regionContinueTargets.push(continueTarget)
+    regionLoopScopeDepths.push(ownedScopes.len())
+    regionLoopTemporaryMarks.push(pendingTemporaries.len())
+}
+
+fn popLoopTargets() {
+    let poppedBreak = regionBreakTargets.pop()
+    let poppedContinue = regionContinueTargets.pop()
+    let poppedDepth = regionLoopScopeDepths.pop()
+    let poppedMark = regionLoopTemporaryMarks.pop()
+}
+
+fn lowerStatementKind(statement: Node) {
     let kind = statement.nodeKind
     if kind == nodeDeclaration {
         let value = lowerExpression(statement.children[0])
         if optimizerBailed { return }
         let variable = variableForSlot(statement.auxiliary, statement.slot, statement.typeIndex)
         if optimizerBailed { return }
-        declareVariable(variable, value)
+        storeVariable(variable, value, true)
         return
     }
     if kind == nodeAssign {
@@ -1040,15 +1320,13 @@ fn lowerStatement(statement: Node) {
         currentIrBlock = headerBlock
         lowerCondition(statement.children[0], bodyBlock, exitBlock)
         sealBlock(bodyBlock)
-        regionBreakTargets.push(exitBlock)
-        regionContinueTargets.push(headerBlock)
+        pushLoopTargets(exitBlock, headerBlock)
         currentLoopDepth += 1
         currentIrBlock = bodyBlock
         lowerBlock(statement.children[1])
         jumpTo(headerBlock)
         currentLoopDepth -= 1
-        let poppedBreak = regionBreakTargets.pop()
-        let poppedContinue = regionContinueTargets.pop()
+        popLoopTargets()
         sealBlock(headerBlock)
         sealBlock(exitBlock)
         currentIrBlock = exitBlock
@@ -1071,8 +1349,7 @@ fn lowerStatement(statement: Node) {
         let current = readVariable(loopVariable, headerBlock)
         terminate(irBranchCompare, [current, limit], conditionLess, [bodyBlock, exitBlock])
         sealBlock(bodyBlock)
-        regionBreakTargets.push(exitBlock)
-        regionContinueTargets.push(stepBlock)
+        pushLoopTargets(exitBlock, stepBlock)
         currentLoopDepth += 1
         currentIrBlock = bodyBlock
         lowerBlock(statement.children[2])
@@ -1083,8 +1360,7 @@ fn lowerStatement(statement: Node) {
         writeVariableValue(loopVariable, incremented)
         jumpTo(headerBlock)
         currentLoopDepth -= 1
-        let poppedBreak = regionBreakTargets.pop()
-        let poppedContinue = regionContinueTargets.pop()
+        popLoopTargets()
         sealBlock(headerBlock)
         sealBlock(exitBlock)
         currentIrBlock = exitBlock
@@ -1099,6 +1375,10 @@ fn lowerStatement(statement: Node) {
         writeVariableValue(indexVariable, integerConstant(0))
         let elementVariable = variableForSlot(identifierKindLocal, statement.slot, elementType)
         if optimizerBailed { return }
+        if isOwnedVariable(elementVariable) {
+            optimizerBail("owned loop element")
+            return
+        }
         currentLoopDepth += 1
         let headerBlock = newBlock()
         let bodyBlock = newBlock()
@@ -1122,8 +1402,7 @@ fn lowerStatement(statement: Node) {
             if isReferenceType(elementType) { irBorrowed[element] = true }
         }
         declareVariable(elementVariable, element)
-        regionBreakTargets.push(exitBlock)
-        regionContinueTargets.push(stepBlock)
+        pushLoopTargets(exitBlock, stepBlock)
         lowerBlock(statement.children[1])
         jumpTo(stepBlock)
         sealBlock(stepBlock)
@@ -1132,8 +1411,7 @@ fn lowerStatement(statement: Node) {
         writeVariableValue(indexVariable, incremented)
         jumpTo(headerBlock)
         currentLoopDepth -= 1
-        let poppedBreak = regionBreakTargets.pop()
-        let poppedContinue = regionContinueTargets.pop()
+        popLoopTargets()
         sealBlock(headerBlock)
         sealBlock(exitBlock)
         currentIrBlock = exitBlock
@@ -1147,8 +1425,12 @@ fn lowerStatement(statement: Node) {
         if statement.children[0].nodeKind != nodeNone {
             let value = lowerExpression(statement.children[0])
             if optimizerBailed { return }
+            if isReferenceType(regionReturnType) { takeOwnership(value) }     // the caller gets a count
             writeVariableValue(regionReturnVariable, value)
         }
+        ensureOpenBlock()
+        releaseTemporariesOnExit(0)
+        releaseScopesFrom(0)
         jumpTo(regionReturnBlock)
         return
     }
@@ -1158,11 +1440,19 @@ fn lowerStatement(statement: Node) {
             optimizerBail("break/continue out of the region")
             return
         }
-        if kind == nodeBreak { jumpTo(regionBreakTargets[regionBreakTargets.len() - 1 - levels]) }
-        else { jumpTo(regionContinueTargets[regionContinueTargets.len() - 1 - levels]) }
+        let target = regionBreakTargets.len() - 1 - levels
+        ensureOpenBlock()
+        releaseTemporariesOnExit(regionLoopTemporaryMarks[target])
+        releaseScopesFrom(regionLoopScopeDepths[target])
+        if kind == nodeBreak { jumpTo(regionBreakTargets[target]) }
+        else { jumpTo(regionContinueTargets[target]) }
         return
     }
     if kind == nodeInline {
+        if isReferenceType(statement.typeIndex) {
+            optimizerBail("inlined reference result")
+            return
+        }
         let endBlock = newBlock()
         regionInlineEnds.push(endBlock)
         regionInlineSlots.push(statement.slot)
@@ -1246,6 +1536,7 @@ fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCou
     regionParentParameterCount = parentParameterCount
     regionParentRegisterCall = parentRegisterCall
     regionGlobalsInMemory = subtreeHasUserCall(loopStatement)
+    findOwnedLocals(loopStatement)
     let entryBlock = newBlock()
     blockSealed[entryBlock] = true
     currentIrBlock = entryBlock
@@ -1267,11 +1558,8 @@ fn lowerFunctionRegion(functionIndex: int) -> bool {
     regionIsFunction = true
     regionFunctionIndex = functionIndex
     regionReturnType = functionDefinition.returnType
-    if isReferenceType(regionReturnType) {
-        optimizerBail("returns a reference")
-        return false
-    }
     regionGlobalsInMemory = subtreeHasUserCall(functionDefinition.body)
+    findOwnedLocals(functionDefinition.body)
     let entryBlock = newBlock()
     blockSealed[entryBlock] = true
     currentIrBlock = entryBlock
@@ -1677,7 +1965,7 @@ fn numberPositions() {
             else {
                 instructionPositions[instruction] = position
                 if irOpcodes[instruction] == irCall { callPositions.push(position) }
-                if irOpcodes[instruction] == irCall and not callOnlyReads(instruction) { freeingCallPositions.push(position) }
+                if irOpcodes[instruction] == irCall and not callKeepsHeapIntact(instruction) { freeingCallPositions.push(position) }
                 position += 2
             }
         }
@@ -2392,7 +2680,7 @@ fn emitCallInstruction(value: int) {
         clearMoves()
         for i in 0..min(operands.len(), 4) { addMove(locationOf(operands[i]), argumentRegisters[i]) }
         emitParallelMoves()
-        emitOptimized("call {windowsCallSymbols[0 - 1 - functionIndex]}")
+        emitOptimized("call {regionSymbols[0 - 1 - functionIndex]}")
         finishResult(value, "rax")
         return
     }
@@ -2424,6 +2712,12 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode == irFloatConstant { return }            // read from the constant pool by its users
+    if opcode == irSymbolAddress {
+        let target = resultRegister(value, "rax")
+        emitOptimized("lea {target}, [rip + {regionSymbols[immediate]}]")
+        finishResult(value, target)
+        return
+    }
     if opcode == irDataAddress {
         let target = resultRegister(value, "rax")
         emitOptimized("lea {target}, [rip + __s{immediate}]")
@@ -3361,7 +3655,7 @@ fn scanMemoryEffects() {
     for block in blockOrder {
         for instruction in blockInstructions[block] {
             let opcode = irOpcodes[instruction]
-            if (opcode == irCall and not callOnlyReads(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { regionClobbersMemory = true }
+            if (opcode == irCall and not callKeepsHeapIntact(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { regionClobbersMemory = true }
             if opcode == irStore or opcode == irFloatStore { storedFieldOffsets.push(irImmediates[instruction]) }
         }
     }
@@ -3380,7 +3674,7 @@ fn isMovable(value: int) -> bool {
     let opcode = irOpcodes[value]
     if opcode == irListLength or opcode == irListData { return not regionClobbersMemory }
     if opcode == irLoad or opcode == irFloatLoad { return not regionClobbersMemory and not fieldOffsetStored(irImmediates[value]) }
-    if opcode == irConstant or opcode == irFloatConstant or opcode == irDataAddress or opcode == irReciprocal { return true }
+    if opcode == irConstant or opcode == irFloatConstant or opcode == irDataAddress or opcode == irSymbolAddress or opcode == irReciprocal { return true }
     if opcode >= irAdd and opcode <= irFloatAbsolute { return opcode != irDivide and opcode != irModulo }
     if opcode == irIntegerToFloat or opcode == irFloatToInteger or opcode == irFloatFromBits or opcode == irBitsFromFloat { return true }
     if opcode == irIntegerMinimum or opcode == irIntegerMaximum or opcode == irIntegerAbsolute { return true }
@@ -3597,7 +3891,7 @@ fn optimizerNote(text: str) {
 // whole function: replaces generateFunctionBody when every statement lowers
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
-    if functionDefinition.hasEnvironment { return false }
+    if functionDefinition.hasEnvironment or functionDefinition.name == "runtimeCollectGarbage" { return false }
     if containsBaselineVectorCandidate(functionDefinition.body) {
         optimizerNote("function {functionDefinition.name}: baseline (holds an AVX2 kernel loop)")
         return false
