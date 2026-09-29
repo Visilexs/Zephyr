@@ -46,7 +46,7 @@ fn io_write(handle: int, data: str) {
     }
 }
 
-fn eprint(s: str) { io_write(win("GetStdHandle", -12), s + "\n") }
+fn eprint(text: str) { io_write(win("GetStdHandle", -12), text + "\n") }
 fn exit(code: int) { let ignored = win("ExitProcess", code) }
 
 // FILE_APPEND_DATA + OPEN_ALWAYS makes each write append, without truncating.
@@ -134,9 +134,9 @@ fn now_ns() -> int {
     return (ticks / ticksPerSecond) * 1000000000 + fraction
 }
 
-fn sleep_ms(ms: int) {
-    assert(ms >= 0 and ms < 4294967295, "sleep_ms: duration out of range")
-    let ignored = win("Sleep", ms)
+fn sleep_ms(milliseconds: int) {
+    assert(milliseconds >= 0 and milliseconds < 4294967295, "sleep_ms: duration out of range")
+    let ignored = win("Sleep", milliseconds)
 }
 
 // Windows command line, no implicit shell; pass cmd.exe /c for shell commands.

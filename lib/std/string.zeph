@@ -1,38 +1,38 @@
 // Byte-oriented string utilities; ASCII classification and whitespace.
-fn is_digit(b: int) -> bool { return b >= 48 and b <= 57 }
-fn is_upper(b: int) -> bool { return b >= 65 and b <= 90 }
-fn is_lower(b: int) -> bool { return b >= 97 and b <= 122 }
-fn is_alpha(b: int) -> bool { return is_upper(b) or is_lower(b) }
-fn is_alnum(b: int) -> bool { return is_alpha(b) or is_digit(b) }
-fn is_space(b: int) -> bool { return b == 32 or b == 9 or b == 10 or b == 13 }
+fn is_digit(byteValue: int) -> bool { return byteValue >= 48 and byteValue <= 57 }
+fn is_upper(byteValue: int) -> bool { return byteValue >= 65 and byteValue <= 90 }
+fn is_lower(byteValue: int) -> bool { return byteValue >= 97 and byteValue <= 122 }
+fn is_alpha(byteValue: int) -> bool { return is_upper(byteValue) or is_lower(byteValue) }
+fn is_alnum(byteValue: int) -> bool { return is_alpha(byteValue) or is_digit(byteValue) }
+fn is_space(byteValue: int) -> bool { return byteValue == 32 or byteValue == 9 or byteValue == 10 or byteValue == 13 }
 
-fn ord(s: str) -> int {
-    assert(s.len() > 0, "ord: empty string")
-    return s.byte(0)
+fn ord(text: str) -> int {
+    assert(text.len() > 0, "ord: empty string")
+    return text.byte(0)
 }
 
-fn chars(s: str) -> [str] { return s.split("") }
+fn chars(text: str) -> [str] { return text.split("") }
 
-fn reverse_str(s: str) -> str {
+fn reverse_str(text: str) -> str {
     var parts: [str] = []
-    var remaining = s.len()
+    var remaining = text.len()
     while remaining > 0 {
         remaining -= 1
-        parts.push(chr(s.byte(remaining)))
+        parts.push(chr(text.byte(remaining)))
     }
     return parts.join()
 }
 
-fn trim_left(s: str) -> str {
+fn trim_left(text: str) -> str {
     var start = 0
-    while start < s.len() and is_space(s.byte(start)) { start += 1 }
-    return s.sub(start, s.len())
+    while start < text.len() and is_space(text.byte(start)) { start += 1 }
+    return text.sub(start, text.len())
 }
 
-fn trim_right(s: str) -> str {
-    var end = s.len()
-    while end > 0 and is_space(s.byte(end - 1)) { end -= 1 }
-    return s.sub(0, end)
+fn trim_right(text: str) -> str {
+    var end = text.len()
+    while end > 0 and is_space(text.byte(end - 1)) { end -= 1 }
+    return text.sub(0, end)
 }
 
 fn join_with(parts: [str], separator: str) -> str {
@@ -44,21 +44,21 @@ fn join_with(parts: [str], separator: str) -> str {
     return pieces.join()
 }
 
-fn pad_left(s: str, width: int, fill: str) -> str {
+fn pad_left(text: str, width: int, fill: str) -> str {
     assert(fill.len() == 1, "pad_left: fill must be one byte")
-    if width <= s.len() { return s }
-    return fill.repeat(width - s.len()) + s
+    if width <= text.len() { return text }
+    return fill.repeat(width - text.len()) + text
 }
 
-fn pad_right(s: str, width: int, fill: str) -> str {
+fn pad_right(text: str, width: int, fill: str) -> str {
     assert(fill.len() == 1, "pad_right: fill must be one byte")
-    if width <= s.len() { return s }
-    return s + fill.repeat(width - s.len())
+    if width <= text.len() { return text }
+    return text + fill.repeat(width - text.len())
 }
 
 // Empty fields, including one after a final newline, are preserved.
-fn lines(s: str) -> [str] {
-    let result = s.split("\n")
+fn lines(text: str) -> [str] {
+    let result = text.split("\n")
     for i in 0..result.len() {
         let line = result[i]
         if line.len() > 0 and line.byte(line.len() - 1) == 13 {
@@ -68,13 +68,13 @@ fn lines(s: str) -> [str] {
     return result
 }
 
-fn to_hex(n: int) -> str {
+fn to_hex(value: int) -> str {
     let alphabet = "0123456789abcdef"
     var parts: [str] = []
     var started = false
     var shift = 60
     while shift >= 0 {
-        let digitValue = (n >> shift) & 15
+        let digitValue = (value >> shift) & 15
         if digitValue != 0 or started or shift == 0 {
             parts.push(alphabet.sub(digitValue, digitValue + 1))
             started = true
@@ -85,12 +85,12 @@ fn to_hex(n: int) -> str {
 }
 
 // Negative integers use their full 64-bit two's-complement representation.
-fn to_binary(n: int) -> str {
+fn to_binary(value: int) -> str {
     var parts: [str] = []
     var started = false
     var shift = 63
     while shift >= 0 {
-        let digitValue = (n >> shift) & 1
+        let digitValue = (value >> shift) & 1
         if digitValue != 0 or started or shift == 0 {
             parts.push(chr(48 + digitValue))
             started = true
@@ -101,8 +101,8 @@ fn to_binary(n: int) -> str {
 }
 
 // Accumulate negatively so INT_MIN is representable; check before each step.
-fn parse_int(s: str) -> int? {
-    let input = trim_right(trim_left(s))
+fn parse_int(text: str) -> int? {
+    let input = trim_right(trim_left(text))
     if input.len() == 0 { return none }
     var position = 0
     var negative = false
@@ -129,8 +129,8 @@ fn parse_int(s: str) -> int? {
 }
 
 // Validate the entire decimal grammar before conversion. Range overflow is none.
-fn parse_float(s: str) -> float? {
-    let input = trim_right(trim_left(s))
+fn parse_float(text: str) -> float? {
+    let input = trim_right(trim_left(text))
     if input.len() == 0 { return none }
     var position = 0
     if input.byte(0) == 45 or input.byte(0) == 43 { position = 1 }
@@ -294,9 +294,9 @@ fn string_scale_digits(digits: [int], factor: int) {
 
 // Exact binary-to-decimal conversion, then round half away from zero.
 // Integer digit arithmetic avoids overflow, double rounding and lost carries.
-fn fmt_fixed(x: float, decimals: int) -> str {
+fn fmt_fixed(value: float, decimals: int) -> str {
     assert(decimals >= 0, "fmt_fixed: negative decimals")
-    let representation = bits(x)
+    let representation = bits(value)
     let exponentBits = (representation >> 52) & 2047
     var significand = representation & 4503599627370495
     if exponentBits == 2047 {

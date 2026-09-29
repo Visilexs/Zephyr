@@ -12,26 +12,26 @@ All character operations work on bytes, not Unicode code points. Whitespace mean
 
 | Signature | Description |
 | --- | --- |
-| `reverse_str(s: str) -> str` | Reverse the bytes. |
-| `ord(s: str) -> int` | First byte value; panic on empty input. |
-| `trim_left(s: str) -> str` | Remove leading whitespace. |
-| `trim_right(s: str) -> str` | Remove trailing whitespace. |
+| `reverse_str(text: str) -> str` | Reverse the bytes. |
+| `ord(text: str) -> int` | First byte value; panic on empty input. |
+| `trim_left(text: str) -> str` | Remove leading whitespace. |
+| `trim_right(text: str) -> str` | Remove trailing whitespace. |
 | `join_with(parts: [str], separator: str) -> str` | Join strings with a separator; empty list gives an empty string. |
-| `pad_left(s: str, width: int, fill: str) -> str` | Pad on the left to the requested byte width with a one-byte fill. |
-| `pad_right(s: str, width: int, fill: str) -> str` | Pad on the right; strings already wide enough are unchanged. |
-| `fmt_fixed(x: float, decimals: int) -> str` | Format with nonnegative decimal places, rounding the exact binary value half away from zero. |
-| `to_hex(n: int) -> str` | Lowercase hexadecimal without prefix; negatives use 16 two's-complement digits. |
-| `to_binary(n: int) -> str` | Binary without prefix; negatives use 64 two's-complement digits. |
-| `is_digit(b: int) -> bool` | Test ASCII 0 through 9. |
-| `is_alpha(b: int) -> bool` | Test ASCII letters. |
-| `is_alnum(b: int) -> bool` | Test ASCII letters or digits. |
-| `is_space(b: int) -> bool` | Test space, tab, LF, or CR. |
-| `is_upper(b: int) -> bool` | Test ASCII uppercase letters. |
-| `is_lower(b: int) -> bool` | Test ASCII lowercase letters. |
-| `chars(s: str) -> [str]` | Return one single-byte string per input byte. |
-| `lines(s: str) -> [str]` | Split on LF and strip one trailing CR per line; preserve empty fields, including a final one. |
-| `parse_int(s: str) -> int?` | Parse signed decimal with surrounding whitespace; return none for invalid syntax or overflow. |
-| `parse_float(s: str) -> float?` | Parse signed decimal with optional fraction and exponent; return none for invalid syntax or overflow. |
+| `pad_left(text: str, width: int, fill: str) -> str` | Pad on the left to the requested byte width with a one-byte fill. |
+| `pad_right(text: str, width: int, fill: str) -> str` | Pad on the right; strings already wide enough are unchanged. |
+| `fmt_fixed(value: float, decimals: int) -> str` | Format with nonnegative decimal places, rounding the exact binary value half away from zero. |
+| `to_hex(value: int) -> str` | Lowercase hexadecimal without prefix; negatives use 16 two's-complement digits. |
+| `to_binary(value: int) -> str` | Binary without prefix; negatives use 64 two's-complement digits. |
+| `is_digit(byteValue: int) -> bool` | Test ASCII 0 through 9. |
+| `is_alpha(byteValue: int) -> bool` | Test ASCII letters. |
+| `is_alnum(byteValue: int) -> bool` | Test ASCII letters or digits. |
+| `is_space(byteValue: int) -> bool` | Test space, tab, LF, or CR. |
+| `is_upper(byteValue: int) -> bool` | Test ASCII uppercase letters. |
+| `is_lower(byteValue: int) -> bool` | Test ASCII lowercase letters. |
+| `chars(text: str) -> [str]` | Return one single-byte string per input byte. |
+| `lines(text: str) -> [str]` | Split on LF and strip one trailing CR per line; preserve empty fields, including a final one. |
+| `parse_int(text: str) -> int?` | Parse signed decimal with surrounding whitespace; return none for invalid syntax or overflow. |
+| `parse_float(text: str) -> float?` | Parse signed decimal with optional fraction and exponent; return none for invalid syntax or overflow. |
 
 Float parsing accepts `.5`, `1.`, and `1e3`; underflow produces signed zero. Fixed formatting rounds the stored binary float, so `fmt_fixed(2.675, 2)` is `"2.67"`.
 
@@ -60,11 +60,11 @@ The mutable `Rng { state: int }` uses xorshift64* with shifts 12, 25, 27 and mul
 | Signature | Description |
 | --- | --- |
 | `rng_new(seed: int) -> Rng` | Create a deterministic generator. |
-| `next_int(r: Rng) -> int` | Advance state and return a full-width signed 64-bit result. |
-| `int_between(r: Rng, lo: int, hi: int) -> int` | Rejection-sample an unbiased integer in [lo, hi); panic unless lo < hi. |
-| `next_float(r: Rng) -> float` | Return a value in [0, 1) using 53 random bits. |
-| `chance(r: Rng, p: float) -> bool` | Return true with probability p; require 0 <= p <= 1. |
-| `shuffle[T](r: Rng, xs: [T])` | Shuffle in place with Fisher-Yates. |
+| `next_int(rng: Rng) -> int` | Advance state and return a full-width signed 64-bit result. |
+| `int_between(rng: Rng, low: int, high: int) -> int` | Rejection-sample an unbiased integer in [low, high); panic unless low < high. |
+| `next_float(rng: Rng) -> float` | Return a value in [0, 1) using 53 random bits. |
+| `chance(rng: Rng, probability: float) -> bool` | Return true with the given probability; require 0 <= probability <= 1. |
+| `shuffle[T](rng: Rng, items: [T])` | Shuffle in place with Fisher-Yates. |
 
 ```zeph
 let generator = rng_new(42)
@@ -84,7 +84,7 @@ Typed kernel32 wrappers use the Linux syscall shim under `--linux`. All function
 | Signature | Description |
 | --- | --- |
 | `read_line() -> str?` | Read stdin through LF, strip LF and one trailing CR; return none at EOF before any bytes. |
-| `eprint(s: str)` | Write to stderr with a newline. |
+| `eprint(text: str)` | Write to stderr with a newline. |
 | `exit(code: int)` | Terminate the process with the requested status. |
 | `append_file(path: str, data: str)` | Append bytes, creating the file if absent; panic on failure. |
 | `file_exists(path: str) -> bool` | Test whether the path exists. |
@@ -93,7 +93,7 @@ Typed kernel32 wrappers use the Linux syscall shim under `--linux`. All function
 | `env(name: str) -> str?` | Read an environment variable; missing is none, present empty is an empty string. |
 | `now_ms() -> int` | Monotonic milliseconds with an unspecified origin. |
 | `now_ns() -> int` | Monotonic nanoseconds, using QueryPerformanceCounter on Windows; precision depends on the clock. |
-| `sleep_ms(ms: int)` | Sleep for 0 <= ms < 4294967295 milliseconds; panic outside that range. |
+| `sleep_ms(milliseconds: int)` | Sleep for 0 <= milliseconds < 4294967295; panic outside that range. |
 | `run(command: str) -> int` | Run a Windows command line, wait, and return its exit code; panic if launch fails. |
 
 Commands are raw Windows command lines; invoke `cmd.exe /c` explicitly for shell syntax. Directory ordering is unspecified. Relative paths resolve from the process working directory.
@@ -124,22 +124,22 @@ Generic operations are checked against the element type when instantiated. Reduc
 
 | Signature | Description |
 | --- | --- |
-| `contains[T](xs: [T], x: T) -> bool` | Test membership. |
-| `index_of[T](xs: [T], x: T) -> int` | First matching index, or -1. |
-| `reverse[T](xs: [T])` | Reverse in place. |
-| `slice[T](xs: [T], lo: int, hi: int) -> [T]` | Copy [lo, hi); panic for invalid bounds. |
-| `first[T](xs: [T]) -> T?` | First element, or none. |
-| `last[T](xs: [T]) -> T?` | Last element, or none. |
-| `map[T, U](xs: [T], f: fn(T) -> U) -> [U]` | Transform each element. |
-| `filter[T](xs: [T], keep: fn(T) -> bool) -> [T]` | Copy matching elements. |
-| `fold[T, A](xs: [T], start: A, f: fn(A, T) -> A) -> A` | Reduce from an explicit initial accumulator. |
-| `any[T](xs: [T], pred: fn(T) -> bool) -> bool` | Test whether at least one element matches. |
-| `all[T](xs: [T], pred: fn(T) -> bool) -> bool` | Test whether every element matches; true on empty lists. |
-| `count[T](xs: [T], x: T) -> int` | Count equal elements. |
-| `sort_by[T](xs: [T], cmp: fn(T, T) -> int)` | Stable in-place merge sort: O(n log n) comparisons and O(n) scratch storage. |
-| `sum[T](xs: [T]) -> T` | Add elements; panic on empty input. |
-| `min_of[T](xs: [T]) -> T` | Smallest element; panic on empty input. |
-| `max_of[T](xs: [T]) -> T` | Largest element; panic on empty input. |
+| `contains[T](items: [T], target: T) -> bool` | Test membership. |
+| `index_of[T](items: [T], target: T) -> int` | First matching index, or -1. |
+| `reverse[T](items: [T])` | Reverse in place. |
+| `slice[T](items: [T], low: int, high: int) -> [T]` | Copy [low, high); panic for invalid bounds. |
+| `first[T](items: [T]) -> T?` | First element, or none. |
+| `last[T](items: [T]) -> T?` | Last element, or none. |
+| `map[T, U](items: [T], transform: fn(T) -> U) -> [U]` | Transform each element. |
+| `filter[T](items: [T], keep: fn(T) -> bool) -> [T]` | Copy matching elements. |
+| `fold[T, A](items: [T], start: A, combine: fn(A, T) -> A) -> A` | Reduce from an explicit initial accumulator. |
+| `any[T](items: [T], predicate: fn(T) -> bool) -> bool` | Test whether at least one element matches. |
+| `all[T](items: [T], predicate: fn(T) -> bool) -> bool` | Test whether every element matches; true on empty lists. |
+| `count[T](items: [T], target: T) -> int` | Count equal elements. |
+| `sort_by[T](items: [T], compare: fn(T, T) -> int)` | Stable in-place merge sort: O(n log n) comparisons and O(n) scratch storage. |
+| `sum[T](items: [T]) -> T` | Add elements; panic on empty input. |
+| `min_of[T](items: [T]) -> T` | Smallest element; panic on empty input. |
+| `max_of[T](items: [T]) -> T` | Largest element; panic on empty input. |
 
 ```zeph
 let values = [3, 1, 2]
@@ -259,8 +259,8 @@ Functions use double precision. Angles are radians. Domain errors generally prod
 | `log10(x: float) -> float` | Base-ten logarithm. |
 | `log2(x: float) -> float` | Base-two logarithm. |
 | `cbrt(x: float) -> float` | Real cube root, including negative inputs. |
-| `clamp(x: float, lo: float, hi: float) -> float` | Restrict x to [lo, hi]; panic for reversed bounds. |
-| `clamp_int(x: int, lo: int, hi: int) -> int` | Integer clamp; panic for reversed bounds. |
+| `clamp(x: float, low: float, high: float) -> float` | Restrict x to [low, high]; panic for reversed bounds. |
+| `clamp_int(x: int, low: int, high: int) -> int` | Integer clamp; panic for reversed bounds. |
 | `powf(base: float, exponent: float) -> float` | Real power; integer exponents support negative bases; 0^0 is one. |
 | `fmod(x: float, y: float) -> float` | Remainder with the sign of x; zero divisor gives NaN. |
 | `atan2(y: float, x: float) -> float` | Quadrant-aware angle, including signed zeros. |

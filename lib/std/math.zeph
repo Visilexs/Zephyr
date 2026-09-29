@@ -31,17 +31,17 @@ fn round(x: float) -> float {
     return integral
 }
 
-fn clamp(x: float, lo: float, hi: float) -> float {
-    assert(lo <= hi, "clamp: reversed bounds")
-    if x < lo { return lo }
-    if x > hi { return hi }
+fn clamp(x: float, low: float, high: float) -> float {
+    assert(low <= high, "clamp: reversed bounds")
+    if x < low { return low }
+    if x > high { return high }
     return x
 }
 
-fn clamp_int(x: int, lo: int, hi: int) -> int {
-    assert(lo <= hi, "clamp_int: reversed bounds")
-    if x < lo { return lo }
-    if x > hi { return hi }
+fn clamp_int(x: int, low: int, high: int) -> int {
+    assert(low <= high, "clamp_int: reversed bounds")
+    if x < low { return low }
+    if x > high { return high }
     return x
 }
 
