@@ -40,12 +40,12 @@ fn rndi(n: int) -> int {
     return SEED % n
 }
 fn fill_random(t: Tensor) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
         let re = 0.4 * rnd()
-        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, 0.4 * rnd()) } else { t_set(t, idx, re) }
-        more = idx_next(idx, t.shape)
+        if dtypeIsComplex(t.dtype) { tensorSetComplex(t, idx, re, 0.4 * rnd()) } else { tensorSet(t, idx, re) }
+        more = indexNext(idx, t.shape)
     }
 }
 
@@ -56,58 +56,58 @@ let IV = 6
 let OV = 3
 let NB = 4
 let T = 3
-let CFG = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: 1, pad: 0, eps: 0.00000001}
+let CFG = PhaseConfig{inputVocab: IV, outputVocab: OV, stateDimension: D, embeddingDimension: E, hiddenDimension: H, thinkSteps: 1, padToken: 0, epsilon: 0.00000001}
 
 fn build() -> PhaseParams {
-    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
-              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    let ps = [tensorZeros(DType.F64, [IV, E]), tensorZeros(DType.F64, [E]), tensorZeros(DType.F64, [H, E + 3 * D]),
+              tensorZeros(DType.F64, [H]), tensorZeros(DType.F64, [3 * D, H]), tensorZeros(DType.F64, [3 * D])]
     for i in 0..ps.len() { fill_random(ps[i]) }
-    let zi = t_zeros(DType.C64, [D])
-    let Mo = t_zeros(DType.C64, [OV, D])
+    let zi = tensorZeros(DType.C64, [D])
+    let Mo = tensorZeros(DType.C64, [OV, D])
     fill_random(zi)
     fill_random(Mo)
-    return PhaseParams{config: CFG, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
-                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+    return PhaseParams{config: CFG, embedding: ps[0], think: ps[1], hiddenWeight: ps[2], hiddenBias: ps[3],
+                       angleWeight: ps[4], angleBias: ps[5], initialState: zi, readoutMatrix: Mo}
 }
 fn params_of(p: PhaseParams) -> [Tensor] {
-    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+    return [p.embedding, p.think, p.hiddenWeight, p.hiddenBias, p.angleWeight, p.angleBias, p.initialState, p.readoutMatrix]
 }
 
 let save = SEED
 let P = build()
-let tokens = t_zeros(DType.I64, [NB, T])
+let tokens = tensorZeros(DType.I64, [NB, T])
 var targets: [int] = []
 for row in 0..NB {
-    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    for st in 0..T { tensorSetInt(tokens, [row, st], 1 + rndi(IV - 1)) }
     targets.push(rndi(OV))
 }
 
 fn loss_now() -> float {
-    av_reset()
-    let m = pad_params(P, false)
-    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+    autogradReset()
+    let m = phaseAutogradParameters(P, false)
+    return tensorGet(autogradValue(phaseAutogradLoss(m, tokens, targets)), [0])
 }
 fn probs_now() -> Tensor {
-    av_reset()
-    let m = pad_params(P, false)
-    return t_copy(av_value(pad_readout(m, pad_forward(m, tokens))))
+    autogradReset()
+    let m = phaseAutogradParameters(P, false)
+    return tensorCopy(autogradValue(phaseAutogradReadout(m, phaseAutogradForward(m, tokens))))
 }
 
 fn grad_check(label: str, minnz: int) {
-    av_reset()
-    let m = pad_params(P, true)
-    let loss = pad_loss(m, tokens, targets)
-    av_backward(loss)
-    let hs = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    autogradReset()
+    let m = phaseAutogradParameters(P, true)
+    let loss = phaseAutogradLoss(m, tokens, targets)
+    autogradBackward(loss)
+    let hs = [m.embedding, m.think, m.hiddenWeight, m.hiddenBias, m.angleWeight, m.angleBias, m.initialState, m.readoutMatrix]
     var grads: [Tensor] = []
-    for i in 0..hs.len() { grads.push(t_copy(av_grad(hs[i]))) }
+    for i in 0..hs.len() { grads.push(tensorCopy(autogradGradient(hs[i]))) }
     let ts = params_of(P)
     let h = 0.000001
     var worst = 0.0
     var nonzero = 0
     for i in 0..ts.len() {
-        var idx = idx_zeros(ts[i].shape.len())
-        let n = t_numel(ts[i])
+        var idx = indexZeros(ts[i].shape.len())
+        let n = tensorElementCount(ts[i])
         var rem = (i * 5 + 1) % n
         var k = ts[i].shape.len() - 1
         while k >= 0 {
@@ -115,28 +115,28 @@ fn grad_check(label: str, minnz: int) {
             rem = rem / ts[i].shape[k]
             k = k - 1
         }
-        if dtype_is_complex(ts[i].dt) {
-            let orr = t_get_re(ts[i], idx)
-            let oii = t_get_im(ts[i], idx)
-            t_set_c(ts[i], idx, orr + h, oii)
+        if dtypeIsComplex(ts[i].dtype) {
+            let orr = tensorGetReal(ts[i], idx)
+            let oii = tensorGetImaginary(ts[i], idx)
+            tensorSetComplex(ts[i], idx, orr + h, oii)
             let up = loss_now()
-            t_set_c(ts[i], idx, orr - h, oii)
+            tensorSetComplex(ts[i], idx, orr - h, oii)
             let dn = loss_now()
-            t_set_c(ts[i], idx, orr, oii)
+            tensorSetComplex(ts[i], idx, orr, oii)
             let fd = (up - dn) / (2.0 * h)
-            let an = t_get_re(grads[i], idx)
+            let an = tensorGetReal(grads[i], idx)
             let rel = fabs(fd - an) / (1.0 + fabs(an))
             if rel > worst { worst = rel }
             if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
         } else {
-            let orig = t_get(ts[i], idx)
-            t_set(ts[i], idx, orig + h)
+            let orig = tensorGet(ts[i], idx)
+            tensorSet(ts[i], idx, orig + h)
             let up = loss_now()
-            t_set(ts[i], idx, orig - h)
+            tensorSet(ts[i], idx, orig - h)
             let dn = loss_now()
-            t_set(ts[i], idx, orig)
+            tensorSet(ts[i], idx, orig)
             let fd = (up - dn) / (2.0 * h)
-            let an = t_get(grads[i], idx)
+            let an = tensorGet(grads[i], idx)
             let rel = fabs(fd - an) / (1.0 + fabs(an))
             if rel > worst { worst = rel }
             if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
@@ -148,8 +148,8 @@ fn grad_check(label: str, minnz: int) {
 }
 
 // ---- the default path is untouched -----------------------------------------
-READOUT_INCOHERENT = false
-PHASE_REAL_ROTATIONS = false
+readoutIncoherent = false
+phaseRealRotations = false
 let base_loss = loss_now()
 let base_probs = probs_now()
 chk(base_loss == base_loss and base_loss > 0.0, "the unablated loss is finite and positive ({base_loss})")
@@ -160,21 +160,21 @@ grad_check("baseline", 6)
 // per-coordinate phase is applied to the state, because the contributions
 // interfere. The incoherent one cannot see that rotation at all.
 fn probs_with_twist(twist: bool) -> Tensor {
-    av_reset()
-    let m = pad_params(P, false)
-    var z = pad_forward(m, tokens)
+    autogradReset()
+    let m = phaseAutogradParameters(P, false)
+    var z = phaseAutogradForward(m, tokens)
     if twist {
-        let ph = t_zeros(DType.F64, [1, D])
-        for j in 0..D { t_set(ph, [0, j], 0.3 + 0.21 * (j as float)) }
-        z = av_mul(z, av_expi(av_leaf(ph, false), DType.C64))
+        let ph = tensorZeros(DType.F64, [1, D])
+        for j in 0..D { tensorSet(ph, [0, j], 0.3 + 0.21 * (j as float)) }
+        z = autogradMultiply(z, autogradExpImaginary(autogradLeaf(ph, false), DType.C64))
     }
-    return t_copy(av_value(pad_readout(m, z)))
+    return tensorCopy(autogradValue(phaseAutogradReadout(m, z)))
 }
 
-READOUT_INCOHERENT = false
+readoutIncoherent = false
 let coh_plain = probs_with_twist(false)
 let coh_twist = probs_with_twist(true)
-READOUT_INCOHERENT = true
+readoutIncoherent = true
 let inc_plain = probs_with_twist(false)
 let inc_twist = probs_with_twist(true)
 
@@ -182,7 +182,7 @@ fn max_abs_diff(a: Tensor, b: Tensor) -> float {
     var w = 0.0
     for r in 0..a.shape[0] {
         for c in 0..a.shape[1] {
-            let d2 = fabs(t_get(a, [r, c]) - t_get(b, [r, c]))
+            let d2 = fabs(tensorGet(a, [r, c]) - tensorGet(b, [r, c]))
             if d2 > w { w = d2 }
         }
     }
@@ -199,12 +199,12 @@ chk(max_abs_diff(coh_plain, inc_plain) > 0.001, "the two readouts are different 
 var wsum = 0.0
 for r in 0..NB {
     var s = 0.0
-    for c in 0..OV { s = s + t_get(inc_plain, [r, c]) }
+    for c in 0..OV { s = s + tensorGet(inc_plain, [r, c]) }
     if fabs(s - 1.0) > wsum { wsum = fabs(s - 1.0) }
 }
 chk(wsum < 0.000000000001, "the incoherent readout is still a probability distribution ({wsum})")
 grad_check("incoherent readout", 6)
-READOUT_INCOHERENT = false
+readoutIncoherent = false
 
 // ---- real rotations -----------------------------------------------------------
 // The defining property: with the phase modulation removed and every phi
@@ -212,23 +212,23 @@ READOUT_INCOHERENT = false
 // entirely real stays entirely real for ever. The unablated model does not
 // have that property -- that is the mechanism.
 fn imag_mass_after(steps: int) -> float {
-    let zr = t_zeros(DType.C64, [D])
-    for j in 0..D { t_set_c(zr, [j], 0.3 + 0.1 * (j as float), 0.0) }
-    let p2 = PhaseParams{config: CFG, embedding: P.embedding, think: P.think, W1: P.W1, b1: P.b1,
-                         W2: P.W2, b2: P.b2, z_init: zr, M: P.M}
-    av_reset()
-    let m = pad_params(p2, false)
-    let z = pad_forward(m, tokens)
-    let v = av_value(z)
+    let zr = tensorZeros(DType.C64, [D])
+    for j in 0..D { tensorSetComplex(zr, [j], 0.3 + 0.1 * (j as float), 0.0) }
+    let p2 = PhaseParams{config: CFG, embedding: P.embedding, think: P.think, hiddenWeight: P.hiddenWeight, hiddenBias: P.hiddenBias,
+                         angleWeight: P.angleWeight, angleBias: P.angleBias, initialState: zr, readoutMatrix: P.readoutMatrix}
+    autogradReset()
+    let m = phaseAutogradParameters(p2, false)
+    let z = phaseAutogradForward(m, tokens)
+    let v = autogradValue(z)
     var mass = 0.0
     for r in 0..NB {
-        for j in 0..D { mass = mass + fabs(t_get_im(v, [r, j])) }
+        for j in 0..D { mass = mass + fabs(tensorGetImaginary(v, [r, j])) }
     }
     return mass
 }
-PHASE_REAL_ROTATIONS = false
+phaseRealRotations = false
 let coh_imag = imag_mass_after(T)
-PHASE_REAL_ROTATIONS = true
+phaseRealRotations = true
 let real_imag = imag_mass_after(T)
 print("imaginary mass from a real initial state: unablated {coh_imag}, real-rotation ablation {real_imag}")
 chk(coh_imag > 0.01, "the unablated model turns a real state complex, which is the mechanism ({coh_imag})")
@@ -244,11 +244,11 @@ chk(fabs(abl_loss - base_loss) > 0.000001, "the ablation changes the loss, so it
 // loosened bound.
 grad_check("real rotations", 5)
 
-av_reset()
-let mr = pad_params(P, true)
-av_backward(pad_loss(mr, tokens, targets))
-let gW2 = av_grad(mr.W2)
-let gb2 = av_grad(mr.b2)
+autogradReset()
+let mr = phaseAutogradParameters(P, true)
+autogradBackward(phaseAutogradLoss(mr, tokens, targets))
+let gW2 = autogradGradient(mr.angleWeight)
+let gb2 = autogradGradient(mr.angleBias)
 var dead_ok = true
 var live_any = false
 for row in 0..(3 * D) {
@@ -257,8 +257,8 @@ for row in 0..(3 * D) {
     var should_be_dead = row < D
     if row >= D + D / 2 and row < 2 * D { should_be_dead = true }
     if row >= 2 * D + D / 2 { should_be_dead = true }
-    var rowsum = fabs(t_get(gb2, [row]))
-    for c in 0..H { rowsum = rowsum + fabs(t_get(gW2, [row, c])) }
+    var rowsum = fabs(tensorGet(gb2, [row]))
+    for c in 0..H { rowsum = rowsum + fabs(tensorGet(gW2, [row, c])) }
     if should_be_dead and rowsum != 0.0 { dead_ok = false }
     if not should_be_dead and rowsum > 0.0000001 { live_any = true }
 }
@@ -271,8 +271,8 @@ var shapes_ok = true
 if ts.len() != 8 { shapes_ok = false }
 var nparam = 0
 for i in 0..ts.len() {
-    var n = t_numel(ts[i])
-    if dtype_is_complex(ts[i].dt) { n = n * 2 }
+    var n = tensorElementCount(ts[i])
+    if dtypeIsComplex(ts[i].dtype) { n = n * 2 }
     nparam = nparam + n
 }
 chk(shapes_ok, "both ablations keep the same eight parameter tensors")
@@ -280,14 +280,14 @@ print("parameter count under every setting: {nparam} real numbers")
 
 // Both at once, since the protocol runs them independently but nothing
 // should break if they are combined.
-READOUT_INCOHERENT = true
+readoutIncoherent = true
 let both = loss_now()
 chk(both == both, "both ablations together still give a finite loss ({both})")
-READOUT_INCOHERENT = false
-PHASE_REAL_ROTATIONS = false
+readoutIncoherent = false
+phaseRealRotations = false
 
 // And the default is restored, bit for bit.
-chk(t_hex(t_full(DType.F64, [1], loss_now())) == t_hex(t_full(DType.F64, [1], base_loss)),
+chk(tensorHex(tensorFull(DType.F64, [1], loss_now())) == tensorHex(tensorFull(DType.F64, [1], base_loss)),
     "switching both ablations off restores the original loss bit-for-bit")
 
 if failed == 0 {

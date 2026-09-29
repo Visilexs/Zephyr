@@ -1,10 +1,10 @@
 // Byte-oriented string utilities; ASCII classification and whitespace.
-fn is_digit(byteValue: int) -> bool { return byteValue >= 48 and byteValue <= 57 }
-fn is_upper(byteValue: int) -> bool { return byteValue >= 65 and byteValue <= 90 }
-fn is_lower(byteValue: int) -> bool { return byteValue >= 97 and byteValue <= 122 }
-fn is_alpha(byteValue: int) -> bool { return is_upper(byteValue) or is_lower(byteValue) }
-fn is_alnum(byteValue: int) -> bool { return is_alpha(byteValue) or is_digit(byteValue) }
-fn is_space(byteValue: int) -> bool { return byteValue == 32 or byteValue == 9 or byteValue == 10 or byteValue == 13 }
+fn isDigit(byteValue: int) -> bool { return byteValue >= 48 and byteValue <= 57 }
+fn isUpper(byteValue: int) -> bool { return byteValue >= 65 and byteValue <= 90 }
+fn isLower(byteValue: int) -> bool { return byteValue >= 97 and byteValue <= 122 }
+fn isAlpha(byteValue: int) -> bool { return isUpper(byteValue) or isLower(byteValue) }
+fn isAlphanumeric(byteValue: int) -> bool { return isAlpha(byteValue) or isDigit(byteValue) }
+fn isWhitespace(byteValue: int) -> bool { return byteValue == 32 or byteValue == 9 or byteValue == 10 or byteValue == 13 }
 
 fn ord(text: str) -> int {
     assert(text.len() > 0, "ord: empty string")
@@ -13,7 +13,7 @@ fn ord(text: str) -> int {
 
 fn chars(text: str) -> [str] { return text.split("") }
 
-fn reverse_str(text: str) -> str {
+fn reverseString(text: str) -> str {
     var parts: [str] = []
     var remaining = text.len()
     while remaining > 0 {
@@ -23,19 +23,19 @@ fn reverse_str(text: str) -> str {
     return parts.join()
 }
 
-fn trim_left(text: str) -> str {
+fn trimLeft(text: str) -> str {
     var start = 0
-    while start < text.len() and is_space(text.byte(start)) { start += 1 }
+    while start < text.len() and isWhitespace(text.byte(start)) { start += 1 }
     return text.sub(start, text.len())
 }
 
-fn trim_right(text: str) -> str {
+fn trimRight(text: str) -> str {
     var end = text.len()
-    while end > 0 and is_space(text.byte(end - 1)) { end -= 1 }
+    while end > 0 and isWhitespace(text.byte(end - 1)) { end -= 1 }
     return text.sub(0, end)
 }
 
-fn join_with(parts: [str], separator: str) -> str {
+fn joinWith(parts: [str], separator: str) -> str {
     var pieces: [str] = []
     for i in 0..parts.len() {
         if i > 0 { pieces.push(separator) }
@@ -44,14 +44,14 @@ fn join_with(parts: [str], separator: str) -> str {
     return pieces.join()
 }
 
-fn pad_left(text: str, width: int, fill: str) -> str {
-    assert(fill.len() == 1, "pad_left: fill must be one byte")
+fn padLeft(text: str, width: int, fill: str) -> str {
+    assert(fill.len() == 1, "padLeft: fill must be one byte")
     if width <= text.len() { return text }
     return fill.repeat(width - text.len()) + text
 }
 
-fn pad_right(text: str, width: int, fill: str) -> str {
-    assert(fill.len() == 1, "pad_right: fill must be one byte")
+fn padRight(text: str, width: int, fill: str) -> str {
+    assert(fill.len() == 1, "padRight: fill must be one byte")
     if width <= text.len() { return text }
     return text + fill.repeat(width - text.len())
 }
@@ -68,7 +68,7 @@ fn lines(text: str) -> [str] {
     return result
 }
 
-fn to_hex(value: int) -> str {
+fn toHex(value: int) -> str {
     let alphabet = "0123456789abcdef"
     var parts: [str] = []
     var started = false
@@ -85,7 +85,7 @@ fn to_hex(value: int) -> str {
 }
 
 // Negative integers use their full 64-bit two's-complement representation.
-fn to_binary(value: int) -> str {
+fn toBinary(value: int) -> str {
     var parts: [str] = []
     var started = false
     var shift = 63
@@ -101,8 +101,8 @@ fn to_binary(value: int) -> str {
 }
 
 // Accumulate negatively so INT_MIN is representable; check before each step.
-fn parse_int(text: str) -> int? {
-    let input = trim_right(trim_left(text))
+fn parseInt(text: str) -> int? {
+    let input = trimRight(trimLeft(text))
     if input.len() == 0 { return none }
     var position = 0
     var negative = false
@@ -116,7 +116,7 @@ fn parse_int(text: str) -> int? {
     if negative { lastDigit = 8 }
     while position < input.len() {
         let digitByte = input.byte(position)
-        if not is_digit(digitByte) { return none }
+        if not isDigit(digitByte) { return none }
         let digitValue = digitByte - 48
         if result < -922337203685477580 or (result == -922337203685477580 and digitValue > lastDigit) {
             return none
@@ -129,19 +129,19 @@ fn parse_int(text: str) -> int? {
 }
 
 // Validate the entire decimal grammar before conversion. Range overflow is none.
-fn parse_float(text: str) -> float? {
-    let input = trim_right(trim_left(text))
+fn parseFloat(text: str) -> float? {
+    let input = trimRight(trimLeft(text))
     if input.len() == 0 { return none }
     var position = 0
     if input.byte(0) == 45 or input.byte(0) == 43 { position = 1 }
     var digitCount = 0
-    while position < input.len() and is_digit(input.byte(position)) {
+    while position < input.len() and isDigit(input.byte(position)) {
         position += 1
         digitCount += 1
     }
     if position < input.len() and input.byte(position) == 46 {
         position += 1
-        while position < input.len() and is_digit(input.byte(position)) {
+        while position < input.len() and isDigit(input.byte(position)) {
             position += 1
             digitCount += 1
         }
@@ -151,7 +151,7 @@ fn parse_float(text: str) -> float? {
         position += 1
         if position < input.len() and (input.byte(position) == 45 or input.byte(position) == 43) { position += 1 }
         let exponentStart = position
-        while position < input.len() and is_digit(input.byte(position)) { position += 1 }
+        while position < input.len() and isDigit(input.byte(position)) { position += 1 }
         if exponentStart == position { return none }
     }
     if position != input.len() { return none }
@@ -192,7 +192,7 @@ fn parse_float(text: str) -> float? {
     if negativeExponent { exponent = 0 - exponent }
     var sign = 0
     if negative { sign = 1 << 63 }
-    if digits.len() == 0 { return frombits(sign) }
+    if digits.len() == 0 { return floatFromBits(sign) }
     var decimalPower = exponent - fractionalDigits
     while digits.len() > 0 and digits[digits.len() - 1] == 0 {
         digits.pop()
@@ -200,12 +200,12 @@ fn parse_float(text: str) -> float? {
     }
     let decimalPoint = digits.len() + decimalPower
     if decimalPoint > 309 { return none }
-    if decimalPoint < -323 { return frombits(sign) }
-    return string_decimal_float(digits, decimalPoint, sign)
+    if decimalPoint < -323 { return floatFromBits(sign) }
+    return decimalDigitsToFloat(digits, decimalPoint, sign)
 }
 
 // Multiply decimal fractional digits by two; return the next binary digit.
-fn string_fraction_bit(fraction: [int]) -> int {
+fn nextFractionBit(fraction: [int]) -> int {
     var carry = 0
     var position = fraction.len()
     while position > 0 {
@@ -217,14 +217,14 @@ fn string_fraction_bit(fraction: [int]) -> int {
     return carry
 }
 
-fn string_nonzero(digits: [int]) -> bool {
+fn hasNonzeroDigit(digits: [int]) -> bool {
     for digitValue in digits { if digitValue != 0 { return true } }
     return false
 }
 
 // Decimal long division/multiplication produces the 53 significand bits plus
 // a guard and sticky bit. Round once, to nearest-even, including subnormals.
-fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
+fn decimalDigitsToFloat(digits: [int], decimalPoint: int, sign: int) -> float? {
     var integerDigits: [int] = []
     var fraction: [int] = []
     for i in 0..max(decimalPoint, 0) {
@@ -235,7 +235,7 @@ fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
     for i in 0..max(0 - decimalPoint, 0) { fraction.push(0) }
     for i in max(decimalPoint, 0)..digits.len() { fraction.push(digits[i]) }
     var integerBits: [int] = []
-    while string_nonzero(integerDigits) {
+    while hasNonzeroDigit(integerDigits) {
         var remainder = 0
         for i in 0..integerDigits.len() {
             let dividend = remainder * 10 + integerDigits[i]
@@ -246,13 +246,13 @@ fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
     }
     var binaryExponent = integerBits.len() - 1
     if integerBits.len() == 0 {
-        while string_fraction_bit(fraction) == 0 and binaryExponent >= -1075 { binaryExponent -= 1 }
+        while nextFractionBit(fraction) == 0 and binaryExponent >= -1075 { binaryExponent -= 1 }
     }
     if binaryExponent > 1023 { return none }
-    if binaryExponent < -1075 { return frombits(sign) }
+    if binaryExponent < -1075 { return floatFromBits(sign) }
     if binaryExponent == -1075 {
-        if string_nonzero(fraction) { return frombits(sign | 1) }
-        return frombits(sign)
+        if hasNonzeroDigit(fraction) { return floatFromBits(sign | 1) }
+        return floatFromBits(sign)
     }
     var significand = 1
     var integerPosition = integerBits.len() - 2
@@ -260,26 +260,26 @@ fn string_decimal_float(digits: [int], decimalPoint: int, sign: int) -> float? {
     for i in 1..significantBits {
         var nextBit = 0
         if integerPosition >= 0 { nextBit = integerBits[integerPosition] }
-        else { nextBit = string_fraction_bit(fraction) }
+        else { nextBit = nextFractionBit(fraction) }
         integerPosition -= 1
         significand = significand * 2 + nextBit
     }
     var guard = 0
     if integerPosition >= 0 { guard = integerBits[integerPosition] }
-    else { guard = string_fraction_bit(fraction) }
-    var sticky = string_nonzero(fraction)
+    else { guard = nextFractionBit(fraction) }
+    var sticky = hasNonzeroDigit(fraction)
     for i in 0..max(integerPosition, 0) { if integerBits[i] != 0 { sticky = true } }
     if guard == 1 and (sticky or (significand & 1) == 1) { significand += 1 }
-    if binaryExponent < -1022 { return frombits(sign | significand) }
+    if binaryExponent < -1022 { return floatFromBits(sign | significand) }
     if significand == 9007199254740992 {
         significand /= 2
         binaryExponent += 1
     }
     if binaryExponent > 1023 { return none }
-    return frombits(sign | ((binaryExponent + 1023) << 52) | (significand - 4503599627370496))
+    return floatFromBits(sign | ((binaryExponent + 1023) << 52) | (significand - 4503599627370496))
 }
 // Internal decimal multiplication, least-significant digit first.
-fn string_scale_digits(digits: [int], factor: int) {
+fn scaleDecimalDigits(digits: [int], factor: int) {
     var carry = 0
     for i in 0..digits.len() {
         let product = digits[i] * factor + carry
@@ -294,8 +294,8 @@ fn string_scale_digits(digits: [int], factor: int) {
 
 // Exact binary-to-decimal conversion, then round half away from zero.
 // Integer digit arithmetic avoids overflow, double rounding and lost carries.
-fn fmt_fixed(value: float, decimals: int) -> str {
-    assert(decimals >= 0, "fmt_fixed: negative decimals")
+fn formatFixed(value: float, decimals: int) -> str {
+    assert(decimals >= 0, "formatFixed: negative decimals")
     let representation = bits(value)
     let exponentBits = (representation >> 52) & 2047
     var significand = representation & 4503599627370495
@@ -318,9 +318,9 @@ fn fmt_fixed(value: float, decimals: int) -> str {
     var decimalScale = 0
     if binaryExponent < 0 {
         decimalScale = 0 - binaryExponent
-        for i in 0..decimalScale { string_scale_digits(digits, 5) }
+        for i in 0..decimalScale { scaleDecimalDigits(digits, 5) }
     } else {
-        for i in 0..binaryExponent { string_scale_digits(digits, 2) }
+        for i in 0..binaryExponent { scaleDecimalDigits(digits, 2) }
     }
     // Skip discarded low digits and carry into the retained integer.
     var dropped = decimalScale - decimals

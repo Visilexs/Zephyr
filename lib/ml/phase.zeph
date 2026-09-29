@@ -2,26 +2,26 @@
 import "ml/ops.zeph"
 
 struct PhaseConfig {
-    input_vocab: int,
-    output_vocab: int,
-    D: int,
-    E: int,
-    H: int,
-    K: int,
-    pad: int,
-    eps: float,
+    inputVocab: int,
+    outputVocab: int,
+    stateDimension: int,
+    embeddingDimension: int,
+    hiddenDimension: int,
+    thinkSteps: int,
+    padToken: int,
+    epsilon: float,
 }
 
 struct PhaseParams {
     config: PhaseConfig,
     embedding: Tensor,
     think: Tensor,
-    W1: Tensor,
-    b1: Tensor,
-    W2: Tensor,
-    b2: Tensor,
-    z_init: Tensor,
-    M: Tensor,
+    hiddenWeight: Tensor,
+    hiddenBias: Tensor,
+    angleWeight: Tensor,
+    angleBias: Tensor,
+    initialState: Tensor,
+    readoutMatrix: Tensor,
 }
 
 // Diagnostics are the actual intermediates used by the update, never recomputed.
@@ -43,186 +43,186 @@ struct PhaseResult {
     trajectory: [Tensor],
 }
 
-fn phase_finite(x: float) -> bool { return x == x and fabs(x) != INF }
+fn phaseIsFinite(value: float) -> bool { return value == value and fabs(value) != infinity }
 
 // Reject malformed public parameters before any sequence work or allocation.
-fn phase_validate(p: PhaseParams) {
-    let c = p.config
-    if c.D < 2 or c.D % 2 != 0 { panic("phase: D must be positive and even") }
-    if c.input_vocab < 1 or c.output_vocab < 1 or c.E < 1 or c.H < 1 or c.K < 0 { panic("phase: invalid dimensions or THINK count") }
-    if c.pad < 0 or c.pad >= c.input_vocab or not phase_finite(c.eps) or c.eps <= 0.0 { panic("phase: invalid PAD or epsilon") }
-    if not dtype_is_complex(p.z_init.dt) { panic("phase: complex initial state required") }
-    let real = dtype_component(p.z_init.dt)
-    let tensors = [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
-    let shapes = [[c.input_vocab, c.E], [c.E], [c.H, c.E + 3 * c.D], [c.H], [3 * c.D, c.H], [3 * c.D], [c.D], [c.output_vocab, c.D]]
+fn phaseValidate(parameters: PhaseParams) {
+    let config = parameters.config
+    if config.stateDimension < 2 or config.stateDimension % 2 != 0 { panic("phase: stateDimension must be positive and even") }
+    if config.inputVocab < 1 or config.outputVocab < 1 or config.embeddingDimension < 1 or config.hiddenDimension < 1 or config.thinkSteps < 0 { panic("phase: invalid dimensions or THINK count") }
+    if config.padToken < 0 or config.padToken >= config.inputVocab or not phaseIsFinite(config.epsilon) or config.epsilon <= 0.0 { panic("phase: invalid PAD or epsilon") }
+    if not dtypeIsComplex(parameters.initialState.dtype) { panic("phase: complex initial state required") }
+    let realDtype = dtypeComponent(parameters.initialState.dtype)
+    let tensors = [parameters.embedding, parameters.think, parameters.hiddenWeight, parameters.hiddenBias, parameters.angleWeight, parameters.angleBias, parameters.initialState, parameters.readoutMatrix]
+    let shapes = [[config.inputVocab, config.embeddingDimension], [config.embeddingDimension], [config.hiddenDimension, config.embeddingDimension + 3 * config.stateDimension], [config.hiddenDimension], [3 * config.stateDimension, config.hiddenDimension], [3 * config.stateDimension], [config.stateDimension], [config.outputVocab, config.stateDimension]]
     for i in 0..tensors.len() {
-        let t = tensors[i]
-        var dt = real
-        if i >= 6 { dt = p.z_init.dt }
-        if t.dt != dt or not shapes_equal(t.shape, shapes[i]) { panic("phase: parameter shape or dtype mismatch") }
-        var idx = idx_zeros(t.shape.len())
-        var more = t_numel(t) > 0
+        let tensor = tensors[i]
+        var expectedDtype = realDtype
+        if i >= 6 { expectedDtype = parameters.initialState.dtype }
+        if tensor.dtype != expectedDtype or not shapesEqual(tensor.shape, shapes[i]) { panic("phase: parameter shape or dtype mismatch") }
+        var index = indexZeros(tensor.shape.len())
+        var more = tensorElementCount(tensor) > 0
         while more {
-            if dtype_is_complex(t.dt) {
-                if not phase_finite(t_get_re(t, idx)) or not phase_finite(t_get_im(t, idx)) { panic("phase: nonfinite parameter") }
+            if dtypeIsComplex(tensor.dtype) {
+                if not phaseIsFinite(tensorGetReal(tensor, index)) or not phaseIsFinite(tensorGetImaginary(tensor, index)) { panic("phase: nonfinite parameter") }
             } else {
-                if not phase_finite(t_get(t, idx)) { panic("phase: nonfinite parameter") }
+                if not phaseIsFinite(tensorGet(tensor, index)) { panic("phase: nonfinite parameter") }
             }
-            more = idx_next(idx, t.shape)
+            more = indexNext(index, tensor.shape)
         }
     }
 }
 
 // Normalize the learned state once, then broadcast an independent batch copy.
-fn phase_initial(p: PhaseParams, batch: int) -> Tensor {
-    phase_validate(p)
+fn phaseInitial(parameters: PhaseParams, batch: int) -> Tensor {
+    phaseValidate(parameters)
     if batch < 1 { panic("phase: empty batch") }
-    let norm = sqrt(t_sum_all(t_abs2(p.z_init)))
-    if not phase_finite(norm) or norm == 0.0 { panic("phase: initial norm must be finite and nonzero") }
-    let normalized = t_mul(p.z_init, t_full(p.z_init.dt, [], 1.0 / norm))
-    return t_copy(t_expand(normalized, [batch, p.config.D]))
+    let norm = sqrt(tensorSumAll(tensorAbs2(parameters.initialState)))
+    if not phaseIsFinite(norm) or norm == 0.0 { panic("phase: initial norm must be finite and nonzero") }
+    let normalized = tensorMultiply(parameters.initialState, tensorFull(parameters.initialState.dtype, [], 1.0 / norm))
+    return tensorCopy(tensorExpand(normalized, [batch, parameters.config.stateDimension]))
 }
 
 // Cyclic neighbor products preserve global phase but expose relative phase.
-fn phase_features(z: Tensor) -> Tensor {
-    if z.shape.len() != 2 { panic("phase_features: expected [B,D]") }
-    let neighbor = t_mul(t_conj(z), t_roll(z, 1, 0 - 1))
-    return t_concat(t_concat(t_abs2(z), t_real(neighbor), 1), t_imag(neighbor), 1)
+fn phaseFeatures(state: Tensor) -> Tensor {
+    if state.shape.len() != 2 { panic("phaseFeatures: expected [B,stateDimension]") }
+    let neighbor = tensorMultiply(tensorConjugate(state), tensorRoll(state, 1, 0 - 1))
+    return tensorConcat(tensorConcat(tensorAbs2(state), tensorReal(neighbor), 1), tensorImaginary(neighbor), 1)
 }
 
 // Each stage gathers both old pair values before either scatter writes.
-fn phase_givens(z: Tensor, theta: Tensor, phi: Tensor, stage: int) -> Tensor {
-    let d = z.shape[1]
-    if d < 2 or d % 2 != 0 or stage < 0 or stage > 1 { panic("phase_givens: invalid dimension or stage") }
+fn phaseGivens(state: Tensor, theta: Tensor, phi: Tensor, stage: int) -> Tensor {
+    let width = state.shape[1]
+    if width < 2 or width % 2 != 0 or stage < 0 or stage > 1 { panic("phaseGivens: invalid dimension or stage") }
     var left: [int] = []
     var right: [int] = []
-    for j in 0..(d / 2) {
+    for j in 0..(width / 2) {
         left.push(2 * j + stage)
-        right.push((2 * j + stage + 1) % d)
+        right.push((2 * j + stage + 1) % width)
     }
-    let a = t_index_select(z, 1, left)
-    let b = t_index_select(z, 1, right)
-    let c = t_cast(t_cos(theta), z.dt)
-    let s = t_cast(t_sin(theta), z.dt)
-    let q = t_expi(phi, z.dt)
-    let new_a = t_add(t_mul(c, a), t_mul(s, t_mul(q, b)))
-    let new_b = t_add(t_neg(t_mul(s, t_mul(t_conj(q), a))), t_mul(c, b))
-    let out = t_copy(z)
-    t_index_copy(out, 1, left, new_a)
-    t_index_copy(out, 1, right, new_b)
-    return out
+    let pairFirst = tensorIndexSelect(state, 1, left)
+    let pairSecond = tensorIndexSelect(state, 1, right)
+    let cosTheta = tensorCast(tensorCos(theta), state.dtype)
+    let sinTheta = tensorCast(tensorSin(theta), state.dtype)
+    let phase = tensorExpImaginary(phi, state.dtype)
+    let newPairFirst = tensorAdd(tensorMultiply(cosTheta, pairFirst), tensorMultiply(sinTheta, tensorMultiply(phase, pairSecond)))
+    let newPairSecond = tensorAdd(tensorNegate(tensorMultiply(sinTheta, tensorMultiply(tensorConjugate(phase), pairFirst))), tensorMultiply(cosTheta, pairSecond))
+    let output = tensorCopy(state)
+    tensorIndexCopy(output, 1, left, newPairFirst)
+    tensorIndexCopy(output, 1, right, newPairSecond)
+    return output
 }
 
 // All 3D angles are computed once from the pre-update state.
-fn phase_update_trace(p: PhaseParams, z: Tensor, embedding: Tensor) -> PhaseStep {
-    let d = p.config.D
-    if z.shape.len() != 2 or z.shape[1] != d or z.dt != p.z_init.dt { panic("phase_update: invalid state") }
-    if not shapes_equal(embedding.shape, [z.shape[0], p.config.E]) { panic("phase_update: invalid embedding") }
-    let features = phase_features(z)
-    let inputs = t_concat(embedding, features, 1)
-    let hidden = t_tanh(t_add(t_matmul(inputs, t_transpose(p.W1, 0, 1)), p.b1))
-    let bounded = t_tanh(t_add(t_matmul(hidden, t_transpose(p.W2, 0, 1)), p.b2))
-    let angles = t_mul(bounded, t_full(bounded.dt, [], PI))
-    let phased = t_mul(z, t_expi(t_slice(angles, 1, 0, d), z.dt))
-    let even = phase_givens(phased, t_slice(angles, 1, d, d + d / 2), t_slice(angles, 1, d + d / 2, 2 * d), 0)
-    let odd = phase_givens(even, t_slice(angles, 1, 2 * d, 2 * d + d / 2), t_slice(angles, 1, 2 * d + d / 2, 3 * d), 1)
+fn phaseUpdateTrace(parameters: PhaseParams, state: Tensor, embedding: Tensor) -> PhaseStep {
+    let width = parameters.config.stateDimension
+    if state.shape.len() != 2 or state.shape[1] != width or state.dtype != parameters.initialState.dtype { panic("phaseUpdate: invalid state") }
+    if not shapesEqual(embedding.shape, [state.shape[0], parameters.config.embeddingDimension]) { panic("phaseUpdate: invalid embedding") }
+    let features = phaseFeatures(state)
+    let inputs = tensorConcat(embedding, features, 1)
+    let hidden = tensorTanh(tensorAdd(tensorMatmul(inputs, tensorTranspose(parameters.hiddenWeight, 0, 1)), parameters.hiddenBias))
+    let bounded = tensorTanh(tensorAdd(tensorMatmul(hidden, tensorTranspose(parameters.angleWeight, 0, 1)), parameters.angleBias))
+    let angles = tensorMultiply(bounded, tensorFull(bounded.dtype, [], pi))
+    let phased = tensorMultiply(state, tensorExpImaginary(tensorSlice(angles, 1, 0, width), state.dtype))
+    let even = phaseGivens(phased, tensorSlice(angles, 1, width, width + width / 2), tensorSlice(angles, 1, width + width / 2, 2 * width), 0)
+    let odd = phaseGivens(even, tensorSlice(angles, 1, 2 * width, 2 * width + width / 2), tensorSlice(angles, 1, 2 * width + width / 2, 3 * width), 1)
     var active: [int] = []
     return PhaseStep{active: active, features: features, hidden: hidden, angles: angles, phased: phased, even: even, odd: odd}
 }
 
-fn phase_update(p: PhaseParams, z: Tensor, embedding: Tensor) -> Tensor {
-    return phase_update_trace(p, z, embedding).odd
+fn phaseUpdate(parameters: PhaseParams, state: Tensor, embedding: Tensor) -> Tensor {
+    return phaseUpdateTrace(parameters, state, embedding).odd
 }
 
 // fln's normal-number implementation needs explicit scaling for subnormals.
-fn phase_log_positive(x: float) -> float {
-    if x > 0.0 and x < frombits(1 << 52) { return fln(x * 4503599627370496.0) - 52.0 * LN2 }
-    return fln(x)
+fn phaseLogPositive(value: float) -> float {
+    if value > 0.0 and value < floatFromBits(1 << 52) { return fln(value * 4503599627370496.0) - 52.0 * ln2 }
+    return fln(value)
 }
 
 // Finite or negative-infinity inputs; used for epsilon addition and logsumexp.
-fn phase_logadd(a: float, b: float) -> float {
-    if a == 0.0 - INF { return b }
-    if b == 0.0 - INF { return a }
-    var hi = a
-    var lo = b
-    if b > a {
-        hi = b
-        lo = a
+fn phaseLogAdd(left: float, right: float) -> float {
+    if left == 0.0 - infinity { return right }
+    if right == 0.0 - infinity { return left }
+    var larger = left
+    var smaller = right
+    if right > left {
+        larger = right
+        smaller = left
     }
-    return hi + fln(1.0 + fexp(lo - hi))
+    return larger + fln(1.0 + fexp(smaller - larger))
 }
 
 // Stable log(|a|^2 + eps), avoiding overflow even when |a|^2 cannot fit.
-fn phase_readout(p: PhaseParams, z: Tensor) -> Tensor {
-    let a = t_matmul(z, t_transpose(p.M, 0, 1))
-    let logs = t_zeros(dtype_component(z.dt), a.shape)
-    let out = t_zeros(logs.dt, a.shape)
-    for row in 0..a.shape[0] {
-        var total = 0.0 - INF
-        for j in 0..a.shape[1] {
-            let re = fabs(t_get_re(a, [row, j]))
-            let im = fabs(t_get_im(a, [row, j]))
-            if not phase_finite(re) or not phase_finite(im) { panic("phase: nonfinite readout amplitude") }
-            var scale = re
-            if im > scale { scale = im }
-            var weight = 0.0 - INF
+fn phaseReadout(parameters: PhaseParams, state: Tensor) -> Tensor {
+    let amplitudes = tensorMatmul(state, tensorTranspose(parameters.readoutMatrix, 0, 1))
+    let logs = tensorZeros(dtypeComponent(state.dtype), amplitudes.shape)
+    let output = tensorZeros(logs.dtype, amplitudes.shape)
+    for row in 0..amplitudes.shape[0] {
+        var total = 0.0 - infinity
+        for j in 0..amplitudes.shape[1] {
+            let realMagnitude = fabs(tensorGetReal(amplitudes, [row, j]))
+            let imaginaryMagnitude = fabs(tensorGetImaginary(amplitudes, [row, j]))
+            if not phaseIsFinite(realMagnitude) or not phaseIsFinite(imaginaryMagnitude) { panic("phase: nonfinite readout amplitude") }
+            var scale = realMagnitude
+            if imaginaryMagnitude > scale { scale = imaginaryMagnitude }
+            var weight = 0.0 - infinity
             if scale > 0.0 {
-                let x = re / scale
-                let y = im / scale
-                weight = 2.0 * phase_log_positive(scale) + fln(x * x + y * y)
+                let scaledReal = realMagnitude / scale
+                let scaledImaginary = imaginaryMagnitude / scale
+                weight = 2.0 * phaseLogPositive(scale) + fln(scaledReal * scaledReal + scaledImaginary * scaledImaginary)
             }
-            let smoothed = phase_logadd(weight, phase_log_positive(p.config.eps))
-            t_set(logs, [row, j], smoothed)
-            total = phase_logadd(total, smoothed)
+            let smoothed = phaseLogAdd(weight, phaseLogPositive(parameters.config.epsilon))
+            tensorSet(logs, [row, j], smoothed)
+            total = phaseLogAdd(total, smoothed)
         }
-        for j in 0..a.shape[1] { t_set(out, [row, j], fexp(t_get(logs, [row, j]) - total)) }
+        for j in 0..amplitudes.shape[1] { tensorSet(output, [row, j], fexp(tensorGet(logs, [row, j]) - total)) }
     }
-    return out
+    return output
 }
 
-// Integer [B,T] tokens; PAD rows never enter the controller. THINK runs K times.
+// Integer [B,T] tokens; PAD rows never enter the controller. THINK runs thinkSteps times.
 // Set record=true for diagnostics; no trajectory is retained otherwise.
-fn phase_forward(p: PhaseParams, tokens: Tensor, record: bool) -> PhaseResult {
+fn phaseForward(parameters: PhaseParams, tokens: Tensor, record: bool) -> PhaseResult {
     if tokens.shape.len() != 2 or tokens.shape[0] == 0 { panic("phase: tokens must be nonempty [B,T]") }
-    if tokens.dt != DType.I32 and tokens.dt != DType.I64 { panic("phase: integer tokens required") }
+    if tokens.dtype != DType.I32 and tokens.dtype != DType.I64 { panic("phase: integer tokens required") }
     let batch = tokens.shape[0]
     let length = tokens.shape[1]
     for row in 0..batch {
         for step in 0..length {
-            let token = t_get_int(tokens, [row, step])
-            if token < 0 or token >= p.config.input_vocab { panic("phase: token outside vocabulary") }
+            let token = tensorGetInt(tokens, [row, step])
+            if token < 0 or token >= parameters.config.inputVocab { panic("phase: token outside vocabulary") }
         }
     }
-    let initial = phase_initial(p, batch)
-    var z = initial
+    let initial = phaseInitial(parameters, batch)
+    var state = initial
     var steps: [PhaseStep] = []
     var trajectory: [Tensor] = []
     if record { trajectory.push(initial) }
-    for step in 0..(length + p.config.K) {
+    for step in 0..(length + parameters.config.thinkSteps) {
         var active: [int] = []
-        var ids: [int] = []
+        var tokenIds: [int] = []
         for row in 0..batch {
             if step >= length {
                 active.push(row)
             } else {
-                let token = t_get_int(tokens, [row, step])
-                if token != p.config.pad {
+                let token = tensorGetInt(tokens, [row, step])
+                if token != parameters.config.padToken {
                     active.push(row)
-                    ids.push(token)
+                    tokenIds.push(token)
                 }
             }
         }
-        var embedding = t_expand(p.think, [active.len(), p.config.E])
-        if step < length { embedding = t_index_select(p.embedding, 0, ids) }
-        let update = phase_update_trace(p, t_index_select(z, 0, active), embedding)
+        var embedding = tensorExpand(parameters.think, [active.len(), parameters.config.embeddingDimension])
+        if step < length { embedding = tensorIndexSelect(parameters.embedding, 0, tokenIds) }
+        let update = phaseUpdateTrace(parameters, tensorIndexSelect(state, 0, active), embedding)
         update.active = active
-        z = t_copy(z)
-        t_index_copy(z, 0, active, update.odd)
+        state = tensorCopy(state)
+        tensorIndexCopy(state, 0, active, update.odd)
         if record {
             steps.push(update)
-            trajectory.push(z)
+            trajectory.push(state)
         }
     }
-    return PhaseResult{initial: initial, state: z, probabilities: phase_readout(p, z), steps: steps, trajectory: trajectory}
+    return PhaseResult{initial: initial, state: state, probabilities: phaseReadout(parameters, state), steps: steps, trajectory: trajectory}
 }

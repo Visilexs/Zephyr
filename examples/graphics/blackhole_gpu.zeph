@@ -88,7 +88,7 @@ let TDECAY = 1.0                    // turbulent decorrelation rate, in orbits
 // the visible band. Everything downstream follows from real blackbody physics.
 let T_PEAK = 4200.0                 // K at the profile peak, r = 8.17 r_g
 let T_REF = 4200.0
-let EXPO = 0.075                    // HDR exposure, applied before tone mapping
+let EXPO = 0.075                    // runtimeObjectHeaderBytes exposure, applied before tone mapping
 
 // ---- GL constants ----
 let GL_ARRAY_BUFFER = 34962
@@ -423,7 +423,7 @@ fn hole_fs_src() -> str {
     return p.join()
 }
 
-// ---- tone mapping: HDR accumulation -> displayable sRGB ----
+// ---- tone mapping: runtimeObjectHeaderBytes accumulation -> displayable sRGB ----
 fn tone_vs_src() -> str {
     var p: [str] = []
     p.push("#version 330\n")
@@ -465,13 +465,13 @@ var intbuf = mem(16)
 var logbuf = mem(2048)
 
 fn compile(kind: int, src: str) -> int {
-    let sh = callptr(pCreateShader, kind)
+    let sh = callPointer(pCreateShader, kind)
     store64(srcbuf, cstr(src))
-    let s1 = callptr(pShaderSource, sh, 1, srcbuf, 0)
-    let s2 = callptr(pCompileShader, sh)
-    let s3 = callptr(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
+    let s1 = callPointer(pShaderSource, sh, 1, srcbuf, 0)
+    let s2 = callPointer(pCompileShader, sh)
+    let s3 = callPointer(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
     if lo32(load64(intbuf)) == 0 {
-        let s4 = callptr(pGetShaderInfoLog, sh, 2047, 0, logbuf)
+        let s4 = callPointer(pGetShaderInfoLog, sh, 2047, 0, logbuf)
         print("shader compile failed:")
         print(from_cstr(logbuf))
         assert(false, "shader compile failed")
@@ -479,25 +479,25 @@ fn compile(kind: int, src: str) -> int {
     return sh
 }
 fn bind_attrs(prog: int) {
-    let b0 = callptr(pBindAttribLocation, prog, 0, cstr("iPos"))
-    let b1 = callptr(pBindAttribLocation, prog, 1, cstr("iVel"))
+    let b0 = callPointer(pBindAttribLocation, prog, 0, cstr("iPos"))
+    let b1 = callPointer(pBindAttribLocation, prog, 1, cstr("iVel"))
 }
 fn link(prog: int) {
-    let l1 = callptr(pLinkProgram, prog)
-    let l2 = callptr(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
+    let l1 = callPointer(pLinkProgram, prog)
+    let l2 = callPointer(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
     if lo32(load64(intbuf)) == 0 {
-        let l3 = callptr(pGetProgramInfoLog, prog, 2047, 0, logbuf)
+        let l3 = callPointer(pGetProgramInfoLog, prog, 2047, 0, logbuf)
         print("program link failed:")
         print(from_cstr(logbuf))
         assert(false, "program link failed")
     }
 }
 fn attach_buffer(buf: int) {
-    let b1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, buf)
-    let e0 = callptr(pEnableVertexAttribArray, 0)
-    let e1 = callptr(pEnableVertexAttribArray, 1)
-    let v0 = callptr(pVertexAttribPointer, 0, 3, GL_FLOATC, 0, STRIDE, 0)
-    let v1 = callptr(pVertexAttribPointer, 1, 3, GL_FLOATC, 0, STRIDE, 12)
+    let b1 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, buf)
+    let e0 = callPointer(pEnableVertexAttribArray, 0)
+    let e1 = callPointer(pEnableVertexAttribArray, 1)
+    let v0 = callPointer(pVertexAttribPointer, 0, 3, GL_FLOATC, 0, STRIDE, 0)
+    let v1 = callPointer(pVertexAttribPointer, 1, 3, GL_FLOATC, 0, STRIDE, 12)
 }
 var ubuf = mem(16)
 fn set4(loc: int, x: float, y: float, z: float, w: float) {
@@ -506,11 +506,11 @@ fn set4(loc: int, x: float, y: float, z: float, w: float) {
     store32(ubuf + 4, f32(y))
     store32(ubuf + 8, f32(z))
     store32(ubuf + 12, f32(w))
-    let u = callptr(pUniform4fv, loc, 1, ubuf)
+    let u = callPointer(pUniform4fv, loc, 1, ubuf)
 }
-fn uloc(prog: int, name: str) -> int { return callptr(pGetUniformLocation, prog, cstr(name)) }
+fn uloc(prog: int, name: str) -> int { return callPointer(pGetUniformLocation, prog, cstr(name)) }
 
-// ---- HDR framebuffer ----
+// ---- runtimeObjectHeaderBytes framebuffer ----
 var fbo = 0
 var fbtex = 0
 var fbdepth = 0
@@ -521,11 +521,11 @@ var idbuf = mem(16)
 fn ensure_fbo(w: int, h: int) {
     if w == fbw and h == fbh { return }
     if fbo == 0 {
-        let g1 = callptr(pGenFramebuffers, 1, idbuf)
+        let g1 = callPointer(pGenFramebuffers, 1, idbuf)
         fbo = lo32(load64(idbuf))
         let g2 = win("opengl32!glGenTextures", 1, idbuf)
         fbtex = lo32(load64(idbuf))
-        let g3 = callptr(pGenRenderbuffers, 1, idbuf)
+        let g3 = callPointer(pGenRenderbuffers, 1, idbuf)
         fbdepth = lo32(load64(idbuf))
     }
     let b1 = win("opengl32!glBindTexture", GL_TEXTURE_2D, fbtex)
@@ -536,14 +536,14 @@ fn ensure_fbo(w: int, h: int) {
     let t3 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEARF)
     let t4 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
     let t5 = win("opengl32!glTexParameteri", GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-    let r1 = callptr(pBindRenderbuffer, GL_RENDERBUFFER, fbdepth)
-    let r2 = callptr(pRenderbufferStorage, GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
-    let f1 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
-    let f2 = callptr(pFramebufferTexture2D, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbtex, 0)
-    let f3 = callptr(pFramebufferRenderbuffer, GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fbdepth)
-    let st = callptr(pCheckFramebufferStatus, GL_FRAMEBUFFER)
+    let r1 = callPointer(pBindRenderbuffer, GL_RENDERBUFFER, fbdepth)
+    let r2 = callPointer(pRenderbufferStorage, GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
+    let f1 = callPointer(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
+    let f2 = callPointer(pFramebufferTexture2D, GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbtex, 0)
+    let f3 = callPointer(pFramebufferRenderbuffer, GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fbdepth)
+    let st = callPointer(pCheckFramebufferStatus, GL_FRAMEBUFFER)
     assert(st == GL_FRAMEBUFFER_COMPLETE, "HDR framebuffer incomplete ({st}) -- no RGBA16F support?")
-    let f4 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, 0)
+    let f4 = callPointer(pBindFramebuffer, GL_FRAMEBUFFER, 0)
     fbw = w
     fbh = h
 }
@@ -700,40 +700,40 @@ pRenderbufferStorage = gp("glRenderbufferStorage")
 pFramebufferRenderbuffer = gp("glFramebufferRenderbuffer")
 pCheckFramebufferStatus = gp("glCheckFramebufferStatus")
 
-let uprog = callptr(pCreateProgram)
-let a1 = callptr(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
+let uprog = callPointer(pCreateProgram)
+let a1 = callPointer(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
 bind_attrs(uprog)
 let vary = mem(16)
 store64(vary + 0, cstr("oPos"))
 store64(vary + 8, cstr("oVel"))
-let tf = callptr(pTransformFeedbackVaryings, uprog, 2, vary, GL_INTERLEAVED_ATTRIBS)
+let tf = callPointer(pTransformFeedbackVaryings, uprog, 2, vary, GL_INTERLEAVED_ATTRIBS)
 link(uprog)
 
-let dprog = callptr(pCreateProgram)
-let a2 = callptr(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
-let a3 = callptr(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
+let dprog = callPointer(pCreateProgram)
+let a2 = callPointer(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
+let a3 = callPointer(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
 bind_attrs(dprog)
 link(dprog)
 
-let hprog = callptr(pCreateProgram)
-let a4 = callptr(pAttachShader, hprog, compile(GL_VERTEX_SHADER, hole_vs_src()))
-let a5 = callptr(pAttachShader, hprog, compile(GL_FRAGMENT_SHADER, hole_fs_src()))
+let hprog = callPointer(pCreateProgram)
+let a4 = callPointer(pAttachShader, hprog, compile(GL_VERTEX_SHADER, hole_vs_src()))
+let a5 = callPointer(pAttachShader, hprog, compile(GL_FRAGMENT_SHADER, hole_fs_src()))
 link(hprog)
 
-let tprog = callptr(pCreateProgram)
-let a6 = callptr(pAttachShader, tprog, compile(GL_VERTEX_SHADER, tone_vs_src()))
-let a7 = callptr(pAttachShader, tprog, compile(GL_FRAGMENT_SHADER, tone_fs_src()))
+let tprog = callPointer(pCreateProgram)
+let a6 = callPointer(pAttachShader, tprog, compile(GL_VERTEX_SHADER, tone_vs_src()))
+let a7 = callPointer(pAttachShader, tprog, compile(GL_FRAGMENT_SHADER, tone_fs_src()))
 link(tprog)
 
 let bufs = mem(16)
-let gb = callptr(pGenBuffers, 2, bufs)
+let gb = callPointer(pGenBuffers, 2, bufs)
 var bufA = lo32(load64(bufs))
 var bufB = load64(bufs) >> 32
 let zero = mem(COUNT * STRIDE)
-let d1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufA)
-let d2 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
-let d3 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufB)
-let d4 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d1 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, bufA)
+let d2 = callPointer(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d3 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, bufB)
+let d4 = callPointer(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
 
 let uA = uloc(uprog, "A")
 let uB = uloc(uprog, "B")
@@ -804,30 +804,30 @@ while running == 1 {
             let kpx = FOV * (ch as float) * 0.5
 
             // pass 1: advance the accretion flow on the GPU
-            let up = callptr(pUseProgram, uprog)
+            let up = callPointer(pUseProgram, uprog)
             set4(uA, DTS, BH_M, ALPHA, frame as float)
             set4(uB, R_HOR, R_ISCO, R_DISC_OUT, R_ESCAPE)
             set4(uC, HR, TURB, TDECAY, 0.0)
             attach_buffer(bufA)
-            let bb = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
+            let bb = callPointer(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
             let rd = win("opengl32!glEnable", GL_RASTERIZER_DISCARD)
-            let bt = callptr(pBeginTransformFeedback, GL_POINTS)
+            let bt = callPointer(pBeginTransformFeedback, GL_POINTS)
             let dr = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
-            let et = callptr(pEndTransformFeedback)
+            let et = callPointer(pEndTransformFeedback)
             let rd2 = win("opengl32!glDisable", GL_RASTERIZER_DISCARD)
-            let bb0 = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
+            let bb0 = callPointer(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
 
-            // ---- render the scene into the HDR buffer ----
-            let fb1 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
+            // ---- render the scene into the runtimeObjectHeaderBytes buffer ----
+            let fb1 = callPointer(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
             let vp = win("opengl32!glViewport", 0, 0, cw, ch)
             let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             let de1 = win("opengl32!glEnable", GL_DEPTH_TEST)
 
             // pass 2: the shadow, opaque and depth-writing, so the flow behind
             // it is correctly hidden
-            let da0 = callptr(pDisableVertexAttribArray, 0)
-            let da1 = callptr(pDisableVertexAttribArray, 1)
-            let hp = callptr(pUseProgram, hprog)
+            let da0 = callPointer(pDisableVertexAttribArray, 0)
+            let da1 = callPointer(pDisableVertexAttribArray, 1)
+            let hp = callPointer(pUseProgram, hprog)
             set4(hCR, rx, 0.0, rz, FOV / aspect)
             set4(hCU, upx, upy, upz, FOV)
             set4(hCF, fx, fy, fz2, kpx)
@@ -842,7 +842,7 @@ while running == 1 {
             set4(hH, B_CRIT, 1.7, 1.0, 0.0)                // photon ring
             let hd2 = win("opengl32!glDrawArrays", GL_TRIANGLE_STRIP, 0, 4)
 
-            let dp2 = callptr(pUseProgram, dprog)
+            let dp2 = callPointer(pUseProgram, dprog)
             set4(dCR, rx, 0.0, rz, FOV / aspect)
             set4(dCU, upx, upy, upz, FOV)
             set4(dCF, fx, fy, fz2, kpx)
@@ -853,15 +853,15 @@ while running == 1 {
             let dr2 = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
             let dm2 = win("opengl32!glDepthMask", 1)
 
-            // ---- pass 4: tone-map the HDR buffer to the window ----
-            let fb2 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, 0)
+            // ---- pass 4: tone-map the runtimeObjectHeaderBytes buffer to the window ----
+            let fb2 = callPointer(pBindFramebuffer, GL_FRAMEBUFFER, 0)
             let bd = win("opengl32!glDisable", GL_BLEND)
             let de2 = win("opengl32!glDisable", GL_DEPTH_TEST)
-            let da2 = callptr(pDisableVertexAttribArray, 0)
-            let da3 = callptr(pDisableVertexAttribArray, 1)
-            let tp = callptr(pUseProgram, tprog)
+            let da2 = callPointer(pDisableVertexAttribArray, 0)
+            let da3 = callPointer(pDisableVertexAttribArray, 1)
+            let tp = callPointer(pUseProgram, tprog)
             let bt2 = win("opengl32!glBindTexture", GL_TEXTURE_2D, fbtex)
-            let u1 = callptr(pUniform1i, tS, 0)
+            let u1 = callPointer(pUniform1i, tS, 0)
             set4(tT, (frame % 1024) as float, 0.0, 0.0, 0.0)
             let dr3 = win("opengl32!glDrawArrays", GL_TRIANGLES, 0, 3)
 

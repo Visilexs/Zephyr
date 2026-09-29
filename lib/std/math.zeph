@@ -1,13 +1,13 @@
 // Public math facade. Existing dependency libraries can import math_core.zeph
-// to retain the original API without introducing the E global into callers.
+// to retain the original API without introducing the eulerNumber global into callers.
 import "std/math_core.zeph"
-let E = 2.718281828459045
+let eulerNumber = 2.718281828459045
 
 // Integral-valued doubles above 2^52 need no conversion (which could overflow).
 fn trunc(x: float) -> float {
-    if is_nan(x) or fabs(x) >= 4503599627370496.0 or x == 0.0 { return x }
+    if isNan(x) or fabs(x) >= 4503599627370496.0 or x == 0.0 { return x }
     let integral = (x as int) as float
-    if integral == 0.0 { return frombits(bits(x) & (1 << 63)) }
+    if integral == 0.0 { return floatFromBits(bits(x) & (1 << 63)) }
     return integral
 }
 
@@ -38,27 +38,27 @@ fn clamp(x: float, low: float, high: float) -> float {
     return x
 }
 
-fn clamp_int(x: int, low: int, high: int) -> int {
-    assert(low <= high, "clamp_int: reversed bounds")
+fn clampInt(x: int, low: int, high: int) -> int {
+    assert(low <= high, "clampInt: reversed bounds")
     if x < low { return low }
     if x > high { return high }
     return x
 }
 
-fn is_inf(x: float) -> bool { return (bits(x) & 9223372036854775807) == (2047 << 52) }
+fn isInfinite(x: float) -> bool { return (bits(x) & 9223372036854775807) == (2047 << 52) }
 fn exp(x: float) -> float { return fexp(x) }
 fn ln(x: float) -> float { return fln(x) }
 fn log10(x: float) -> float { return fln(x) / 2.302585092994046 }
-fn log2(x: float) -> float { return fln(x) / LN2 }
+fn log2(x: float) -> float { return fln(x) / ln2 }
 
 // Integer powers use repeated squaring, retaining exact results when representable.
 fn powf(base: float, exponent: float) -> float {
     if exponent == 0.0 or base == 1.0 { return 1.0 }
-    if is_nan(base) or is_nan(exponent) { return NAN }
-    if is_inf(exponent) {
+    if isNan(base) or isNan(exponent) { return nan }
+    if isInfinite(exponent) {
         let magnitude = fabs(base)
         if magnitude == 1.0 { return 1.0 }
-        if (magnitude > 1.0) == (exponent > 0.0) { return INF }
+        if (magnitude > 1.0) == (exponent > 0.0) { return infinity }
         return 0.0
     }
     if trunc(exponent) == exponent {
@@ -74,9 +74,9 @@ fn powf(base: float, exponent: float) -> float {
         }
         return result
     }
-    if base < 0.0 { return NAN }
+    if base < 0.0 { return nan }
     if base == 0.0 {
-        if exponent < 0.0 { return INF }
+        if exponent < 0.0 { return infinity }
         return 0.0
     }
     return fexp(exponent * fln(base))
@@ -84,7 +84,7 @@ fn powf(base: float, exponent: float) -> float {
 
 // Binary long division avoids overflow and catastrophic quotient cancellation.
 fn fmod(x: float, y: float) -> float {
-    if is_nan(x) or is_nan(y) or is_inf(x) or y == 0.0 { return NAN }
+    if isNan(x) or isNan(y) or isInfinite(x) or y == 0.0 { return nan }
     var remaining = fabs(x)
     let divisor = fabs(y)
     if remaining < divisor { return x }
@@ -95,34 +95,34 @@ fn fmod(x: float, y: float) -> float {
         if scaled == divisor { break }
         scaled /= 2.0
     }
-    return frombits(bits(remaining) | (bits(x) & (1 << 63)))
+    return floatFromBits(bits(remaining) | (bits(x) & (1 << 63)))
 }
 
 // Signed zeros distinguish the two sides of the negative x axis.
 fn atan2(y: float, x: float) -> float {
-    if is_nan(x) or is_nan(y) { return NAN }
+    if isNan(x) or isNan(y) { return nan }
     let negativeY = bits(y) < 0
     var angle = 0.0
     if y == 0.0 {
         if bits(x) >= 0 { return y }
-        angle = PI
+        angle = pi
     } else if x == 0.0 {
-        angle = HALF_PI
-    } else if is_inf(x) and is_inf(y) {
-        angle = PI / 4.0
-        if x < 0.0 { angle = 3.0 * PI / 4.0 }
+        angle = halfPi
+    } else if isInfinite(x) and isInfinite(y) {
+        angle = pi / 4.0
+        if x < 0.0 { angle = 3.0 * pi / 4.0 }
     } else {
         angle = fatan(fabs(y / x))
-        if x < 0.0 { angle = PI - angle }
+        if x < 0.0 { angle = pi - angle }
     }
-    if negativeY { return frombits(bits(angle) | (1 << 63)) }
+    if negativeY { return floatFromBits(bits(angle) | (1 << 63)) }
     return angle
 }
 
 // Scale before squaring to avoid unnecessary overflow and underflow.
 fn hypot(x: float, y: float) -> float {
-    if is_inf(x) or is_inf(y) { return INF }
-    if is_nan(x) or is_nan(y) { return NAN }
+    if isInfinite(x) or isInfinite(y) { return infinity }
+    if isNan(x) or isNan(y) { return nan }
     let larger = max(fabs(x), fabs(y))
     let smaller = min(fabs(x), fabs(y))
     if larger == 0.0 { return 0.0 }
@@ -132,7 +132,7 @@ fn hypot(x: float, y: float) -> float {
 
 // A logarithmic estimate followed by Newton refinement, including subnormals.
 fn cbrt(x: float) -> float {
-    if x == 0.0 or is_inf(x) or is_nan(x) { return x }
+    if x == 0.0 or isInfinite(x) or isNan(x) { return x }
     let magnitude = fabs(x)
     var estimate = fexp(fln(magnitude) / 3.0)
     for i in 0..3 { estimate = (2.0 * estimate + (magnitude / estimate) / estimate) / 3.0 }

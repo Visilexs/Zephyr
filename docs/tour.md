@@ -114,7 +114,7 @@ outer: for row in grid {         // labeled loops
 }
 
 fn save(path: str) {
-    let log = open_log()
+    let log = openLog()
     defer log.close()            // runs however the block is left
 }
 ```
@@ -190,11 +190,11 @@ ages["ben"] = 25
 print(ages.has("ben"))            // true
 print(ages.get("nope").or(0))     // 0 — safe lookup returns an optional
 
-fn first_even(xs: [int]) -> int? {   // T? holds a value or `none`
+fn firstEven(xs: [int]) -> int? {   // T? holds a value or `none`
     for x in xs { if x % 2 == 0 { return x } }
     return none
 }
-print(first_even([1, 3, 4]).or(-1))  // 4
+print(firstEven([1, 3, 4]).or(-1))  // 4
 ```
 
 An optional must be unwrapped (`.or(default)`, `.get()`, `.has()`, `if let`)
@@ -257,7 +257,7 @@ import "std/list.zeph"     // splices that file's declarations in; used unqualif
 import "sub/mathx.zeph"    // paths are relative to the importing file
 ```
 
-`std/list.zeph` is the standard library — `map`, `filter`, `fold`, `sort_by`,
+`std/list.zeph` is the standard library — `map`, `filter`, `fold`, `sortBy`,
 `contains` and friends — written as ordinary generic Zephyr, not baked into the
 compiler. See [docs/std.md](std.md) for the rest (strings, math, random, io,
 sync, result, set).
@@ -282,8 +282,8 @@ division by zero, popping an empty list, or a failed `str` parse in `as`.
 Functions: `print(v)` (or `print(a, b, ...)`, space-separated), `emit(s)` (stdout without a newline — use it to stream
 large output instead of assembling one huge string), `panic(msg)`, `sqrt(x)`,
 `chr(code)` (byte → 1-char str), `bits(f)` (float → its IEEE bit pattern as
-int), `args()` (command-line arguments as `[str]`), `read_file(path)`,
-`write_file(path, data)`.
+int), `args()` (command-line arguments as `[str]`), `readFile(path)`,
+`writeFile(path, data)`.
 
 Methods: `.len()` (list or str), `.push(v)`, `.pop()`, `.byte(i)` (str byte
 as int, bounds-checked), `.sub(lo, hi)` (substring, half-open), `.join()` /
@@ -303,7 +303,7 @@ This tour covers the safe core. Three things it deliberately skips, each in the
   "x.dll"`, and raw-memory builtins let pure Zephyr call the OS and the GPU.
   This is unsafe by nature; the `Bytes` type in `lib/std/bytes.zeph` is the
   checked way to use it. (§3.6)
-- **Threads** — `std/thread.zeph` gives `thread_spawn` and `parallel_for`. (§8)
+- **Threads** — `std/thread.zeph` gives `spawnThread` and `parallelFor`. (§8)
 
 Those primitives are what the `lib/vk` Vulkan wrapper and the graphics demos
 are built from — see [docs/graphics.md](graphics.md).

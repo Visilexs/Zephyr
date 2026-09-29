@@ -430,9 +430,9 @@ no trait system.
 
 A generic function has no single type, so it cannot be used as a function value.
 
-`std/list.zeph` is written entirely in these terms — `contains`, `index_of`,
+`std/list.zeph` is written entirely in these terms — `contains`, `indexOf`,
 `reverse`, `slice`, `map`, `filter`, `fold`, `any`, `all`, `first`, `last`,
-`sort_by`. They were compiler builtins before generics existed. `import` it:
+`sortBy`. They were compiler builtins before generics existed. `import` it:
 
     import "std/list.zeph"
 
@@ -684,14 +684,14 @@ running it.
 | `emit(s)`  | str → void | write to stdout without a newline |
 | `chr(c)`   | int → str | one byte, 0..255; panics outside |
 | `bits(x)`  | float → int | IEEE 754 bit pattern, zero cost |
-| `frombits(n)` | int → float | the inverse of `bits`, zero cost |
+| `floatFromBits(n)` | int → float | the inverse of `bits`, zero cost |
 | `s.byte(i)`| str, int → int | byte value 0..255, bounds-checked |
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
 | `l.join(sep)` | [str], str → str | concatenation with `sep` between elements |
 | `args()`   | → [str] | process arguments, `args()[0]` is the program |
-| `read_file(p)` | str → str | whole file; panics if unreadable |
-| `write_file(p, d)` | str, str → void | create/overwrite; panics on failure |
+| `readFile(p)` | str → str | whole file; panics if unreadable |
+| `writeFile(p, d)` | str, str → void | create/overwrite; panics on failure |
 | `zeros(n)` | int → [int] | preallocated list of `n` zeros |
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
 | `abs(x)`   | int→int / float→float | absolute value |
@@ -704,8 +704,8 @@ running it.
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `s.contains(t)` | str → bool | substring test |
-| `s.index_of(t)` | str → int | first byte index, or −1 |
-| `s.starts_with(t)` / `s.ends_with(t)` | str → bool | prefix / suffix test |
+| `s.indexOf(t)` | str → int | first byte index, or −1 |
+| `s.startsWith(t)` / `s.endsWith(t)` | str → bool | prefix / suffix test |
 | `s.split(sep)` | str → [str] | empty `sep` splits into bytes |
 | `s.replace(old, new)` | str, str → str | all non-overlapping occurrences |
 | `s.upper()` / `s.lower()` | → str | ASCII case |
@@ -716,9 +716,9 @@ running it.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sort_by(cmp)` from `std/list.zeph`. |
+| `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sortBy(items, compare)` from `std/list.zeph`. |
 
-`contains`, `index_of`, `reverse`, `slice` and `count` are **not** builtins —
+`contains`, `indexOf`, `reverse`, `slice` and `count` are **not** builtins —
 they are generic library functions in `std/list.zeph` (§3.0.5), called with
 method syntax once imported: `xs.contains(3)`.
 
@@ -726,14 +726,14 @@ method syntax once imported: `xs.contains(3)`.
 Everything else lives in `std/math.zeph`, written in ordinary Zephyr for a
 runtime with no libm: `fexp`, `fln`, `fsin`, `fcos`, `ftan` and the reciprocals
 `fcsc`, `fsec`, `fcot`; the inverses `fatan`, `fasin`, `facos`, `facot`,
-`fasec`, `facsc`; `sinh`, `cosh`, `tanh`; the gudermannian `gd` and `gd_inv`;
+`fasec`, `facsc`; `sinh`, `cosh`, `tanh`; the gudermannian `gd` and `gdInverse`;
 `gamma`, `lgamma` and `digamma`; a `d_`-prefixed analytic derivative for each;
-and `integrate` / `integrate_p` for definite integrals by adaptive Simpson.
-Constants `PI`, `TWO_PI`, `HALF_PI`, `LN2`, `NAN` and `INF` come with it.
+and `integrate` / `integrateWithParameter` for definite integrals by adaptive Simpson.
+Constants `pi`, `twoPi`, `halfPi`, `ln2`, `nan` and `infinity` come with it.
 
 Two conventions worth knowing before you use them. Arguments outside a
-function's domain yield `NAN`, as `sqrt(-1.0)` already does, so test results
-with `is_nan(x)` rather than comparing against a sentinel. And `facot` is the
+function's domain yield `nan`, as `sqrt(-1.0)` already does, so test results
+with `isNan(x)` rather than comparing against a sentinel. And `facot` is the
 continuous branch with range `(0, pi)` — the calculus convention — not the
 `atan(1/x)` one that jumps at the origin.
 
@@ -756,11 +756,11 @@ value or address); the Win64 calling convention is used.
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
 | `win(name, args…)` | str, int… → int | Call a statically-imported DLL entry. `name` is a **string literal**; 1–16 int args, marshalled Win64. A `dll!func` prefix picks the DLL — `kernel32!` (default), `user32!`, `gdi32!`, `opengl32!`; a bare name is kernel32. E.g. `win("user32!GetDC", hwnd)`. |
-| `callptr(addr, args…)` | int, int… → int | Call a function **address obtained at runtime** — `GetProcAddress`, `wglGetProcAddress`, a COM vtable slot. Same 1–16 int-arg marshalling as `win`. |
+| `callPointer(addr, args…)` | int, int… → int | Call a function **address obtained at runtime** — `GetProcAddress`, `wglGetProcAddress`, a COM vtable slot. Same 1–16 int-arg marshalling as `win`. |
 
 `extern fn NAME(p: int, …) -> T from "some.dll"` is the declarative form: it
 desugars into an ordinary Zephyr wrapper that resolves the symbol lazily
-(`LoadLibraryA` + `GetProcAddress`, cached) and then `callptr`s it. Every
+(`LoadLibraryA` + `GetProcAddress`, cached) and then `callPointer`s it. Every
 parameter must be `int`; the return must be `int`, `i32`, or nothing.
 
 ```zephyr
@@ -775,7 +775,7 @@ runtime does not count or trace them (see the caution below).
 | `load64(a)` / `load32(a)` / `load16(a)` / `load8(a)` | int → int | Read 8 / 4 / 2 / 1 bytes at address `a`; narrower reads zero-extend. |
 | `store64(a, v)` / `store32(a, v)` / `store8(a, v)` | int, int → void | Write 8 / 4 / 1 bytes. |
 | `addr(x)` | any → int | Address of a `str`, list, struct, or **function** value. A function yields its `{code, env}` closure cell — the handle a native callback thunk needs. |
-| `stackptr()` | → int | Current stack pointer (`rsp`). |
+| `stackPointer()` | → int | Current stack pointer (`rsp`). |
 | `bits(x)` | float → int | IEEE-754 bit pattern (also in §3.5), the bridge for passing floats through the int-only FFI. |
 
 Off-heap memory is obtained by calling the OS directly, e.g.
@@ -788,11 +788,11 @@ so a raw address stays valid exactly as long as some Zephyr variable still holds
 the value.
 
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
-to the kernel shim `k32_Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
+to the kernel shim `kernel32Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
 prefix (`user32!…`) is a compile error, and `extern fn … from` (which needs an
 import table) is unavailable. Additional builtins on those targets:
-`syscall(n, args…)` (raw Linux syscall, 1–7 args), and wasm-only `memgrow`,
-`hostwrite`, `hostexit`.
+`syscall(n, args…)` (raw Linux syscall, 1–7 args), and wasm-only `growMemory`,
+`hostWrite`, `hostExit`.
 
 All native interop requires the Zephyr runtime (`--rt`).
 
@@ -862,7 +862,7 @@ The same source compiles to three targets, selected by a flag:
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
-| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `k32_*` |
+| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*` |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 
 Not every feature reaches every target. WebAssembly currently omits file I/O,
@@ -897,10 +897,10 @@ Threads are available on Windows and Linux x86-64 through `lib/std/thread.zeph`
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
-| `thread_spawn(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
+| `spawnThread(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
 | `t.join()` | `Thread` → void | Block until the thread finishes. |
-| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
-| `cpu_count()` | → int | Logical processor count. |
+| `parallelFor(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
+| `cpuCount()` | → int | Logical processor count. |
 
 The worker argument is an `int` — a worker index or a raw buffer address — and
 never a heap reference. Either reason alone is sufficient: it travels through
@@ -911,7 +911,7 @@ index.
 
 `import "std/sync.zeph"` provides `Mutex`, `Atomic`, bounded FIFO `Channel`, and
 `WaitGroup` wrappers over off-heap storage. Atomics and channels carry `int`
-values; use `bits`/`frombits` for floats. Pass the integer `address` field to a
+values; use `bits`/`floatFromBits` for floats. Pass the integer `address` field to a
 worker and construct its own local wrapper: the wrappers themselves are counted
 heap objects and must not be shared. Their native storage lasts until process
 exit. Synchronization does not make shared reference counts safe.

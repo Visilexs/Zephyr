@@ -159,7 +159,7 @@ fn type_fn_void() -> int {
 }
 
 fn const_float(v: float) -> int {
-    let fb = f32_bits(v)
+    let fb = float32Bits(v)
     for i in 0..g_const_bits.len() {
         if g_const_bits[i] == fb { return g_const_id[i] }
     }
@@ -519,7 +519,7 @@ for a in argv {
 }
 g_src_name = inpath
 
-let src = read_file(inpath)
+let src = readFile(inpath)
 if src.len() == 0 { panic("cannot read {inpath}") }
 lex(src)
 
@@ -604,5 +604,5 @@ for w in mod {
     out.push(chr((w >> 16) & 255))
     out.push(chr((w >> 24) & 255))
 }
-write_file(outpath, out.join())
+writeFile(outpath, out.join())
 print("{outpath}: {mod.len()} words, {g_next_id - 1} ids")

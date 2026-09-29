@@ -186,17 +186,17 @@ for a in args() {
 }
 if args().len() > 1 {
     let a1 = args()[1]
-    if not a1.starts_with("-") {          // a flag, not a particle count
+    if not a1.startsWith("-") {          // a flag, not a particle count
         let n = a1 as int
         if n > 1000 { COUNT = n }
     }
 }
 banner()
 
-var wnd = window_open("Zephyr - black hole (lensed particle accretion, Vulkan)", WIDTH, HEIGHT)
-var g = Gfx.init_windowed("zephyr-blackhole-lensed", layers, wnd)
-print("gpu: {g.gpu_name()}")
-let format = g.surface_format()
+var wnd = openWindow("Zephyr - black hole (lensed particle accretion, Vulkan)", WIDTH, HEIGHT)
+var g = Gfx.initWindowed("zephyr-blackhole-lensed", layers, wnd)
+print("gpu: {g.gpuName()}")
+let format = g.surfaceFormat()
 
 // ---------------- render pass ----------------
 var attach = Bytes.new(VkAttachmentDescription_sizeof)
@@ -224,11 +224,11 @@ rpci.put64(VkRenderPassCreateInfo_pAttachments, attach.addr())
 rpci.put32(VkRenderPassCreateInfo_subpassCount, 1)
 rpci.put64(VkRenderPassCreateInfo_pSubpasses, subpass.addr())
 var prp = Bytes.new(8)
-vkcheck(vkCreateRenderPass(g.dev, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
+checkVulkanResult(vkCreateRenderPass(g.device, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
 let renderpass = prp.get64(0)
 
 var swap = g.swapchain(format, renderpass, 0)
-print("swapchain: {swap.w}x{swap.h}, {swap.images.len()} images")
+print("swapchain: {swap.width}x{swap.height}, {swap.images.len()} images")
 
 // ---------------- buffers ----------------
 // Particles are never touched by the host: frame 0 seeds them in the shader,
@@ -242,18 +242,18 @@ print("storage: {pbytes / 1048576} MB particles + {gbytes / 1024} KB density gri
 var bufs: [GpuBuffer] = []
 bufs.push(pbuf)
 bufs.push(gbuf)
-let ds = g.storage_set(bufs, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+let ds = g.storageBufferSet(bufs, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
 
 var setlayouts: [int] = []
 setlayouts.push(ds.layout)
-let layout = g.pipeline_layout(setlayouts, 128,
+let layout = g.pipelineLayout(setlayouts, 128,
     VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
 
-var entry = cbytes("main")
+var entry = cString("main")
 let shclear = g.shader("examples/shaders/bh_gclear.comp.spv")
 let shsim = g.shader("examples/shaders/bh_deposit.comp.spv")
-let pipe_clear = g.compute_pipeline(shclear, layout, entry)
-let pipe_sim = g.compute_pipeline(shsim, layout, entry)
+let pipe_clear = g.computePipeline(shclear, layout, entry)
+let pipe_sim = g.computePipeline(shsim, layout, entry)
 print("compute pipelines ok")
 
 // ---------------- present pipeline ----------------
@@ -297,7 +297,7 @@ rs.put32(VkPipelineRasterizationStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELIN
 rs.put32(VkPipelineRasterizationStateCreateInfo_polygonMode, VK_POLYGON_MODE_FILL)
 rs.put32(VkPipelineRasterizationStateCreateInfo_cullMode, VK_CULL_MODE_NONE)
 rs.put32(VkPipelineRasterizationStateCreateInfo_frontFace, VK_FRONT_FACE_CLOCKWISE)
-rs.putf32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
+rs.putFloat32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
 
 var ms = Bytes.new(VkPipelineMultisampleStateCreateInfo_sizeof)
 ms.put32(VkPipelineMultisampleStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
@@ -325,7 +325,7 @@ gpci.put64(VkGraphicsPipelineCreateInfo_layout, layout)
 gpci.put64(VkGraphicsPipelineCreateInfo_renderPass, renderpass)
 gpci.put32(VkGraphicsPipelineCreateInfo_basePipelineIndex, 0 - 1)
 var ppipe = Bytes.new(8)
-vkcheck(vkCreateGraphicsPipelines(g.dev, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
+checkVulkanResult(vkCreateGraphicsPipelines(g.device, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
 let pipe_present = ppipe.get64(0)
 print("present pipeline ok")
 
@@ -342,7 +342,7 @@ mb.put32(16, VK_ACCESS_SHADER_WRITE_BIT)
 mb.put32(20, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
 
 var pushc = Bytes.new(128)
-var sets = u64s([ds.set])
+var sets = uint64Array([ds.set])
 
 var qpc = Bytes.new(8)
 var qpf = Bytes.new(8)
@@ -392,58 +392,58 @@ while running {
         let upx = fy * rz
         let upy = fz * rx - fx * rz
         let upz = 0.0 - fy * rx
-        let fw = swap.w as float
-        let fh = swap.h as float
+        let fw = swap.width as float
+        let fh = swap.height as float
         let aspect = fw / fh
 
         // eye.xyz | time ; right.xyz | tan_x ; up.xyz | tan_y ; fwd.xyz | frame
-        pushc.putf32(0, ex)
-        pushc.putf32(4, ey)
-        pushc.putf32(8, ez)
-        pushc.putf32(12, t)
-        pushc.putf32(16, rx)
-        pushc.putf32(20, 0.0)
-        pushc.putf32(24, rz)
-        pushc.putf32(28, FOVT * aspect)
-        pushc.putf32(32, upx)
-        pushc.putf32(36, upy)
-        pushc.putf32(40, upz)
-        pushc.putf32(44, FOVT)
-        pushc.putf32(48, fx)
-        pushc.putf32(52, fy)
-        pushc.putf32(56, fz)
-        pushc.putf32(60, frame as float)
+        pushc.putFloat32(0, ex)
+        pushc.putFloat32(4, ey)
+        pushc.putFloat32(8, ez)
+        pushc.putFloat32(12, t)
+        pushc.putFloat32(16, rx)
+        pushc.putFloat32(20, 0.0)
+        pushc.putFloat32(24, rz)
+        pushc.putFloat32(28, FOVT * aspect)
+        pushc.putFloat32(32, upx)
+        pushc.putFloat32(36, upy)
+        pushc.putFloat32(40, upz)
+        pushc.putFloat32(44, FOVT)
+        pushc.putFloat32(48, fx)
+        pushc.putFloat32(52, fy)
+        pushc.putFloat32(56, fz)
+        pushc.putFloat32(60, frame as float)
         // disc: r_isco, r_out, T_scale, exposure
-        pushc.putf32(64, R_ISCO)
-        pushc.putf32(68, R_DISC_OUT)
-        pushc.putf32(72, TSCALE)
-        pushc.putf32(76, EXPO)
+        pushc.putFloat32(64, R_ISCO)
+        pushc.putFloat32(68, R_DISC_OUT)
+        pushc.putFloat32(72, TSCALE)
+        pushc.putFloat32(76, EXPO)
         // dims: W, H, NR, NPHI
-        pushc.putf32(80, fw)
-        pushc.putf32(84, fh)
-        pushc.putf32(88, NR as float)
-        pushc.putf32(92, NPHI as float)
+        pushc.putFloat32(80, fw)
+        pushc.putFloat32(84, fh)
+        pushc.putFloat32(88, NR as float)
+        pushc.putFloat32(92, NPHI as float)
         // phys: alpha, H/R, turbulence, dt
-        pushc.putf32(96, ALPHA)
-        pushc.putf32(100, HR)
-        pushc.putf32(104, TURB)
-        pushc.putf32(108, DTS)
+        pushc.putFloat32(96, ALPHA)
+        pushc.putFloat32(100, HR)
+        pushc.putFloat32(104, TURB)
+        pushc.putFloat32(108, DTS)
         // misc: r_horizon, r_escape, particle count, T_ref
-        pushc.putf32(112, R_HOR)
-        pushc.putf32(116, R_ESCAPE)
-        pushc.putf32(120, nparts as float)
-        pushc.putf32(124, T_REF)
+        pushc.putFloat32(112, R_HOR)
+        pushc.putFloat32(116, R_ESCAPE)
+        pushc.putFloat32(120, nparts as float)
+        pushc.putFloat32(124, T_REF)
 
-        viewport.putf32(VkViewport_width, fw)
-        viewport.putf32(VkViewport_height, fh)
-        viewport.putf32(VkViewport_maxDepth, 1.0)
-        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.w)
-        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.h)
-        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
-        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+        viewport.putFloat32(VkViewport_width, fw)
+        viewport.putFloat32(VkViewport_height, fh)
+        viewport.putFloat32(VkViewport_maxDepth, 1.0)
+        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.width)
+        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.height)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.width)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.height)
 
         let clrgroups = (NR * NPHI + 255) / 256
-        let fbs = swap.fbs
+        let fbs = swap.framebuffers
         let ok = g.frame(swap, fn(cb: int, idx: int) {
             // 1. zero the accumulator
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pcl)
@@ -479,7 +479,7 @@ while running {
         }
         frame += 1
         if frame - fps_mark >= 120 {
-            print("{(120.0 / (t - fps_t)) as int} fps  ({swap.w}x{swap.h}, {nparts} particles, eye {orad as int} r_g)")
+            print("{(120.0 / (t - fps_t)) as int} fps  ({swap.width}x{swap.height}, {nparts} particles, eye {orad as int} r_g)")
             fps_mark = frame
             fps_t = t
         }
@@ -489,20 +489,20 @@ while running {
 let q1 = QueryPerformanceCounter(qpc.addr())
 print("{frame} frames in {((qpc.get64(0) - t0) as float) / (freq as float)}s")
 
-vkcheck(vkDeviceWaitIdle(g.dev), "vkDeviceWaitIdle")
-vkDestroyPipeline(g.dev, pipe_present, 0)
-vkDestroyPipeline(g.dev, pipe_sim, 0)
-vkDestroyPipeline(g.dev, pipe_clear, 0)
-vkDestroyPipelineLayout(g.dev, layout, 0)
-vkDestroyShaderModule(g.dev, vs, 0)
-vkDestroyShaderModule(g.dev, fs, 0)
-vkDestroyShaderModule(g.dev, shsim, 0)
-vkDestroyShaderModule(g.dev, shclear, 0)
-g.destroy_desc_set(ds)
-g.destroy_buffer(pbuf)
-g.destroy_buffer(gbuf)
-g.destroy_swapchain(swap)
-vkDestroyRenderPass(g.dev, renderpass, 0)
+checkVulkanResult(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle")
+vkDestroyPipeline(g.device, pipe_present, 0)
+vkDestroyPipeline(g.device, pipe_sim, 0)
+vkDestroyPipeline(g.device, pipe_clear, 0)
+vkDestroyPipelineLayout(g.device, layout, 0)
+vkDestroyShaderModule(g.device, vs, 0)
+vkDestroyShaderModule(g.device, fs, 0)
+vkDestroyShaderModule(g.device, shsim, 0)
+vkDestroyShaderModule(g.device, shclear, 0)
+g.destroyDescriptorSet(ds)
+g.destroyBuffer(pbuf)
+g.destroyBuffer(gbuf)
+g.destroySwapchain(swap)
+vkDestroyRenderPass(g.device, renderpass, 0)
 g.shutdown()
 wnd.close()
 print("OK")

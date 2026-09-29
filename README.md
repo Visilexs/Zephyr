@@ -24,7 +24,7 @@ print(b.dist(a))                    // same call, method syntax
 **Memory safe, without collector pauses.** No pointers, no manual memory, no
 null. Memory is reclaimed by reference counting the compiler inserts; every
 index is bounds-checked and every variable is initialized at creation. Nothing
-stops for a collection: the worst frame under heavy churn is under 65 µs, against
+stops for a collection: the worst frame under heavy churn is under 50 µs, against
 ~4 ms for the tracing collector it replaced. See
 [reference counting](#reference-counting).
 
@@ -39,21 +39,21 @@ Ryzen 7 9800X3D, Windows x86-64, gcc 16.1, rustc 1.98.1:
 
 | Area | Zephyr | C `-O2` | Rust `-O` | |
 |------|-------:|--------:|----------:|---|
-| integer SIMD (matmul) | **43 ms** | 73 | 70 | wins both |
-| rasterization (cube) | **7 ms** | 9 | 11 | wins both |
-| bignum (pi) | **56 ms** | 85 | 94 | wins both |
-| allocation churn (strings) | **154 ms** | 175 | 166 | wins both |
-| sorting | **89 ms** | 299 | 45 | 3.4× faster than C |
-| hash map | **47 ms** | 29 | 71 | 1.5× faster than Rust |
-| recursion (fib) | 21 ms | 10 | 20 | ties Rust |
-| float compute (mandel) | 98 ms | 91 | 92 | 1.07× |
-| fluid / neighbours (liquid) | 2,906 ms | 2,249 | 2,557 | 1.3× |
+| integer SIMD (matmul) | **39 ms** | 72 | 70 | wins both |
+| rasterization (cube) | **7 ms** | 9 | 10 | wins both |
+| bignum (pi) | **57 ms** | 85 | 92 | wins both |
+| allocation churn (strings) | **132 ms** | 172 | 155 | wins both |
+| sorting | **89 ms** | 296 | 44 | 3.3× faster than C |
+| hash map | 89 ms | 31 | 72 | 1.2× |
+| recursion (fib) | 20 ms | 10 | 20 | ties Rust |
+| float compute (mandel) | 97 ms | 89 | 91 | 1.07× |
+| fluid / neighbours (liquid) | 2,859 ms | 2,249 | 2,512 | 1.3× |
 
 The sorting win is a branchless-partition introsort (the pdqsort technique)
 against C's `qsort`. The allocation win is a single-allocation string builder
 against per-format heap strings. Peak memory is the lowest of the three on every
-row but the hash map, and every row compiles faster than with gcc or rustc:
-124–153 ms, against 157–212 ms for gcc and 212–706 ms for rustc. Measured
+row but the hash map, and every row compiles about twice as fast as with gcc or
+rustc: 78–85 ms, against 148–190 ms for gcc and 186–303 ms for rustc. Measured
 2026-09-29.
 
 **The optimizer.** Function inliner, register promotion of loop-hot locals into
@@ -74,8 +74,9 @@ each div/mod site runs `mulhi` plus a conditional fixup, about 2× faster than
 identical. This is what `libdivide` does by hand. It alone flipped the pi
 benchmark from losing to C (93 ms) to winning (68 ms).
 
-**Fast compiler.** `zc` compiles itself — `compiler/zc.zeph`, 18,000 lines with
-the embedded runtime and standard library — to a 5 MB executable in about 1.1 s.
+**Fast compiler.** `zc` compiles itself — `compiler/zc.zeph`, 18,300 lines with
+the embedded runtime and standard library — to a 5 MB executable in about 0.7 s,
+peaking at 180 MB.
 
 **Readable.** `and`/`or`/`not` rather than symbol soup, string interpolation
 (`"hello {name}"`), no semicolons, `let` versus `var`.
@@ -91,16 +92,16 @@ scripts compile both native targets from the same sources and require identical
 output.
 
 **Talks to the machine.** A native-interop layer — `win("user32!GetDC", …)`, the
-`callptr` intrinsic, `extern fn … from "x.dll"`, and raw-memory builtins — lets
+`callPointer` intrinsic, `extern fn … from "x.dll"`, and raw-memory builtins — lets
 pure Zephyr call the OS and the GPU. On top of it the repo ships a Vulkan
 wrapper (`lib/vk`, with a Zephyr→SPIR-V shader compiler in `tools/zspv.zeph`),
 an immediate-mode GUI toolkit (`lib/ui`), and threads (`lib/std/thread.zeph`,
-`parallel_for`). `examples/graphics` drives all of it, from a software particle
+`parallelFor`). `examples/graphics` drives all of it, from a software particle
 rasterizer to a real-time geodesic-ray-traced black hole. See
 [docs/graphics.md](docs/graphics.md).
 
 **A standard library in Zephyr, not welded into the compiler.** `contains`,
-`map`, `filter`, `fold`, `sort_by` and the rest live in `lib/std/list.zeph` as
+`map`, `filter`, `fold`, `sortBy` and the rest live in `lib/std/list.zeph` as
 ordinary generic code:
 
 ```zephyr
@@ -221,9 +222,9 @@ owns a count, and a function releases its locals on the way out — so retain an
 release never appear in source. Nothing is deferred, so freeing spreads through
 the program instead of pooling into a pause.
 
-- 26–63 µs worst frame over 3,000 frames (three runs; p99 18 µs), 50 MB live,
+- 25–48 µs worst frame over 3,000 frames (three runs; p99 10–12 µs), 50 MB live,
   585 MB churned (`bench/gc_pause.zeph`), no frame over 1 ms. The allocation-free
-  control loop in the same program peaks as high as 167 µs, so the worst frame is
+  control loop in the same program peaks as high as 77 µs, so the worst frame is
   at the machine's own jitter. The tracing collector spiked to
   ~4 ms on the same workload, which drops frames.
 - A 300k-iteration churn loop with a four-object live set peaks at 4 MB, and at

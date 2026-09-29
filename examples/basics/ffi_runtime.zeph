@@ -1,6 +1,6 @@
 // A mini "runtime" written in pure Zephyr: stdout I/O and integer formatting
 // implemented with only kernel32 calls (win) and raw memory intrinsics
-// (addr/load64/store8) — no rt_print, no rt_to_str. This is the proof that
+// (addr/load64/store8) — no runtime printing or formatting. This is the proof that
 // Zephyr's runtime can itself be written in Zephyr.
 
 // write raw bytes of a str to stdout via WriteFile

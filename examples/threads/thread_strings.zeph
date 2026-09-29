@@ -38,7 +38,7 @@ fn work(id: int) {
 
 print("workers: {WORKERS}, interpolations each: {ROUNDS * 2}")
 var ts: [Thread] = []
-for i in 0..WORKERS { ts.push(thread_spawn(work, i)) }
+for i in 0..WORKERS { ts.push(spawnThread(work, i)) }
 for t in ts { t.join() }
 
 var total = 0

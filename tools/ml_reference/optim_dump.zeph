@@ -8,33 +8,33 @@ fn optim_rnd() -> float {
 }
 
 fn optim_fixture(d: DType, shape: [int], gradient: bool) -> Tensor {
-    let t = t_zeros(d, shape)
-    var idx = idx_zeros(shape.len())
-    for j in 0..t_numel(t) {
+    let t = tensorZeros(d, shape)
+    var idx = indexZeros(shape.len())
+    for j in 0..tensorElementCount(t) {
         var re = optim_rnd()
-        if dtype_is_complex(d) {
+        if dtypeIsComplex(d) {
             var im = optim_rnd()
             if gradient {
                 re = re * 0.001
                 im = im * 1000.0
             }
-            t_set_c(t, idx, re, im)
+            tensorSetComplex(t, idx, re, im)
         } else {
             if gradient and j == 0 { re = 0.0 }
-            t_set(t, idx, re)
+            tensorSet(t, idx, re)
         }
-        idx_next(idx, shape)
+        indexNext(idx, shape)
     }
     return t
 }
 
 fn optim_dump(tag: str, t: Tensor) {
-    var idx = idx_zeros(t.shape.len())
-    for j in 0..t_numel(t) {
-        if dtype_is_complex(t.dt) {
-            print("{tag} {bits(t_get_re(t, idx))} {bits(t_get_im(t, idx))}")
-        } else { print("{tag} {bits(t_get(t, idx))}") }
-        idx_next(idx, t.shape)
+    var idx = indexZeros(t.shape.len())
+    for j in 0..tensorElementCount(t) {
+        if dtypeIsComplex(t.dtype) {
+            print("{tag} {bits(tensorGetReal(t, idx))} {bits(tensorGetImaginary(t, idx))}")
+        } else { print("{tag} {bits(tensorGet(t, idx))}") }
+        indexNext(idx, t.shape)
     }
 }
 
@@ -52,19 +52,19 @@ for step in 0..3 {
 }
 
 for kind in 0..3 {
-    let params = [t_copy(real), t_copy(complex)]
-    var o = sgd_new(params, 0.03, 0.0, 0.07)
+    let params = [tensorCopy(real), tensorCopy(complex)]
+    var o = newSgd(params, 0.03, 0.0, 0.07)
     var tag = "sgd"
     if kind == 1 {
-        o = sgd_new(params, 0.03, 0.6, 0.07)
+        o = newSgd(params, 0.03, 0.6, 0.07)
         tag = "momentum"
     }
     if kind == 2 {
-        o = adamw_new(params, 0.03, 0.8, 0.95, 0.00000001, 0.07)
+        o = newAdamW(params, 0.03, 0.8, 0.95, 0.00000001, 0.07)
         tag = "adamw"
     }
     for step in 0..3 {
-        optim_step(o, params, [real_grads[step], complex_grads[step]])
+        optimizerStep(o, params, [real_grads[step], complex_grads[step]])
         optim_dump("{tag}.{step}.real", params[0])
         optim_dump("{tag}.{step}.complex", params[1])
         optim_dump("{tag}.{step}.m.real", o.m[0])
@@ -75,12 +75,12 @@ for kind in 0..3 {
         print("{tag}.{step}.count {bits(count)}")
     }
 }
-let clipped = [t_copy(real_grads[0]), t_copy(complex_grads[0])]
-let norm = clip_grad_norm(clipped, 0.5)
+let clipped = [tensorCopy(real_grads[0]), tensorCopy(complex_grads[0])]
+let norm = clipGradientNorm(clipped, 0.5)
 print("clip.norm {bits(norm)}")
 optim_dump("clip.real", clipped[0])
 optim_dump("clip.complex", clipped[1])
-let small_norm = clip_grad_norm(clipped, 1.0)
+let small_norm = clipGradientNorm(clipped, 1.0)
 print("clip.small_norm {bits(small_norm)}")
 optim_dump("clip.unchanged.real", clipped[0])
 optim_dump("clip.unchanged.complex", clipped[1])

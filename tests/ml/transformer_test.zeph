@@ -36,51 +36,51 @@ fn rndi(n: int) -> int {
     return SEED % n
 }
 fn fill_random(t: Tensor, sc: float) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
-        t_set(t, idx, sc * rnd())
-        more = idx_next(idx, t.shape)
+        tensorSet(t, idx, sc * rnd())
+        more = indexNext(idx, t.shape)
     }
 }
 
 // ---- rejection cases, in children ------------------------------------------
 if args().len() > 1 {
     let case = args()[1]
-    let cfg = TfConfig{input_vocab: 9, output_vocab: 3, d: 8, ff: 12, layers: 1, max_len: 6, pad: 0, eps: 0.00001}
-    let p = tf_new(cfg)
-    let ts = tf_param_list(p)
+    let cfg = TfConfig{inputVocab: 9, outputVocab: 3, d: 8, feedForwardDimension: 12, layers: 1, maxLength: 6, padToken: 0, epsilon: 0.00001}
+    let p = newTransformer(cfg)
+    let ts = transformerParameterList(p)
     for i in 0..ts.len() { fill_random(ts[i], 0.2) }
-    av_reset()
-    let m = tf_params(p, true)
+    autogradReset()
+    let m = transformerParameters(p, true)
     if case == "toolong" {
-        let tk = t_zeros(DType.I64, [2, 9])
+        let tk = tensorZeros(DType.I64, [2, 9])
         for r in 0..2 {
-            for s in 0..9 { t_set_int(tk, [r, s], 1) }
+            for s in 0..9 { tensorSetInt(tk, [r, s], 1) }
         }
-        tf_loss(m, tk, [0, 1])
+        transformerLoss(m, tk, [0, 1])
     }
     if case == "vocab" {
-        let tk = t_zeros(DType.I64, [2, 4])
+        let tk = tensorZeros(DType.I64, [2, 4])
         for r in 0..2 {
-            for s in 0..4 { t_set_int(tk, [r, s], 1) }
+            for s in 0..4 { tensorSetInt(tk, [r, s], 1) }
         }
-        t_set_int(tk, [1, 2], 99)
-        tf_loss(m, tk, [0, 1])
+        tensorSetInt(tk, [1, 2], 99)
+        transformerLoss(m, tk, [0, 1])
     }
     if case == "target" {
-        let tk = t_zeros(DType.I64, [2, 4])
+        let tk = tensorZeros(DType.I64, [2, 4])
         for r in 0..2 {
-            for s in 0..4 { t_set_int(tk, [r, s], 1) }
+            for s in 0..4 { tensorSetInt(tk, [r, s], 1) }
         }
-        tf_loss(m, tk, [0, 7])
+        transformerLoss(m, tk, [0, 7])
     }
     print("UNREACHABLE: {case} was accepted")
 }
 let IS_CHILD = args().len() > 1
 
 fn child(case: str) -> int {
-    var cmd = cbytes("\"{args()[0]}\" {case}")
+    var cmd = cString("\"{args()[0]}\" {case}")
     let startup = Bytes.new(104)
     startup.put32(0, 104)
     let process = Bytes.new(24)
@@ -95,38 +95,38 @@ fn child(case: str) -> int {
     return code
 }
 
-let CFG = TfConfig{input_vocab: 9, output_vocab: 3, d: 8, ff: 12, layers: 2, max_len: 7, pad: 0, eps: 0.00001}
-let P = tf_new(CFG)
-let TS = tf_param_list(P)
+let CFG = TfConfig{inputVocab: 9, outputVocab: 3, d: 8, feedForwardDimension: 12, layers: 2, maxLength: 7, padToken: 0, epsilon: 0.00001}
+let P = newTransformer(CFG)
+let TS = transformerParameterList(P)
 for i in 0..TS.len() { fill_random(TS[i], 0.25) }
 
 let B = 4
 let T = 7
-let TOK = t_zeros(DType.I64, [B, T])
+let TOK = tensorZeros(DType.I64, [B, T])
 var TARGETS: [int] = []
 for r in 0..B {
     let real = 4 + r % 3
     for s in 0..T {
-        if s < real { t_set_int(TOK, [r, s], 1 + rndi(8)) } else { t_set_int(TOK, [r, s], CFG.pad) }
+        if s < real { tensorSetInt(TOK, [r, s], 1 + rndi(8)) } else { tensorSetInt(TOK, [r, s], CFG.padToken) }
     }
     TARGETS.push(rndi(3))
 }
 
 fn loss_of(tokens: Tensor) -> float {
-    av_reset()
-    let m = tf_params(P, false)
-    return t_get(av_value(tf_loss(m, tokens, TARGETS)), [0])
+    autogradReset()
+    let m = transformerParameters(P, false)
+    return tensorGet(autogradValue(transformerLoss(m, tokens, TARGETS)), [0])
 }
 
 if not IS_CHILD {
     // ---- gradients against central differences -----------------------------
-    av_reset()
-    let m = tf_params(P, true)
-    let loss = tf_loss(m, TOK, TARGETS)
-    let base = t_get(av_value(loss), [0])
-    av_backward(loss)
+    autogradReset()
+    let m = transformerParameters(P, true)
+    let loss = transformerLoss(m, TOK, TARGETS)
+    let base = tensorGet(autogradValue(loss), [0])
+    autogradBackward(loss)
     var grads: [Tensor] = []
-    for i in 0..m.hs.len() { grads.push(t_copy(av_grad(m.hs[i]))) }
+    for i in 0..m.handles.len() { grads.push(tensorCopy(autogradGradient(m.handles[i]))) }
 
     chk(base == base and base > 0.0, "the loss is finite and positive ({base})")
     chk(grads.len() == 30, "the model has thirty parameter tensors ({grads.len()})")
@@ -139,9 +139,9 @@ if not IS_CHILD {
     for i in 0..TS.len() {
         // Two elements per tensor, chosen by the same generator each run, so
         // this is a fixed test rather than a lottery that passes on average.
-        let n = t_numel(TS[i])
+        let n = tensorElementCount(TS[i])
         for probe in 0..2 {
-            var idx = idx_zeros(TS[i].shape.len())
+            var idx = indexZeros(TS[i].shape.len())
             var flat = (probe * 7 + i * 3) % n
             var rem = flat
             var k = TS[i].shape.len() - 1
@@ -150,14 +150,14 @@ if not IS_CHILD {
                 rem = rem / TS[i].shape[k]
                 k = k - 1
             }
-            let orig = t_get(TS[i], idx)
-            t_set(TS[i], idx, orig + h)
+            let orig = tensorGet(TS[i], idx)
+            tensorSet(TS[i], idx, orig + h)
             let up = loss_of(TOK)
-            t_set(TS[i], idx, orig - h)
+            tensorSet(TS[i], idx, orig - h)
             let dn = loss_of(TOK)
-            t_set(TS[i], idx, orig)
+            tensorSet(TS[i], idx, orig)
             let fd = (up - dn) / (2.0 * h)
-            let an = t_get(grads[i], idx)
+            let an = tensorGet(grads[i], idx)
             let rel = fabs(fd - an) / (1.0 + fabs(an))
             if fabs(an) > 0.0000001 { nonzero = nonzero + 1 }
             if rel > worst { worst = rel
@@ -172,17 +172,17 @@ if not IS_CHILD {
     // ---- causality ----------------------------------------------------------
     // Two inputs agreeing up to position p must give the same hidden state at
     // p. This is the check that the mask is a causal mask and not decoration.
-    let alt = t_copy(TOK)
+    let alt = tensorCopy(TOK)
     let p_cut = 3
     for r in 0..B {
-        for s in (p_cut + 1)..T { t_set_int(alt, [r, s], 1 + ((s * 5 + r) % 8)) }
+        for s in (p_cut + 1)..T { tensorSetInt(alt, [r, s], 1 + ((s * 5 + r) % 8)) }
     }
-    av_reset()
-    let ma = tf_params(P, false)
-    let ha = av_value(tf_encode(ma, TOK))
-    av_reset()
-    let mb = tf_params(P, false)
-    let hb = av_value(tf_encode(mb, alt))
+    autogradReset()
+    let ma = transformerParameters(P, false)
+    let ha = autogradValue(transformerEncode(ma, TOK))
+    autogradReset()
+    let mb = transformerParameters(P, false)
+    let hb = autogradValue(transformerEncode(mb, alt))
     var same_before = true
     var differs_after = false
     for r in 0..B {
@@ -190,7 +190,7 @@ if not IS_CHILD {
             let row = r * T + s
             var equal = true
             for c in 0..CFG.d {
-                if t_get(ha, [row, c]) != t_get(hb, [row, c]) { equal = false }
+                if tensorGet(ha, [row, c]) != tensorGet(hb, [row, c]) { equal = false }
             }
             if s <= p_cut and not equal { same_before = false }
             if s > p_cut and not equal { differs_after = true }
@@ -200,10 +200,10 @@ if not IS_CHILD {
     chk(differs_after, "positions after the cut do change, so the causality check is not passing because nothing moved")
 
     // ---- padding -------------------------------------------------------------
-    let padded = t_copy(TOK)
+    let padded = tensorCopy(TOK)
     for r in 0..B {
         for s in 0..T {
-            if t_get_int(TOK, [r, s]) == CFG.pad { t_set_int(padded, [r, s], CFG.pad) }
+            if tensorGetInt(TOK, [r, s]) == CFG.padToken { tensorSetInt(padded, [r, s], CFG.padToken) }
         }
     }
     // Rewriting PAD positions with a different PAD-valued pattern is a no-op
@@ -212,22 +212,22 @@ if not IS_CHILD {
     var pad_ok = true
     for r in 0..B {
         let real = 4 + r % 3
-        chk(tf_last_real(TOK, r, T, CFG.pad) == real - 1,
+        chk(transformerLastReal(TOK, r, T, CFG.padToken) == real - 1,
             "row {r} reads out at its last real token, position {real - 1}")
-        if tf_last_real(TOK, r, T, CFG.pad) != real - 1 { pad_ok = false }
+        if transformerLastReal(TOK, r, T, CFG.padToken) != real - 1 { pad_ok = false }
     }
     chk(pad_ok, "every row reads out at a real token, not at padding")
 
     // Probabilities are a distribution.
-    av_reset()
-    let mp = tf_params(P, false)
-    let pr = av_value(tf_readout(mp, tf_forward(mp, TOK)))
+    autogradReset()
+    let mp = transformerParameters(P, false)
+    let pr = autogradValue(transformerReadout(mp, transformerForward(mp, TOK)))
     var wsum = 0.0
     var neg = 0
     for r in 0..B {
         var s = 0.0
-        for c in 0..CFG.output_vocab {
-            let v = t_get(pr, [r, c])
+        for c in 0..CFG.outputVocab {
+            let v = tensorGet(pr, [r, c])
             if v < 0.0 { neg = neg + 1 }
             s = s + v
         }
@@ -240,12 +240,12 @@ if not IS_CHILD {
     // A model that is differentiable but cannot fit anything would pass every
     // check above. Thirty-two examples with fixed labels, driven down.
     let nfit = 16
-    let fit_tok = t_zeros(DType.I64, [nfit, T])
+    let fit_tok = tensorZeros(DType.I64, [nfit, T])
     var fit_y: [int] = []
     for r in 0..nfit {
         let real = 4 + r % 3
         for s in 0..T {
-            if s < real { t_set_int(fit_tok, [r, s], 1 + rndi(8)) } else { t_set_int(fit_tok, [r, s], CFG.pad) }
+            if s < real { tensorSetInt(fit_tok, [r, s], 1 + rndi(8)) } else { tensorSetInt(fit_tok, [r, s], CFG.padToken) }
         }
         // The label is a function of the row's contents rather than an
         // independent draw. With independent labels this fixture had three
@@ -253,7 +253,7 @@ if not IS_CHILD {
         // was the data's own entropy and the check was measuring that, not
         // the model -- it plateaued at 0.26 and more steps did not help.
         var acc = 0
-        for s2 in 0..T { acc = acc + (s2 + 1) * t_get_int(fit_tok, [r, s2]) }
+        for s2 in 0..T { acc = acc + (s2 + 1) * tensorGetInt(fit_tok, [r, s2]) }
         fit_y.push(acc % 3)
     }
     // And the guard that stops it silently becoming unfittable again.
@@ -262,25 +262,25 @@ if not IS_CHILD {
         for b in (a + 1)..nfit {
             var same = true
             for s in 0..T {
-                if t_get_int(fit_tok, [a, s]) != t_get_int(fit_tok, [b, s]) { same = false }
+                if tensorGetInt(fit_tok, [a, s]) != tensorGetInt(fit_tok, [b, s]) { same = false }
             }
             if same and fit_y[a] != fit_y[b] { contradictions = contradictions + 1 }
         }
     }
     chk(contradictions == 0, "the overfit fixture has no duplicate rows with contradictory labels ({contradictions})")
-    let opt = adamw_new(TS, 0.05, 0.9, 0.999, 0.00000001, 0.0)
+    let opt = newAdamW(TS, 0.05, 0.9, 0.999, 0.00000001, 0.0)
     var first = 0.0
     var last = 0.0
     for stp in 0..200 {
-        av_reset()
-        let mm = tf_params(P, true)
-        let lo = tf_loss(mm, fit_tok, fit_y)
-        av_backward(lo)
+        autogradReset()
+        let mm = transformerParameters(P, true)
+        let lo = transformerLoss(mm, fit_tok, fit_y)
+        autogradBackward(lo)
         var gs: [Tensor] = []
-        for i in 0..mm.hs.len() { gs.push(t_copy(av_grad(mm.hs[i]))) }
-        clip_grad_norm(gs, 5.0)
-        optim_step(opt, TS, gs)
-        let lv = t_get(av_value(lo), [0])
+        for i in 0..mm.handles.len() { gs.push(tensorCopy(autogradGradient(mm.handles[i]))) }
+        clipGradientNorm(gs, 5.0)
+        optimizerStep(opt, TS, gs)
+        let lv = tensorGet(autogradValue(lo), [0])
         if stp == 0 { first = lv }
         last = lv
     }

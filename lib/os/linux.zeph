@@ -1,65 +1,65 @@
 // lib/os/linux.zeph -- the kernel32 surface runtime.zeph uses, on top of Linux
 // syscalls. Merged ahead of runtime.zeph by `zc --linux --rt`, which rewrites
-// every win("Foo", ...) in the runtime into a call to k32_Foo(...). The runtime,
+// every win("Foo", ...) in the runtime into a call to kernel32Foo(...). The runtime,
 // the GC and the string machinery are already platform-neutral and are compiled
 // unchanged for both targets.
 //
-// Startup/GC shims must not allocate: rx_init calls k32_VirtualAlloc before
+// Startup/GC shims must not allocate: runtimeInitializeHeap calls kernel32VirtualAlloc before
 // the heap exists. They use raw syscalls, load*/store* and mmap only.
 // Unsupported application-only operations may panic after runtime startup.
 
-let SYS_READ = 0
-let SYS_WRITE = 1
-let SYS_OPEN = 2
-let SYS_CLOSE = 3
-let SYS_LSEEK = 8
-let SYS_MMAP = 9
-let SYS_MPROTECT = 10
-let SYS_EXIT_GROUP = 231
+let systemCallRead = 0
+let systemCallWrite = 1
+let systemCallOpen = 2
+let systemCallClose = 3
+let systemCallSeekFile = 8
+let systemCallMapMemory = 9
+let systemCallProtectMemory = 10
+let systemCallExitGroup = 231
 
-let PROT_NONE = 0
-let PROT_RW = 3
-let MAP_ANON_PRIV = 34          // MAP_PRIVATE | MAP_ANONYMOUS
-let MAP_NORESERVE = 16384
+let memoryProtectionNone = 0
+let memoryProtectionReadWrite = 3
+let mapAnonymousPrivate = 34          // MAP_PRIVATE | MAP_ANONYMOUS
+let mapNoReservation = 16384
 
 // mmap and friends report failure as a small negative value (-errno)
-fn lx_failed(r: int) -> bool {
-    return r < 0 and r > 0 - 4096
+fn linuxFailed(result: int) -> bool {
+    return result < 0 and result > 0 - 4096
 }
 
-fn lx_mmap(addr: int, n: int, prot: int, flags: int) -> int {
-    let r = syscall(SYS_MMAP, addr, n, prot, flags, 0 - 1, 0)
-    if lx_failed(r) { return 0 }
-    return r
+fn linuxMapMemory(address: int, byteCount: int, protection: int, flags: int) -> int {
+    let result = syscall(systemCallMapMemory, address, byteCount, protection, flags, 0 - 1, 0)
+    if linuxFailed(result) { return 0 }
+    return result
 }
 
 // ---- memory ----
 
-// MEM_RESERVE=0x2000 MEM_COMMIT=0x1000. A reserve maps PROT_NONE address space
+// MEM_RESERVE=0x2000 MEM_COMMIT=0x1000. A reserve maps memoryProtectionNone address space
 // (Linux overcommits, so this costs nothing); a later commit just mprotects it.
-fn k32_VirtualAlloc(base: int, n: int, flags: int, prot: int) -> int {
-    var protection = PROT_RW
-    if prot == 64 { protection = 7 } // PAGE_EXECUTE_READWRITE
-    let want_commit = (flags & 4096) != 0
-    let want_reserve = (flags & 8192) != 0
-    if want_reserve and not want_commit {
-        return lx_mmap(base, n, PROT_NONE, MAP_ANON_PRIV + MAP_NORESERVE)
+fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgument: int) -> int {
+    var protection = memoryProtectionReadWrite
+    if protectionArgument == 64 { protection = 7 } // PAGE_EXECUTE_READWRITE
+    let wantCommit = (flags & 4096) != 0
+    let wantReserve = (flags & 8192) != 0
+    if wantReserve and not wantCommit {
+        return linuxMapMemory(base, byteCount, memoryProtectionNone, mapAnonymousPrivate + mapNoReservation)
     }
-    if want_commit and base != 0 {
-        let r = syscall(SYS_MPROTECT, base, n, protection)
-        if lx_failed(r) { return 0 }
+    if wantCommit and base != 0 {
+        let result = syscall(systemCallProtectMemory, base, byteCount, protection)
+        if linuxFailed(result) { return 0 }
         return base
     }
     // Keep allocation size in a preceding page for MEM_RELEASE (size == 0).
-    if n <= 0 or n > 9223372036854771711 { return 0 }
-    let mappingAddress = lx_mmap(0, n + 4096, protection, MAP_ANON_PRIV)
+    if byteCount <= 0 or byteCount > 9223372036854771711 { return 0 }
+    let mappingAddress = linuxMapMemory(0, byteCount + 4096, protection, mapAnonymousPrivate)
     if mappingAddress == 0 { return 0 }
-    store64(mappingAddress, n + 4096)
+    store64(mappingAddress, byteCount + 4096)
     return mappingAddress + 4096
 }
 
 // Release a committed allocation returned by VirtualAlloc above.
-fn k32_VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
+fn kernel32VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
     if memoryAddress == 0 or freeFlags != 32768 { return 0 }
     let mappingAddress = memoryAddress - 4096
     if syscall(11, mappingAddress, load64(mappingAddress)) != 0 { return 0 }
@@ -70,74 +70,74 @@ fn k32_VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
 
 // Windows handles are opaque; on Linux we hand back the fd itself, so the
 // runtime's WriteFile/ReadFile calls land on the right descriptor unchanged.
-fn k32_GetStdHandle(which: int) -> int {
+fn kernel32GetStdHandle(which: int) -> int {
     if which == 0 - 10 { return 0 }
     if which == 0 - 11 { return 1 }
     return 2
 }
 
-fn k32_WriteFile(h: int, ptr: int, n: int, pwritten: int, ov: int) -> int {
-    var done = 0
-    while done < n {
-        let r = syscall(SYS_WRITE, h, ptr + done, n - done)
-        if r <= 0 {
-            if pwritten != 0 { store64(pwritten, done) }
+fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCountAddress: int, overlapped: int) -> int {
+    var bytesWritten = 0
+    while bytesWritten < byteCount {
+        let result = syscall(systemCallWrite, handle, bytesAddress + bytesWritten, byteCount - bytesWritten)
+        if result <= 0 {
+            if writtenCountAddress != 0 { store64(writtenCountAddress, bytesWritten) }
             return 0
         }
-        done += r
+        bytesWritten += result
     }
-    if pwritten != 0 { store64(pwritten, done) }
+    if writtenCountAddress != 0 { store64(writtenCountAddress, bytesWritten) }
     return 1
 }
 
-fn k32_ReadFile(h: int, buf: int, n: int, pread: int, ov: int) -> int {
-    let r = syscall(SYS_READ, h, buf, n)
-    if r < 0 {
-        if pread != 0 { store64(pread, 0) }
+fn kernel32ReadFile(handle: int, buffer: int, byteCount: int, readCountAddress: int, overlapped: int) -> int {
+    let result = syscall(systemCallRead, handle, buffer, byteCount)
+    if result < 0 {
+        if readCountAddress != 0 { store64(readCountAddress, 0) }
         return 0
     }
-    if pread != 0 { store64(pread, r) }
+    if readCountAddress != 0 { store64(readCountAddress, result) }
     return 1
 }
 
-fn k32_CreateFileA(cp: int, access: int, share: int, sa: int, disp: int, flags: int, tmpl: int) -> int {
-    var oflags = 0                       // O_RDONLY
+fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, securityAttributes: int, creationDisposition: int, flags: int, templateHandle: int) -> int {
+    var openFlags = 0                       // O_RDONLY
     var mode = 0
     if (access & 1073741824) != 0 {      // GENERIC_WRITE
-        oflags = 1                       // O_WRONLY
+        openFlags = 1                       // O_WRONLY
         mode = 420                       // 0644
     }
-    if (access & 4) != 0 { oflags = 1025  // O_WRONLY | O_APPEND
+    if (access & 4) != 0 { openFlags = 1025  // O_WRONLY | O_APPEND
         mode = 420
     }
-    if disp == 1 { oflags = oflags | 192 } // CREATE_NEW: O_CREAT | O_EXCL
-    if disp == 2 { oflags = oflags | 576 } // CREATE_ALWAYS: O_CREAT | O_TRUNC
-    if disp == 4 { oflags = oflags | 64 }  // OPEN_ALWAYS: O_CREAT
-    if disp == 5 { oflags = oflags | 512 } // TRUNCATE_EXISTING
-    let fd = syscall(SYS_OPEN, cp, oflags, mode)
-    if fd < 0 { return 0 - 1 }
-    return fd
+    if creationDisposition == 1 { openFlags = openFlags | 192 } // CREATE_NEW: O_CREAT | O_EXCL
+    if creationDisposition == 2 { openFlags = openFlags | 576 } // CREATE_ALWAYS: O_CREAT | O_TRUNC
+    if creationDisposition == 4 { openFlags = openFlags | 64 }  // OPEN_ALWAYS: O_CREAT
+    if creationDisposition == 5 { openFlags = openFlags | 512 } // TRUNCATE_EXISTING
+    let fileDescriptor = syscall(systemCallOpen, cStringPointer, openFlags, mode)
+    if fileDescriptor < 0 { return 0 - 1 }
+    return fileDescriptor
 }
 
-fn k32_GetFileSize(h: int, phigh: int) -> int {
-    let size = syscall(SYS_LSEEK, h, 0, 2)      // SEEK_END
-    let back = syscall(SYS_LSEEK, h, 0, 0)      // SEEK_SET
+fn kernel32GetFileSize(handle: int, highSizeAddress: int) -> int {
+    let size = syscall(systemCallSeekFile, handle, 0, 2)      // SEEK_END
+    let rewindResult = syscall(systemCallSeekFile, handle, 0, 0)      // SEEK_SET
     if size < 0 { return 0 }
     return size
 }
 
-fn k32_CloseHandle(h: int) -> int {
-    if lx_close_thread(h) { return 1 }
-    let r = syscall(SYS_CLOSE, h)
-    if r < 0 { return 0 }
+fn kernel32CloseHandle(handle: int) -> int {
+    if linuxCloseThread(handle) { return 1 }
+    let result = syscall(systemCallClose, handle)
+    if result < 0 { return 0 }
     return 1
 }
 
 // stat follows symlinks and provides the directory bit used by std/io.
-fn k32_GetFileAttributesA(cp: int) -> int {
-    let scratch = lx_mmap(0, 144, PROT_RW, MAP_ANON_PRIV)
+fn kernel32GetFileAttributesA(cStringPointer: int) -> int {
+    let scratch = linuxMapMemory(0, 144, memoryProtectionReadWrite, mapAnonymousPrivate)
     if scratch == 0 { return 4294967295 }
-    let status = syscall(4, cp, scratch)
+    let status = syscall(4, cStringPointer, scratch)
     let mode = load64(scratch + 24) & 61440
     let released = syscall(11, scratch, 144)
     if status < 0 { return 4294967295 }
@@ -148,12 +148,12 @@ fn k32_GetFileAttributesA(cp: int) -> int {
 // /proc/self/exe is the Linux answer to GetModuleFileNameA. readlink does not
 // NUL-terminate, so do it here -- callers pass the length back but exe_dir
 // reads the buffer directly.
-var __lx_scratch = 0
+var linuxScratch = 0
 
 // Absolute form of `path` with `.`, `..` and repeated slashes resolved (no symlinks),
 // as the import de-duplicator needs. Returns the length, or the size needed if it won't fit.
-fn k32_GetFullPathNameA(path: int, capacity: int, dest: int, filePart: int) -> int {
-    let joined = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
+fn kernel32GetFullPathNameA(path: int, capacity: int, destination: int, filePart: int) -> int {
+    let joined = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
     var joinedLength = 0
     if load8(path) != 47 {
         let cwdLength = syscall(79, joined, 4096)          // getcwd, length includes the NUL
@@ -165,13 +165,13 @@ fn k32_GetFullPathNameA(path: int, capacity: int, dest: int, filePart: int) -> i
         store8(joined + joinedLength, 47)
         joinedLength += 1
     }
-    var i = 0
-    while load8(path + i) != 0 and joinedLength < 8191 {
-        store8(joined + joinedLength, load8(path + i))
+    var index = 0
+    while load8(path + index) != 0 and joinedLength < 8191 {
+        store8(joined + joinedLength, load8(path + index))
         joinedLength += 1
-        i += 1
+        index += 1
     }
-    var outLength = 0
+    var outputLength = 0
     var position = 0
     while position < joinedLength {
         while position < joinedLength and load8(joined + position) == 47 { position += 1 }
@@ -181,229 +181,229 @@ fn k32_GetFullPathNameA(path: int, capacity: int, dest: int, filePart: int) -> i
         let isDot = segmentLength == 1 and load8(joined + position) == 46
         let isDotDot = segmentLength == 2 and load8(joined + position) == 46 and load8(joined + position + 1) == 46
         if isDotDot {
-            if outLength > 0 { outLength -= 1 }
-            while outLength > 0 and load8(dest + outLength) != 47 { outLength -= 1 }
+            if outputLength > 0 { outputLength -= 1 }
+            while outputLength > 0 and load8(destination + outputLength) != 47 { outputLength -= 1 }
         } else if segmentLength > 0 and not isDot {
-            if outLength + segmentLength + 2 > capacity {
+            if outputLength + segmentLength + 2 > capacity {
                 let freed = syscall(11, joined, 8192)
-                return outLength + segmentLength + 2
+                return outputLength + segmentLength + 2
             }
-            store8(dest + outLength, 47)
-            outLength += 1
-            var j = 0
-            while j < segmentLength {
-                store8(dest + outLength, load8(joined + position + j))
-                outLength += 1
-                j += 1
+            store8(destination + outputLength, 47)
+            outputLength += 1
+            var otherIndex = 0
+            while otherIndex < segmentLength {
+                store8(destination + outputLength, load8(joined + position + otherIndex))
+                outputLength += 1
+                otherIndex += 1
             }
         }
         position = segmentEnd
     }
     let released = syscall(11, joined, 8192)
-    if outLength == 0 {
-        store8(dest, 47)
-        outLength = 1
+    if outputLength == 0 {
+        store8(destination, 47)
+        outputLength = 1
     }
-    store8(dest + outLength, 0)
-    return outLength
+    store8(destination + outputLength, 0)
+    return outputLength
 }
 
-fn k32_GetModuleFileNameA(module: int, buf: int, cap: int) -> int {
-    if __lx_scratch == 0 { __lx_scratch = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
-    let p = lx_path_proc_self(__lx_scratch)
-    store8(p, 101)           // e
-    store8(p + 1, 120)       // x
-    store8(p + 2, 101)       // e
-    store8(p + 3, 0)
-    let n = syscall(89, __lx_scratch, buf, cap - 1)     // readlink
-    if n < 0 { return 0 }
-    store8(buf + n, 0)
-    return n
+fn kernel32GetModuleFileNameA(module: int, buffer: int, capacity: int) -> int {
+    if linuxScratch == 0 { linuxScratch = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate) }
+    let suffixAddress = linuxProcSelfPath(linuxScratch)
+    store8(suffixAddress, 101)           // e
+    store8(suffixAddress + 1, 120)       // x
+    store8(suffixAddress + 2, 101)       // e
+    store8(suffixAddress + 3, 0)
+    let pathLength = syscall(89, linuxScratch, buffer, capacity - 1)     // readlink
+    if pathLength < 0 { return 0 }
+    store8(buffer + pathLength, 0)
+    return pathLength
 }
 
-fn k32_ExitProcess(code: int) -> int {
-    let r = syscall(SYS_EXIT_GROUP, code)
+fn kernel32ExitProcess(code: int) -> int {
+    let result = syscall(systemCallExitGroup, code)
     return 0
 }
 
 // ---- reading a whole /proc file into an off-heap page ----
 
-// The two /proc paths, written out a byte at a time. rx_collect calls into
-// k32_GetCurrentThreadStackLimits, so nothing on that path may touch the heap
+// The two /proc paths, written out a byte at a time. runtimeCollectGarbage calls into
+// kernel32GetCurrentThreadStackLimits, so nothing on that path may touch the heap
 // -- not even a list literal for the filename.
-fn lx_path_proc_self(dst: int) -> int {
-    store8(dst, 47)          // /
-    store8(dst + 1, 112)     // p
-    store8(dst + 2, 114)     // r
-    store8(dst + 3, 111)     // o
-    store8(dst + 4, 99)      // c
-    store8(dst + 5, 47)      // /
-    store8(dst + 6, 115)     // s
-    store8(dst + 7, 101)     // e
-    store8(dst + 8, 108)     // l
-    store8(dst + 9, 102)     // f
-    store8(dst + 10, 47)     // /
-    return dst + 11
+fn linuxProcSelfPath(destination: int) -> int {
+    store8(destination, 47)          // /
+    store8(destination + 1, 112)     // p
+    store8(destination + 2, 114)     // r
+    store8(destination + 3, 111)     // o
+    store8(destination + 4, 99)      // c
+    store8(destination + 5, 47)      // /
+    store8(destination + 6, 115)     // s
+    store8(destination + 7, 101)     // e
+    store8(destination + 8, 108)     // l
+    store8(destination + 9, 102)     // f
+    store8(destination + 10, 47)     // /
+    return destination + 11
 }
 
-fn lx_path_maps(dst: int) -> int {
-    let p = lx_path_proc_self(dst)
-    store8(p, 109)           // m
-    store8(p + 1, 97)        // a
-    store8(p + 2, 112)       // p
-    store8(p + 3, 115)       // s
-    store8(p + 4, 0)
-    return dst
+fn linuxProcMapsPath(destination: int) -> int {
+    let suffixAddress = linuxProcSelfPath(destination)
+    store8(suffixAddress, 109)           // m
+    store8(suffixAddress + 1, 97)        // a
+    store8(suffixAddress + 2, 112)       // p
+    store8(suffixAddress + 3, 115)       // s
+    store8(suffixAddress + 4, 0)
+    return destination
 }
 
-fn lx_path_cmdline(dst: int) -> int {
-    let p = lx_path_proc_self(dst)
-    store8(p, 99)            // c
-    store8(p + 1, 109)       // m
-    store8(p + 2, 100)       // d
-    store8(p + 3, 108)       // l
-    store8(p + 4, 105)       // i
-    store8(p + 5, 110)       // n
-    store8(p + 6, 101)       // e
-    store8(p + 7, 0)
-    return dst
+fn linuxProcCommandLinePath(destination: int) -> int {
+    let suffixAddress = linuxProcSelfPath(destination)
+    store8(suffixAddress, 99)            // c
+    store8(suffixAddress + 1, 109)       // m
+    store8(suffixAddress + 2, 100)       // d
+    store8(suffixAddress + 3, 108)       // l
+    store8(suffixAddress + 4, 105)       // i
+    store8(suffixAddress + 5, 110)       // n
+    store8(suffixAddress + 6, 101)       // e
+    store8(suffixAddress + 7, 0)
+    return destination
 }
 
 // Reads a whole file into a fresh off-heap buffer; returns the byte count and
 // leaves the bytes at `buf`. /proc files report size 0, so this just reads
 // until EOF or the buffer is full.
-fn lx_slurp(cpath: int, buf: int, cap: int) -> int {
-    let fd = syscall(SYS_OPEN, cpath, 0, 0)
-    if fd < 0 { return 0 }
-    var got = 0
+fn linuxReadWholeFile(path: int, buffer: int, capacity: int) -> int {
+    let fileDescriptor = syscall(systemCallOpen, path, 0, 0)
+    if fileDescriptor < 0 { return 0 }
+    var bytesRead = 0
     var going = true
     while going {
-        let r = syscall(SYS_READ, fd, buf + got, cap - 1 - got)
-        if r <= 0 { going = false } else { got += r }
-        if got >= cap - 1 { going = false }
+        let result = syscall(systemCallRead, fileDescriptor, buffer + bytesRead, capacity - 1 - bytesRead)
+        if result <= 0 { going = false } else { bytesRead += result }
+        if bytesRead >= capacity - 1 { going = false }
     }
-    let c = syscall(SYS_CLOSE, fd)
-    store8(buf + got, 0)
-    return got
+    let closeResult = syscall(systemCallClose, fileDescriptor)
+    store8(buffer + bytesRead, 0)
+    return bytesRead
 }
 
 // ---- command line ----
 
-// /proc/self/cmdline is argv joined by NULs; rt_args wants the Windows
+// /proc/self/cmdline is argv joined by NULs; runtimeArguments wants the Windows
 // GetCommandLineA shape, so the NULs become spaces.
 // ponytail: no quoting, so an argument containing a space splits in two.
 // Capture argv at _start if that ever matters.
-var __lx_cmdline = 0
+var linuxCommandLine = 0
 
-fn k32_GetCommandLineA() -> int {
-    if __lx_cmdline != 0 { return __lx_cmdline }
-    let page = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
+fn kernel32GetCommandLineA() -> int {
+    if linuxCommandLine != 0 { return linuxCommandLine }
+    let page = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
     if page == 0 { return 0 }
-    let path = lx_path_cmdline(page + 4096)
-    let n = lx_slurp(path, page, 4096)
-    for i in 0..n {
+    let path = linuxProcCommandLinePath(page + 4096)
+    let byteCount = linuxReadWholeFile(path, page, 4096)
+    for i in 0..byteCount {
         if load8(page + i) == 0 { store8(page + i, 32) }
     }
-    store8(page + n, 0)
-    __lx_cmdline = page
+    store8(page + byteCount, 0)
+    linuxCommandLine = page
     return page
 }
 
 // ---- stack bounds (GC root scanning) ----
 
-var __lx_stack_lo = 0
-var __lx_stack_hi = 0
+var linuxStackLowerBound = 0
+var linuxStackUpperBound = 0
 
-fn lx_hex_at(buf: int, pos: int) -> int {
-    var v = 0
-    var i = pos
+fn linuxHexadecimalAt(buffer: int, position: int) -> int {
+    var value = 0
+    var index = position
     var going = true
     while going {
-        let c = load8(buf + i)
-        var d = 0 - 1
-        if c >= 48 and c <= 57 { d = c - 48 }
-        else if c >= 97 and c <= 102 { d = c - 87 }
-        if d < 0 { going = false } else {
-            v = v * 16 + d
-            i += 1
+        let character = load8(buffer + index)
+        var hexDigit = 0 - 1
+        if character >= 48 and character <= 57 { hexDigit = character - 48 }
+        else if character >= 97 and character <= 102 { hexDigit = character - 87 }
+        if hexDigit < 0 { going = false } else {
+            value = value * 16 + hexDigit
+            index += 1
         }
     }
-    return v
+    return value
 }
 
 // "[stack]" at p?
-fn lx_is_stack_tag(p: int) -> bool {
-    if load8(p + 1) != 115 { return false }      // s
-    if load8(p + 2) != 116 { return false }      // t
-    if load8(p + 3) != 97 { return false }       // a
-    if load8(p + 4) != 99 { return false }       // c
-    if load8(p + 5) != 107 { return false }      // k
-    if load8(p + 6) != 93 { return false }       // ]
+fn linuxIsStackTag(address: int) -> bool {
+    if load8(address + 1) != 115 { return false }      // s
+    if load8(address + 2) != 116 { return false }      // t
+    if load8(address + 3) != 97 { return false }       // a
+    if load8(address + 4) != 99 { return false }       // c
+    if load8(address + 5) != 107 { return false }      // k
+    if load8(address + 6) != 93 { return false }       // ]
     return true
 }
 
 // The main thread's stack is the one region /proc/self/maps tags "[stack]".
-fn lx_find_stack() {
-    let page = lx_mmap(0, 262144, PROT_RW, MAP_ANON_PRIV)
+fn linuxFindStack() {
+    let page = linuxMapMemory(0, 262144, memoryProtectionReadWrite, mapAnonymousPrivate)
     if page == 0 { return }
-    let path = lx_path_maps(page + 258048)
-    let n = lx_slurp(path, page, 258048)
-    var linestart = 0
-    var i = 0
-    while i <= n {
-        let c = load8(page + i)
-        if c == 10 or i == n {
+    let path = linuxProcMapsPath(page + 258048)
+    let byteCount = linuxReadWholeFile(path, page, 258048)
+    var lineStart = 0
+    var index = 0
+    while index <= byteCount {
+        let character = load8(page + index)
+        if character == 10 or index == byteCount {
             // a "[stack]" tag anywhere in the line identifies the region
-            var j = linestart
+            var otherIndex = lineStart
             var tagged = false
-            while j + 6 < i {
-                if load8(page + j) == 91 and lx_is_stack_tag(page + j) { tagged = true }
-                j += 1
+            while otherIndex + 6 < index {
+                if load8(page + otherIndex) == 91 and linuxIsStackTag(page + otherIndex) { tagged = true }
+                otherIndex += 1
             }
             if tagged {
-                __lx_stack_lo = lx_hex_at(page, linestart)
-                var k = linestart
-                while load8(page + k) != 45 { k += 1 }
-                __lx_stack_hi = lx_hex_at(page, k + 1)
+                linuxStackLowerBound = linuxHexadecimalAt(page, lineStart)
+                var dashIndex = lineStart
+                while load8(page + dashIndex) != 45 { dashIndex += 1 }
+                linuxStackUpperBound = linuxHexadecimalAt(page, dashIndex + 1)
             }
-            linestart = i + 1
+            lineStart = index + 1
         }
-        i += 1
+        index += 1
     }
 }
 
-fn k32_GetCurrentThreadStackLimits(lo: int, hi: int) -> int {
-    let threadRecord = lx_current_thread()
+fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: int) -> int {
+    let threadRecord = linuxCurrentThread()
     if threadRecord != 0 {
-        store64(lo, load64(threadRecord + 8) + 4096)
-        store64(hi, load64(threadRecord + 40))
+        store64(lowLimitAddress, load64(threadRecord + 8) + 4096)
+        store64(highLimitAddress, load64(threadRecord + 40))
         return 0
     }
-    if __lx_stack_hi == 0 { lx_find_stack() }
-    if __lx_stack_hi == 0 {
+    if linuxStackUpperBound == 0 { linuxFindStack() }
+    if linuxStackUpperBound == 0 {
         // no maps, no roots we can trust -- better to stop than to collect blind
-        let r = syscall(SYS_EXIT_GROUP, 70)
+        let result = syscall(systemCallExitGroup, 70)
     }
-    store64(lo, __lx_stack_lo)
-    store64(hi, __lx_stack_hi)
+    store64(lowLimitAddress, linuxStackLowerBound)
+    store64(highLimitAddress, linuxStackUpperBound)
     return 0
 }
 
 // ---- threads and futex synchronization ----
 // Immutable linked records retain their addresses for lock-free stack lookup.
-// Closed records are reused under rt_lock; their stacks are unmapped on join.
+// Closed records are reused under runtimeLockHeap; their stacks are unmapped on join.
 // Layout: tid32, gate32, mapping, entry, argument, next, stack high, active,
 // generation, then 512 TLS cells at offset 64. A guard precedes each stack.
-var __lx_threads = 0
-var __lx_native = 0
-var __lx_tls = 0
-var __lx_ntls = 0
+var linuxThreads = 0
+var linuxNative = 0
+var linuxThreadLocalStorage = 0
+var linuxThreadLocalSlotCount = 0
 
 // Initialize native CAS32/xadd32/clone code without touching the managed heap.
-fn lx_native_init() {
-    if __lx_native != 0 { return }
-    let codeAddress = lx_mmap(0, 4096, 7, MAP_ANON_PRIV)
-    if codeAddress == 0 { let exited = syscall(SYS_EXIT_GROUP, 70) }
+fn linuxNativeInitialize() {
+    if linuxNative != 0 { return }
+    let codeAddress = linuxMapMemory(0, 4096, 7, mapAnonymousPrivate)
+    if codeAddress == 0 { let exited = syscall(systemCallExitGroup, 70) }
     // CAS32: mov eax,edx; lock cmpxchg [rcx],r8d; ret (old value).
     store8(codeAddress, 137)
     store8(codeAddress + 1, 208)
@@ -508,14 +508,14 @@ fn lx_native_init() {
     store8(codeAddress + 110, 5)
     store8(codeAddress + 111, 15)
     store8(codeAddress + 112, 11)
-    __lx_native = codeAddress
+    linuxNative = codeAddress
 }
 
 // Return the current worker's native record, or zero for the main thread.
 // ponytail: linear range lookup; index ranges if many live records make TLS hot.
-fn lx_current_thread() -> int {
-    let stackAddress = stackptr()
-    var threadRecord = __lx_threads
+fn linuxCurrentThread() -> int {
+    let stackAddress = stackPointer()
+    var threadRecord = linuxThreads
     while threadRecord != 0 {
         // An odd or changed generation belongs to another thread's reuse/close.
         // Our own live record cannot change until this thread exits and joins.
@@ -531,31 +531,31 @@ fn lx_current_thread() -> int {
 }
 
 // Obtain the kernel TID, also used as recursive-lock ownership token.
-fn k32_GetCurrentThreadId() -> int { return syscall(186) }
+fn kernel32GetCurrentThreadId() -> int { return syscall(186) }
 
 // Initialize a recursive lock: owner TID at 0, recursion count at 8.
-fn k32_InitializeCriticalSection(lockAddress: int) -> int {
-    lx_native_init()
+fn kernel32InitializeCriticalSection(lockAddress: int) -> int {
+    linuxNativeInitialize()
     store64(lockAddress, 0)
     store64(lockAddress + 8, 0)
     return 0
 }
 
 // Acquire ownership without sleeping, or increase this owner's recursion count.
-fn k32_TryEnterCriticalSection(lockAddress: int) -> int {
+fn kernel32TryEnterCriticalSection(lockAddress: int) -> int {
     let threadId = syscall(186)
     if (load64(lockAddress) & 4294967295) == threadId {
         store64(lockAddress + 8, load64(lockAddress + 8) + 1)
         return 1
     }
-    if callptr(__lx_native, lockAddress, 0, threadId) != 0 { return 0 }
+    if callPointer(linuxNative, lockAddress, 0, threadId) != 0 { return 0 }
     store64(lockAddress + 8, 1)
     return 1
 }
 
 // Retry acquisition around futex waits; changed ownership yields EAGAIN.
-fn k32_EnterCriticalSection(lockAddress: int) -> int {
-    while k32_TryEnterCriticalSection(lockAddress) == 0 {
+fn kernel32EnterCriticalSection(lockAddress: int) -> int {
+    while kernel32TryEnterCriticalSection(lockAddress) == 0 {
         let ownerId = load64(lockAddress) & 4294967295
         if ownerId != 0 { let waited = syscall(202, lockAddress, 128, ownerId, 0) }
     }
@@ -563,7 +563,7 @@ fn k32_EnterCriticalSection(lockAddress: int) -> int {
 }
 
 // Release the outermost acquisition and wake a waiter.
-fn k32_LeaveCriticalSection(lockAddress: int) -> int {
+fn kernel32LeaveCriticalSection(lockAddress: int) -> int {
     let recursionCount = load64(lockAddress + 8) - 1
     store64(lockAddress + 8, recursionCount)
     if recursionCount == 0 {
@@ -574,70 +574,70 @@ fn k32_LeaveCriticalSection(lockAddress: int) -> int {
 }
 
 // Initialize a futex sequence counter.
-fn k32_InitializeConditionVariable(conditionAddress: int) -> int {
+fn kernel32InitializeConditionVariable(conditionAddress: int) -> int {
     store64(conditionAddress, 0)
     return 0
 }
 
 // Atomically sleep relative to the sequence, releasing and reacquiring the lock.
 // As on Windows the caller must hold the critical section exactly once.
-fn k32_SleepConditionVariableCS(conditionAddress: int, lockAddress: int, waitTimeout: int) -> int {
+fn kernel32SleepConditionVariableCS(conditionAddress: int, lockAddress: int, waitTimeout: int) -> int {
     let sequenceNumber = load64(conditionAddress) & 4294967295
     var timeoutAddress = 0
     if waitTimeout != 4294967295 {
-        timeoutAddress = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+        timeoutAddress = linuxMapMemory(0, 16, memoryProtectionReadWrite, mapAnonymousPrivate)
         if timeoutAddress == 0 { return 0 }
         store64(timeoutAddress, waitTimeout / 1000)
         store64(timeoutAddress + 8, (waitTimeout % 1000) * 1000000)
     }
-    let released = k32_LeaveCriticalSection(lockAddress)
+    let released = kernel32LeaveCriticalSection(lockAddress)
     let waitStatus = syscall(202, conditionAddress, 128, sequenceNumber, timeoutAddress)
-    let acquired = k32_EnterCriticalSection(lockAddress)
+    let acquired = kernel32EnterCriticalSection(lockAddress)
     if timeoutAddress != 0 { let freed = syscall(11, timeoutAddress, 16) }
     if waitStatus == 0 - 110 { return 0 }
     return 1
 }
 
 // Change the sequence before waking one sleeper, preventing missed wakeups.
-fn k32_WakeConditionVariable(conditionAddress: int) -> int {
-    let previousSequence = callptr(__lx_native + 16, conditionAddress, 1)
+fn kernel32WakeConditionVariable(conditionAddress: int) -> int {
+    let previousSequence = callPointer(linuxNative + 16, conditionAddress, 1)
     return syscall(202, conditionAddress, 129, 1)
 }
 
 // Change the sequence and wake every sleeper.
-fn k32_WakeAllConditionVariable(conditionAddress: int) -> int {
-    let previousSequence = callptr(__lx_native + 16, conditionAddress, 1)
+fn kernel32WakeAllConditionVariable(conditionAddress: int) -> int {
+    let previousSequence = callPointer(linuxNative + 16, conditionAddress, 1)
     return syscall(202, conditionAddress, 129, 2147483647)
 }
 
 // Create a guarded stack and clone; the native child waits before entering Zephyr.
-fn k32_CreateThread(securityAddress: int, stackSize: int, entryAddress: int, argument: int, creationFlags: int, threadIdAddress: int) -> int {
-    rt_lock()
-    var threadRecord = __lx_threads
+fn kernel32CreateThread(securityAddress: int, stackSize: int, entryAddress: int, argument: int, creationFlags: int, threadIdAddress: int) -> int {
+    runtimeLockHeap()
+    var threadRecord = linuxThreads
     while threadRecord != 0 and load64(threadRecord + 48) != 0 {
         threadRecord = load64(threadRecord + 32)
     }
     if threadRecord == 0 {
-        threadRecord = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
-        if threadRecord == 0 { rt_unlock()
+        threadRecord = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
+        if threadRecord == 0 { runtimeUnlockHeap()
             return 0
         }
-        store64(threadRecord + 32, __lx_threads)
-        __lx_threads = threadRecord
+        store64(threadRecord + 32, linuxThreads)
+        linuxThreads = threadRecord
     }
     var requestedSize = stackSize
     if requestedSize == 0 { requestedSize = 8388608 }
-    if requestedSize < 16384 or requestedSize > 1073741824 { rt_unlock()
+    if requestedSize < 16384 or requestedSize > 1073741824 { runtimeUnlockHeap()
         return 0
     }
     let mappingSize = ((requestedSize + 4095) / 4096) * 4096 + 4096
-    let stackMapping = lx_mmap(0, mappingSize, PROT_RW, MAP_ANON_PRIV)
-    if stackMapping == 0 { rt_unlock()
+    let stackMapping = linuxMapMemory(0, mappingSize, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if stackMapping == 0 { runtimeUnlockHeap()
         return 0
     }
-    let guarded = syscall(SYS_MPROTECT, stackMapping, 4096, PROT_NONE)
+    let guarded = syscall(systemCallProtectMemory, stackMapping, 4096, memoryProtectionNone)
     if guarded < 0 { let freed = syscall(11, stackMapping, mappingSize)
-        rt_unlock()
+        runtimeUnlockHeap()
         return 0
     }
     store64(threadRecord + 56, load64(threadRecord + 56) + 1)
@@ -654,7 +654,7 @@ fn k32_CreateThread(securityAddress: int, stackSize: int, entryAddress: int, arg
     let childStack = stackMapping + mappingSize - 8
     store64(childStack, threadRecord)
     // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID.
-    let cloneResult = callptr(__lx_native + 32, 3477248, childStack, threadRecord, threadRecord)
+    let cloneResult = callPointer(linuxNative + 32, 3477248, childStack, threadRecord, threadRecord)
     if cloneResult < 0 {
         let freed = syscall(11, stackMapping, mappingSize)
         store64(threadRecord + 56, load64(threadRecord + 56) + 1)
@@ -662,29 +662,29 @@ fn k32_CreateThread(securityAddress: int, stackSize: int, entryAddress: int, arg
         store64(threadRecord + 40, 0)
         store64(threadRecord + 48, 0)
         store64(threadRecord + 56, load64(threadRecord + 56) + 1)
-        rt_unlock()
+        runtimeUnlockHeap()
         return 0
     }
     if threadIdAddress != 0 { store32(threadIdAddress, cloneResult) }
-    rt_unsuspendable_add(1)
-    rt_unlock()
+    runtimeAdjustUnsuspendableThreads(1)
+    runtimeUnlockHeap()
     return threadRecord
 }
 
 // Release a suspended child's startup gate.
-fn k32_ResumeThread(threadHandle: int) -> int {
+fn kernel32ResumeThread(threadHandle: int) -> int {
     store32(threadHandle + 4, 1)
     let awakened = syscall(202, threadHandle + 4, 1, 1)
     return 1
 }
 
 // Signal-based stack suspension is not implemented; the runtime defers GC.
-fn k32_SuspendThread(threadHandle: int) -> int { return 0 - 1 }
+fn kernel32SuspendThread(threadHandle: int) -> int { return 0 - 1 }
 // No stopped register context is available on this platform yet.
-fn k32_GetThreadContext(threadHandle: int, contextAddress: int) -> int { return 0 }
+fn kernel32GetThreadContext(threadHandle: int, contextAddress: int) -> int { return 0 }
 
 // Wait on CHILD_CLEARTID using shared futexes (the kernel's wake convention).
-fn k32_WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {
+fn kernel32WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {
     if waitTimeout != 4294967295 and waitTimeout != 0 { return 4294967295 }
     var threadId = load64(threadHandle) & 4294967295
     while threadId != 0 {
@@ -697,11 +697,11 @@ fn k32_WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {
 }
 
 // Release a joined thread's stack; retain and reuse its TLS directory record.
-fn lx_close_thread(threadHandle: int) -> bool {
-    var threadRecord = __lx_threads
+fn linuxCloseThread(threadHandle: int) -> bool {
+    var threadRecord = linuxThreads
     while threadRecord != 0 {
         if threadRecord == threadHandle {
-            rt_lock()
+            runtimeLockHeap()
             if load64(threadRecord + 48) != 0 and (load64(threadRecord) & 4294967295) == 0 {
                 store64(threadRecord + 56, load64(threadRecord + 56) + 1)
                 let stackMapping = load64(threadRecord + 8)
@@ -710,9 +710,9 @@ fn lx_close_thread(threadHandle: int) -> bool {
                 store64(threadRecord + 40, 0)
                 store64(threadRecord + 48, 0)
                 store64(threadRecord + 56, load64(threadRecord + 56) + 1)
-                rt_unsuspendable_add(0 - 1)
+                runtimeAdjustUnsuspendableThreads(0 - 1)
             }
-            rt_unlock()
+            runtimeUnlockHeap()
             return true
         }
         threadRecord = load64(threadRecord + 32)
@@ -721,8 +721,8 @@ fn lx_close_thread(threadHandle: int) -> bool {
 }
 
 // Count the actual CPUs permitted by the calling thread's affinity mask.
-fn k32_GetSystemInfo(resultAddress: int) -> int {
-    let maskAddress = lx_mmap(0, 131072, PROT_RW, MAP_ANON_PRIV)
+fn kernel32GetSystemInfo(resultAddress: int) -> int {
+    let maskAddress = linuxMapMemory(0, 131072, memoryProtectionReadWrite, mapAnonymousPrivate)
     var processorCount = 0
     if maskAddress != 0 {
         let byteCount = syscall(204, 0, 131072, maskAddress)
@@ -743,47 +743,47 @@ fn k32_GetSystemInfo(resultAddress: int) -> int {
 }
 
 // Allocate a process-wide TLS key; each stack range has its own cell table.
-fn k32_TlsAlloc() -> int {
-    if __lx_tls == 0 { __lx_tls = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
-    if __lx_tls == 0 or __lx_ntls >= 512 { return 4294967295 }
-    let slotIndex = __lx_ntls
-    __lx_ntls += 1
+fn kernel32TlsAlloc() -> int {
+    if linuxThreadLocalStorage == 0 { linuxThreadLocalStorage = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate) }
+    if linuxThreadLocalStorage == 0 or linuxThreadLocalSlotCount >= 512 { return 4294967295 }
+    let slotIndex = linuxThreadLocalSlotCount
+    linuxThreadLocalSlotCount += 1
     return slotIndex
 }
 
 // Store a value in this thread's TLS table without a gettid syscall.
-fn k32_TlsSetValue(slotIndex: int, value: int) -> int {
-    if slotIndex < 0 or slotIndex >= __lx_ntls { return 0 }
-    var tableAddress = __lx_tls
-    let threadRecord = lx_current_thread()
+fn kernel32TlsSetValue(slotIndex: int, value: int) -> int {
+    if slotIndex < 0 or slotIndex >= linuxThreadLocalSlotCount { return 0 }
+    var tableAddress = linuxThreadLocalStorage
+    let threadRecord = linuxCurrentThread()
     if threadRecord != 0 { tableAddress = threadRecord + 64 }
     store64(tableAddress + 8 * slotIndex, value)
     return 1
 }
 
 // Read this thread's TLS table without a gettid syscall.
-fn k32_TlsGetValue(slotIndex: int) -> int {
-    if slotIndex < 0 or slotIndex >= __lx_ntls { return 0 }
-    var tableAddress = __lx_tls
-    let threadRecord = lx_current_thread()
+fn kernel32TlsGetValue(slotIndex: int) -> int {
+    if slotIndex < 0 or slotIndex >= linuxThreadLocalSlotCount { return 0 }
+    var tableAddress = linuxThreadLocalStorage
+    let threadRecord = linuxCurrentThread()
     if threadRecord != 0 { tableAddress = threadRecord + 64 }
     return load64(tableAddress + 8 * slotIndex)
 }
 // ---- standard I/O extensions ----
-var __lx_last_error = 0
-fn k32_SetLastError(code: int) -> int { __lx_last_error = code
+var linuxLastError = 0
+fn kernel32SetLastError(code: int) -> int { linuxLastError = code
     return 0
 }
-fn k32_GetLastError() -> int { return __lx_last_error }
+fn kernel32GetLastError() -> int { return linuxLastError }
 
-fn k32_DeleteFileA(path: int) -> int {
+fn kernel32DeleteFileA(path: int) -> int {
     if syscall(87, path) < 0 { return 0 }
     return 1
 }
 
 // CLOCK_MONOTONIC timespec. Scratch stays off the managed heap.
-fn k32_QueryPerformanceCounter(result: int) -> int {
-    let scratch = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+fn kernel32QueryPerformanceCounter(result: int) -> int {
+    let scratch = linuxMapMemory(0, 16, memoryProtectionReadWrite, mapAnonymousPrivate)
     if scratch == 0 { return 0 }
     let status = syscall(228, 1, scratch)
     if status == 0 { store64(result, load64(scratch) * 1000000000 + load64(scratch + 8)) }
@@ -792,13 +792,13 @@ fn k32_QueryPerformanceCounter(result: int) -> int {
     return 1
 }
 
-fn k32_QueryPerformanceFrequency(result: int) -> int {
+fn kernel32QueryPerformanceFrequency(result: int) -> int {
     store64(result, 1000000000)
     return 1
 }
 
-fn k32_GetTickCount64() -> int {
-    let scratch = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+fn kernel32GetTickCount64() -> int {
+    let scratch = linuxMapMemory(0, 16, memoryProtectionReadWrite, mapAnonymousPrivate)
     if scratch == 0 { return 0 }
     let status = syscall(228, 1, scratch)
     var milliseconds = 0
@@ -807,8 +807,8 @@ fn k32_GetTickCount64() -> int {
     return milliseconds
 }
 
-fn k32_Sleep(milliseconds: int) -> int {
-    let scratch = lx_mmap(0, 32, PROT_RW, MAP_ANON_PRIV)
+fn kernel32Sleep(milliseconds: int) -> int {
+    let scratch = linuxMapMemory(0, 32, memoryProtectionReadWrite, mapAnonymousPrivate)
     if scratch == 0 { return 0 }
     store64(scratch, milliseconds / 1000)
     store64(scratch + 8, (milliseconds % 1000) * 1000000)
@@ -824,14 +824,14 @@ fn k32_Sleep(milliseconds: int) -> int {
 
 // A directory handle owns one mmap: fd, cursor, count, then getdents64 records.
 // Linux d_name is at byte 19; Windows WIN32_FIND_DATAA cFileName is at byte 44.
-fn k32_FindNextFileA(handle: int, result: int) -> int {
+fn kernel32FindNextFileA(handle: int, result: int) -> int {
     var cursor = load64(handle + 8)
     var available = load64(handle + 16)
     if cursor >= available {
         available = syscall(217, load64(handle), handle + 24, 32744)
         if available <= 0 {
-            __lx_last_error = 18
-            if available < 0 { __lx_last_error = 5 }
+            linuxLastError = 18
+            if available < 0 { linuxLastError = 5 }
             return 0
         }
         cursor = 0
@@ -840,7 +840,7 @@ fn k32_FindNextFileA(handle: int, result: int) -> int {
     let record = handle + 24 + cursor
     let recordLength = load8(record + 16) + load8(record + 17) * 256
     if recordLength < 20 or cursor + recordLength > available {
-        __lx_last_error = 5
+        linuxLastError = 5
         return 0
     }
     var length = 0
@@ -853,18 +853,18 @@ fn k32_FindNextFileA(handle: int, result: int) -> int {
     return 1
 }
 
-fn k32_FindClose(handle: int) -> int {
-    let closed = syscall(SYS_CLOSE, load64(handle))
+fn kernel32FindClose(handle: int) -> int {
+    let closed = syscall(systemCallClose, load64(handle))
     let released = syscall(11, handle, 32768)
     if closed < 0 or released < 0 { return 0 }
     return 1
 }
 
-fn k32_FindFirstFileA(pattern: int, result: int) -> int {
+fn kernel32FindFirstFileA(pattern: int, result: int) -> int {
     var length = 0
     while load8(pattern + length) != 0 { length += 1 }
-    let path = lx_mmap(0, length + 1, PROT_RW, MAP_ANON_PRIV)
-    if path == 0 { __lx_last_error = 8
+    let path = linuxMapMemory(0, length + 1, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if path == 0 { linuxLastError = 8
         return -1
     }
     // std/io appends /*, so remove exactly that suffix without wildcard parsing.
@@ -874,20 +874,20 @@ fn k32_FindFirstFileA(pattern: int, result: int) -> int {
     }
     for i in 0..pathLength { store8(path + i, load8(pattern + i)) }
     store8(path + pathLength, 0)
-    let descriptor = syscall(SYS_OPEN, path, 65536, 0)
+    let descriptor = syscall(systemCallOpen, path, 65536, 0)
     let pathReleased = syscall(11, path, length + 1)
-    if descriptor < 0 { __lx_last_error = 5
+    if descriptor < 0 { linuxLastError = 5
         return -1
     }
-    let handle = lx_mmap(0, 32768, PROT_RW, MAP_ANON_PRIV)
+    let handle = linuxMapMemory(0, 32768, memoryProtectionReadWrite, mapAnonymousPrivate)
     if handle == 0 {
-        let closed = syscall(SYS_CLOSE, descriptor)
-        __lx_last_error = 8
+        let closed = syscall(systemCallClose, descriptor)
+        linuxLastError = 8
         return -1
     }
     store64(handle, descriptor)
-    if k32_FindNextFileA(handle, result) == 0 {
-        let closed = k32_FindClose(handle)
+    if kernel32FindNextFileA(handle, result) == 0 {
+        let closed = kernel32FindClose(handle)
         return -1
     }
     return handle
@@ -895,15 +895,15 @@ fn k32_FindFirstFileA(pattern: int, result: int) -> int {
 
 // These paths are reached only after runtime initialization, so panic is safe.
 // Environment capture and process creation need more than a direct syscall shim.
-fn k32_GetEnvironmentVariableA(name: int, buffer: int, capacity: int) -> int {
+fn kernel32GetEnvironmentVariableA(name: int, buffer: int, capacity: int) -> int {
     panic("env: not supported on linux")
     return 0
 }
-fn k32_CreateProcessA(application: int, command: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, process: int) -> int {
+fn kernel32CreateProcessA(application: int, command: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, process: int) -> int {
     panic("run: not supported on linux")
     return 0
 }
-fn k32_GetExitCodeProcess(handle: int, result: int) -> int {
+fn kernel32GetExitCodeProcess(handle: int, result: int) -> int {
     panic("run: not supported on linux")
     return 0
 }

@@ -54,10 +54,10 @@ fn expected(id: int) -> int {
     return acc
 }
 
-print("cpus: {cpu_count()}, workers: {WORKERS}")
+print("cpus: {cpuCount()}, workers: {WORKERS}")
 
 var ts: [Thread] = []
-for i in 0..WORKERS { ts.push(thread_spawn(work, i)) }
+for i in 0..WORKERS { ts.push(spawnThread(work, i)) }
 for t in ts { t.join() }
 
 var bad = 0

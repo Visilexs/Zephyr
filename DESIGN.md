@@ -8,7 +8,7 @@ session can see what was already tried.
 ## D1 — the ML library is library code, not compiler builtins
 
 `lib/ml/` is ordinary Zephyr over the existing `Bytes`. Adding a builtin means
-editing `is_builtin_name`, the typecheck dispatch chain and a codegen case
+editing `isBuiltinName`, the typecheck dispatch chain and a codegen case
 inside a 6,200-line compiler, which is only justified for something needing a
 raw instruction — `sqrt` earns that, tensor descriptors do not. This matches
 `zephyr-ml/02_ARCHITECTURE.md`: library semantics first, language types only
@@ -39,20 +39,20 @@ programs driven from `tests/run_tests.ps1`, the same shape as the existing
 
 ## D4 — two allocation caps, with two different jobs
 
-`MAX_ELEMS` (2^40) is the overflow guard. Checked before each dimension
+`maxElements` (2^40) is the overflow guard. Checked before each dimension
 multiply, it makes the element count provably unable to wrap i64, and since
 the widest dtype is 16 bytes the byte product is then bounded by 2^44 and
 cannot wrap either.
 
-`MAX_BYTES` (128 GiB) is a sanity cap, and is deliberately **not** derived from
-`MAX_ELEMS`. An earlier version set it to 2^44, which made it unreachable —
+`maxBytes` (128 GiB) is a sanity cap, and is deliberately **not** derived from
+`maxElements`. An earlier version set it to 2^44, which made it unreachable —
 dead code that looked like a safety check. With it unreachable, an absurd
 request fell through to the allocator and came back as a bare "heap full",
 naming neither the request nor the limit.
 
 ## D5 — strides and offsets count elements, bytes only at the access site
 
-One conversion point, `t_byte_offset`, which every read and write goes
+One conversion point, `tensorByteOffset`, which every read and write goes
 through. A stride expressed in bytes has to be re-derived whenever the dtype
 changes, and mixing the two units is a classic source of silent corruption.
 
@@ -64,13 +64,13 @@ mutation version with no extra machinery. Use-after-free is therefore not
 representable for CPU storage, which is most of what A03 asks about.
 
 The byte counters are diagnostics only and need an explicit
-`storage_release` to be accurate. They exist for the GPU allocator later,
+`storageRelease` to be accurate. They exist for the GPU allocator later,
 where a buffer genuinely cannot be recycled until the device has finished
 with it, and where the deferred-free accounting will matter.
 
 ## D7 — the mutation version is the saved-tensor guard
 
-`t_save` records the storage version; `saved_get` refuses if it has moved.
+`tensorSave` records the storage version; `savedGet` refuses if it has moved.
 Because views share the `Storage`, a write through *any* view invalidates a
 save taken on the owner. This is the mechanism `zephyr-ml/06_AUTOGRAD.md`
 requires before backward reads a saved value, put in place now so the tape
@@ -79,7 +79,7 @@ cannot be built without it.
 ## D8 — complex is interleaved, with component-width names
 
 `C32` is two f32 components (8 bytes) and maps to `torch.complex64`; `C64` is
-two f64 components (16 bytes) and maps to `torch.complex128`. `dtype_name`
+two f64 components (16 bytes) and maps to `torch.complex128`. `dtypeName`
 returns `c32_components` / `c64_components` rather than a bare width, so the
 name cannot be silently matched against PyTorch's. Storage is real then
 imaginary, which is also the canonical checkpoint layout.
@@ -108,7 +108,7 @@ no caller changed.
 
 ## D11 — broadcast views are read-only, enforced by the descriptor
 
-`t_expand` produces a zero-stride view, which means many logical elements
+`tensorExpand` produces a zero-stride view, which means many logical elements
 alias one stored element. A write through such a view would silently scatter,
 so `Tensor` carries `ro: bool` and all three setters panic on it. This is
 stricter than PyTorch, which permits the write and lets the aliasing surprise
@@ -117,9 +117,9 @@ write through a broadcast.
 
 ## D12 — no dtype promotion, ever
 
-`t_add(f32, f64)` panics rather than promoting. Promotion rules are the most
+`tensorAdd(f32, f64)` panics rather than promoting. Promotion rules are the most
 common source of silent precision loss in a framework, and the phase model has
-exactly one dtype per tensor decided up front. A cast is available as `t_cast`
+exactly one dtype per tensor decided up front. A cast is available as `tensorCast`
 and has to be written down.
 
 ## D13 — numpy is the operator oracle, and says what it can
@@ -127,16 +127,16 @@ and has to be written down.
 PyTorch is not installed, so `check_ops.py` compares against numpy. That is
 sound for A04/A05 specifically because both are IEEE-754 double arithmetic,
 and the one thing numpy could differ on — complex memory layout — is checked
-directly at the byte level with `t_hex` rather than assumed. Where accumulation
+directly at the byte level with `tensorHex` rather than assumed. Where accumulation
 order is unspecified (matmul, sums) the agreement is 1–4 ulp, not bit-exact,
 and that is recorded as such rather than hidden behind a loose tolerance.
 
 ## D14 — one gather covers three needs, and refuses duplicate scatter indices
 
-`t_index_select` serves the embedding lookup (dim 0), the Givens pair
-extraction (dim 1) and `t_roll`, which is a permutation of the same call.
+`tensorIndexSelect` serves the embedding lookup (dim 0), the Givens pair
+extraction (dim 1) and `tensorRoll`, which is a permutation of the same call.
 Writing three operators would have triplicated the stride traversal, which is
-where the bugs live. Its counterpart `t_index_copy` **panics on a duplicate
+where the bugs live. Its counterpart `tensorIndexCopy` **panics on a duplicate
 index** rather than letting the last write win. Every use in this model is a
 disjoint pairing, so a duplicate is a caller bug; when the backward pass later
 needs genuine accumulation that will be a separate, named scatter-add.
@@ -198,7 +198,7 @@ the implementation's.
 ## D18 -- the pairing is pinned natively, not only through parity
 
 The parity harness runs at D=4 and D=8. The specification's own dimension is
-D=128, and `phase_givens` constructs its pairing in Zephyr independently of
+D=128, and `phaseGivens` constructs its pairing in Zephyr independently of
 the reference. A pairing that was a valid bijection but paired the wrong
 coordinates would preserve the norm exactly and produce a perfectly plausible
 trajectory, so norm checks cannot catch it.
@@ -232,7 +232,7 @@ node after all of its consumers, and no topological sort is needed.
 
 Saved tensors go through the version-checked `Saved` type from M2a, which was
 built for this and had been unused. If a saved tensor's storage is mutated
-between the forward and reverse passes, `saved_get` panics. The alternative
+between the forward and reverse passes, `savedGet` panics. The alternative
 is a gradient that is quietly computed from the wrong values, which is the
 single worst failure mode an AD system has, because every downstream number
 still looks plausible.
@@ -240,7 +240,7 @@ still looks plausible.
 ## D21 -- the tape is explicitly reset, and that is asserted
 
 A07 requires the tape not to grow without bound across steps. Rather than
-trimming heuristically, the tape is reset explicitly and `av_nodes()` is
+trimming heuristically, the tape is reset explicitly and `autogradNodeCount()` is
 exported so a test can measure it. The test asserts that one step records
 exactly three nodes and that twenty-five steps leave three -- an exact
 measured count, not a loose upper bound that a leak could hide under.

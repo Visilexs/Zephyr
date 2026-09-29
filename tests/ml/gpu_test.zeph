@@ -3,7 +3,7 @@
 // and PyTorch, plus the unavailable-backend message.
 //
 // The backward check is deliberately not "GPU formula against CPU formula" --
-// that would compare gpu_matmul_backward to a copy of itself. It runs the
+// that would compare gpuMatmulBackward to a copy of itself. It runs the
 // autograd tape, whose matmul VJP is verified against finite differences in
 // autograd_test.zeph, and compares the tape's gradients to the device's.
 import "ml/gpu.zeph"
@@ -28,23 +28,23 @@ fn near(a: float, b: float, tol: float, what: str) {
 // ---- the unavailable-backend message -------------------------------------
 // Checked on a path that really is absent, so the branch is exercised rather
 // than assumed. An unavailable backend that has a fixable cause must say so.
-let msg = gpu_kernel_missing("examples/shaders/no_such_kernel.comp.spv")
+let msg = gpuKernelMissing("examples/shaders/no_such_kernel.comp.spv")
 chk(msg != "", "missing kernel is reported")
 chk(msg.contains("no_such_kernel.comp.spv"), "message names the missing file")
 chk(msg.contains("build-compute-shaders.ps1"), "message names the fix")
 chk(msg.contains("glslc"), "message names the tool the fix needs")
-chk(gpu_unavailable() == "", "backend is available here")
+chk(gpuUnavailable() == "", "backend is available here")
 
-let m = gpu_init()
-print("device: {gpu_device_name(m)}")
+let m = gpuInitialize()
+print("device: {gpuDeviceName(m)}")
 
 // ---- the optional device features the kernels rely on --------------------
 // Every f64 kernel needs shaderFloat64 and scatter_add_f64 needs 64-bit
 // buffer atomics. Both are optional in Vulkan and using one unenabled is
 // undefined behaviour, so assert they really were enabled: a regression that
 // silently stops requesting them would otherwise keep passing here by luck.
-chk(m.g.has_f64, "shaderFloat64 is enabled on this device")
-chk(m.g.has_int64_atomics, "shaderBufferInt64Atomics is enabled on this device")
+chk(m.g.hasFloat64, "shaderFloat64 is enabled on this device")
+chk(m.g.hasInt64Atomics, "shaderBufferInt64Atomics is enabled on this device")
 
 var SEED = 20260921
 fn rnd() -> float {
@@ -61,55 +61,55 @@ let N = 4
 chk(M % 16 != 0 and N % 16 != 0, "shapes are not workgroup multiples")
 
 // ---- real float64 forward -------------------------------------------------
-let A = t_zeros(DType.F64, [M, K])
-let B = t_zeros(DType.F64, [K, N])
+let A = tensorZeros(DType.F64, [M, K])
+let B = tensorZeros(DType.F64, [K, N])
 for i in 0..M {
-    for j in 0..K { t_set(A, [i, j], rnd()) }
+    for j in 0..K { tensorSet(A, [i, j], rnd()) }
 }
 for i in 0..K {
-    for j in 0..N { t_set(B, [i, j], rnd()) }
+    for j in 0..N { tensorSet(B, [i, j], rnd()) }
 }
-let C_cpu = t_matmul(A, B)
-let C_gpu = gpu_matmul(m, A, B)
-chk(t_rank(C_gpu) == 2 and C_gpu.shape[0] == M and C_gpu.shape[1] == N, "real result shape")
+let C_cpu = tensorMatmul(A, B)
+let C_gpu = gpuMatmul(m, A, B)
+chk(tensorRank(C_gpu) == 2 and C_gpu.shape[0] == M and C_gpu.shape[1] == N, "real result shape")
 for i in 0..M {
-    for j in 0..N { near(t_get(C_gpu, [i, j]), t_get(C_cpu, [i, j]), 0.000000000001, "real forward [{i},{j}]") }
+    for j in 0..N { near(tensorGet(C_gpu, [i, j]), tensorGet(C_cpu, [i, j]), 0.000000000001, "real forward [{i},{j}]") }
 }
 
 // ---- real backward, against the tape --------------------------------------
 // loss = sum(A @ B), so dL/dC is all ones and the tape's gradients are the
-// two matmuls gpu_matmul_backward should reproduce.
-av_reset()
-let ia = av_leaf(A, true)
-let ib = av_leaf(B, true)
-av_backward(av_sum_all(av_matmul(ia, ib)))
-let gA_cpu = av_grad(ia)
-let gB_cpu = av_grad(ib)
-let gr = gpu_matmul_backward(m, A, B, t_ones(DType.F64, [M, N]))
+// two matmuls gpuMatmulBackward should reproduce.
+autogradReset()
+let ia = autogradLeaf(A, true)
+let ib = autogradLeaf(B, true)
+autogradBackward(autogradSumAll(autogradMatmul(ia, ib)))
+let gA_cpu = autogradGradient(ia)
+let gB_cpu = autogradGradient(ib)
+let gr = gpuMatmulBackward(m, A, B, tensorOnes(DType.F64, [M, N]))
 for i in 0..M {
-    for j in 0..K { near(t_get(gr[0], [i, j]), t_get(gA_cpu, [i, j]), 0.000000000001, "real dA [{i},{j}]") }
+    for j in 0..K { near(tensorGet(gr[0], [i, j]), tensorGet(gA_cpu, [i, j]), 0.000000000001, "real dA [{i},{j}]") }
 }
 for i in 0..K {
-    for j in 0..N { near(t_get(gr[1], [i, j]), t_get(gB_cpu, [i, j]), 0.000000000001, "real dB [{i},{j}]") }
+    for j in 0..N { near(tensorGet(gr[1], [i, j]), tensorGet(gB_cpu, [i, j]), 0.000000000001, "real dB [{i},{j}]") }
 }
 
 // ---- complex float64 forward ----------------------------------------------
-let cA = t_zeros(DType.C64, [M, K])
-let cB = t_zeros(DType.C64, [K, N])
+let cA = tensorZeros(DType.C64, [M, K])
+let cB = tensorZeros(DType.C64, [K, N])
 for i in 0..M {
-    for j in 0..K { t_set_c(cA, [i, j], rnd(), rnd()) }
+    for j in 0..K { tensorSetComplex(cA, [i, j], rnd(), rnd()) }
 }
 for i in 0..K {
-    for j in 0..N { t_set_c(cB, [i, j], rnd(), rnd()) }
+    for j in 0..N { tensorSetComplex(cB, [i, j], rnd(), rnd()) }
 }
-let cC_cpu = t_matmul(cA, cB)
-let cC_gpu = gpu_matmul(m, cA, cB)
+let cC_cpu = tensorMatmul(cA, cB)
+let cC_gpu = gpuMatmul(m, cA, cB)
 var any_im = false
 for i in 0..M {
     for j in 0..N {
-        near(t_get_re(cC_gpu, [i, j]), t_get_re(cC_cpu, [i, j]), 0.000000000001, "complex forward re [{i},{j}]")
-        near(t_get_im(cC_gpu, [i, j]), t_get_im(cC_cpu, [i, j]), 0.000000000001, "complex forward im [{i},{j}]")
-        if fabs(t_get_im(cC_cpu, [i, j])) > 0.01 { any_im = true }
+        near(tensorGetReal(cC_gpu, [i, j]), tensorGetReal(cC_cpu, [i, j]), 0.000000000001, "complex forward re [{i},{j}]")
+        near(tensorGetImaginary(cC_gpu, [i, j]), tensorGetImaginary(cC_cpu, [i, j]), 0.000000000001, "complex forward im [{i},{j}]")
+        if fabs(tensorGetImaginary(cC_cpu, [i, j])) > 0.01 { any_im = true }
     }
 }
 // Without this the imaginary comparisons above could all be passing on zeros,
@@ -119,40 +119,40 @@ chk(any_im, "complex result has a non-trivial imaginary part")
 // ---- complex backward, against the tape ------------------------------------
 // loss = sum(abs2(A @ B)) is real, and under the dL = Re(sum(conj(g) dz))
 // convention its gradient with respect to C is exactly 2C -- so the conjugate
-// transposes in gpu_matmul_backward are exercised, not bypassed.
-av_reset()
-let ica = av_leaf(cA, true)
-let icb = av_leaf(cB, true)
-av_backward(av_sum_all(av_abs2(av_matmul(ica, icb))))
-let cgA_cpu = av_grad(ica)
-let cgB_cpu = av_grad(icb)
-let gc = t_add(cC_cpu, cC_cpu)
-let cgr = gpu_matmul_backward(m, cA, cB, gc)
+// transposes in gpuMatmulBackward are exercised, not bypassed.
+autogradReset()
+let ica = autogradLeaf(cA, true)
+let icb = autogradLeaf(cB, true)
+autogradBackward(autogradSumAll(autogradAbs2(autogradMatmul(ica, icb))))
+let cgA_cpu = autogradGradient(ica)
+let cgB_cpu = autogradGradient(icb)
+let gc = tensorAdd(cC_cpu, cC_cpu)
+let cgr = gpuMatmulBackward(m, cA, cB, gc)
 for i in 0..M {
     for j in 0..K {
-        near(t_get_re(cgr[0], [i, j]), t_get_re(cgA_cpu, [i, j]), 0.000000000001, "complex dA re [{i},{j}]")
-        near(t_get_im(cgr[0], [i, j]), t_get_im(cgA_cpu, [i, j]), 0.000000000001, "complex dA im [{i},{j}]")
+        near(tensorGetReal(cgr[0], [i, j]), tensorGetReal(cgA_cpu, [i, j]), 0.000000000001, "complex dA re [{i},{j}]")
+        near(tensorGetImaginary(cgr[0], [i, j]), tensorGetImaginary(cgA_cpu, [i, j]), 0.000000000001, "complex dA im [{i},{j}]")
     }
 }
 for i in 0..K {
     for j in 0..N {
-        near(t_get_re(cgr[1], [i, j]), t_get_re(cgB_cpu, [i, j]), 0.000000000001, "complex dB re [{i},{j}]")
-        near(t_get_im(cgr[1], [i, j]), t_get_im(cgB_cpu, [i, j]), 0.000000000001, "complex dB im [{i},{j}]")
+        near(tensorGetReal(cgr[1], [i, j]), tensorGetReal(cgB_cpu, [i, j]), 0.000000000001, "complex dB re [{i},{j}]")
+        near(tensorGetImaginary(cgr[1], [i, j]), tensorGetImaginary(cgB_cpu, [i, j]), 0.000000000001, "complex dB im [{i},{j}]")
     }
 }
 
 // ---- non-contiguous operands ----------------------------------------------
-// gpu_upload reads through t_get, so a transposed view must upload correctly
+// gpuUpload reads through tensorGet, so a transposed view must upload correctly
 // without being made contiguous first. This is exactly the shape the backward
 // pass feeds it, so a repack bug here would corrupt every gradient.
-let Bt = t_transpose(B, 0, 1)
-let D_cpu = t_matmul(Bt, t_transpose(A, 0, 1))
-let D_gpu = gpu_matmul(m, Bt, t_transpose(A, 0, 1))
+let Bt = tensorTranspose(B, 0, 1)
+let D_cpu = tensorMatmul(Bt, tensorTranspose(A, 0, 1))
+let D_gpu = gpuMatmul(m, Bt, tensorTranspose(A, 0, 1))
 for i in 0..N {
-    for j in 0..M { near(t_get(D_gpu, [i, j]), t_get(D_cpu, [i, j]), 0.000000000001, "transposed view [{i},{j}]") }
+    for j in 0..M { near(tensorGet(D_gpu, [i, j]), tensorGet(D_cpu, [i, j]), 0.000000000001, "transposed view [{i},{j}]") }
 }
 
-gpu_done(m)
+gpuShutdown(m)
 
 if failed == 0 {
     print("gpu: {passed} checks passed")

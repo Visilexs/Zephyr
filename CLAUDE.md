@@ -60,7 +60,7 @@ until an installed `zc.exe` understands it — stage 1 is always built by the ol
 - **Interfaces** give dynamic dispatch: `fn describe(s: Shape)` accepts any impl.
 - **Collections:** lists `[T]`, maps `[K: V]` (`["alice": 30]`, `.has`, `.keys`, `.remove`).
 - **Strings** interpolate with braces: `"len = {p.len()}"`. Methods: `.upper`,
-  `.split`, `.replace`, `.contains`, `.trim`, `.repeat`, `.starts_with`, `.index_of`.
+  `.split`, `.replace`, `.contains`, `.trim`, `.repeat`, `.startsWith`, `.indexOf`.
 - **Multi-file:** `import "std/list.zeph"` — library paths resolve relative to zc.exe (it looks in `lib/`), so they work from any directory.
 - **`assert(cond)` / `assert(cond, msg)`** is built in.
 - **Literals:** `0xFF`, `0b1010`, `1_000`, `6.02e23`, `'a'` (an int byte), raw `r"C:\dir"`,
@@ -102,7 +102,7 @@ against `zc.exe`'s directory, so nesting an example deeper does not change them.
   syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Threads run on
   Windows and Linux. Not on wasm: files, closures, interfaces and threads.
   wasm frames live in a shadow stack in linear memory so the conservative GC can
-  scan them — see the memory-map comment above `write_wasm` in `zc.zeph`.
+  scan them — see the memory-map comment above `writeWasm` in `zc.zeph`.
 - One name, one function — **no overloading** (generics cover the real cases).
 - Editor tooling lives outside this repo: an IntelliJ plugin (`../zephyr-idea-plugin`)
   and a VS Code extension + LSP (`../zephyr-vscode`).

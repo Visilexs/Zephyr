@@ -16,40 +16,40 @@ var window: Window? = none
 var hwnd = 0
 var hinst = 0
 if present {
-    let wnd = window_open("Zephyr storage image: GPU gradient + circle", 640, 480)
+    let wnd = openWindow("Zephyr storage image: GPU gradient + circle", 640, 480)
     window = wnd
     hwnd = wnd.hwnd
-    hinst = wnd.hinst
+    hinst = wnd.hinstance
 }
 var g = Gfx.make("zephyr-storage-image", layers, hwnd, hinst)
-print("gpu: {g.gpu_name()}")
+print("gpu: {g.gpuName()}")
 
 // Gfx selects a graphics queue; compute support is checked rather than assumed.
-let count_out = vk_output(8)
-vkGetPhysicalDeviceQueueFamilyProperties(g.phys, count_out.addr(), 0)
-let queue_props = vk_output(count_out.get32(0) * VkQueueFamilyProperties_sizeof)
-vkGetPhysicalDeviceQueueFamilyProperties(g.phys, count_out.addr(), queue_props.addr())
-let queue_flags = queue_props.get32(g.qfam * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
+let count_out = vulkanOutput(8)
+vkGetPhysicalDeviceQueueFamilyProperties(g.physicalDevice, count_out.addr(), 0)
+let queue_props = vulkanOutput(count_out.get32(0) * VkQueueFamilyProperties_sizeof)
+vkGetPhysicalDeviceQueueFamilyProperties(g.physicalDevice, count_out.addr(), queue_props.addr())
+let queue_flags = queue_props.get32(g.queueFamily * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
 assert((queue_flags & VK_QUEUE_COMPUTE_BIT) != 0, "selected queue does not support compute")
-vk_free_output(queue_props)
-vk_free_output(count_out)
+freeVulkanOutput(queue_props)
+freeVulkanOutput(count_out)
 
-let target = g.storage_image(W, H)
-let descriptors = g.storage_image_set(target, VK_SHADER_STAGE_COMPUTE_BIT)
+let target = g.storageImage(W, H)
+let descriptors = g.storageImageSet(target, VK_SHADER_STAGE_COMPUTE_BIT)
 let shader = g.shader("examples/shaders/storage_image.comp.spv")
-let entry = cbytes("main")
-let layout = g.pipeline_layout([descriptors.layout], 0, 0)
-let pipeline = g.compute_pipeline(shader, layout, entry)
-let sets = u64s([descriptors.set])
+let entry = cString("main")
+let layout = g.pipelineLayout([descriptors.layout], 0, 0)
+let pipeline = g.computePipeline(shader, layout, entry)
+let sets = uint64Array([descriptors.set])
 let image = target.image
 g.immediate(fn(cb: int) {
-    image_barrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+    imageBarrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, VK_ACCESS_SHADER_WRITE_BIT)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, sets.addr(), 0, 0)
     vkCmdDispatch(cb, (W + 15) / 16, (H + 15) / 16, 1)
-    image_barrier(cb, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    imageBarrier(cb, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
 })
@@ -57,7 +57,7 @@ print("dispatched 17 x 13 workgroups into {W}x{H} RGBA8 storage image")
 
 // This copies the actual optimal-tiled GPU image with vkCmdCopyImageToBuffer,
 // waits for its fence, then maps HOST_VISIBLE | HOST_COHERENT device memory.
-let pixels = g.read_image(image, W, H)
+let pixels = g.readImage(image, W, H)
 var bad = 0
 var inside = 0
 let radius = H / 4
@@ -93,40 +93,40 @@ assert(inside > 0 and inside < W * H, "verification must cover circle and gradie
 print("PASS: GPU readback verified {W * H} pixels ({inside} circle, {W * H - inside} gradient), 0 mismatches")
 
 if present {
-    let format = g.surface_format()
-    assert((g.format_features(VK_FORMAT_R8G8B8A8_UNORM) & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0,
+    let format = g.surfaceFormat()
+    assert((g.formatFeatures(VK_FORMAT_R8G8B8A8_UNORM) & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0,
            "RGBA8 blit source unsupported")
-    assert((g.format_features(format) & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
+    assert((g.formatFeatures(format) & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
            "swapchain format does not support blit destination")
-    let swap = g.swapchain_usage(format, 0, 0, 0, VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+    let swap = g.swapchainWithUsage(format, 0, 0, 0, VK_IMAGE_USAGE_TRANSFER_DST_BIT)
     let region = VkImageBlit.new()
         .srcSubresource_aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).srcSubresource_layerCount(1)
         .srcOffsets_1_x(W).srcOffsets_1_y(H).srcOffsets_1_z(1)
         .dstSubresource_aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).dstSubresource_layerCount(1)
-        .dstOffsets_1_x(swap.w).dstOffsets_1_y(swap.h).dstOffsets_1_z(1)
+        .dstOffsets_1_x(swap.width).dstOffsets_1_y(swap.height).dstOffsets_1_z(1)
     for frame in 0..8 {
         assert(window.get().poll(), "presentation window closed before verification completed")
-        let shown = g.frame_at_stage(swap, VK_PIPELINE_STAGE_TRANSFER_BIT, fn(cb: int, idx: int) {
+        let shown = g.frameAtStage(swap, VK_PIPELINE_STAGE_TRANSFER_BIT, fn(cb: int, idx: int) {
             let destination = swap.images[idx]
             // Discard the acquired image's prior contents; acquisition waits at TRANSFER.
-            image_barrier(cb, destination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            imageBarrier(cb, destination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT)
             vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region.addr(), VK_FILTER_NEAREST)
-            image_barrier(cb, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            imageBarrier(cb, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0)
         })
         assert(shown, "swapchain resized during finite presentation check; rerun")
     }
-    g.destroy_swapchain(swap)
+    g.destroySwapchain(swap)
     print("PASS: blitted storage image and presented 8 swapchain frames")
 }
 
-vkDestroyPipeline(g.dev, pipeline, 0)
-vkDestroyPipelineLayout(g.dev, layout, 0)
-vkDestroyShaderModule(g.dev, shader, 0)
-g.destroy_desc_set(descriptors)
-g.destroy_image(target)
+vkDestroyPipeline(g.device, pipeline, 0)
+vkDestroyPipelineLayout(g.device, layout, 0)
+vkDestroyShaderModule(g.device, shader, 0)
+g.destroyDescriptorSet(descriptors)
+g.destroyImage(target)
 g.shutdown()
 if window.has() { window.get().close() }
 print("PASS: storage image resources destroyed cleanly")

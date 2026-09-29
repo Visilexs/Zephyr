@@ -12,9 +12,9 @@
 //
 // That needs GL 3.3 entry points, which Windows' opengl32.dll does not export
 // -- they come from wglGetProcAddress at runtime. Calling a raw address like
-// that is what the `callptr(addr, args...)` intrinsic is for (it marshals
+// that is what the `callPointer(addr, args...)` intrinsic is for (it marshals
 // Win64 the same way `win()` does). Uniforms go up through the *fv pointer
-// forms, since callptr passes integer registers only; f32() converts Zephyr's
+// forms, since callPointer passes integer registers only; f32() converts Zephyr's
 // doubles to the 32-bit floats the GPU wants.
 //
 //   zc.exe --rt examples\particles_gpu.zeph particles_gpu.exe && .\particles_gpu.exe
@@ -183,13 +183,13 @@ var intbuf = mem(16)                // one GLint out-param
 var logbuf = mem(2048)
 
 fn compile(kind: int, src: str) -> int {
-    let sh = callptr(pCreateShader, kind)
+    let sh = callPointer(pCreateShader, kind)
     store64(srcbuf, cstr(src))
-    let s1 = callptr(pShaderSource, sh, 1, srcbuf, 0)
-    let s2 = callptr(pCompileShader, sh)
-    let s3 = callptr(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
+    let s1 = callPointer(pShaderSource, sh, 1, srcbuf, 0)
+    let s2 = callPointer(pCompileShader, sh)
+    let s3 = callPointer(pGetShaderiv, sh, GL_COMPILE_STATUS, intbuf)
     if lo32(load64(intbuf)) == 0 {
-        let s4 = callptr(pGetShaderInfoLog, sh, 2047, 0, logbuf)
+        let s4 = callPointer(pGetShaderInfoLog, sh, 2047, 0, logbuf)
         print("shader compile failed:")
         print(from_cstr(logbuf))
         assert(false, "shader compile failed")
@@ -199,16 +199,16 @@ fn compile(kind: int, src: str) -> int {
 
 // bind the three particle attributes to fixed locations, so no lookups later
 fn bind_attrs(prog: int) {
-    let b0 = callptr(pBindAttribLocation, prog, 0, cstr("iPos"))
-    let b1 = callptr(pBindAttribLocation, prog, 1, cstr("iVel"))
-    let b2 = callptr(pBindAttribLocation, prog, 2, cstr("iLife"))
+    let b0 = callPointer(pBindAttribLocation, prog, 0, cstr("iPos"))
+    let b1 = callPointer(pBindAttribLocation, prog, 1, cstr("iVel"))
+    let b2 = callPointer(pBindAttribLocation, prog, 2, cstr("iLife"))
 }
 
 fn link(prog: int) {
-    let l1 = callptr(pLinkProgram, prog)
-    let l2 = callptr(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
+    let l1 = callPointer(pLinkProgram, prog)
+    let l2 = callPointer(pGetProgramiv, prog, GL_LINK_STATUS, intbuf)
     if lo32(load64(intbuf)) == 0 {
-        let l3 = callptr(pGetProgramInfoLog, prog, 2047, 0, logbuf)
+        let l3 = callPointer(pGetProgramInfoLog, prog, 2047, 0, logbuf)
         print("program link failed:")
         print(from_cstr(logbuf))
         assert(false, "program link failed")
@@ -217,13 +217,13 @@ fn link(prog: int) {
 
 // point the three attributes at a buffer's interleaved records
 fn attach_buffer(buf: int) {
-    let b1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, buf)
-    let e0 = callptr(pEnableVertexAttribArray, 0)
-    let e1 = callptr(pEnableVertexAttribArray, 1)
-    let e2 = callptr(pEnableVertexAttribArray, 2)
-    let v0 = callptr(pVertexAttribPointer, 0, 2, GL_FLOAT, 0, STRIDE, 0)
-    let v1 = callptr(pVertexAttribPointer, 1, 2, GL_FLOAT, 0, STRIDE, 8)
-    let v2 = callptr(pVertexAttribPointer, 2, 1, GL_FLOAT, 0, STRIDE, 16)
+    let b1 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, buf)
+    let e0 = callPointer(pEnableVertexAttribArray, 0)
+    let e1 = callPointer(pEnableVertexAttribArray, 1)
+    let e2 = callPointer(pEnableVertexAttribArray, 2)
+    let v0 = callPointer(pVertexAttribPointer, 0, 2, GL_FLOAT, 0, STRIDE, 0)
+    let v1 = callPointer(pVertexAttribPointer, 1, 2, GL_FLOAT, 0, STRIDE, 8)
+    let v2 = callPointer(pVertexAttribPointer, 2, 1, GL_FLOAT, 0, STRIDE, 16)
 }
 
 var ubuf = mem(16)                  // a vec4, staged as four 32-bit floats
@@ -233,9 +233,9 @@ fn set4(loc: int, x: float, y: float, z: float, w: float) {
     store32(ubuf + 4, f32(y))
     store32(ubuf + 8, f32(z))
     store32(ubuf + 12, f32(w))
-    let u = callptr(pUniform4fv, loc, 1, ubuf)
+    let u = callPointer(pUniform4fv, loc, 1, ubuf)
 }
-fn uloc(prog: int, name: str) -> int { return callptr(pGetUniformLocation, prog, cstr(name)) }
+fn uloc(prog: int, name: str) -> int { return callPointer(pGetUniformLocation, prog, cstr(name)) }
 
 if args().len() > 1 { COUNT = args()[1] as int }
 
@@ -298,33 +298,33 @@ pGetUniformLocation = gp("glGetUniformLocation")
 pUniform4fv = gp("glUniform4fv")
 
 // ---- the update program: a vertex shader whose outputs are captured ----
-let uprog = callptr(pCreateProgram)
-let a1 = callptr(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
+let uprog = callPointer(pCreateProgram)
+let a1 = callPointer(pAttachShader, uprog, compile(GL_VERTEX_SHADER, update_src()))
 bind_attrs(uprog)
 let vary = mem(24)                     // char*[3], the captured outputs
 store64(vary + 0, cstr("oPos"))
 store64(vary + 8, cstr("oVel"))
 store64(vary + 16, cstr("oLife"))
-let tf = callptr(pTransformFeedbackVaryings, uprog, 3, vary, GL_INTERLEAVED_ATTRIBS)
+let tf = callPointer(pTransformFeedbackVaryings, uprog, 3, vary, GL_INTERLEAVED_ATTRIBS)
 link(uprog)
 
 // ---- the draw program ----
-let dprog = callptr(pCreateProgram)
-let a2 = callptr(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
-let a3 = callptr(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
+let dprog = callPointer(pCreateProgram)
+let a2 = callPointer(pAttachShader, dprog, compile(GL_VERTEX_SHADER, draw_vs_src()))
+let a3 = callPointer(pAttachShader, dprog, compile(GL_FRAGMENT_SHADER, draw_fs_src()))
 bind_attrs(dprog)
 link(dprog)
 
 // ---- two state buffers, zero-filled: life 0 means "respawn me" ----
 let bufs = mem(8)
-let gb = callptr(pGenBuffers, 2, bufs)
+let gb = callPointer(pGenBuffers, 2, bufs)
 var bufA = lo32(load64(bufs))
 var bufB = load64(bufs) >> 32
 let zero = mem(COUNT * STRIDE)         // zeros() memory, so lives start at 0
-let d1 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufA)
-let d2 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
-let d3 = callptr(pBindBuffer, GL_ARRAY_BUFFER, bufB)
-let d4 = callptr(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d1 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, bufA)
+let d2 = callPointer(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
+let d3 = callPointer(pBindBuffer, GL_ARRAY_BUFFER, bufB)
+let d4 = callPointer(pBufferData, GL_ARRAY_BUFFER, COUNT * STRIDE, zero, GL_STREAM_COPY)
 
 let uA = uloc(uprog, "A")
 let uB = uloc(uprog, "B")
@@ -369,24 +369,24 @@ while running == 1 {
         frame += 1
 
         // pass 1: integrate bufA -> bufB, rasterizer off
-        let up = callptr(pUseProgram, uprog)
+        let up = callPointer(pUseProgram, uprog)
         set4(uA, DT, gdt, DRAG, LIFE)
         set4(uB, mx, my, att, mode as float)
         set4(uC, wx * WIND * DT, SPEED, frame as float, (PH - 3) as float)
         set4(uD, PW as float, PH as float, 0.0, 0.0)
         attach_buffer(bufA)
-        let bb = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
+        let bb = callPointer(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, bufB)
         let rd = win("opengl32!glEnable", GL_RASTERIZER_DISCARD)
-        let bt = callptr(pBeginTransformFeedback, GL_POINTS)
+        let bt = callPointer(pBeginTransformFeedback, GL_POINTS)
         let dr = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
-        let et = callptr(pEndTransformFeedback)
+        let et = callPointer(pEndTransformFeedback)
         let rd2 = win("opengl32!glDisable", GL_RASTERIZER_DISCARD)
-        let bb0 = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
+        let bb0 = callPointer(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
 
         // pass 2: draw the buffer we just wrote
         let vp = win("opengl32!glViewport", 0, 0, gcw, gch)
         let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT)
-        let dp2 = callptr(pUseProgram, dprog)
+        let dp2 = callPointer(pUseProgram, dprog)
         set4(dA, DT, gdt, DRAG, LIFE)
         set4(dD, PW as float, PH as float, 0.0, 0.0)
         attach_buffer(bufB)

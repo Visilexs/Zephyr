@@ -4,28 +4,28 @@
 // (u64 each), rank u64 dimensions, then raw logical row-major bytes.
 import "ml/optim.zeph"
 
-let CHECKPOINT_MAGIC = 3554826236233868634
+let checkpointMagic = 3554826236233868634
 // ponytail: whole-file buffering capped at 256 MiB; stream records for larger models.
-let CHECKPOINT_MAX = 268435456
+let checkpointMaxBytes = 268435456
 
-struct Checkpoint { params: [Tensor], optim: Optim }
-struct CheckpointRecord { dt: DType, shape: [int], offset: int, size: int }
-struct CheckpointWriter { handle: int, temp: Bytes, target: Bytes }
-var CHECKPOINT_SERIAL = 0
+struct Checkpoint { params: [Tensor], optimizer: Optim }
+struct CheckpointRecord { dtype: DType, shape: [int], offset: int, size: int }
+struct CheckpointWriter { handle: int, temporaryPath: Bytes, target: Bytes }
+var checkpointSerial = 0
 
 // FNV-1a covers all payload bytes, including tensor metadata and optimizer state.
-fn checkpoint_checksum(b: Bytes) -> int {
-    var h = 2166136261
-    for i in 32..b.n { h = ((h ^ b.get8(i)) * 16777619) & 4294967295 }
-    return h
+fn checkpointChecksum(buffer: Bytes) -> int {
+    var hash = 2166136261
+    for i in 32..buffer.size { hash = ((hash ^ buffer.get8(i)) * 16777619) & 4294967295 }
+    return hash
 }
 
 // Bound every addition before allocating or reading untrusted lengths.
-fn checkpoint_bound(n: int) {
-    if n < 0 or n > CHECKPOINT_MAX { panic("checkpoint: implausibly large allocation") }
+fn checkpointCheckBound(value: int) {
+    if value < 0 or value > checkpointMaxBytes { panic("checkpoint: implausibly large allocation") }
 }
 
-fn checkpoint_dtype(code: int) -> DType {
+fn checkpointDtype(code: int) -> DType {
     if code == 0 { return DType.F32 }
     if code == 1 { return DType.F64 }
     if code == 2 { return DType.C32 }
@@ -38,196 +38,196 @@ fn checkpoint_dtype(code: int) -> DType {
 }
 
 // Encode raw bytes, not float conversions: NaN payloads and signed zero survive.
-fn checkpoint_encode(params: [Tensor], o: Optim) -> Bytes {
-    optim_state(o, params)
+fn checkpointEncode(params: [Tensor], optimizer: Optim) -> Bytes {
+    optimizerValidateState(optimizer, params)
     assert(params.len() <= 65536, "checkpoint: implausibly large allocation")
     var tensors: [Tensor] = []
     var size = 104
     for i in 0..params.len() {
         tensors.push(params[i])
-        tensors.push(o.m[i])
-        tensors.push(o.v[i])
+        tensors.push(optimizer.m[i])
+        tensors.push(optimizer.v[i])
     }
-    for t in tensors {
-        assert(t.shape.len() <= 32, "checkpoint: implausibly large allocation")
-        let bytes = t_numel(t) * dtype_size(t.dt)
-        checkpoint_bound(bytes)
-        size += 24 + 8 * t.shape.len() + bytes
-        checkpoint_bound(size)
+    for tensor in tensors {
+        assert(tensor.shape.len() <= 32, "checkpoint: implausibly large allocation")
+        let byteCount = tensorElementCount(tensor) * dtypeSize(tensor.dtype)
+        checkpointCheckBound(byteCount)
+        size += 24 + 8 * tensor.shape.len() + byteCount
+        checkpointCheckBound(size)
     }
-    let b = Bytes.new(size)
-    b.put64(0, CHECKPOINT_MAGIC)
-    b.put64(8, 1)
-    b.put64(16, size - 32)
-    b.put64(32, o.kind)
-    b.put64(40, o.step)
-    b.putf64(48, o.lr)
-    b.putf64(56, o.wd)
-    b.putf64(64, o.momentum)
-    b.putf64(72, o.beta1)
-    b.putf64(80, o.beta2)
-    b.putf64(88, o.eps)
-    b.put64(96, params.len())
-    var pos = 104
-    for t in tensors {
-        let width = dtype_size(t.dt)
-        b.put64(pos, t.dt as int)
-        b.put64(pos + 8, t.shape.len())
-        b.put64(pos + 16, t_numel(t) * width)
-        pos += 24
-        for dim in t.shape {
-            b.put64(pos, dim)
-            pos += 8
+    let buffer = Bytes.new(size)
+    buffer.put64(0, checkpointMagic)
+    buffer.put64(8, 1)
+    buffer.put64(16, size - 32)
+    buffer.put64(32, optimizer.kind)
+    buffer.put64(40, optimizer.step)
+    buffer.putFloat64(48, optimizer.learningRate)
+    buffer.putFloat64(56, optimizer.weightDecay)
+    buffer.putFloat64(64, optimizer.momentum)
+    buffer.putFloat64(72, optimizer.beta1)
+    buffer.putFloat64(80, optimizer.beta2)
+    buffer.putFloat64(88, optimizer.epsilon)
+    buffer.put64(96, params.len())
+    var position = 104
+    for tensor in tensors {
+        let width = dtypeSize(tensor.dtype)
+        buffer.put64(position, tensor.dtype as int)
+        buffer.put64(position + 8, tensor.shape.len())
+        buffer.put64(position + 16, tensorElementCount(tensor) * width)
+        position += 24
+        for dimension in tensor.shape {
+            buffer.put64(position, dimension)
+            position += 8
         }
-        var idx = idx_zeros(t.shape.len())
-        for j in 0..t_numel(t) {
-            let src = t_byte_offset(t, idx)
-            for k in 0..width { b.put8(pos + k, t.st.buf.get8(src + k)) }
-            pos += width
-            idx_next(idx, t.shape)
+        var index = indexZeros(tensor.shape.len())
+        for j in 0..tensorElementCount(tensor) {
+            let sourceOffset = tensorByteOffset(tensor, index)
+            for k in 0..width { buffer.put8(position + k, tensor.storage.buffer.get8(sourceOffset + k)) }
+            position += width
+            indexNext(index, tensor.shape)
         }
     }
-    b.put64(24, checkpoint_checksum(b))
-    return b
+    buffer.put64(24, checkpointChecksum(buffer))
+    return buffer
 }
 
 // Validate every record and checksum before allocating tensor storage.
-fn checkpoint_decode(b: Bytes) -> Checkpoint {
-    if b.n < 32 { panic("checkpoint: truncated file") }
-    if b.get64(0) != CHECKPOINT_MAGIC { panic("checkpoint: bad magic") }
-    if b.get64(8) != 1 { panic("checkpoint: unknown version") }
-    let length = b.get64(16)
-    checkpoint_bound(length)
-    if length > b.n - 32 { panic("checkpoint: declared length exceeds file") }
-    if length < b.n - 32 { panic("checkpoint: trailing data") }
-    if b.n < 104 { panic("checkpoint: truncated file") }
-    let count = b.get64(96)
-    if count < 0 or count > 65536 { panic("checkpoint: implausibly large allocation") }
+fn checkpointDecode(buffer: Bytes) -> Checkpoint {
+    if buffer.size < 32 { panic("checkpoint: truncated file") }
+    if buffer.get64(0) != checkpointMagic { panic("checkpoint: bad magic") }
+    if buffer.get64(8) != 1 { panic("checkpoint: unknown version") }
+    let length = buffer.get64(16)
+    checkpointCheckBound(length)
+    if length > buffer.size - 32 { panic("checkpoint: declared length exceeds file") }
+    if length < buffer.size - 32 { panic("checkpoint: trailing data") }
+    if buffer.size < 104 { panic("checkpoint: truncated file") }
+    let parameterCount = buffer.get64(96)
+    if parameterCount < 0 or parameterCount > 65536 { panic("checkpoint: implausibly large allocation") }
     var records: [CheckpointRecord] = []
-    var pos = 104
-    for i in 0..count * 3 {
-        if b.n - pos < 24 { panic("checkpoint: truncated file") }
-        let dt = checkpoint_dtype(b.get64(pos))
-        let rank = b.get64(pos + 8)
-        let size = b.get64(pos + 16)
-        checkpoint_bound(size)
+    var position = 104
+    for i in 0..parameterCount * 3 {
+        if buffer.size - position < 24 { panic("checkpoint: truncated file") }
+        let dtype = checkpointDtype(buffer.get64(position))
+        let rank = buffer.get64(position + 8)
+        let size = buffer.get64(position + 16)
+        checkpointCheckBound(size)
         if rank < 0 or rank > 32 { panic("checkpoint: implausibly large allocation") }
-        pos += 24
-        if rank * 8 > b.n - pos { panic("checkpoint: truncated file") }
+        position += 24
+        if rank * 8 > buffer.size - position { panic("checkpoint: truncated file") }
         var shape: [int] = []
         var elements = 1
         for j in 0..rank {
-            let dim = b.get64(pos)
-            checkpoint_bound(dim)
-            if dim != 0 and elements > CHECKPOINT_MAX / dim { panic("checkpoint: implausibly large allocation") }
-            elements = elements * dim
-            shape.push(dim)
-            pos += 8
+            let dimension = buffer.get64(position)
+            checkpointCheckBound(dimension)
+            if dimension != 0 and elements > checkpointMaxBytes / dimension { panic("checkpoint: implausibly large allocation") }
+            elements = elements * dimension
+            shape.push(dimension)
+            position += 8
         }
-        if elements > CHECKPOINT_MAX / dtype_size(dt) { panic("checkpoint: implausibly large allocation") }
-        if elements * dtype_size(dt) != size { panic("checkpoint: shape payload mismatch") }
-        if size > b.n - pos { panic("checkpoint: declared length exceeds file") }
-        records.push(CheckpointRecord{dt: dt, shape: shape, offset: pos, size: size})
-        pos += size
+        if elements > checkpointMaxBytes / dtypeSize(dtype) { panic("checkpoint: implausibly large allocation") }
+        if elements * dtypeSize(dtype) != size { panic("checkpoint: shape payload mismatch") }
+        if size > buffer.size - position { panic("checkpoint: declared length exceeds file") }
+        records.push(CheckpointRecord{dtype: dtype, shape: shape, offset: position, size: size})
+        position += size
     }
-    if pos != b.n { panic("checkpoint: trailing data") }
-    if checkpoint_checksum(b) != b.get64(24) { panic("checkpoint: bad checksum") }
+    if position != buffer.size { panic("checkpoint: trailing data") }
+    if checkpointChecksum(buffer) != buffer.get64(24) { panic("checkpoint: bad checksum") }
     var params: [Tensor] = []
-    var m: [Tensor] = []
-    var v: [Tensor] = []
+    var firstMoments: [Tensor] = []
+    var secondMoments: [Tensor] = []
     for i in 0..records.len() {
-        let r = records[i]
-        let t = t_zeros(r.dt, r.shape)
-        for j in 0..r.size { t.st.buf.put8(j, b.get8(r.offset + j)) }
-        if i % 3 == 0 { params.push(t) }
-        if i % 3 == 1 { m.push(t) }
-        if i % 3 == 2 { v.push(t) }
+        let currentRecord = records[i]
+        let tensor = tensorZeros(currentRecord.dtype, currentRecord.shape)
+        for j in 0..currentRecord.size { tensor.storage.buffer.put8(j, buffer.get8(currentRecord.offset + j)) }
+        if i % 3 == 0 { params.push(tensor) }
+        if i % 3 == 1 { firstMoments.push(tensor) }
+        if i % 3 == 2 { secondMoments.push(tensor) }
     }
-    let o = Optim{kind: b.get64(32), step: b.get64(40), lr: b.getf64(48), wd: b.getf64(56), momentum: b.getf64(64), beta1: b.getf64(72), beta2: b.getf64(80), eps: b.getf64(88), m: m, v: v}
-    optim_state(o, params)
-    return Checkpoint{params: params, optim: o}
+    let optimizer = Optim{kind: buffer.get64(32), step: buffer.get64(40), learningRate: buffer.getFloat64(48), weightDecay: buffer.getFloat64(56), momentum: buffer.getFloat64(64), beta1: buffer.getFloat64(72), beta2: buffer.getFloat64(80), epsilon: buffer.getFloat64(88), m: firstMoments, v: secondMoments}
+    optimizerValidateState(optimizer, params)
+    return Checkpoint{params: params, optimizer: optimizer}
 }
 
 // Check size before allocation and require a complete native read.
-fn checkpoint_read(path: str) -> Bytes {
-    let name = cbytes(path)
-    let h = win("CreateFileA", name.p, 2147483648, 1, 0, 3, 128, 0)
-    assert(h != 0 - 1, "checkpoint: open failed")
-    let size = Bytes.new(8)
-    let sized = win("GetFileSizeEx", h, size.p)
+fn checkpointRead(path: str) -> Bytes {
+    let pathBytes = cString(path)
+    let handle = win("CreateFileA", pathBytes.address, 2147483648, 1, 0, 3, 128, 0)
+    assert(handle != 0 - 1, "checkpoint: open failed")
+    let sizeOutput = Bytes.new(8)
+    let sized = win("GetFileSizeEx", handle, sizeOutput.address)
     if sized == 0 {
-        win("CloseHandle", h)
+        win("CloseHandle", handle)
         panic("checkpoint: size failed")
     }
-    let nbytes = size.get64(0)
-    if nbytes < 0 or nbytes > CHECKPOINT_MAX {
-        win("CloseHandle", h)
+    let byteCount = sizeOutput.get64(0)
+    if byteCount < 0 or byteCount > checkpointMaxBytes {
+        win("CloseHandle", handle)
         panic("checkpoint: implausibly large allocation")
     }
-    let b = Bytes.new(nbytes)
-    let got = Bytes.new(4)
-    let read = win("ReadFile", h, b.p, nbytes, got.p, 0)
-    let closed = win("CloseHandle", h)
-    assert(read != 0 and got.get32(0) == nbytes, "checkpoint: truncated file")
+    let buffer = Bytes.new(byteCount)
+    let bytesRead = Bytes.new(4)
+    let readSucceeded = win("ReadFile", handle, buffer.address, byteCount, bytesRead.address, 0)
+    let closed = win("CloseHandle", handle)
+    assert(readSucceeded != 0 and bytesRead.get32(0) == byteCount, "checkpoint: truncated file")
     assert(closed != 0, "checkpoint: close failed")
-    return b
+    return buffer
 }
 
-fn checkpoint_load(path: str) -> Checkpoint { return checkpoint_decode(checkpoint_read(path)) }
+fn checkpointLoad(path: str) -> Checkpoint { return checkpointDecode(checkpointRead(path)) }
 
 // Staged writer keeps the target untouched until commit. CREATE_NEW prevents
 // two writers (or a stale interrupted temp) from sharing a temporary file.
-fn checkpoint_begin(path: str) -> CheckpointWriter {
-    let pid = win("GetCurrentProcessId")
-    let target = cbytes(path)
+fn checkpointBegin(path: str) -> CheckpointWriter {
+    let processId = win("GetCurrentProcessId")
+    let target = cString(path)
     for attempt in 0..100 {
-        CHECKPOINT_SERIAL += 1
-        let temp = cbytes("{path}.tmp.{pid}.{CHECKPOINT_SERIAL}")
-        let h = win("CreateFileA", temp.p, 1073741824, 0, 0, 1, 128, 0)
-        if h != 0 - 1 { return CheckpointWriter{handle: h, temp: temp, target: target} }
+        checkpointSerial += 1
+        let temporaryPath = cString("{path}.tmp.{processId}.{checkpointSerial}")
+        let handle = win("CreateFileA", temporaryPath.address, 1073741824, 0, 0, 1, 128, 0)
+        if handle != 0 - 1 { return CheckpointWriter{handle: handle, temporaryPath: temporaryPath, target: target} }
         if win("GetLastError") != 80 { panic("checkpoint: temporary open failed") }
     }
     panic("checkpoint: temporary names exhausted")
-    return CheckpointWriter{handle: 0 - 1, temp: target, target: target}
+    return CheckpointWriter{handle: 0 - 1, temporaryPath: target, target: target}
 }
 
-fn checkpoint_abort(w: CheckpointWriter) {
-    if w.handle != 0 - 1 { win("CloseHandle", w.handle) }
-    w.handle = 0 - 1
-    win("DeleteFileA", w.temp.p)
+fn checkpointAbort(writer: CheckpointWriter) {
+    if writer.handle != 0 - 1 { win("CloseHandle", writer.handle) }
+    writer.handle = 0 - 1
+    win("DeleteFileA", writer.temporaryPath.address)
 }
 
 // A failed/short write discards only the temporary file.
-fn checkpoint_write(w: CheckpointWriter, b: Bytes, off: int, size: int) {
-    assert(off >= 0 and size >= 0 and off <= b.n and size <= b.n - off, "checkpoint: write bounds")
-    let wrote = Bytes.new(4)
-    let ok = win("WriteFile", w.handle, b.at(off), size, wrote.p, 0)
-    if ok == 0 or wrote.get32(0) != size {
-        checkpoint_abort(w)
+fn checkpointWrite(writer: CheckpointWriter, buffer: Bytes, offset: int, size: int) {
+    assert(offset >= 0 and size >= 0 and offset <= buffer.size and size <= buffer.size - offset, "checkpoint: write bounds")
+    let bytesWritten = Bytes.new(4)
+    let succeeded = win("WriteFile", writer.handle, buffer.at(offset), size, bytesWritten.address, 0)
+    if succeeded == 0 or bytesWritten.get32(0) != size {
+        checkpointAbort(writer)
         panic("checkpoint: write failed")
     }
 }
 
 // Flush and close BEFORE atomic same-directory replacement. No delete-target
 // fallback: failed publication must leave the previous checkpoint intact.
-fn checkpoint_commit(w: CheckpointWriter) {
-    let flushed = win("FlushFileBuffers", w.handle)
-    let closed = win("CloseHandle", w.handle)
-    w.handle = 0 - 1
+fn checkpointCommit(writer: CheckpointWriter) {
+    let flushed = win("FlushFileBuffers", writer.handle)
+    let closed = win("CloseHandle", writer.handle)
+    writer.handle = 0 - 1
     if flushed == 0 or closed == 0 {
-        checkpoint_abort(w)
+        checkpointAbort(writer)
         panic("checkpoint: flush/close failed")
     }
-    if win("MoveFileExA", w.temp.p, w.target.p, 9) == 0 {
-        checkpoint_abort(w)
+    if win("MoveFileExA", writer.temporaryPath.address, writer.target.address, 9) == 0 {
+        checkpointAbort(writer)
         panic("checkpoint: atomic rename failed")
     }
 }
 
-fn checkpoint_save(path: str, params: [Tensor], o: Optim) {
-    let b = checkpoint_encode(params, o)
-    let w = checkpoint_begin(path)
-    checkpoint_write(w, b, 0, 32)
-    checkpoint_write(w, b, 32, b.n - 32)
-    checkpoint_commit(w)
+fn checkpointSave(path: str, params: [Tensor], optimizer: Optim) {
+    let buffer = checkpointEncode(params, optimizer)
+    let writer = checkpointBegin(path)
+    checkpointWrite(writer, buffer, 0, 32)
+    checkpointWrite(writer, buffer, 32, buffer.size - 32)
+    checkpointCommit(writer)
 }

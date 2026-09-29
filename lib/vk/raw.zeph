@@ -12,31 +12,31 @@ import "vk/consts.zeph"
 import "std/bytes.zeph"
 
 // Off-heap scratch for native output only; the caller must free it after its last use.
-fn vk_output(n: int) -> Bytes {
-    assert(n > 0, "vk_output: size must be positive")
-    let p = win("VirtualAlloc", 0, n, 12288, 4)
-    assert(p != 0, "vk_output: VirtualAlloc failed")
-    let mem: [int] = []
-    return Bytes{mem: mem, p: p, n: n}
+fn vulkanOutput(size: int) -> Bytes {
+    assert(size > 0, "vulkanOutput: size must be positive")
+    let address = win("VirtualAlloc", 0, size, 12288, 4)
+    assert(address != 0, "vulkanOutput: VirtualAlloc failed")
+    let memory: [int] = []
+    return Bytes{memory: memory, address: address, size: size}
 }
 
-// Release only scratch obtained from vk_output; no references may be used afterward.
-fn vk_free_output(b: Bytes) {
-    let freed = win("VirtualFree", b.addr(), 0, 32768)
-    assert(freed != 0, "vk_free_output: VirtualFree failed")
+// Release only scratch obtained from vulkanOutput; no references may be used afterward.
+fn freeVulkanOutput(buffer: Bytes) {
+    let freed = win("VirtualFree", buffer.addr(), 0, 32768)
+    assert(freed != 0, "freeVulkanOutput: VirtualFree failed")
 }
 
-fn vkcheck(r: int, what: str) {
+fn checkVulkanResult(result: int, what: str) {
     // externs declared `-> i32` already sign-extend, so r is a true VkResult
-    if r != VK_SUCCESS { panic("{what}: VkResult {r}") }
+    if result != VK_SUCCESS { panic("{what}: VkResult {result}") }
 }
 
 // A foreign function returning a 32-bit value leaves it in EAX, which the CPU
 // zero-extends into RAX -- so a negative VkResult arrives as a large positive
 // number. Sign-extend it before comparing against the VK_ERROR_* constants.
-fn i32(v: int) -> int {
-    if v >= 2147483648 { return v - 4294967296 }
-    return v
+fn i32(value: int) -> int {
+    if value >= 2147483648 { return value - 4294967296 }
+    return value
 }
 
 // ---- instance ----

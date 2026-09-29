@@ -18,7 +18,7 @@ fn contains[T](items: [T], target: T) -> bool {
     return false
 }
 
-fn index_of[T](items: [T], target: T) -> int {
+fn indexOf[T](items: [T], target: T) -> int {
     for i in 0..items.len() {
         if items[i] == target { return i }
     }
@@ -39,9 +39,9 @@ fn reverse[T](items: [T]) {
 
 fn slice[T](items: [T], low: int, high: int) -> [T] {
     if low < 0 or high < low or high > items.len() { panic("slice out of range") }
-    var out: [T] = []
-    for i in low..high { out.push(items[i]) }
-    return out
+    var result: [T] = []
+    for i in low..high { result.push(items[i]) }
+    return result
 }
 
 fn first[T](items: [T]) -> T? {
@@ -55,17 +55,17 @@ fn last[T](items: [T]) -> T? {
 }
 
 fn map[T, U](items: [T], transform: fn(T) -> U) -> [U] {
-    var out: [U] = []
-    for item in items { out.push(transform(item)) }
-    return out
+    var result: [U] = []
+    for item in items { result.push(transform(item)) }
+    return result
 }
 
 fn filter[T](items: [T], keep: fn(T) -> bool) -> [T] {
-    var out: [T] = []
+    var result: [T] = []
     for item in items {
-        if keep(item) { out.push(item) }
+        if keep(item) { result.push(item) }
     }
-    return out
+    return result
 }
 
 fn fold[T, A](items: [T], start: A, combine: fn(A, T) -> A) -> A {
@@ -98,7 +98,7 @@ fn count[T](items: [T], target: T) -> int {
 
 // Stable bottom-up merge sort: O(n log n) comparisons, O(n) scratch space.
 // compare(left, right) < 0 when left should come first; ties retain their original order.
-fn sort_by[T](items: [T], compare: fn(T, T) -> int) {
+fn sortBy[T](items: [T], compare: fn(T, T) -> int) {
     let length = items.len()
     if length < 2 { return }
     let scratch = slice(items, 0, length)
@@ -134,15 +134,15 @@ fn sum[T](items: [T]) -> T {
     return total
 }
 
-fn min_of[T](items: [T]) -> T {
-    if items.len() == 0 { panic("min_of: empty list") }
+fn minOf[T](items: [T]) -> T {
+    if items.len() == 0 { panic("minOf: empty list") }
     var smallest = items[0]
     for i in 1..items.len() { if items[i] < smallest { smallest = items[i] } }
     return smallest
 }
 
-fn max_of[T](items: [T]) -> T {
-    if items.len() == 0 { panic("max_of: empty list") }
+fn maxOf[T](items: [T]) -> T {
+    if items.len() == 0 { panic("maxOf: empty list") }
     var largest = items[0]
     for i in 1..items.len() { if items[i] > largest { largest = items[i] } }
     return largest

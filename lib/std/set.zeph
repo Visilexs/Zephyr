@@ -1,7 +1,7 @@
 // std/set.zeph — Set[T]: distinct values with O(1) add, has and remove.
 //
 //     import "std/set.zeph"
-//     let seen = set_of(["a", "b", "a"])
+//     let seen = setOf(["a", "b", "a"])
 //     seen.add("c")
 //     print(seen.len())               // 3
 //
@@ -13,7 +13,7 @@ struct Set[T] {
 }
 
 // A set holding each distinct item once.
-fn set_of[T](items: [T]) -> Set[T] {
+fn setOf[T](items: [T]) -> Set[T] {
     var result: Set[T] = Set{}
     for item in items { result.add(item) }
     return result
@@ -65,7 +65,7 @@ impl Set[T] {
     }
 
     // Whether every item of this set is in the other.
-    fn is_subset(self, other: Set[T]) -> bool {
+    fn isSubset(self, other: Set[T]) -> bool {
         for item in self.entries.keys() {
             if not other.has(item) { return false }
         }
