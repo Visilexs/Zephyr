@@ -8363,6 +8363,16 @@ fn generateLoadAddress(expression: Node) -> str {
 }
 
 // store64/32/8: address then value, value register named by width
+// the import slot a win() call goes through; the name may carry a "dll!func"
+// prefix to pick the DLL (default kernel32)
+fn windowsImportSymbol(importName: str) -> str {
+    if textStartsWith(importName, "user32!") { return "__imp_u_" + importName.sub(7, importName.len()) }
+    if textStartsWith(importName, "gdi32!") { return "__imp_g_" + importName.sub(6, importName.len()) }
+    if textStartsWith(importName, "opengl32!") { return "__imp_o_" + importName.sub(9, importName.len()) }
+    if textStartsWith(importName, "kernel32!") { return "__imp_k_" + importName.sub(9, importName.len()) }
+    return "__imp_k_" + importName
+}
+
 fn generateStoreRaw(expression: Node, valueRegisterArgument: str) {
     let addressOperand = addressOperandFree(expression.children[1])
     if addressOperand != "" and addressSafeValue(expression.children[2]) {
@@ -8876,23 +8886,7 @@ fn generateCall(expression: Node) {
             emitInstruction("mov [rsp + {32 + 8 * stackArgumentIndex}], rax")
             stackArgumentIndex += 1
         }
-        // name may carry a "dll!func" prefix to pick the DLL (default kernel32)
-        let importName = expression.children[1].children[0].name
-        var prefix = "__imp_k_"
-        var functionName = importName
-        if textStartsWith(importName, "user32!") {
-            prefix = "__imp_u_"
-            functionName = importName.sub(7, importName.len())
-        } else if textStartsWith(importName, "gdi32!") {
-            prefix = "__imp_g_"
-            functionName = importName.sub(6, importName.len())
-        } else if textStartsWith(importName, "opengl32!") {
-            prefix = "__imp_o_"
-            functionName = importName.sub(9, importName.len())
-        } else if textStartsWith(importName, "kernel32!") {
-            functionName = importName.sub(9, importName.len())
-        }
-        emitInstruction("call {prefix}{functionName}")
+        emitInstruction("call {windowsImportSymbol(expression.children[1].children[0].name)}")
         emitInstruction("mov rsp, r12")
         if argumentCount > 0 { emitInstruction("add rsp, {8 * argumentCount}") }
         return

@@ -93,6 +93,13 @@ let irDivideByInvariant = 60    // a / b with c = irReciprocal(b): multiply-high
 let irModuloByInvariant = 61
 let irDivideByConstant = 62     // a / immediate, immediate > 1 and not a power of two
 let irModuloByConstant = 63
+let irLoadRaw64 = 65             // load64(a + immediate) and friends: raw memory, zero-extended
+let irLoadRaw32 = 66
+let irLoadRaw16 = 67
+let irLoadRaw8 = 68
+let irStoreRaw64 = 69            // store64(a + immediate, b) and friends
+let irStoreRaw32 = 70
+let irStoreRaw8 = 71
 let irLoadByte = 64              // zero-extended byte [a + b + 8]: a string's bytes (strings never change)
 // terminators
 let irJump = 100                // successors[0]
@@ -157,7 +164,7 @@ var regionParentSlotCount = 0
 var regionParentParameterCount = 0
 var regionParentRegisterCall = false
 var regionFrameValue = 0 - 1               // the parent frame pointer (outlined loops)
-var regionHasUserCall = false
+var windowsCallSymbols: [str] = []    // irCall with immediate -1 - i calls windowsCallSymbols[i] (Win64 ABI)
 var regionGlobalsInMemory = false          // a callee may read or write globals: keep them in memory
 var regionBreakTargets: [int] = []
 var regionContinueTargets: [int] = []
@@ -222,7 +229,6 @@ fn resetIr() {
     optimizerBailed = false
     optimizerBailReason = ""
     currentLoopDepth = 0
-    regionHasUserCall = false
     var noBreaks: [int] = []
     regionBreakTargets = noBreaks
     var noContinues: [int] = []
@@ -765,6 +771,48 @@ fn lowerCall(expression: Node) -> int {
         }
         return emitIr1(irListLength, classInteger, lowerExpression(receiver), 0)
     }
+    if callKind == callKindLoad64 or callKind == callKindLoad32 or callKind == callKindLoad16 or callKind == callKindLoad8 {
+        var addressNode = expression.children[1]
+        let displacement = addressDisplacement(addressNode)
+        if displacement != 0 { addressNode = addressBaseNode }
+        let address = lowerExpression(addressNode)
+        if optimizerBailed { return 0 }
+        var opcode = irLoadRaw8
+        if callKind == callKindLoad64 { opcode = irLoadRaw64 }
+        if callKind == callKindLoad32 { opcode = irLoadRaw32 }
+        if callKind == callKindLoad16 { opcode = irLoadRaw16 }
+        return emitIr1(opcode, classInteger, address, displacement)
+    }
+    if callKind == callKindStore64 or callKind == callKindStore32 or callKind == callKindStore8 {
+        var addressNode = expression.children[1]
+        let displacement = addressDisplacement(addressNode)
+        if displacement != 0 { addressNode = addressBaseNode }
+        let address = lowerExpression(addressNode)
+        let stored = lowerExpression(expression.children[2])
+        if optimizerBailed { return 0 }
+        var opcode = irStoreRaw8
+        if callKind == callKindStore64 { opcode = irStoreRaw64 }
+        if callKind == callKindStore32 { opcode = irStoreRaw32 }
+        emitIr2(opcode, classInteger, address, stored, displacement)
+        return 0
+    }
+    if callKind == callKindWindows {
+        if linuxTargetEnabled or wasmTargetEnabled {
+            optimizerBail("win() off Windows")
+            return 0
+        }
+        var operands: [int] = []
+        for i in 2..expression.children.len() {
+            var argument = lowerExpression(expression.children[i])
+            if optimizerBailed { return 0 }
+            if irClasses[argument] == classFloat { argument = emitIr1(irBitsFromFloat, classInteger, argument, 0) }
+            operands.push(argument)
+        }
+        windowsCallSymbols.push(windowsImportSymbol(expression.children[1].children[0].name))
+        let result = emitIr(irCall, classInteger, operands, 0 - windowsCallSymbols.len())
+        irReferenceArguments[result] = 0
+        return result
+    }
     if callKind == callKindByte {
         let text = lowerExpression(expression.children[0].children[0])
         let index = lowerExpression(expression.children[1])
@@ -810,7 +858,7 @@ fn lowerCall(expression: Node) -> int {
         lowerFixedPanic(panicStringIndex(expression, literalText(callArguments[0])))
         return 0
     }
-    if functionDefinition.hasEnvironment or textStartsWith(functionDefinition.name, "runtime") {
+    if functionDefinition.hasEnvironment {
         optimizerBail("call to {functionDefinition.name}")
         return 0
     }
@@ -831,7 +879,6 @@ fn lowerCall(expression: Node) -> int {
         optimizerBail("too many arguments")
         return 0
     }
-    regionHasUserCall = true
     let result = emitIr(irCall, classInteger, operands, expression.referenceIndex)
     irReferenceArguments[result] = referenceMask
     if typeKinds[functionDefinition.returnType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
@@ -1229,6 +1276,7 @@ fn isPureOpcode(opcode: int) -> bool {
     if opcode == irStore or opcode == irStoreIndexed or opcode == irStoreGlobal or opcode == irStoreFrame { return false }
     if opcode == irFloatStore or opcode == irFloatStoreIndexed or opcode == irFloatStoreGlobal or opcode == irFloatStoreFrame { return false }
     if opcode == irBoundsCheck or opcode == irZeroCheck or opcode == irCall { return false }
+    if opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { return false }
     return not isTerminatorOpcode(opcode)
 }
 
@@ -2283,9 +2331,30 @@ fn emitFloatCompareValue(value: int) {
     else { emitSetFromFlags(value, "ae") }
 }
 
+// stack slots a call's arguments take in the outgoing area
+fn outgoingSlotsOfCall(instruction: int) -> int {
+    let argumentCount = irOperands[instruction].len()
+    if irImmediates[instruction] < 0 { return max(argumentCount, 4) }       // Win64: shadow space + stack arguments
+    if functionIsRegisterCall(irImmediates[instruction]) { return 0 }
+    return argumentCount
+}
+
 fn emitCallInstruction(value: int) {
     let functionIndex = irImmediates[value]
     let operands = irOperands[value]
+    if functionIndex < 0 {
+        for i in 4..operands.len() {
+            let argument = integerIn(operands[i], "rax")
+            emitOptimized("mov qword ptr [rsp + {8 * i}], {argument}")
+        }
+        let argumentRegisters = ["rcx", "rdx", "r8", "r9"]
+        clearMoves()
+        for i in 0..min(operands.len(), 4) { addMove(locationOf(operands[i]), argumentRegisters[i]) }
+        emitParallelMoves()
+        emitOptimized("call {windowsCallSymbols[0 - 1 - functionIndex]}")
+        finishResult(value, "rax")
+        return
+    }
     if functionIsRegisterCall(functionIndex) {
         let argumentRegisters = ["rcx", "rdx", "r8", "r9"]
         clearMoves()
@@ -2538,6 +2607,33 @@ fn emitInstructionFor(value: int) {
             emitOptimized("mov {target}, {memoryAt(base, immediate)}")
             finishResult(value, target)
         }
+        return
+    }
+    if opcode >= irLoadRaw64 and opcode <= irLoadRaw8 {
+        let base = integerIn(operands[0], "rcx")
+        let target = resultRegister(value, "rax")
+        let address = memoryAt(base, immediate)
+        if opcode == irLoadRaw64 { emitOptimized("mov {target}, {address}") }
+        else if opcode == irLoadRaw32 {
+            emitOptimized("mov eax, dword ptr {address}")     // writing eax zero-extends
+            finishResult(value, "rax")
+            return
+        }
+        else if opcode == irLoadRaw16 { emitOptimized("movzx {target}, word ptr {address}") }
+        else { emitOptimized("movzx {target}, byte ptr {address}") }
+        finishResult(value, target)
+        return
+    }
+    if opcode >= irStoreRaw64 and opcode <= irStoreRaw8 {
+        let base = integerIn(operands[0], "rcx")
+        let address = memoryAt(base, immediate)
+        if opcode == irStoreRaw64 {
+            let stored = integerIn(operands[1], "rax")
+            emitOptimized("mov {address}, {stored}")
+            return
+        }
+        emitOptimized("mov rax, {locationOf(operands[1])}")
+        if opcode == irStoreRaw32 { emitOptimized("mov {address}, eax") } else { emitOptimized("mov {address}, al") }
         return
     }
     if opcode == irLoadByte {
@@ -2822,9 +2918,7 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     var maximumStackArguments = 0
     for block in blockOrder {
         for instruction in blockInstructions[block] {
-            if irOpcodes[instruction] == irCall and not functionIsRegisterCall(irImmediates[instruction]) {
-                if irOperands[instruction].len() > maximumStackArguments { maximumStackArguments = irOperands[instruction].len() }
-            }
+            if irOpcodes[instruction] == irCall { maximumStackArguments = max(maximumStackArguments, outgoingSlotsOfCall(instruction)) }
         }
     }
     outgoingAreaSize = 8 * maximumStackArguments
@@ -3216,17 +3310,17 @@ fn blockDominates(dominator: int, block: int) -> bool {
 }
 
 // facts about memory the region can change, for which loads may be reused or moved
-var regionMakesCalls = false
+var regionClobbersMemory = false
 var storedFieldOffsets: [int] = []
 
 fn scanMemoryEffects() {
-    regionMakesCalls = false
+    regionClobbersMemory = false
     var noOffsets: [int] = []
     storedFieldOffsets = noOffsets
     for block in blockOrder {
         for instruction in blockInstructions[block] {
             let opcode = irOpcodes[instruction]
-            if opcode == irCall { regionMakesCalls = true }
+            if opcode == irCall or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { regionClobbersMemory = true }
             if opcode == irStore or opcode == irFloatStore { storedFieldOffsets.push(irImmediates[instruction]) }
         }
     }
@@ -3243,8 +3337,8 @@ fn fieldOffsetStored(offset: int) -> bool {
 // once for all equal copies, and moved to wherever its operands exist.
 fn isMovable(value: int) -> bool {
     let opcode = irOpcodes[value]
-    if opcode == irListLength or opcode == irListData { return not regionMakesCalls }
-    if opcode == irLoad or opcode == irFloatLoad { return not regionMakesCalls and not fieldOffsetStored(irImmediates[value]) }
+    if opcode == irListLength or opcode == irListData { return not regionClobbersMemory }
+    if opcode == irLoad or opcode == irFloatLoad { return not regionClobbersMemory and not fieldOffsetStored(irImmediates[value]) }
     if opcode == irConstant or opcode == irFloatConstant or opcode == irDataAddress or opcode == irReciprocal { return true }
     if opcode >= irAdd and opcode <= irFloatAbsolute { return opcode != irDivide and opcode != irModulo }
     if opcode == irIntegerToFloat or opcode == irFloatToInteger or opcode == irFloatFromBits or opcode == irBitsFromFloat { return true }
@@ -3462,7 +3556,7 @@ fn optimizerNote(text: str) {
 // whole function: replaces generateFunctionBody when every statement lowers
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
-    if textStartsWith(functionDefinition.name, "runtime") or functionDefinition.hasEnvironment { return false }
+    if functionDefinition.hasEnvironment { return false }
     if containsBaselineVectorCandidate(functionDefinition.body) {
         optimizerNote("function {functionDefinition.name}: baseline (holds an AVX2 kernel loop)")
         return false
@@ -3600,7 +3694,7 @@ fn outlineLoops(statements: [Node], slotCount: int, parameterCount: int, registe
 fn prepareOptimizedLoops(label: str, statements: [Node], slotCount: int, parameterCount: int, registerCall: bool) {
     clearBooleans(excludedLocalSlots)
     clearBooleans(excludedParameterSlots)
-    if not optimizerEnabled or debugEnabled or textStartsWith(label, "runtime") { return }
+    if not optimizerEnabled or debugEnabled { return }
     for i in 0..slotCount { excludedLocalSlots.push(false) }
     for i in 0..parameterCount { excludedParameterSlots.push(false) }
     outlineLoops(statements, slotCount, parameterCount, registerCall, label)
