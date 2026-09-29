@@ -336,6 +336,9 @@ $errors = @{
     "default-param-order"  = "fn f(a: int = 1, b: int) -> int { return a + b }"
     "alias-cycle"          = "type A = B`ntype B = A`nlet v: A = 1"
     "enum-cast-from-str"   = "enum C { A }`nlet c = `"A`" as C"
+    "eq-fn-values"         = "fn f() -> int { return 1 }`nlet g = f`nprint(g == g)"
+    "map-key-float"        = "var m: [float: int] = [:]"
+    "map-key-float-field"  = "struct P { x: float }`nvar m: [P: int] = [:]"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -1184,6 +1187,48 @@ print(outer(1))
 '@
 $exp = @("800x600 main 0 true", "3 untitled true", "[[1, 2], [3]] zeph", "deep blue", "leafy green", "3", "Red Green Blue ", "Blue", "Hello, Ann", "Hi, Bo", "Yo! , CyYo! , Cy", "Hello, x", "21") -join [Environment]::NewLine
 Check "lang-types" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: structural equality, compound map keys ----
+$r = RunSrc "lang_equality" @'
+struct Point { x: int, y: int }
+struct Line { from: Point, to: Point, label: str, weight: float }
+let a = Point{x: 1, y: 2}
+let b = Point{x: 1, y: 2}
+print("{a == b} {a != b} {a == Point{x: 2, y: 2}}")
+print("{[1, 2, 3] == [1, 2, 3]} {[1, 2] == [1, 2, 3]} {[[1], [2]] == [[1], [2]]} {["a", "b"] != ["a", "c"]}")
+let l1 = Line{from: a, to: b, label: "ab", weight: 0.5}
+let l2 = Line{from: b, to: a, label: "ab", weight: 0.5}
+print("{l1 == l2} {l1 == Line{from: a, to: b, label: "ab", weight: 0.25}}")
+let o1: int? = 3
+let o2: int? = 3
+let o3: int? = none
+print("{o1 == o2} {o1 == o3} {o3 == o3}")
+let m1 = ["a": 1, "b": 2]
+let m2 = ["b": 2, "a": 1]
+print("{m1 == m2} {m1 == ["a": 1]}")
+var grid: [Point: str] = [:]
+grid[Point{x: 0, y: 0}] = "origin"
+grid[Point{x: 3, y: 4}] = "far"
+print(grid[Point{x: 3, y: 4}])
+print(grid.has(Point{x: 0, y: 0}))
+print(grid.has(Point{x: 9, y: 0}))
+grid[Point{x: 0, y: 0}] = "zero"
+print(grid.len())
+var seen: [[int]: int] = [:]
+for i in 0..200 { seen[[i % 7, i % 3]] = i }
+print(seen.len())
+print(seen[[6, 2]])
+fn same(p: Point) -> str {
+    return match p {
+        (Point{x: 0, y: 0}) { "origin" }
+        else { "elsewhere" }
+    }
+}
+print(same(Point{x: 0, y: 0}) + " " + same(a))
+print(grid)
+'@
+$exp = @("true false false", "true false true true", "true false", "true false true", "true false", "far", "true", "false", "2", "21", "188", "origin elsewhere", "{Point{x: 3, y: 4}: `"far`", Point{x: 0, y: 0}: `"zero`"}") -join [Environment]::NewLine
+Check "lang-equality" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

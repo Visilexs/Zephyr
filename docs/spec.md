@@ -201,8 +201,11 @@ default parameters (§3.4).
     print(ages["alice"])        // panics if the key is absent
     print(ages.has("bob"))
 
-`[K: V]` is a hash map. The key type `K` must be `int`, `str`, `bool`, or an
-enum — types with value equality (`str` compares structurally). `[:]` is the
+`[K: V]` is a hash map. The key type `K` must be `int`, `str`, `bool`, an
+enum, or a list, struct or optional built only from those — types compared by
+value (§3.3). Floats (NaN is not equal to itself) and maps cannot be keys.
+Lists and structs are mutable: changing one after using it as a key leaves it
+filed under its old hash, so lookups of it become unreliable. `[:]` is the
 empty map literal and, like `[]`, needs an annotation to supply its type.
 
 Reading a missing key panics; use `.has(k)` to test first, or `.get(k)`,
@@ -409,9 +412,13 @@ panic (§6) on any other malformed input.
   Precedence (Go-style): `& << >>` bind at the `*` level, `| ^` at the `+`
   level.
 - `~x`: bitwise complement of an int (`x ^ -1`).
-- `== !=`: numbers (mixed widens), bools, or strs (byte equality). Not
-  defined for lists or structs. `x == none` / `x != none` on an optional is
-  a presence test, the same as `not x.has()` / `x.has()`.
+- `== !=`: numbers (mixed widens), bools, strs (byte equality), enums, and
+  — structurally — two lists, structs, optionals or maps of the same type:
+  equal when their elements, fields, wrapped values or entries are equal
+  (maps ignore order). Function and interface values have no `==`.
+  `x == none` / `x != none` on an optional is a presence test, the same as
+  `not x.has()` / `x.has()`. Comparing a structure that contains itself does
+  not terminate.
 - `< <= > >=`: numbers or strs (lexicographic byte order). Consecutive
   comparisons chain: `lo <= x < hi` is `lo <= x and x < hi`. The middle
   operand appears twice, so it may not contain a call; store a call's result

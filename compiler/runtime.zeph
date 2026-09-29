@@ -976,13 +976,118 @@ fn rx_hash_str(s: int) -> int {
     return h & 9223372036854775807
 }
 fn rx_map_hash(m: int, k: int) -> int {
-    if load64(m + 24) == 1 { return rx_hash_str(k) }
+    let keyKind = load64(m + 24)
+    if keyKind == 1 { return rx_hash_str(k) }
+    if keyKind != 0 { return rt_value_hash(k, keyKind) }   // a type descriptor
     return rx_hash_int(k) >> load64(m + 40)
 }
 fn rx_key_eq(m: int, a: int, b: int) -> int {
-    if load64(m + 24) == 1 { return rt_str_eq(a, b) }
+    let keyKind = load64(m + 24)
+    if keyKind == 1 { return rt_str_eq(a, b) }
+    if keyKind != 0 { return rt_value_eq(a, b, keyKind) }
     if a == b { return 1 }
     return 0
+}
+
+// Structural == for lists, structs, optionals and maps, walking the same type
+// descriptors print uses (kinds: 0 int, 1 float, 2 bool, 3 str, 4 list,
+// 5 struct, 6 enum, 7 map, 8 optional).
+// ponytail: recursion follows the data, so a cyclic structure never returns.
+fn rt_value_eq(a: int, b: int, td: int) -> int {
+    let kind = load64(td)
+    if kind == 3 { return rt_str_eq(a, b) }
+    if kind == 1 {
+        if frombits(a) == frombits(b) { return 1 }
+        return 0
+    }
+    if kind == 4 {
+        let count = load64(a)
+        if count != load64(b) { return 0 }
+        let elementTd = load64(td + 8)
+        let dataA = load64(a + 16)
+        let dataB = load64(b + 16)
+        var i = 0
+        while i < count {
+            if rt_value_eq(load64(dataA + i * 8), load64(dataB + i * 8), elementTd) == 0 { return 0 }
+            i += 1
+        }
+        return 1
+    }
+    if kind == 5 {
+        let fieldCount = load64(td + 16)
+        var i = 0
+        while i < fieldCount {
+            if rt_value_eq(load64(a + i * 8), load64(b + i * 8), load64(td + 32 + i * 16)) == 0 { return 0 }
+            i += 1
+        }
+        return 1
+    }
+    if kind == 8 {
+        if a == 0 or b == 0 {
+            if a == b { return 1 }
+            return 0
+        }
+        return rt_value_eq(load64(a), load64(b), load64(td + 8))
+    }
+    if kind == 7 {
+        if load64(a) != load64(b) { return 0 }
+        let valueTd = load64(td + 16)
+        let capacity = load64(a + 8)
+        let slots = load64(a + 16)
+        var i = 0
+        while i < capacity {
+            let slot = slots + i * 24
+            if load64(slot) == 1 {
+                let found = rx_lookup(b, load64(slot + 8))
+                if found < 0 { return 0 }
+                if rt_value_eq(load64(slot + 16), load64(load64(b + 16) + found * 24 + 16), valueTd) == 0 { return 0 }
+            }
+            i += 1
+        }
+        return 1
+    }
+    if a == b { return 1 }
+    return 0
+}
+
+fn rx_hash_mix(hash: int, value: int) -> int {
+    var mixed = (hash * 1000003) ^ (value * -7046029254386353131)
+    mixed = mixed ^ (mixed >> 29)
+    return mixed & 9223372036854775807
+}
+
+// A hash consistent with rt_value_eq, for list/struct/optional map keys
+// (float and map keys are rejected by the compiler).
+fn rt_value_hash(v: int, td: int) -> int {
+    let kind = load64(td)
+    if kind == 3 { return rx_hash_str(v) }
+    if kind == 4 {
+        let count = load64(v)
+        let elementTd = load64(td + 8)
+        let data = load64(v + 16)
+        var hash = count
+        var i = 0
+        while i < count {
+            hash = rx_hash_mix(hash, rt_value_hash(load64(data + i * 8), elementTd))
+            i += 1
+        }
+        return hash
+    }
+    if kind == 5 {
+        let fieldCount = load64(td + 16)
+        var hash = fieldCount
+        var i = 0
+        while i < fieldCount {
+            hash = rx_hash_mix(hash, rt_value_hash(load64(v + i * 8), load64(td + 32 + i * 16)))
+            i += 1
+        }
+        return hash
+    }
+    if kind == 8 {
+        if v == 0 { return 0 }
+        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))
+    }
+    return rx_hash_mix(0, v)
 }
 // slot holding k, or -1
 fn rx_map_lookup(m: int, k: int) -> int {

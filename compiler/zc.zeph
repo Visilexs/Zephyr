@@ -2019,12 +2019,36 @@ fn type_eq(a: int, b: int) -> bool {
 }
 
 // keys need value equality: int/bool/enum compare by value, str structurally
-fn valid_map_key(t: int) -> bool {
-    let k = ty_kind[t]
-    return k == K_INT or k == K_BOOL or k == K_STR or k == K_ENUM
+fn valid_map_key(t: int) -> bool { return value_comparable(t, true, emptyStructList()) }
+fn emptyStructList() -> [int] {
+    var structIndices: [int] = []
+    return structIndices
 }
+// Whether `==` compares values of t structurally. As a map key (asKey) floats and
+// maps are out: NaN breaks equality and a map key would need an order-free hash.
+fn value_comparable(t: int, asKey: bool, visiting: [int]) -> bool {
+    let k = ty_kind[t]
+    if k == K_INT or k == K_BOOL or k == K_STR or k == K_ENUM { return true }
+    if k == K_FLOAT { return not asKey }
+    if k == K_LIST or k == K_OPT { return value_comparable(ty_el[t], asKey, visiting) }
+    if k == K_MAP { return not asKey and value_comparable(ty_sd[t], true, visiting) and value_comparable(ty_el[t], false, visiting) }
+    if k == K_STRUCT {
+        for seen in visiting {
+            if seen == ty_sd[t] { return true }
+        }
+        visiting.push(ty_sd[t])
+        for fieldType in g_structs[ty_sd[t]].ftypes {
+            if not value_comparable(fieldType, asKey, visiting) { return false }
+        }
+        return true
+    }
+    return false
+}
+// 0: int-like keys by value, 1: str, 2: compared through the key's type descriptor
 fn map_keykind(t: int) -> int {
-    if ty_kind[ty_sd[t]] == K_STR { return 1 }
+    let keyKind = ty_kind[ty_sd[t]]
+    if keyKind == K_STR { return 1 }
+    if keyKind == K_LIST or keyKind == K_STRUCT or keyKind == K_OPT { return 2 }
     return 0
 }
 // the map records its key kind at creation, so one set/get serves both
@@ -2122,7 +2146,7 @@ fn resolve_type(te: Node) -> int {
     if te.k == N_TYLIST { return list_of(resolve_type(te.kids[0])) }
     if te.k == N_TYMAP {
         let kt = resolve_type(te.kids[0])
-        if not valid_map_key(kt) { die(te.line, "{type_str(kt)} cannot be a map key (use int, str, bool, or an enum)") }
+        if not valid_map_key(kt) { die(te.line, "{type_str(kt)} cannot be a map key (use int, str, bool, an enum, or a list, struct or optional of those)") }
         return map_of(kt, resolve_type(te.kids[1]))
     }
     let n = te.name
@@ -2273,6 +2297,10 @@ fn check_bin(e: Node) -> int {
         } else if type_eq(lt, rt) and ty_kind[lt] == K_BOOL { e.aux = BC_BOOL }
         else if type_eq(lt, rt) and ty_kind[lt] == K_STR { e.aux = BC_STR }
         else if type_eq(lt, rt) and ty_kind[lt] == K_ENUM { e.aux = BC_INT }
+        else if type_eq(lt, rt) and value_comparable(lt, false, emptyStructList()) {
+            e.aux = BC_STR                       // a runtime call that only reads both sides
+            e.slot = td_index(lt) + 1            // + 1: 0 means plain str
+        }
         else { die(e.line, "'{TOKNAMES[op]}' is not defined for {type_str(lt)} and {type_str(rt)}") }
         return TI_BOOL
     }
@@ -3232,7 +3260,7 @@ fn ce_inner(e: Node) -> int {
             }
             i += 2
         }
-        if not valid_map_key(kt) { die(e.line, "{type_str(kt)} cannot be a map key (use int, str, bool, or an enum)") }
+        if not valid_map_key(kt) { die(e.line, "{type_str(kt)} cannot be a map key (use int, str, bool, an enum, or a list, struct or optional of those)") }
         i = 0
         while i < e.kids.len() {
             e.kids[i] = coerce(e.kids[i], kt, "map key")
@@ -6532,7 +6560,12 @@ fn gen_binop(e: Node) {
         if op == T_PLUS {
             rcall("rt_str_concat")
         } else if op == T_EQEQ or op == T_NE {
-            rcall("rt_str_eq")
+            if e.slot > 0 {
+                o("lea r8, [rip + __td{e.slot - 1}]")
+                rcall("rt_value_eq")
+            } else {
+                rcall("rt_str_eq")
+            }
             if op == T_NE { o("xor rax, 1") }
         } else {
             rcall("rt_str_cmp")
@@ -8023,7 +8056,8 @@ fn gen_expr(e: Node) {
     }
     if e.k == N_MAPLIT {
         let setfn = map_setfn(e.ty)
-        o("mov rcx, {map_keykind(e.ty)}")
+        if map_keykind(e.ty) == 2 { o("lea rcx, [rip + __td{td_index(ty_sd[e.ty])}]") }
+        else { o("mov rcx, {map_keykind(e.ty)}") }
         o("lea rdx, [rip + __dt{dt_map(e.ty)}]")
         rcall("rt_map_new_d")
         o("push rax")                      // map stays at [rsp]
@@ -11207,13 +11241,118 @@ fn __emb_rt() -> str {
     p.push("    return h & 9223372036854775807\n")
     p.push("\}\n")
     p.push("fn rx_map_hash(m: int, k: int) -> int \{\n")
-    p.push("    if load64(m + 24) == 1 \{ return rx_hash_str(k) \}\n")
+    p.push("    let keyKind = load64(m + 24)\n")
+    p.push("    if keyKind == 1 \{ return rx_hash_str(k) \}\n")
+    p.push("    if keyKind != 0 \{ return rt_value_hash(k, keyKind) \}   // a type descriptor\n")
     p.push("    return rx_hash_int(k) >> load64(m + 40)\n")
     p.push("\}\n")
     p.push("fn rx_key_eq(m: int, a: int, b: int) -> int \{\n")
-    p.push("    if load64(m + 24) == 1 \{ return rt_str_eq(a, b) \}\n")
+    p.push("    let keyKind = load64(m + 24)\n")
+    p.push("    if keyKind == 1 \{ return rt_str_eq(a, b) \}\n")
+    p.push("    if keyKind != 0 \{ return rt_value_eq(a, b, keyKind) \}\n")
     p.push("    if a == b \{ return 1 \}\n")
     p.push("    return 0\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// Structural == for lists, structs, optionals and maps, walking the same type\n")
+    p.push("// descriptors print uses (kinds: 0 int, 1 float, 2 bool, 3 str, 4 list,\n")
+    p.push("// 5 struct, 6 enum, 7 map, 8 optional).\n")
+    p.push("// ponytail: recursion follows the data, so a cyclic structure never returns.\n")
+    p.push("fn rt_value_eq(a: int, b: int, td: int) -> int \{\n")
+    p.push("    let kind = load64(td)\n")
+    p.push("    if kind == 3 \{ return rt_str_eq(a, b) \}\n")
+    p.push("    if kind == 1 \{\n")
+    p.push("        if frombits(a) == frombits(b) \{ return 1 \}\n")
+    p.push("        return 0\n")
+    p.push("    \}\n")
+    p.push("    if kind == 4 \{\n")
+    p.push("        let count = load64(a)\n")
+    p.push("        if count != load64(b) \{ return 0 \}\n")
+    p.push("        let elementTd = load64(td + 8)\n")
+    p.push("        let dataA = load64(a + 16)\n")
+    p.push("        let dataB = load64(b + 16)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < count \{\n")
+    p.push("            if rt_value_eq(load64(dataA + i * 8), load64(dataB + i * 8), elementTd) == 0 \{ return 0 \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return 1\n")
+    p.push("    \}\n")
+    p.push("    if kind == 5 \{\n")
+    p.push("        let fieldCount = load64(td + 16)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < fieldCount \{\n")
+    p.push("            if rt_value_eq(load64(a + i * 8), load64(b + i * 8), load64(td + 32 + i * 16)) == 0 \{ return 0 \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return 1\n")
+    p.push("    \}\n")
+    p.push("    if kind == 8 \{\n")
+    p.push("        if a == 0 or b == 0 \{\n")
+    p.push("            if a == b \{ return 1 \}\n")
+    p.push("            return 0\n")
+    p.push("        \}\n")
+    p.push("        return rt_value_eq(load64(a), load64(b), load64(td + 8))\n")
+    p.push("    \}\n")
+    p.push("    if kind == 7 \{\n")
+    p.push("        if load64(a) != load64(b) \{ return 0 \}\n")
+    p.push("        let valueTd = load64(td + 16)\n")
+    p.push("        let capacity = load64(a + 8)\n")
+    p.push("        let slots = load64(a + 16)\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < capacity \{\n")
+    p.push("            let slot = slots + i * 24\n")
+    p.push("            if load64(slot) == 1 \{\n")
+    p.push("                let found = rx_lookup(b, load64(slot + 8))\n")
+    p.push("                if found < 0 \{ return 0 \}\n")
+    p.push("                if rt_value_eq(load64(slot + 16), load64(load64(b + 16) + found * 24 + 16), valueTd) == 0 \{ return 0 \}\n")
+    p.push("            \}\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return 1\n")
+    p.push("    \}\n")
+    p.push("    if a == b \{ return 1 \}\n")
+    p.push("    return 0\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("fn rx_hash_mix(hash: int, value: int) -> int \{\n")
+    p.push("    var mixed = (hash * 1000003) ^ (value * -7046029254386353131)\n")
+    p.push("    mixed = mixed ^ (mixed >> 29)\n")
+    p.push("    return mixed & 9223372036854775807\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// A hash consistent with rt_value_eq, for list/struct/optional map keys\n")
+    p.push("// (float and map keys are rejected by the compiler).\n")
+    p.push("fn rt_value_hash(v: int, td: int) -> int \{\n")
+    p.push("    let kind = load64(td)\n")
+    p.push("    if kind == 3 \{ return rx_hash_str(v) \}\n")
+    p.push("    if kind == 4 \{\n")
+    p.push("        let count = load64(v)\n")
+    p.push("        let elementTd = load64(td + 8)\n")
+    p.push("        let data = load64(v + 16)\n")
+    p.push("        var hash = count\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < count \{\n")
+    p.push("            hash = rx_hash_mix(hash, rt_value_hash(load64(data + i * 8), elementTd))\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return hash\n")
+    p.push("    \}\n")
+    p.push("    if kind == 5 \{\n")
+    p.push("        let fieldCount = load64(td + 16)\n")
+    p.push("        var hash = fieldCount\n")
+    p.push("        var i = 0\n")
+    p.push("        while i < fieldCount \{\n")
+    p.push("            hash = rx_hash_mix(hash, rt_value_hash(load64(v + i * 8), load64(td + 32 + i * 16)))\n")
+    p.push("            i += 1\n")
+    p.push("        \}\n")
+    p.push("        return hash\n")
+    p.push("    \}\n")
+    p.push("    if kind == 8 \{\n")
+    p.push("        if v == 0 \{ return 0 \}\n")
+    p.push("        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))\n")
+    p.push("    \}\n")
+    p.push("    return rx_hash_mix(0, v)\n")
     p.push("\}\n")
     p.push("// slot holding k, or -1\n")
     p.push("fn rx_map_lookup(m: int, k: int) -> int \{\n")
@@ -15369,7 +15508,8 @@ fn wexpr(e: Node) {
     }
     if k == N_MAPLIT {
         let r = wroot_take(e.line)
-        wconst(map_keykind(e.ty))
+        if map_keykind(e.ty) == 2 { wconst(wtaddr(td_index(ty_sd[e.ty]))) }
+        else { wconst(map_keykind(e.ty)) }
         wcall_named("rt_map_new")
         wroot_store(r)
         let setfn = map_setfn(e.ty)
@@ -15564,7 +15704,12 @@ fn wbin(e: Node) {
             return
         }
         if op == T_EQEQ or op == T_NE {
-            wcall_named("rt_str_eq")
+            if e.slot > 0 {
+                wconst(wtaddr(e.slot - 1))
+                wcall_named("rt_value_eq")
+            } else {
+                wcall_named("rt_str_eq")
+            }
             if op == T_NE {
                 wconst(1)
                 wc.push(133)                 // i64.xor
@@ -16567,7 +16712,8 @@ fn gen_wasm_twice(prog: Node) {
     gen_wasm(prog)
     wlayout()
     wtrunc_str(g_dstrs)                      // add_dstr does not dedupe: reset it
-    wtrunc_int(g_descs)                      // so pass two re-interns identically
+    // g_descs is kept: td_index dedupes, so pass two gets pass one's indices back,
+    // which are the ones wlayout gave addresses to
     wtrunc_int(g_wfidx)
     wtrunc_int(g_warity)
     wtrunc_int(g_wcode)
