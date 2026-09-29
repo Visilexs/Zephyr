@@ -184,6 +184,7 @@ var ownedScopes: [[int]] = []              // per open block: the owned variable
 var regionLoopScopeDepths: [int] = []      // parallel to regionBreakTargets: ownedScopes.len() at the loop
 var regionLoopTemporaryMarks: [int] = []   // parallel to regionBreakTargets: pendingTemporaries.len() at the loop
 var irFromGlobal: [bool] = []              // a global's value: runtime primitives never reassign a global
+var regionSourceMakesCalls = false         // the region's source calls something: loads may be freed under a local
 
 fn optimizerBail(reason: str) {
     if not optimizerBailed {
@@ -460,7 +461,7 @@ fn loadVariableHome(variable: int, block: int) -> int {
     if kind == identifierKindGlobal {
         if valueClass == classFloat { value = addInstruction(block, irFloatLoadGlobal, classFloat, noOperands, index) }
         else { value = addInstruction(block, irLoadGlobal, classInteger, noOperands, index) }
-        if variableIsReference[variable] {
+        if variableIsReference[variable] and regionGlobalsInMemory {
             irBorrowed[value] = true              // a callee may reassign the global
             irFromGlobal[value] = true
         }
@@ -661,6 +662,7 @@ fn lowerExpression(expression: Node) -> int {
     }
     if kind == nodeCall { return lowerCall(expression) }
     if kind == nodeStructLiteral { return lowerStructLiteral(expression) }
+    if kind == nodeList { return lowerListLiteral(expression) }
     optimizerBail("expression kind {kind}")
     return 0
 }
@@ -676,13 +678,29 @@ fn lowerStructLiteral(expression: Node) -> int {
     let descriptor = symbolAddress("__dt{slotShapeDescriptor(structDefinition.fieldTypes)}")
     let object = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(8 * structDefinition.fieldNames.len()), descriptor]))
     for fieldInitializer in expression.children {
-        let value = lowerExpression(fieldInitializer.children[0])
+        var value = lowerExpression(fieldInitializer.children[0])
         if optimizerBailed { return 0 }
-        if isReferenceType(structDefinition.fieldTypes[fieldInitializer.slot]) { takeOwnership(value) }
+        if isReferenceType(structDefinition.fieldTypes[fieldInitializer.slot]) { value = takeOwnership(value) }
         if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, object, value, 8 * fieldInitializer.slot) }
         else { let stored = emitIr2(irStore, classInteger, object, value, 8 * fieldInitializer.slot) }
     }
     return object
+}
+
+// a fresh list of known length: the elements' counts move into it
+fn lowerListLiteral(expression: Node) -> int {
+    let descriptor = symbolAddress("__dt{listShapeDescriptor(expression.typeIndex)}")
+    let list = ownedTemporary(lowerRuntimeCall("runtimeNewDescribedList", [integerConstant(expression.children.len()), descriptor]))
+    for i in 0..expression.children.len() {
+        let element = expression.children[i]
+        var value = lowerExpression(element)
+        if optimizerBailed { return 0 }
+        if isReferenceType(element.typeIndex) { value = takeOwnership(value) }
+        let data = emitIr1(irListData, classInteger, list, 0)
+        if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, data, value, 8 * i) }
+        else { let stored = emitIr2(irStore, classInteger, data, value, 8 * i) }
+    }
+    return list
 }
 
 fn lowerBranchValue(result: int, branch: Node) {
@@ -750,7 +768,7 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
-    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject"
+    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeNewDescribedList"
 }
 
 fn callKeepsHeapIntact(instruction: int) -> bool {
@@ -788,8 +806,8 @@ fn isPendingTemporary(value: int) -> bool {
 }
 
 // a count for a value about to be stored where it is owned: a pending
-// temporary hands its own over, anything else is retained
-fn takeOwnership(value: int) {
+// temporary hands its own over, anything else is retained; returns the owned value
+fn takeOwnership(value: int) -> int {
     var remaining: [int] = []
     var found = false
     for pending in pendingTemporaries {
@@ -797,7 +815,8 @@ fn takeOwnership(value: int) {
         else { remaining.push(pending) }
     }
     pendingTemporaries = remaining
-    if not found { let retained = emitRetain(value) }
+    if not found { return emitRetain(value) }
+    return value
 }
 
 // drop the temporaries made since `mark`: the statement or branch is over
@@ -842,13 +861,13 @@ fn storeVariable(variable: int, value: int, isDeclaration: bool) {
             optimizerBail("owned local outside a block")
             return
         }
-        takeOwnership(value)
+        let owned = takeOwnership(value)
         if isDeclaration {
-            declareVariable(variable, value)
+            declareVariable(variable, owned)
             ownedScopes[ownedScopes.len() - 1].push(variable)
         } else {
             let previous = readVariableValue(variable)
-            writeVariableValue(variable, value)
+            writeVariableValue(variable, owned)
             emitRelease(previous)
         }
         return
@@ -889,24 +908,71 @@ fn markOwnedLocals(node: Node) -> bool {
     return changed
 }
 
-// borrowed sources: parameters, literals, globals, borrowed locals, and loads
-// (which the allocator keeps clear of any call that could free them)
+// borrowed sources: parameters, literals, globals and borrowed locals; loads
+// too when the region makes no call that could free what they came from
 fn needsOwnedHome(value: Node) -> bool {
     let kind = value.nodeKind
     if kind == nodeIdentifier { return value.auxiliary == identifierKindLocal and ownedLocalSlots.has(value.slot) }
-    return not (isPlainLiteral(value) or kind == nodeNoneLiteral or kind == nodeMember or kind == nodeIndex)
+    if kind == nodeMember or kind == nodeIndex { return regionSourceMakesCalls }
+    return not (isPlainLiteral(value) or kind == nodeNoneLiteral)
+}
+
+
+// can this subtree run a call that releases a count (user code, a runtime
+// method, a list push or pop, a call through a value)?
+fn mayCallFreeingCode(node: Node) -> bool {
+    if node.nodeKind == nodeCall {
+        let callKind = node.auxiliary
+        if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
+        if callKind == callKindRuntimeCall or callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect { return true }
+        if callKind == callKindInterfaceDispatch or callKind == callKindWindows or callKind == callKindFunctionPointerCall { return true }
+    }
+    for child in node.children {
+        if mayCallFreeingCode(child) { return true }
+    }
+    return false
 }
 
 fn findOwnedLocals(root: Node) {
+    regionSourceMakesCalls = mayCallFreeingCode(root)
     var changed = true
     while changed { changed = markOwnedLocals(root) }
+}
+
+// an argument evaluated before a later one that calls: a borrowed reference
+// takes a count so that call cannot free it first
+fn pinBeforeLaterCalls(value: int, argument: Node, laterArguments: [Node], pinned: [int]) -> int {
+    if not irBorrowed[value] or not isReferenceType(argument.typeIndex) { return value }
+    for later in laterArguments {
+        if hasCall(later) {
+            let retained = emitRetain(value)
+            pinned.push(retained)
+            return retained
+        }
+    }
+    return value
+}
+
+// a container read before an operand that calls: it holds a count until the statement ends
+fn lowerContainer(container: Node, later: [Node]) -> int {
+    let value = lowerExpression(container)
+    if optimizerBailed or not irBorrowed[value] or not isReferenceType(container.typeIndex) { return value }
+    for operand in later {
+        if hasCall(operand) { return ownedTemporary(emitRetain(value)) }
+    }
+    return value
+}
+
+fn argumentsAfter(arguments: [Node], index: int) -> [Node] {
+    var later: [Node] = []
+    for i in (index + 1)..arguments.len() { later.push(arguments[i]) }
+    return later
 }
 
 // Borrowed reference arguments get a count for the call: the callee may free
 // the container they came from. Runtime primitives that call no user code
 // never reassign a global, so a global's value may go as it is.
-fn pinArguments(operands: [int], arguments: [Node], globalsStay: bool) -> [int] {
-    var pinned: [int] = []
+fn pinArguments(operands: [int], arguments: [Node], globalsStay: bool, pinned: [int]) {
     for i in 0..operands.len() {
         var value = operands[i]
         if irBorrowed[value] and isReferenceType(arguments[i].typeIndex) and not (globalsStay and irFromGlobal[value]) {
@@ -915,7 +981,6 @@ fn pinArguments(operands: [int], arguments: [Node], globalsStay: bool) -> [int] 
             operands[i] = value
         }
     }
-    return pinned
 }
 
 // str == != < <= > >=: the runtime compares; + concatenates into a fresh string
@@ -965,7 +1030,7 @@ fn lowerElementAddress(list: int, index: int, site: Node) -> int {
 fn lowerIndexRead(expression: Node) -> int {
     let elementType = plainListElement(expression.children[0].typeIndex)
     if optimizerBailed { return 0 }
-    let list = lowerExpression(expression.children[0])
+    let list = lowerContainer(expression.children[0], [expression.children[1]])
     let index = lowerExpression(expression.children[1])
     if optimizerBailed { return 0 }
     let data = lowerElementAddress(list, index, expression)
@@ -1065,16 +1130,19 @@ fn lowerCall(expression: Node) -> int {
         return result
     }
     if callKind == callKindPush {
-        let list = lowerExpression(expression.children[0].children[0])
+        var pinned: [int] = []
+        let receiver = expression.children[0].children[0]
+        let list = pinBeforeLaterCalls(lowerExpression(receiver), receiver, [expression.children[1]], pinned)
         var value = lowerExpression(expression.children[1])
         if optimizerBailed { return 0 }
-        if isReferenceType(expression.children[1].typeIndex) { takeOwnership(value) }   // the list keeps the count
+        if isReferenceType(expression.children[1].typeIndex) { value = takeOwnership(value) }   // the list keeps the count
         if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
         let pushed = lowerRuntimeCall("runtimeListPush", [list, value])
+        for pinnedValue in pinned { emitRelease(pinnedValue) }
         return 0
     }
     if callKind == callKindSubstring {
-        let text = lowerExpression(expression.children[0].children[0])
+        let text = lowerContainer(expression.children[0].children[0], [expression.children[1], expression.children[2]])
         let lower = lowerExpression(expression.children[1])
         let upper = lowerExpression(expression.children[2])
         if optimizerBailed { return 0 }
@@ -1089,18 +1157,18 @@ fn lowerCall(expression: Node) -> int {
             optimizerBail("no {expression.name}")
             return 0
         }
+        var arguments: [Node] = [expression.children[0].children[0]]
+        for i in 1..expression.children.len() { arguments.push(expression.children[i]) }
         var operands: [int] = []
-        var arguments: [Node] = []
-        for i in 0..expression.children.len() {
-            var argument = expression.children[i]
-            if i == 0 { argument = argument.children[0] }
-            var value = lowerExpression(argument)
+        var pinned: [int] = []
+        for i in 0..arguments.len() {
+            var value = lowerExpression(arguments[i])
             if optimizerBailed { return 0 }
+            value = pinBeforeLaterCalls(value, arguments[i], argumentsAfter(arguments, i), pinned)
             if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
             operands.push(value)
-            arguments.push(argument)
         }
-        let pinned = pinArguments(operands, arguments, not hasFunctionArgument(expression))
+        pinArguments(operands, arguments, not hasFunctionArgument(expression), pinned)
         let result = emitIr(irCall, classInteger, operands, functionNameIndices[expression.name])
         for value in pinned { emitRelease(value) }
         if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
@@ -1108,7 +1176,7 @@ fn lowerCall(expression: Node) -> int {
         return result
     }
     if callKind == callKindByte {
-        let text = lowerExpression(expression.children[0].children[0])
+        let text = lowerContainer(expression.children[0].children[0], [expression.children[1]])
         let index = lowerExpression(expression.children[1])
         if optimizerBailed { return 0 }
         let length = emitIr1(irListLength, classInteger, text, 0)
@@ -1157,10 +1225,12 @@ fn lowerCall(expression: Node) -> int {
         return 0
     }
     var operands: [int] = []
+    var pinned: [int] = []
     var referenceMask = 0
     for i in 0..callArguments.len() {
         var value = lowerExpression(callArguments[i])
         if optimizerBailed { return 0 }
+        value = pinBeforeLaterCalls(value, callArguments[i], argumentsAfter(callArguments, i), pinned)
         if isReferenceType(callArguments[i].typeIndex) { referenceMask = referenceMask | (1 << i) }
         if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
         operands.push(value)
@@ -1169,7 +1239,7 @@ fn lowerCall(expression: Node) -> int {
         optimizerBail("too many arguments")
         return 0
     }
-    let pinned = pinArguments(operands, callArguments, false)
+    pinArguments(operands, callArguments, false, pinned)
     let result = emitIr(irCall, classInteger, operands, expression.referenceIndex)
     irReferenceArguments[result] = referenceMask
     for value in pinned { emitRelease(value) }
@@ -1423,9 +1493,9 @@ fn lowerStatementKind(statement: Node) {
             return
         }
         if statement.children[0].nodeKind != nodeNone {
-            let value = lowerExpression(statement.children[0])
+            var value = lowerExpression(statement.children[0])
             if optimizerBailed { return }
-            if isReferenceType(regionReturnType) { takeOwnership(value) }     // the caller gets a count
+            if isReferenceType(regionReturnType) { value = takeOwnership(value) }     // the caller gets a count
             writeVariableValue(regionReturnVariable, value)
         }
         ensureOpenBlock()
@@ -1498,8 +1568,11 @@ fn lowerStatementKind(statement: Node) {
 
 // does any call in this subtree reach user code (which may touch globals)?
 fn subtreeHasUserCall(node: Node) -> bool {
-    if node.nodeKind == nodeCall and node.auxiliary == callKindUser {
-        if functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
+    if node.nodeKind == nodeCall {
+        let callKind = node.auxiliary
+        if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
+        if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows { return true }
+        if callKind == callKindRuntimeCall and hasFunctionArgument(node) { return true }
     }
     for child in node.children {
         if subtreeHasUserCall(child) { return true }
@@ -2300,7 +2373,7 @@ fn allocateRegisters() {
         var registerCount = integerRegisterNames.len()
         if valueClass == classFloat { registerCount = floatRegisterNames.len() }
         let needsCalleeSaved = crossesAnyPosition(current, callPositions)
-        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call") }
+        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]})") }
         var blocked: [bool] = []
         for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
         for other in active {
