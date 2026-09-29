@@ -66,6 +66,14 @@ let T_NONE = 59
 let T_IMPL = 60
 let T_INTERFACE = 61
 let T_EXTERN = 62
+let T_CONST = 63
+let T_PCTEQ = 64
+let T_AMPEQ = 65
+let T_PIPEEQ = 66
+let T_CARETEQ = 67
+let T_SHLEQ = 68
+let T_SHREQ = 69
+let T_TILDE = 70
 
 let TOKNAMES = ["end of file", "newline", "int literal", "float literal", "string",
     "identifier", "fn", "let", "var", "if", "else", "while", "for", "in", "return",
@@ -73,7 +81,7 @@ let TOKNAMES = ["end of file", "newline", "int literal", "float literal", "strin
     "(", ")", "\{", "\}", "[", "]", ",", ":", ".", "..",
     "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "=", "->",
     "+=", "-=", "*=", "/=", "&", "|", "^", "<<", ">>", "enum", "import", "?", "none",
-    "impl", "interface", "extern"]
+    "impl", "interface", "extern", "const", "%=", "&=", "|=", "^=", "<<=", ">>=", "~"]
 
 // ---------------- node kinds ----------------
 let N_NONE = 0
@@ -232,6 +240,7 @@ let ID_PARAM = 1
 let ID_GLOBAL = 2
 let ID_FUNC = 3     // N_ID naming a function used as a value (refi = g_fns index)
 let ID_CAPTURE = 4  // N_ID captured by the enclosing closure (slot = capture index)
+let DECL_CONST = 1  // N_DECL.ival: declared with `const`
 
 // ---------------- data structures ----------------
 struct Part { is_expr: bool, text: str, line: int }
@@ -243,7 +252,7 @@ struct Node {
     ty: int, slot: int, aux: int, refi: int, mut: bool,
     file: str    // source file this node was parsed from (for -g debug info)
 }
-struct VarInfo { name: str, ty: int, mut: bool, kind: int, idx: int }
+struct VarInfo { name: str, ty: int, mut: bool, kind: int, idx: int, isConst: bool }
 struct SDef { name: str, fnames: [str], ftypes: [int], line: int }
 struct EDef { name: str, members: [str], line: int }
 // an interface: method names + their signatures (K_FN types, self excluded)
@@ -412,6 +421,9 @@ fn dot_continues(src: str, from: int) -> bool {
             i += 1
         } else if c == 47 and byte_at(src, i + 1) == 47 {
             while i < n and src.byte(i) != 10 { i += 1 }
+        } else if c == 47 and byte_at(src, i + 1) == 42 {
+            i = block_comment_end(src, i)
+            if i < 0 { return false }
         } else {
             if c != 46 { return false }
             let d = byte_at(src, i + 1)
@@ -420,6 +432,184 @@ fn dot_continues(src: str, from: int) -> bool {
         }
     }
     return false
+}
+
+// Index just past the `*/` closing the block comment that opens at `start`, or
+// -1 if it never closes. Block comments nest, so a commented-out region may
+// itself hold comments.
+fn block_comment_end(src: str, start: int) -> int {
+    let sourceLength = src.len()
+    var nesting = 0
+    var i = start
+    while i < sourceLength {
+        let current = src.byte(i)
+        let next = byte_at(src, i + 1)
+        if current == 47 and next == 42 {
+            nesting += 1
+            i += 2
+        } else if current == 42 and next == 47 {
+            nesting -= 1
+            i += 2
+            if nesting == 0 { return i }
+        } else {
+            i += 1
+        }
+    }
+    return -1
+}
+
+fn count_newlines(text: str) -> int {
+    var newlineCount = 0
+    for i in 0..text.len() {
+        if text.byte(i) == 10 { newlineCount += 1 }
+    }
+    return newlineCount
+}
+
+// Value of one digit in base 2, 8, 10 or 16; -1 if `c` is not a digit there.
+fn digit_value(c: int, radix: int) -> int {
+    var value = 99
+    if c >= 48 and c <= 57 { value = c - 48 }
+    else if c >= 97 and c <= 102 { value = c - 87 }
+    else if c >= 65 and c <= 70 { value = c - 55 }
+    if value >= radix { return -1 }
+    return value
+}
+
+// The byte an escape sequence stands for; `at` is the index of the backslash.
+// Sets g_escape_length to how many source bytes the escape spans.
+var g_escape_length = 2
+fn escape_value(text: str, at: int, line: int) -> int {
+    let letter = byte_at(text, at + 1)
+    g_escape_length = 2
+    if letter == 110 { return 10 }      // \n
+    if letter == 116 { return 9 }       // \t
+    if letter == 114 { return 13 }      // \r
+    if letter == 48 { return 0 }        // \0
+    if letter == 92 or letter == 34 or letter == 39 or letter == 123 or letter == 125 { return letter }
+    if letter == 120 {                  // \xNN
+        let high = digit_value(byte_at(text, at + 2), 16)
+        let low = digit_value(byte_at(text, at + 3), 16)
+        if high < 0 or low < 0 { die(line, "\\x needs two hex digits, e.g. \\x1b") }
+        g_escape_length = 4
+        return high * 16 + low
+    }
+    die(line, "unknown escape \\{chr(letter)}")
+    return 0
+}
+
+// Split a string literal's body into text runs and `\{expr\}` interpolations.
+// A raw body is taken verbatim: no escapes, no interpolation.
+fn string_parts(body: str, raw: bool, startLine: int) -> [Part] {
+    var parts: [Part] = []
+    if raw {
+        parts.push(Part{is_expr: false, text: body, line: startLine})
+        return parts
+    }
+    var pieces: [str] = []
+    var line = startLine
+    var runStart = 0
+    var i = 0
+    let bodyLength = body.len()
+    while i < bodyLength {
+        let current = body.byte(i)
+        if current == 92 {
+            pieces.push(body.sub(runStart, i))
+            pieces.push(chr(escape_value(body, i, line)))
+            i += g_escape_length
+            runStart = i
+            continue
+        }
+        if current == 123 {
+            pieces.push(body.sub(runStart, i))
+            let text = pieces.join()
+            if text.len() > 0 { parts.push(Part{is_expr: false, text: text, line: line}) }
+            pieces = no_strs()
+            var braceDepth = 1
+            var j = i + 1
+            while j < bodyLength and braceDepth > 0 {
+                let inner = body.byte(j)
+                if inner == 123 { braceDepth += 1 }
+                else if inner == 125 {
+                    braceDepth -= 1
+                    if braceDepth == 0 { break }
+                }
+                else if inner == 10 { die(line, "unterminated interpolation") }
+                j += 1
+            }
+            if braceDepth > 0 { die(line, "unterminated interpolation") }
+            parts.push(Part{is_expr: true, text: body.sub(i + 1, j), line: line})
+            i = j + 1
+            runStart = i
+            continue
+        }
+        if current == 10 { line += 1 }
+        i += 1
+    }
+    pieces.push(body.sub(runStart, bodyLength))
+    let tail = pieces.join()
+    if tail.len() > 0 or parts.len() == 0 {
+        parts.push(Part{is_expr: false, text: tail, line: line})
+    }
+    return parts
+}
+
+// Index of the `"` closing a single-line string whose body starts at `start`.
+fn string_end(src: str, start: int, raw: bool, line: int) -> int {
+    let sourceLength = src.len()
+    var i = start
+    while true {
+        if i >= sourceLength or src.byte(i) == 10 { die(line, "unterminated string") }
+        let current = src.byte(i)
+        if current == 34 { return i }
+        if current == 92 and not raw {
+            i += 2
+        } else if current == 123 and not raw {
+            var braceDepth = 1
+            i += 1
+            while i < sourceLength and braceDepth > 0 {
+                let inner = src.byte(i)
+                if inner == 123 { braceDepth += 1 }
+                else if inner == 125 { braceDepth -= 1 }
+                else if inner == 10 { die(line, "unterminated interpolation") }
+                i += 1
+            }
+        } else {
+            i += 1
+        }
+    }
+    return i
+}
+
+// A `"""` string runs to the next `"""`. When the text starts on the line after
+// the opening quotes and the closing quotes sit alone on their own line, that
+// first newline is dropped and the closing line's indentation is removed from
+// every line -- so the literal can be indented along with the code around it.
+fn multiline_body(rawText: str, line: int) -> str {
+    var text = rawText
+    if text.len() > 0 and text.byte(0) == 10 { text = text.sub(1, text.len()) }
+    else if text.len() > 1 and text.byte(0) == 13 and text.byte(1) == 10 { text = text.sub(2, text.len()) }
+    var lastNewline = text.len() - 1
+    while lastNewline >= 0 and text.byte(lastNewline) != 10 { lastNewline -= 1 }
+    if lastNewline < 0 { return text }
+    let closingIndent = text.sub(lastNewline + 1, text.len())
+    for i in 0..closingIndent.len() {
+        let current = closingIndent.byte(i)
+        if current != 32 and current != 9 { return text }
+    }
+    var kept: [str] = []
+    let lines = text.sub(0, lastNewline).split("\n")
+    for i in 0..lines.len() {
+        var lineText = lines[i]
+        if lineText.len() > 0 and lineText.byte(lineText.len() - 1) == 13 { lineText = lineText.sub(0, lineText.len() - 1) }
+        if i > 0 { kept.push("\n") }
+        if lineText.starts_with(closingIndent) {
+            kept.push(lineText.sub(closingIndent.len(), lineText.len()))
+        } else if lineText.trim() != "" {
+            die(line, "a line in this multi-line string is indented less than its closing quotes")
+        }
+    }
+    return kept.join()
 }
 
 fn kw_lookup(w: str) -> int {
@@ -447,6 +637,7 @@ fn kw_lookup(w: str) -> int {
     if w == "not" { return T_NOT }
     if w == "break" { return T_BREAK }
     if w == "continue" { return T_CONTINUE }
+    if w == "const" { return T_CONST }
     return T_IDENT
 }
 
@@ -464,6 +655,10 @@ fn punct2(a: int, b: int) -> int {
     if a == 45 and b == 61 { return T_MINUSEQ }
     if a == 42 and b == 61 { return T_STAREQ }
     if a == 47 and b == 61 { return T_SLASHEQ }
+    if a == 37 and b == 61 { return T_PCTEQ }
+    if a == 38 and b == 61 { return T_AMPEQ }
+    if a == 124 and b == 61 { return T_PIPEEQ }
+    if a == 94 and b == 61 { return T_CARETEQ }
     return -1
 }
 
@@ -489,6 +684,7 @@ fn punct1(a: int) -> int {
     if a == 38 { return T_AMP }
     if a == 124 { return T_PIPE }
     if a == 94 { return T_CARET }
+    if a == 126 { return T_TILDE }
     return -1
 }
 
@@ -519,82 +715,136 @@ fn lex_src(src: str, start_line: int) -> [Tok] {
             while i < n and src.byte(i) != 10 { i += 1 }
             continue
         }
+        if c == 47 and byte_at(src, i + 1) == 42 {
+            let commentEnd = block_comment_end(src, i)
+            if commentEnd < 0 { die(tl, "unterminated block comment") }
+            let spannedLines = count_newlines(src.sub(i, commentEnd))
+            i = commentEnd
+            if spannedLines > 0 {
+                // a comment spanning lines ends the statement, as a newline would
+                if depth == 0 and not dot_continues(src, i) { out.push(tok(T_NL, line)) }
+                line += spannedLines
+            }
+            continue
+        }
         if is_digit(c) {
             var j = i
-            while j < n and is_digit(byte_at(src, j)) { j += 1 }
-            var isf = false
-            if byte_at(src, j) == 46 and byte_at(src, j + 1) != 46 and is_digit(byte_at(src, j + 1)) {
-                isf = true
-                j += 1
-                while j < n and is_digit(byte_at(src, j)) { j += 1 }
-            }
-            let text = src.sub(i, j)
             var t = tok(T_INTLIT, tl)
-            if isf {
-                t = tok(T_FLOATLIT, tl)
-                t.f = text as float
+            let radixLetter = byte_at(src, i + 1)
+            var radix = 10
+            if c == 48 and (radixLetter == 120 or radixLetter == 88) { radix = 16 }
+            if c == 48 and (radixLetter == 98 or radixLetter == 66) { radix = 2 }
+            if c == 48 and (radixLetter == 111 or radixLetter == 79) { radix = 8 }
+            if radix != 10 {
+                // 0x / 0b / 0o use all 64 bits, so 0xFFFFFFFFFFFFFFFF is -1
+                var bitsPerDigit = 4
+                if radix == 2 { bitsPerDigit = 1 }
+                if radix == 8 { bitsPerDigit = 3 }
+                var value = 0
+                var digitCount = 0
+                j = i + 2
+                while j < n {
+                    let current = src.byte(j)
+                    if current == 95 and digitCount > 0 and digit_value(byte_at(src, j + 1), radix) >= 0 {
+                        j += 1
+                        continue
+                    }
+                    let digit = digit_value(current, radix)
+                    if digit < 0 { break }
+                    if (value >> (64 - bitsPerDigit)) & ((1 << bitsPerDigit) - 1) != 0 {
+                        die(tl, "integer literal {src.sub(i, j + 1)}... does not fit in 64 bits")
+                    }
+                    value = (value << bitsPerDigit) | digit
+                    digitCount += 1
+                    j += 1
+                }
+                if digitCount == 0 { die(tl, "expected digits after '{src.sub(i, i + 2)}'") }
+                t.i = value
             } else {
-                t.i = text as int
+                // `_` may separate digits: 1_000_000
+                var isFloat = false
+                while j < n and (is_digit(byte_at(src, j)) or (byte_at(src, j) == 95 and is_digit(byte_at(src, j + 1)))) { j += 1 }
+                if byte_at(src, j) == 46 and is_digit(byte_at(src, j + 1)) {
+                    isFloat = true
+                    j += 1
+                    while j < n and (is_digit(byte_at(src, j)) or (byte_at(src, j) == 95 and is_digit(byte_at(src, j + 1)))) { j += 1 }
+                }
+                let exponentLetter = byte_at(src, j)
+                if exponentLetter == 101 or exponentLetter == 69 {
+                    var exponentEnd = j + 1
+                    if byte_at(src, exponentEnd) == 43 or byte_at(src, exponentEnd) == 45 { exponentEnd += 1 }
+                    if is_digit(byte_at(src, exponentEnd)) {
+                        isFloat = true
+                        j = exponentEnd
+                        while j < n and is_digit(byte_at(src, j)) { j += 1 }
+                    }
+                }
+                let text = src.sub(i, j).replace("_", "")
+                if isFloat {
+                    t = tok(T_FLOATLIT, tl)
+                    t.f = text as float
+                } else {
+                    var value = 0
+                    for k in 0..text.len() {
+                        let digit = text.byte(k) - 48
+                        if value > (9223372036854775807 - digit) / 10 {
+                            die(tl, "integer literal {text} is too large for int (the largest is 9223372036854775807)")
+                        }
+                        value = value * 10 + digit
+                    }
+                    t.i = value
+                }
             }
+            if is_id_char(byte_at(src, j)) { die(tl, "invalid character '{chr(byte_at(src, j))}' in number literal") }
             out.push(t)
             i = j
             continue
         }
-        if c == 34 {
-            i += 1
-            var parts: [Part] = []
-            var buf: [str] = []
-            var open = true
-            while open {
-                if i >= n or src.byte(i) == 10 { die(tl, "unterminated string") }
-                let ch = src.byte(i)
-                if ch == 34 {
-                    i += 1
-                    open = false
-                    continue
-                }
-                if ch == 92 {
-                    let e = byte_at(src, i + 1)
-                    if e == 110 { buf.push(chr(10)) }
-                    else if e == 116 { buf.push(chr(9)) }
-                    else if e == 92 { buf.push(chr(92)) }
-                    else if e == 34 { buf.push(chr(34)) }
-                    else if e == 123 { buf.push(chr(123)) }
-                    else if e == 125 { buf.push(chr(125)) }
-                    else { die(line, "unknown escape \\{chr(e)}") }
-                    i += 2
-                    continue
-                }
-                if ch == 123 {
-                    if buf.len() > 0 {
-                        parts.push(Part{is_expr: false, text: buf.join(), line: line})
-                        buf = no_strs()
-                    }
-                    var d = 1
-                    var j = i + 1
-                    while j < n and d > 0 {
-                        let b = src.byte(j)
-                        if b == 123 { d += 1 }
-                        else if b == 125 {
-                            d -= 1
-                            if d == 0 { break }
-                        }
-                        else if b == 10 { die(line, "unterminated interpolation") }
-                        j += 1
-                    }
-                    if d > 0 { die(line, "unterminated interpolation") }
-                    parts.push(Part{is_expr: true, text: src.sub(i + 1, j), line: line})
-                    i = j + 1
-                    continue
-                }
-                buf.push(src.sub(i, i + 1))
-                i += 1
+        if c == 39 {                          // 'a' -- one byte, typed int
+            var value = byte_at(src, i + 1)
+            var length = 1
+            if value == 92 {
+                value = escape_value(src, i + 1, tl)
+                length = g_escape_length
+            } else if value == 39 or value == 10 or i + 1 >= n {
+                die(tl, "empty or unterminated character literal")
+            } else if value >= 128 {
+                die(tl, "a character literal holds one byte; write non-ASCII text as a string")
             }
-            if buf.len() > 0 or parts.len() == 0 {
-                parts.push(Part{is_expr: false, text: buf.join(), line: line})
+            if byte_at(src, i + 1 + length) != 39 { die(tl, "a character literal holds exactly one character, e.g. 'a' or '\\n'") }
+            var t = tok(T_INTLIT, tl)
+            t.i = value
+            out.push(t)
+            i += length + 2
+            continue
+        }
+        // "text", r"raw text", """multi-line""", r"""raw multi-line"""
+        if c == 34 or (c == 114 and byte_at(src, i + 1) == 34) {
+            let raw = c == 114
+            var bodyStart = i + 1
+            if raw { bodyStart = i + 2 }
+            var body = ""
+            var bodyLine = tl
+            if byte_at(src, bodyStart) == 34 and byte_at(src, bodyStart + 1) == 34 {
+                bodyStart += 2
+                var closeAt = bodyStart
+                while closeAt < n and not (src.byte(closeAt) == 34 and byte_at(src, closeAt + 1) == 34 and byte_at(src, closeAt + 2) == 34) {
+                    if src.byte(closeAt) == 92 and not raw { closeAt += 1 }
+                    closeAt += 1
+                }
+                if closeAt >= n { die(tl, "unterminated multi-line string") }
+                let spanned = src.sub(bodyStart, closeAt)
+                if spanned.len() > 0 and (spanned.byte(0) == 10 or spanned.byte(0) == 13) { bodyLine += 1 }
+                body = multiline_body(spanned, tl)
+                line += count_newlines(spanned)
+                i = closeAt + 3
+            } else {
+                let closeAt = string_end(src, bodyStart, raw, tl)
+                body = src.sub(bodyStart, closeAt)
+                i = closeAt + 1
             }
             var t = tok(T_STRTOK, tl)
-            t.parts = parts
+            t.parts = string_parts(body, raw, bodyLine)
             out.push(t)
             continue
         }
@@ -610,8 +860,16 @@ fn lex_src(src: str, start_line: int) -> [Tok] {
             i = j
             continue
         }
-        var pt = punct2(c, byte_at(src, i + 1))
-        var plen = 2
+        var pt = -1
+        var plen = 3
+        if (c == 60 or c == 62) and byte_at(src, i + 1) == c and byte_at(src, i + 2) == 61 {
+            pt = T_SHLEQ                 // <<=  >>=
+            if c == 62 { pt = T_SHREQ }
+        }
+        if pt < 0 {
+            pt = punct2(c, byte_at(src, i + 1))
+            plen = 2
+        }
         if pt < 0 {
             pt = punct1(c)
             plen = 1
@@ -995,10 +1253,11 @@ fn p_if() -> Node {
 
 fn p_stmt() -> Node {
     let t = peek()
-    if t.t == T_LET or t.t == T_VAR {
+    if t.t == T_LET or t.t == T_VAR or t.t == T_CONST {
         let x = pnext()
         var n = nnode(N_DECL, t.line)
         n.mut = t.t == T_VAR
+        if t.t == T_CONST { n.ival = DECL_CONST }
         n.name = expect(T_IDENT, "variable name").s
         var ann = nnode(N_NONE, t.line)
         if at(T_COLON) {
@@ -1063,6 +1322,12 @@ fn p_stmt() -> Node {
     if nx.t == T_MINUSEQ { desugar = T_MINUS }
     if nx.t == T_STAREQ { desugar = T_STAR }
     if nx.t == T_SLASHEQ { desugar = T_SLASH }
+    if nx.t == T_PCTEQ { desugar = T_PCT }
+    if nx.t == T_AMPEQ { desugar = T_AMP }
+    if nx.t == T_PIPEEQ { desugar = T_PIPE }
+    if nx.t == T_CARETEQ { desugar = T_CARET }
+    if nx.t == T_SHLEQ { desugar = T_SHL }
+    if nx.t == T_SHREQ { desugar = T_SHR }
     if nx.t == T_ASSIGN or desugar != 0 {
         let x = pnext()
         if e.k != N_ID and e.k != N_MEMBER and e.k != N_INDEX {
@@ -1099,6 +1364,7 @@ fn binprec(t: int) -> int {
 
 fn p_expr(minbp: int) -> Node {
     var lhs = p_unary()
+    var lastComparison = nnode(N_NONE, 0)   // the comparison just parsed, for chaining
     var going = true
     while going {
         let t = peek()
@@ -1119,9 +1385,34 @@ fn p_expr(minbp: int) -> Node {
         n.op = t.t
         n.kids.push(lhs)
         n.kids.push(p_expr(bp + 1))
-        lhs = n
+        // `a < b < c` reads as `a < b and b < c`, the middle operand shared
+        if bp == 4 and lastComparison.k == N_BIN {
+            let middle = lastComparison.kids[1]
+            if has_call_syntax(middle) {
+                die(t.line, "a chained comparison evaluates its middle operand twice; store the call's result in a variable first")
+            }
+            n.kids[0] = clone_node(middle)
+            var both = nnode(N_BIN, t.line)
+            both.op = T_AND
+            both.kids.push(lhs)
+            both.kids.push(n)
+            lhs = both
+        } else {
+            lhs = n
+        }
+        lastComparison = nnode(N_NONE, t.line)
+        if bp == 4 { lastComparison = n }
     }
     return lhs
+}
+
+// Does this parsed (unchecked) expression contain a call anywhere?
+fn has_call_syntax(e: Node) -> bool {
+    if e.k == N_CALL or e.k == N_FNLIT { return true }
+    for kid in e.kids {
+        if has_call_syntax(kid) { return true }
+    }
+    return false
 }
 
 fn p_unary() -> Node {
@@ -1136,6 +1427,16 @@ fn p_unary() -> Node {
         let x = pnext()
         var n = nnode(N_NOT, t.line)
         n.kids.push(p_unary())
+        return n
+    }
+    if t.t == T_TILDE {                  // ~x is x ^ -1: every bit flipped
+        let x = pnext()
+        var n = nnode(N_BIN, t.line)
+        n.op = T_CARET
+        n.kids.push(p_unary())
+        var allOnes = nnode(N_INT, t.line)
+        allOnes.ival = -1
+        n.kids.push(allOnes)
         return n
     }
     return p_postfix()
@@ -1564,7 +1865,7 @@ fn env_find_here(name: str) -> bool {
 }
 
 fn env_add(name: str, ty: int, mut: bool, kind: int, idx: int) {
-    g_scopes[g_scopes.len() - 1].push(VarInfo{name: name, ty: ty, mut: mut, kind: kind, idx: idx})
+    g_scopes[g_scopes.len() - 1].push(VarInfo{name: name, ty: ty, mut: mut, kind: kind, idx: idx, isConst: false})
 }
 
 // ---------------- checker ----------------
@@ -1621,6 +1922,27 @@ fn check_bin(e: Node) -> int {
         return TI_BOOL
     }
     if op == T_EQEQ or op == T_NE {
+        // `x == none` / `x != none` on an optional: a presence test
+        if (ty_kind[lt] == K_OPT and ty_kind[rt] == K_NONE) or (ty_kind[lt] == K_NONE and ty_kind[rt] == K_OPT) {
+            var optional = e.kids[0]
+            if ty_kind[lt] == K_NONE { optional = e.kids[1] }
+            var member = nnode(N_MEMBER, e.line)
+            member.name = "has"
+            member.kids.push(optional)
+            var presence = nnode(N_CALL, e.line)
+            presence.kids.push(member)
+            presence.aux = CK_OPT_HAS
+            presence.ty = TI_BOOL
+            if op == T_EQEQ {
+                var absence = nnode(N_NOT, e.line)
+                absence.kids.push(presence)
+                absence.ty = TI_BOOL
+                node_become(e, absence)
+            } else {
+                node_become(e, presence)
+            }
+            return TI_BOOL
+        }
         if is_num(lt) and is_num(rt) {
             if ty_kind[lt] == K_FLOAT or ty_kind[rt] == K_FLOAT {
                 e.kids[0] = coerce(e.kids[0], TI_FLOAT, "comparison")
@@ -2699,7 +3021,9 @@ fn check_stmt(s: Node) {
             if ty_kind[ty] != K_MAP { die(s.line, "empty map literal '[:]' needs a map type") }
             s.kids[0].ty = ty
         } else {
-            let et = ce(s.kids[0])
+            var et = TI_VOID
+            if s.kids[1].k != N_NONE { et = ce_expect(s.kids[0], resolve_type(s.kids[1])) }
+            else { et = ce(s.kids[0]) }
             if ty_kind[et] == K_VOID { die(s.line, "cannot assign a void expression") }
             if ty_kind[et] == K_NONE and s.kids[1].k == N_NONE {
                 die(s.line, "cannot infer the type of 'none'; annotate it, e.g. let {s.name}: int? = none")
@@ -2711,6 +3035,9 @@ fn check_stmt(s: Node) {
             }
         }
         s.ty = ty
+        if s.ival == DECL_CONST and not is_const_expr(s.kids[0]) {
+            die(s.line, "'{s.name}' is a const, so its value must be known at compile time: literals, other consts, enum members and operators over them")
+        }
         if g_at_global {
             s.aux = ID_GLOBAL
             s.slot = g_nglobals
@@ -2721,6 +3048,10 @@ fn check_stmt(s: Node) {
             g_nslots += 1
         }
         env_add(s.name, ty, s.mut, s.aux, s.slot)
+        if s.ival == DECL_CONST {
+            let scope = g_scopes[g_scopes.len() - 1]
+            scope[scope.len() - 1].isConst = true
+        }
         return
     }
     if s.k == N_ASSIGN {
@@ -2730,6 +3061,7 @@ fn check_stmt(s: Node) {
             let h = env_find(t.name)
             if h < 0 { die(t.line, "unknown variable '{t.name}'") }
             let v = env_get(h)
+            if v.isConst { die(t.line, "'{t.name}' is a const and cannot be assigned to") }
             if not v.mut { die(t.line, "'{t.name}' is immutable (declared with 'let'; use 'var' to allow reassignment)") }
             if capture_of(t, h, v) >= 0 {
                 die(t.line, "'{t.name}' is captured by this closure and cannot be assigned to; closures capture by value")
@@ -2812,11 +3144,64 @@ fn check_stmt(s: Node) {
     die(s.line, "internal: unknown statement kind {s.k}")
 }
 
+// A `const` must be computable at compile time: literals, other consts, enum
+// members (already folded to ints), and operators or conversions over those.
+fn is_const_expr(e: Node) -> bool {
+    let k = e.k
+    if k == N_INT or k == N_FLOAT or k == N_BOOL { return true }
+    if k == N_ID {
+        let handle = env_find(e.name)
+        return handle >= 0 and env_get(handle).isConst
+    }
+    if k == N_STRLIT or k == N_INTERP or k == N_STRTXT or k == N_NEG or k == N_NOT or k == N_BIN or k == N_CAST {
+        for kid in e.kids {
+            if kid.k != N_NONE and not is_const_expr(kid) { return false }
+        }
+        return true
+    }
+    return false
+}
+
+// Top-level consts are initialised before any other top-level code runs, so a
+// function may use one declared further down the file.
+fn hoist_consts(prog: Node, firstUserNode: int) {
+    var reordered: [Node] = []
+    for i in 0..firstUserNode { reordered.push(prog.kids[i]) }
+    for i in firstUserNode..prog.kids.len() {
+        let node = prog.kids[i]
+        if node.k == N_DECL and node.ival == DECL_CONST { reordered.push(node) }
+    }
+    for i in firstUserNode..prog.kids.len() {
+        let node = prog.kids[i]
+        if not (node.k == N_DECL and node.ival == DECL_CONST) { reordered.push(node) }
+    }
+    prog.kids = reordered
+}
+
 fn always_returns(stmts: [Node]) -> bool {
     for s in stmts {
         if s.k == N_RET { return true }
         if s.k == N_IF and s.kids[2].k != N_NONE {
             if always_returns(s.kids[1].kids) and always_returns(s.kids[2].kids) { return true }
+        }
+        if s.k == N_IF and is_true_literal(s.kids[0]) and always_returns(s.kids[1].kids) { return true }
+        // panic() never comes back
+        if s.k == N_EXPRST and s.kids[0].k == N_CALL and s.kids[0].kids[0].k == N_ID and s.kids[0].kids[0].name == "panic" { return true }
+        // `while true` with no break leaves only through return or panic
+        if s.k == N_WHILE and is_true_literal(s.kids[0]) and not breaks_out(s.kids[1]) { return true }
+    }
+    return false
+}
+
+fn is_true_literal(e: Node) -> bool { return e.k == N_BOOL and e.ival == 1 }
+
+// Does this loop body hold a `break` that leaves this loop (not a nested one)?
+fn breaks_out(body: Node) -> bool {
+    for s in body.kids {
+        if s.k == N_BRK { return true }
+        if s.k == N_IF {
+            if breaks_out(s.kids[1]) { return true }
+            if s.kids[2].k != N_NONE and breaks_out(s.kids[2]) { return true }
         }
     }
     return false
@@ -10555,33 +10940,47 @@ fn __emb_rt() -> str {
     p.push("            i += 1\n")
     p.push("        \}\n")
     p.push("    \}\n")
+    p.push("    // optional exponent: e/E, a sign, digits\n")
+    p.push("    var exponent = 0\n")
+    p.push("    if any and i < n and (load8(s + 8 + i) == 101 or load8(s + 8 + i) == 69) \{\n")
+    p.push("        var j = i + 1\n")
+    p.push("        var exponentNegative = false\n")
+    p.push("        if j < n and (load8(s + 8 + j) == 43 or load8(s + 8 + j) == 45) \{\n")
+    p.push("            if load8(s + 8 + j) == 45 \{ exponentNegative = true \}\n")
+    p.push("            j += 1\n")
+    p.push("        \}\n")
+    p.push("        if j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 \{\n")
+    p.push("            while j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 \{\n")
+    p.push("                if exponent < 100000 \{ exponent = exponent * 10 + load8(s + 8 + j) - 48 \}\n")
+    p.push("                j += 1\n")
+    p.push("            \}\n")
+    p.push("            if exponentNegative \{ exponent = 0 - exponent \}\n")
+    p.push("            i = j\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("    // One multiply or divide by an exact power of ten (10^22 and below are\n")
+    p.push("    // exact) rounds once, landing on strtod's answer. Larger scales go in\n")
+    p.push("    // exact 10^22 steps and may be off by an ulp.\n")
     p.push("    var val = mant as float\n")
-    p.push("    if extra > 0 \{\n")
-    p.push("        // more integer digits than fit: scale back up (loses exactness, but\n")
-    p.push("        // such a literal has already lost it)\n")
-    p.push("        var e = 0\n")
-    p.push("        while e < extra \{\n")
-    p.push("            val = val * 10.0\n")
-    p.push("            e += 1\n")
-    p.push("        \}\n")
+    p.push("    var scale = extra - k + exponent\n")
+    p.push("    while scale > 22 \{\n")
+    p.push("        val = val * 10000000000000000000000.0\n")
+    p.push("        scale -= 22\n")
     p.push("    \}\n")
-    p.push("    if k > 0 \{\n")
-    p.push("        if k <= 22 \{\n")
-    p.push("            var p = 1.0                            // 10^k is exact through 10^22\n")
-    p.push("            var e2 = 0\n")
-    p.push("            while e2 < k \{\n")
-    p.push("                p = p * 10.0\n")
-    p.push("                e2 += 1\n")
-    p.push("            \}\n")
-    p.push("            val = val / p\n")
-    p.push("        \} else \{\n")
-    p.push("            var e3 = 0\n")
-    p.push("            while e3 < k \{\n")
-    p.push("                val = val / 10.0\n")
-    p.push("                e3 += 1\n")
-    p.push("            \}\n")
-    p.push("        \}\n")
+    p.push("    while scale < -22 \{\n")
+    p.push("        val = val / 10000000000000000000000.0\n")
+    p.push("        scale += 22\n")
     p.push("    \}\n")
+    p.push("    var power = 1.0\n")
+    p.push("    var steps = 0\n")
+    p.push("    var magnitude = scale\n")
+    p.push("    if magnitude < 0 \{ magnitude = 0 - magnitude \}\n")
+    p.push("    while steps < magnitude \{\n")
+    p.push("        power = power * 10.0\n")
+    p.push("        steps += 1\n")
+    p.push("    \}\n")
+    p.push("    if scale > 0 \{ val = val * power \}\n")
+    p.push("    if scale < 0 \{ val = val / power \}\n")
     p.push("    while i < n and load8(s + 8 + i) == 32 \{ i += 1 \}\n")
     p.push("    if not any or i != n \{ rt_die(\"cannot convert to float\") \}\n")
     p.push("    if neg \{ val = -val \}                  // not 0.0 - val: \"-0\" must parse as -0.0\n")
@@ -14444,12 +14843,13 @@ if d_in == "" and d_version {
     // --version alone: nothing to compile
 } else {
     if d_in == "" or d_out == "" {
-        panic("usage: zc [--rt] [--version] <input.zeph> <output.exe|output.s>")
+        panic("usage: zc [--rt] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>")
     }
     g_file = basename(d_in)
     g_exedir = exe_dir()
     var prog = parse(lex_src(read_file(d_in), 1))
     prog = expand_imports(prog, dirname(d_in))
+    var firstUserNode = 0
     g_file = basename(d_in)
     if d_rt {
         // prepend the Zephyr runtime so rt_* resolve locally (kernel32-only
@@ -14509,7 +14909,9 @@ if d_in == "" and d_version {
         for i in 0..prog.kids.len() { merged.push(prog.kids[i]) }
         prog.kids = merged
         g_file = basename(d_in)
+        firstUserNode = rtprog.kids.len()
     }
+    hoist_consts(prog, firstUserNode)
     desugar_extern(prog)
     desugar_oop(prog)
     check(prog)

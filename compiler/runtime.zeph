@@ -1632,33 +1632,47 @@ fn rt_str_to_float(s: int) -> int {
             i += 1
         }
     }
+    // optional exponent: e/E, a sign, digits
+    var exponent = 0
+    if any and i < n and (load8(s + 8 + i) == 101 or load8(s + 8 + i) == 69) {
+        var j = i + 1
+        var exponentNegative = false
+        if j < n and (load8(s + 8 + j) == 43 or load8(s + 8 + j) == 45) {
+            if load8(s + 8 + j) == 45 { exponentNegative = true }
+            j += 1
+        }
+        if j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
+            while j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
+                if exponent < 100000 { exponent = exponent * 10 + load8(s + 8 + j) - 48 }
+                j += 1
+            }
+            if exponentNegative { exponent = 0 - exponent }
+            i = j
+        }
+    }
+    // One multiply or divide by an exact power of ten (10^22 and below are
+    // exact) rounds once, landing on strtod's answer. Larger scales go in
+    // exact 10^22 steps and may be off by an ulp.
     var val = mant as float
-    if extra > 0 {
-        // more integer digits than fit: scale back up (loses exactness, but
-        // such a literal has already lost it)
-        var e = 0
-        while e < extra {
-            val = val * 10.0
-            e += 1
-        }
+    var scale = extra - k + exponent
+    while scale > 22 {
+        val = val * 10000000000000000000000.0
+        scale -= 22
     }
-    if k > 0 {
-        if k <= 22 {
-            var p = 1.0                            // 10^k is exact through 10^22
-            var e2 = 0
-            while e2 < k {
-                p = p * 10.0
-                e2 += 1
-            }
-            val = val / p
-        } else {
-            var e3 = 0
-            while e3 < k {
-                val = val / 10.0
-                e3 += 1
-            }
-        }
+    while scale < -22 {
+        val = val / 10000000000000000000000.0
+        scale += 22
     }
+    var power = 1.0
+    var steps = 0
+    var magnitude = scale
+    if magnitude < 0 { magnitude = 0 - magnitude }
+    while steps < magnitude {
+        power = power * 10.0
+        steps += 1
+    }
+    if scale > 0 { val = val * power }
+    if scale < 0 { val = val / power }
     while i < n and load8(s + 8 + i) == 32 { i += 1 }
     if not any or i != n { rt_die("cannot convert to float") }
     if neg { val = -val }                  // not 0.0 - val: "-0" must parse as -0.0

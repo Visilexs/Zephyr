@@ -313,6 +313,15 @@ $errors = @{
     "bad-cast"       = "let b = true`nlet n = b as int"
     "arity"          = "fn f(a: int) -> int { return a }`nprint(f(1, 2))"
     "void-assign"    = "let xs = [1]`nlet y = xs.push(2)"
+    "int-literal-overflow" = "print(9223372036854775808)"
+    "hex-literal-overflow" = "print(0x1_0000_0000_0000_0000)"
+    "char-literal-long"    = "print('ab')"
+    "bad-escape"           = 'print("\q")'
+    "unterminated-comment" = "/* never closed"
+    "const-not-constant"   = "fn f() -> int { return 1 }`nconst C = f()"
+    "const-assign"         = "const C = 1`nC = 2"
+    "chain-call-middle"    = "fn f() -> int { return 1 }`nprint(1 < f() < 3)"
+    "multiline-dedent"     = "let s = `"`"`"`n  a`n b`n  `"`"`""
 }
 foreach ($name in $errors.Keys) {
     $r = RunSrc "err_$name" $errors[$name]
@@ -986,6 +995,54 @@ Remove-Item "$rgdir\f.exe" -ErrorAction SilentlyContinue
 $fOut = if (Test-Path "$rgdir\f.exe") { (cmd /c "`"$rgdir\f.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 $fWant = @("100000000000000000000", "-100000000000000000000", "9223372036854775808", "1.5") -join "`n"
 Check "float-big-format" ($fOut -eq $fWant) "got: $fOut"
+
+# ---- language: literals, operators, const ----
+$r = RunSrc "lang_literals" @'
+const LIMIT = 1_000
+const HALF = LIMIT / 2
+print(0xFF + 0b1010_1010 + 0o17)
+print(0xFFFFFFFFFFFFFFFF)
+print(1e3 + 2.5e-3)
+print('a' + '\n' + '\x41')
+print("t\tr\r|\x41\0|".len())
+print(r"C:\dir\{raw}")
+let block = """
+    first
+      indented
+    last
+    """
+print(block)
+/* block comment
+   /* nested */ still comment */
+var x = 17
+x %= 5
+x <<= 3
+x |= 1
+x ^= 0b11
+x &= 0xF
+x >>= 1
+print(x)
+print(~0 + ~5)
+let a = 3
+print(1 < a < 5 and not (1 < a <= 2))
+print(later())
+fn later() -> int { return LIMIT + HALF + LATE }
+const LATE = 7
+let maybe: int? = none
+print(maybe == none and not (maybe != none))
+fn forever() -> int {
+    while true { return 7 }
+}
+fn boom() -> int { panic("unreachable") }
+print(forever())
+interface Named { fn name(self) -> str }
+struct Dog { n: str }
+impl Dog { fn name(self) -> str { return self.n } }
+let pack: [Named] = [Dog{n: "rex"}, Dog{n: "fido"}]
+print(pack[1].name())
+'@
+$exp = @("440", "-1", "1000.0025", "172", "8", "C:\dir\{raw}", "first", "  indented", "last", "1", "-7", "true", "1507", "true", "7", "fido") -join [Environment]::NewLine
+Check "lang-literals-operators" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

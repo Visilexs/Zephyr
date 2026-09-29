@@ -11,34 +11,61 @@ The compiler emits three native targets from the same source: Windows x86-64
 ## 1. Source text
 
 Zephyr source is a sequence of bytes interpreted as ASCII/UTF-8. Comments run
-from `//` to end of line. Statements are terminated by a newline or by the
-closing `}` of their block. Newlines inside `(...)` and `[...]` are ignored,
-so calls and list literals may span lines.
+from `//` to end of line, or from `/*` to the matching `*/`; block comments
+nest, so a commented-out region may itself contain comments. Statements are
+terminated by a newline or by the closing `}` of their block. Newlines inside
+`(...)` and `[...]` are ignored, so calls and list literals may span lines. A
+line whose first token is `.` (but not `..`) continues the previous statement,
+so a method chain can be written one call per line.
 
 ### 1.1 Tokens
 
 Keywords:
 
 ```
-fn let var if else while for in return struct enum impl interface import as
-extern from true false none and or not break continue
+fn let var const if else while for in return struct enum impl interface import
+as extern from true false none and or not break continue
 ```
+
+`from` is only a keyword after an `extern fn` signature; elsewhere it is an
+ordinary identifier.
 
 Identifiers: `[A-Za-z_][A-Za-z0-9_]*`, excluding keywords.
 
 Literals:
 
-- integer: `[0-9]+`, a 64-bit signed value
-- float: `[0-9]+ '.' [0-9]+`
-- string: `"..."` with escapes `\n \t \\ \" \{ \}` and interpolation `{expr}`;
-  strings may not contain raw newlines
+- integer: decimal `[0-9]+`, hex `0x…`, binary `0b…`, octal `0o…`. An `_`
+  may separate digits (`1_000_000`, `0xFF_FF`). A decimal literal above
+  `9223372036854775807` is a compile error; hex, binary and octal literals
+  may use all 64 bits, so `0xFFFFFFFFFFFFFFFF` is `-1`.
+- float: `[0-9]+ '.' [0-9]+`, optionally followed by an exponent (`e` or `E`,
+  an optional sign, digits): `6.02e23`, `2.5E-3`; `1e3` alone is also a
+  float. A leading or trailing dot (`.5`, `5.`) is not a float.
+- character: `'a'`, `'\n'`, `'\x1b'` — one byte, of type `int` (its value).
+  Non-ASCII characters are written as strings.
+- string: `"..."` with interpolation `{expr}` and escapes `\n \t \r \0 \\ \"
+  \' \{ \} \xNN`. A plain string may not contain a raw newline.
+- raw string: `r"..."` — taken verbatim: no escapes, no interpolation
+  (`r"C:\dir\{x}"`).
+- multi-line string: `"""..."""` (or raw `r"""..."""`). When the text starts on
+  the line after the opening quotes and the closing quotes sit alone on their
+  own line, the first newline is dropped and the closing line's indentation is
+  removed from every line, so the literal can be indented with its code:
+
+      let usage = """
+          zc [flags] input.zeph output
+            --rt   link the runtime
+          """
+      // "zc [flags] input.zeph output\n  --rt   link the runtime"
+
+  A line indented less than the closing quotes is a compile error.
 - `true`, `false`, `none`
 
 Operators and punctuation:
 
 ```
-+ - * / % == != < <= > >= = += -= *= /= -> .. . , : ? ( ) [ ] { }
-& | ^ << >>
++ - * / % == != < <= > >= = += -= *= /= %= &= |= ^= <<= >>=
+-> .. . , : ? ( ) [ ] { } & | ^ << >> ~
 ```
 
 ## 2. Grammar
@@ -71,8 +98,9 @@ basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
 block      = "{" { stmt } "}" ;
 stmt       = decl | assign | ifstmt | while | for | return
            | "break" | "continue" | expr ;
-decl       = ( "let" | "var" ) ID [ ":" type ] "=" expr ;
-assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" ) expr ;
+decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr ;
+assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                    | "&=" | "|=" | "^=" | "<<=" | ">>=" ) expr ;
 target     = ID | postfix "." ID | postfix "[" expr "]" ;
 ifstmt     = "if" expr block [ "else" ( ifstmt | block ) ] ;
 while      = "while" expr block ;
@@ -88,7 +116,7 @@ shiftexpr  = addexpr { ( "|" | "^" ) addexpr } ;
 addexpr    = mulexpr { ( "+" | "-" ) mulexpr } ;
 mulexpr    = castexpr { ( "*" | "/" | "%" | "&" | "<<" | ">>" ) castexpr } ;
 castexpr   = unary { "as" type } ;
-unary      = ( "-" | "not" ) unary | postfix ;
+unary      = ( "-" | "not" | "~" ) unary | postfix ;
 postfix    = primary { "(" args ")" | "[" expr "]" | "." ID } ;
 primary    = INT | FLOAT | STRING | "true" | "false" | "none" | ID
            | ID "{" fieldinits "}"                           (* struct literal *)
@@ -102,8 +130,10 @@ fieldinits = { ID ":" expr [ "," ] } ;
 
 Binding strength, weakest to tightest: `or`, `and`, `== !=`, `< <= > >=`,
 `| ^`, `+ -`, `* / % & << >>`, `as`, unary `- not`, postfix call/index/member.
-All binary operators are left-associative. (The bitwise levels follow Go:
-`& << >>` bind like `*`, `| ^` bind like `+`.)
+All binary operators are left-associative, except that comparisons chain:
+`a < b <= c` means `a < b and b <= c` (see §3.3). (The bitwise levels follow
+Go: `& << >>` bind like `*`, `| ^` bind like `+`.) `x op= y` means
+`x = x op y`.
 
 Disambiguation: an identifier followed by `{` is a struct literal, except in
 the header expression of `if`/`while`/`for`, where `{` begins the block
@@ -117,7 +147,7 @@ at the top level.
 map), and named struct and enum types. `void` is the type of no value; it
 cannot be named in source.
 
-`i32` is a 32-bit signed integer that exists only as an `extern fn` return type
+`i32` (listed in the grammar above) is a 32-bit signed integer that exists only as an `extern fn` return type
 (§3.6): the low 32 bits of the return register, sign-extended to a Zephyr `int`.
 It is not a general-purpose type — locals, fields and arithmetic all use `int`.
 
@@ -147,8 +177,9 @@ ordinal) and `as str` (the member name). `print` shows the member name.
 enum — types with value equality (`str` compares structurally). `[:]` is the
 empty map literal and, like `[]`, needs an annotation to supply its type.
 
-Reading a missing key panics; use `.has(k)` to test first. Methods: `.len()`,
-`.has(k)`, `.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
+Reading a missing key panics; use `.has(k)` to test first, or `.get(k)`,
+which returns `V?` (§3.0.4). Methods: `.len()`, `.has(k)`, `.get(k)` → `V?`,
+`.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
 `for k in m.keys()`. Iteration order is unspecified. Maps are open-addressed
 and rehash at 50% occupied slots (including tombstones), so insert/lookup
 are amortized O(1).
@@ -312,6 +343,15 @@ visible inside every function that appears after them in the source, and they
 are roots for the backstop collector (§4). Declarations nested in any block
 (including top-level `if`/`for`/`while` bodies) are locals. Top-level code executes in source order.
 
+`const` declares an immutable binding whose value is known at compile time:
+its initializer may use only literals, other consts declared before it, enum
+members, and operators or `as` conversions over those. A top-level const is
+initialized before any other top-level code, so every function may use it
+regardless of where it is declared. Assigning to a const is an error.
+
+    const MAX_PLAYERS = 8
+    const GRID = MAX_PLAYERS * 4 + 1
+
 ### 3.2 Conversions
 
 A value of type `S` *fits* type `T` if `S = T`, or `S = int` and `T = float`
@@ -340,9 +380,14 @@ panic (§6) on any other malformed input.
   the low 6 bits of the right operand; `>>` is arithmetic (sign-preserving).
   Precedence (Go-style): `& << >>` bind at the `*` level, `| ^` at the `+`
   level.
+- `~x`: bitwise complement of an int (`x ^ -1`).
 - `== !=`: numbers (mixed widens), bools, or strs (byte equality). Not
-  defined for lists or structs.
-- `< <= > >=`: numbers or strs (lexicographic byte order).
+  defined for lists or structs. `x == none` / `x != none` on an optional is
+  a presence test, the same as `not x.has()` / `x.has()`.
+- `< <= > >=`: numbers or strs (lexicographic byte order). Consecutive
+  comparisons chain: `lo <= x < hi` is `lo <= x and x < hi`. The middle
+  operand appears twice, so it may not contain a call; store a call's result
+  in a variable first.
 - `and or not`: bools only; `and`/`or` short-circuit.
 - Unary `-`: numeric.
 - Conditions of `if`/`while` must be `bool`.
@@ -350,8 +395,8 @@ panic (§6) on any other malformed input.
 ### 3.4 Functions
 
 Parameter and return types are declared; a function with a non-void return
-type must provably return on every path (a `return`, or an `if`/`else` whose
-branches both return). Top-level code runs in order; functions and structs
+type must provably return on every path: a `return`, a `panic(...)`, a
+`while true` loop with no `break`, or an `if`/`else` whose branches both do. Top-level code runs in order; functions and structs
 may be referenced before their declaration. Function and variable namespaces
 are shared: a call resolves builtins first, then declared functions.
 
@@ -371,6 +416,7 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 | `emit(s)`  | str → void | write to stdout without a newline |
 | `chr(c)`   | int → str | one byte, 0..255; panics outside |
 | `bits(x)`  | float → int | IEEE 754 bit pattern, zero cost |
+| `frombits(n)` | int → float | the inverse of `bits`, zero cost |
 | `s.byte(i)`| str, int → int | byte value 0..255, bounds-checked |
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
@@ -381,7 +427,7 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |
-| `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 |
+| `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 (integer division of 1 by `b^-e`) |
 
 **String methods** (all byte-oriented, half-open ranges):
 
@@ -400,12 +446,11 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `l.contains(x)` | T → bool | value equality (structural for `[str]`) |
-| `l.index_of(x)` | T → int | first index, or −1 |
 | `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sort_by(cmp)` from `std/list.zeph`. |
 
-`contains`, `index_of`, `reverse` and `slice` are **not** builtins — they are
-generic library functions in `std/list.zeph` (§3.0.5).
+`contains`, `index_of`, `reverse`, `slice` and `count` are **not** builtins —
+they are generic library functions in `std/list.zeph` (§3.0.5), called with
+method syntax once imported: `xs.contains(3)`.
 
 `sqrt` is the only transcendental builtin, because it is one instruction.
 Everything else lives in `std/math.zeph`, written in ordinary Zephyr for a
@@ -526,8 +571,9 @@ or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 
 ## 6. Panics
 
-A panic prints `panic: <message>` to stderr and terminates the process with
-exit code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
+A panic prints `panic: <file>:<line>: <message>` to stderr (the source
+location of the panicking operation) and terminates the process with exit
+code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
 (int), `.pop()` on an empty list, failed `as int`/`as float` parse, and heap
 exhaustion. Panics are not catchable.
 
