@@ -93,6 +93,7 @@ let irDivideByInvariant = 60    // a / b with c = irReciprocal(b): multiply-high
 let irModuloByInvariant = 61
 let irDivideByConstant = 62     // a / immediate, immediate > 1 and not a power of two
 let irModuloByConstant = 63
+let irLoadByte = 64              // zero-extended byte [a + b + 8]: a string's bytes (strings never change)
 // terminators
 let irJump = 100                // successors[0]
 let irBranch = 101              // a != 0 -> successors[0] else successors[1]
@@ -763,6 +764,14 @@ fn lowerCall(expression: Node) -> int {
             return 0
         }
         return emitIr1(irListLength, classInteger, lowerExpression(receiver), 0)
+    }
+    if callKind == callKindByte {
+        let text = lowerExpression(expression.children[0].children[0])
+        let index = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        let length = emitIr1(irListLength, classInteger, text, 0)
+        emitIr2(irBoundsCheck, classInteger, length, index, panicStringIndex(expression, "index out of bounds"))
+        return emitIr2(irLoadByte, classInteger, text, index, 0)
     }
     if callKind == callKindBits {                // bits() and floatFromBits(): same bits, retyped
         let operand = lowerExpression(expression.children[1])
@@ -2529,6 +2538,14 @@ fn emitInstructionFor(value: int) {
             emitOptimized("mov {target}, {memoryAt(base, immediate)}")
             finishResult(value, target)
         }
+        return
+    }
+    if opcode == irLoadByte {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        let target = resultRegister(value, "rax")
+        emitOptimized("movzx {target}, byte ptr [{base} + {index} + 8]")
+        finishResult(value, target)
         return
     }
     if opcode == irLoadIndexed or opcode == irFloatLoadIndexed {
