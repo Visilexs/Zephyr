@@ -4,8 +4,9 @@
 // the GC and the string machinery are already platform-neutral and are compiled
 // unchanged for both targets.
 //
-// Nothing in here may allocate: rx_init calls k32_VirtualAlloc before the GC
-// heap exists, so these functions use raw syscalls, load*/store* and mmap only.
+// Startup/GC shims must not allocate: rx_init calls k32_VirtualAlloc before
+// the heap exists. They use raw syscalls, load*/store* and mmap only.
+// Unsupported application-only operations may panic after runtime startup.
 
 let SYS_READ = 0
 let SYS_WRITE = 1
@@ -88,9 +89,16 @@ fn k32_CreateFileA(cp: int, access: int, share: int, sa: int, disp: int, flags: 
     var oflags = 0                       // O_RDONLY
     var mode = 0
     if (access & 1073741824) != 0 {      // GENERIC_WRITE
-        oflags = 577                     // O_WRONLY | O_CREAT | O_TRUNC
+        oflags = 1                       // O_WRONLY
         mode = 420                       // 0644
     }
+    if (access & 4) != 0 { oflags = 1025  // O_WRONLY | O_APPEND
+        mode = 420
+    }
+    if disp == 1 { oflags = oflags | 192 } // CREATE_NEW: O_CREAT | O_EXCL
+    if disp == 2 { oflags = oflags | 576 } // CREATE_ALWAYS: O_CREAT | O_TRUNC
+    if disp == 4 { oflags = oflags | 64 }  // OPEN_ALWAYS: O_CREAT
+    if disp == 5 { oflags = oflags | 512 } // TRUNCATE_EXISTING
     let fd = syscall(SYS_OPEN, cp, oflags, mode)
     if fd < 0 { return 0 - 1 }
     return fd
@@ -105,15 +113,20 @@ fn k32_GetFileSize(h: int, phigh: int) -> int {
 
 fn k32_CloseHandle(h: int) -> int {
     let r = syscall(SYS_CLOSE, h)
+    if r < 0 { return 0 }
     return 1
 }
 
-// Only the "does it exist" bit is ever read, so access(F_OK) is enough:
-// 0 for present, INVALID_FILE_ATTRIBUTES for anything else.
+// stat follows symlinks and provides the directory bit used by std/io.
 fn k32_GetFileAttributesA(cp: int) -> int {
-    let r = syscall(21, cp, 0)                  // access(path, F_OK)
-    if r == 0 { return 0 }
-    return 4294967295
+    let scratch = lx_mmap(0, 144, PROT_RW, MAP_ANON_PRIV)
+    if scratch == 0 { return 4294967295 }
+    let status = syscall(4, cp, scratch)
+    let mode = load64(scratch + 24) & 61440
+    let released = syscall(11, scratch, 144)
+    if status < 0 { return 4294967295 }
+    if mode == 16384 { return 16 }
+    return 0
 }
 
 // /proc/self/exe is the Linux answer to GetModuleFileNameA. readlink does not
@@ -332,4 +345,147 @@ fn k32_TlsSetValue(i: int, v: int) -> int {
 
 fn k32_TlsGetValue(i: int) -> int {
     return load64(__lx_tls + 8 * i)
+}
+
+// ---- standard I/O extensions ----
+var __lx_last_error = 0
+fn k32_SetLastError(code: int) -> int { __lx_last_error = code
+    return 0
+}
+fn k32_GetLastError() -> int { return __lx_last_error }
+
+fn k32_DeleteFileA(path: int) -> int {
+    if syscall(87, path) < 0 { return 0 }
+    return 1
+}
+
+// CLOCK_MONOTONIC timespec. Scratch stays off the managed heap.
+fn k32_QueryPerformanceCounter(result: int) -> int {
+    let scratch = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+    if scratch == 0 { return 0 }
+    let status = syscall(228, 1, scratch)
+    if status == 0 { store64(result, load64(scratch) * 1000000000 + load64(scratch + 8)) }
+    let released = syscall(11, scratch, 16)
+    if status < 0 { return 0 }
+    return 1
+}
+
+fn k32_QueryPerformanceFrequency(result: int) -> int {
+    store64(result, 1000000000)
+    return 1
+}
+
+fn k32_GetTickCount64() -> int {
+    let scratch = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+    if scratch == 0 { return 0 }
+    let status = syscall(228, 1, scratch)
+    var milliseconds = 0
+    if status == 0 { milliseconds = load64(scratch) * 1000 + load64(scratch + 8) / 1000000 }
+    let released = syscall(11, scratch, 16)
+    return milliseconds
+}
+
+fn k32_Sleep(milliseconds: int) -> int {
+    let scratch = lx_mmap(0, 32, PROT_RW, MAP_ANON_PRIV)
+    if scratch == 0 { return 0 }
+    store64(scratch, milliseconds / 1000)
+    store64(scratch + 8, (milliseconds % 1000) * 1000000)
+    var status = syscall(35, scratch, scratch + 16)
+    while status == -4 {
+        store64(scratch, load64(scratch + 16))
+        store64(scratch + 8, load64(scratch + 24))
+        status = syscall(35, scratch, scratch + 16)
+    }
+    let released = syscall(11, scratch, 32)
+    return 0
+}
+
+// A directory handle owns one mmap: fd, cursor, count, then getdents64 records.
+// Linux d_name is at byte 19; Windows WIN32_FIND_DATAA cFileName is at byte 44.
+fn k32_FindNextFileA(handle: int, result: int) -> int {
+    var cursor = load64(handle + 8)
+    var available = load64(handle + 16)
+    if cursor >= available {
+        available = syscall(217, load64(handle), handle + 24, 32744)
+        if available <= 0 {
+            __lx_last_error = 18
+            if available < 0 { __lx_last_error = 5 }
+            return 0
+        }
+        cursor = 0
+        store64(handle + 16, available)
+    }
+    let record = handle + 24 + cursor
+    let recordLength = load8(record + 16) + load8(record + 17) * 256
+    if recordLength < 20 or cursor + recordLength > available {
+        __lx_last_error = 5
+        return 0
+    }
+    var length = 0
+    while length < 259 and length + 19 < recordLength and load8(record + 19 + length) != 0 {
+        store8(result + 44 + length, load8(record + 19 + length))
+        length += 1
+    }
+    store8(result + 44 + length, 0)
+    store64(handle + 8, cursor + recordLength)
+    return 1
+}
+
+fn k32_FindClose(handle: int) -> int {
+    let closed = syscall(SYS_CLOSE, load64(handle))
+    let released = syscall(11, handle, 32768)
+    if closed < 0 or released < 0 { return 0 }
+    return 1
+}
+
+fn k32_FindFirstFileA(pattern: int, result: int) -> int {
+    var length = 0
+    while load8(pattern + length) != 0 { length += 1 }
+    let path = lx_mmap(0, length + 1, PROT_RW, MAP_ANON_PRIV)
+    if path == 0 { __lx_last_error = 8
+        return -1
+    }
+    // std/io appends /*, so remove exactly that suffix without wildcard parsing.
+    var pathLength = length
+    if length >= 2 and load8(pattern + length - 1) == 42 and load8(pattern + length - 2) == 47 {
+        pathLength -= 2
+    }
+    for i in 0..pathLength { store8(path + i, load8(pattern + i)) }
+    store8(path + pathLength, 0)
+    let descriptor = syscall(SYS_OPEN, path, 65536, 0)
+    let pathReleased = syscall(11, path, length + 1)
+    if descriptor < 0 { __lx_last_error = 5
+        return -1
+    }
+    let handle = lx_mmap(0, 32768, PROT_RW, MAP_ANON_PRIV)
+    if handle == 0 {
+        let closed = syscall(SYS_CLOSE, descriptor)
+        __lx_last_error = 8
+        return -1
+    }
+    store64(handle, descriptor)
+    if k32_FindNextFileA(handle, result) == 0 {
+        let closed = k32_FindClose(handle)
+        return -1
+    }
+    return handle
+}
+
+// These paths are reached only after runtime initialization, so panic is safe.
+// Environment capture and process creation need more than a direct syscall shim.
+fn k32_GetEnvironmentVariableA(name: int, buffer: int, capacity: int) -> int {
+    panic("env: not supported on linux")
+    return 0
+}
+fn k32_CreateProcessA(application: int, command: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, process: int) -> int {
+    panic("run: not supported on linux")
+    return 0
+}
+fn k32_WaitForSingleObject(handle: int, timeout: int) -> int {
+    panic("run: not supported on linux")
+    return 0
+}
+fn k32_GetExitCodeProcess(handle: int, result: int) -> int {
+    panic("run: not supported on linux")
+    return 0
 }

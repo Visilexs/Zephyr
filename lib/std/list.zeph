@@ -96,19 +96,54 @@ fn count[T](xs: [T], x: T) -> int {
     return n
 }
 
-// in-place insertion sort with a caller-supplied ordering.
-// cmp(a, b) < 0 when a should come first. For the common orders, `.sort()` is a
-// native heapsort in the runtime and is what you want on large lists.
+// Stable bottom-up merge sort: O(n log n) comparisons, O(n) scratch space.
+// cmp(a, b) < 0 when a should come first; ties retain their original order.
 fn sort_by[T](xs: [T], cmp: fn(T, T) -> int) {
-    var i = 1
-    while i < xs.len() {
-        let v = xs[i]
-        var j = i - 1
-        while j >= 0 and cmp(xs[j], v) > 0 {
-            xs[j + 1] = xs[j]
-            j -= 1
+    let length = xs.len()
+    if length < 2 { return }
+    let scratch = slice(xs, 0, length)
+    var width = 1
+    while width < length {
+        var start = 0
+        while start < length {
+            let middle = min(start + width, length)
+            let end = min(middle + width, length)
+            var leftIndex = start
+            var rightIndex = middle
+            for i in start..end {
+                if leftIndex < middle and (rightIndex >= end or cmp(xs[leftIndex], xs[rightIndex]) <= 0) {
+                    scratch[i] = xs[leftIndex]
+                    leftIndex += 1
+                } else {
+                    scratch[i] = xs[rightIndex]
+                    rightIndex += 1
+                }
+            }
+            start = end
         }
-        xs[j + 1] = v
-        i += 1
+        for i in 0..length { xs[i] = scratch[i] }
+        width *= 2
     }
+}
+
+// Reductions require a nonempty list and the corresponding operator on T.
+fn sum[T](xs: [T]) -> T {
+    if xs.len() == 0 { panic("sum: empty list") }
+    var total = xs[0]
+    for i in 1..xs.len() { total = total + xs[i] }
+    return total
+}
+
+fn min_of[T](xs: [T]) -> T {
+    if xs.len() == 0 { panic("min_of: empty list") }
+    var smallest = xs[0]
+    for i in 1..xs.len() { if xs[i] < smallest { smallest = xs[i] } }
+    return smallest
+}
+
+fn max_of[T](xs: [T]) -> T {
+    if xs.len() == 0 { panic("max_of: empty list") }
+    var largest = xs[0]
+    for i in 1..xs.len() { if xs[i] > largest { largest = xs[i] } }
+    return largest
 }
