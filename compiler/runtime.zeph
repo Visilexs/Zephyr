@@ -162,6 +162,12 @@ var __gcpad = 0        // collector's own scratch: rx_scratch() is shared
 var __nthr = 0
 var __lock = 0
 var __ctx = 0
+var __threads_unsuspendable = 0   // Linux workers not yet joined (under rt_lock)
+
+// Linux calls this under rt_lock when a native worker is created or joined.
+fn rt_unsuspendable_add(threadDelta: int) {
+    __threads_unsuspendable += threadDelta
+}
 
 fn rx_thr_init() {
     if __lock != 0 { return }
@@ -294,6 +300,10 @@ fn rx_scan_threads() {
 }
 
 fn rx_collect() {
+    // ponytail: Linux cannot suspend stacks yet, including the unregistered
+    // main thread. Defer cyclic garbage until all workers are joined; add signal
+    // safepoints if long-lived workers need bounded cyclic-heap growth.
+    if __threads_unsuspendable != 0 { return }
     // clear marks
     var i = 0
     while i < __bcommit {
@@ -754,6 +764,107 @@ fn rt_chr(c: int) -> int {
 }
 
 // ---- stdlib: string / list / math helpers ----
+// pow() with a float operand: exact repeated squaring for whole exponents below
+// 2^31, e^(y ln x) otherwise. Bits in and out. rx_fexp / rx_fln are the
+// algorithms of std/math_core.zeph's fexp / fln, which stay usable without --rt.
+fn rt_fpow(baseBits: int, exponentBits: int) -> int {
+    return bits(rx_fpow(frombits(baseBits), frombits(exponentBits)))
+}
+
+fn rx_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rx_fpow(base: float, exponent: float) -> float {
+    if exponent == 0.0 or base == 1.0 { return 1.0 }
+    if base != base or exponent != exponent { return base + exponent }   // nan
+    let infinity = frombits(2047 << 52)
+    if rx_fabs(exponent) == infinity {
+        let magnitude = rx_fabs(base)
+        if magnitude == 1.0 { return 1.0 }
+        if (magnitude > 1.0) == (exponent > 0.0) { return infinity }
+        return 0.0
+    }
+    var whole = rx_fabs(exponent) >= 9007199254740992.0     // every float this large is even
+    var odd = false
+    if not whole and ((exponent as int) as float) == exponent {
+        whole = true
+        odd = (exponent as int) & 1 == 1
+        if rx_fabs(exponent) < 2147483648.0 {
+            var remaining = exponent as int
+            var factor = base
+            if remaining < 0 {
+                remaining = 0 - remaining
+                factor = 1.0 / base
+            }
+            var result = 1.0
+            while remaining > 0 {
+                if remaining & 1 == 1 { result = result * factor }
+                factor = factor * factor
+                remaining = remaining >> 1
+            }
+            return result
+        }
+    }
+    var magnitudeBase = base
+    if base < 0.0 {
+        if not whole { return frombits((2047 << 52) | (1 << 51)) }
+        magnitudeBase = 0.0 - base
+    }
+    if magnitudeBase == 0.0 {
+        if exponent < 0.0 { return infinity }
+        return 0.0
+    }
+    let result = rx_fexp(exponent * rx_fln(magnitudeBase))
+    if base < 0.0 and odd { return 0.0 - result }
+    return result
+}
+
+fn rx_fexp(x: float) -> float {
+    if x != x { return x }
+    if x < 0.0 - 745.2 { return 0.0 }
+    if x > 709.782712893384 { return frombits(2047 << 52) }
+    let scaled = x / 0.6931471805599453
+    var n = 0
+    if scaled >= 0.0 { n = (scaled + 0.5) as int }
+    else { n = 0 - ((0.5 - scaled) as int) }
+    if n > 1023 { n = 1023 }
+    let nf = n as float
+    let r = (x - nf * 0.6931471803691238) - nf * 0.00000000019082149292705877
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 15 {
+        term = term * r / (i as float)
+        sum += term
+        i += 1
+    }
+    if n < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52) }
+    return sum * frombits((1023 + n) << 52)
+}
+
+fn rx_fln(x: float) -> float {
+    if x < 0.0 { return frombits((2047 << 52) | (1 << 51)) }
+    if x == 0.0 { return 0.0 - frombits(2047 << 52) }
+    if x != x or x == frombits(2047 << 52) { return x }
+    if x < frombits(1 << 52) { return rx_fln(x * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
+    let b = bits(x)
+    let e = ((b >> 52) & 2047) - 1023
+    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
+    let t = (m - 1.0) / (m + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = t
+    var i = 1
+    while i < 20 {
+        term = term * t2
+        sum += term / ((2 * i + 1) as float)
+        i += 1
+    }
+    return (e as float) * 0.6931471805599453 + 2.0 * sum
+}
+
 fn rt_ipow(base: int, exp: int) -> int {
     if exp < 0 { return 0 }
     var r = 1
@@ -966,13 +1077,149 @@ fn rx_hash_str(s: int) -> int {
     return h & 9223372036854775807
 }
 fn rx_map_hash(m: int, k: int) -> int {
-    if load64(m + 24) == 1 { return rx_hash_str(k) }
+    let keyKind = load64(m + 24)
+    if keyKind == 1 { return rx_hash_str(k) }
+    if keyKind != 0 { return rt_value_hash(k, keyKind) }   // a type descriptor
     return rx_hash_int(k) >> load64(m + 40)
 }
 fn rx_key_eq(m: int, a: int, b: int) -> int {
-    if load64(m + 24) == 1 { return rt_str_eq(a, b) }
+    let keyKind = load64(m + 24)
+    if keyKind == 1 { return rt_str_eq(a, b) }
+    if keyKind != 0 { return rt_value_eq(a, b, keyKind) }
     if a == b { return 1 }
     return 0
+}
+
+// Structural == for lists, structs, optionals and maps, walking the same type
+// descriptors print uses (kinds: 0 int, 1 float, 2 bool, 3 str, 4 list,
+// 5 struct, 6 enum, 7 map, 8 optional).
+// ponytail: recursion follows the data, so a cyclic structure never returns.
+fn rt_value_eq(a: int, b: int, td: int) -> int {
+    let kind = load64(td)
+    if kind == 3 { return rt_str_eq(a, b) }
+    if kind == 1 {
+        if frombits(a) == frombits(b) { return 1 }
+        return 0
+    }
+    if kind == 4 {
+        let count = load64(a)
+        if count != load64(b) { return 0 }
+        let elementTd = load64(td + 8)
+        let dataA = load64(a + 16)
+        let dataB = load64(b + 16)
+        var i = 0
+        while i < count {
+            if rt_value_eq(load64(dataA + i * 8), load64(dataB + i * 8), elementTd) == 0 { return 0 }
+            i += 1
+        }
+        return 1
+    }
+    if kind == 5 {
+        let fieldCount = load64(td + 16)
+        var i = 0
+        while i < fieldCount {
+            if rt_value_eq(load64(a + i * 8), load64(b + i * 8), load64(td + 32 + i * 16)) == 0 { return 0 }
+            i += 1
+        }
+        return 1
+    }
+    if kind == 8 {
+        if a == 0 or b == 0 {
+            if a == b { return 1 }
+            return 0
+        }
+        return rt_value_eq(load64(a), load64(b), load64(td + 8))
+    }
+    if kind == 9 {                        // same variant, then its fields
+        if load64(a) != load64(b) { return 0 }
+        return rt_value_eq(a, b, load64(td + 16 + load64(a) * 8))
+    }
+    if kind == 10 or kind == 11 {         // packed lists, element by element
+        let count = load64(a)
+        if count != load64(b) { return 0 }
+        var width = 1
+        if kind == 11 { width = 4 }
+        var i = 0
+        while i < count {
+            if kind == 10 {
+                if rx_packed_load(a, i, 1) != rx_packed_load(b, i, 1) { return 0 }
+            } else {
+                if frombits(rx_packed_load(a, i, 4)) != frombits(rx_packed_load(b, i, 4)) { return 0 }
+            }
+            i += 1
+        }
+        return 1
+    }
+    if kind == 7 {
+        if load64(a) != load64(b) { return 0 }
+        let valueTd = load64(td + 16)
+        let capacity = load64(a + 8)
+        let slots = load64(a + 16)
+        var i = 0
+        while i < capacity {
+            let slot = slots + i * 24
+            if load64(slot) == 1 {
+                let found = rx_lookup(b, load64(slot + 8))
+                if found < 0 { return 0 }
+                if rt_value_eq(load64(slot + 16), load64(load64(b + 16) + found * 24 + 16), valueTd) == 0 { return 0 }
+            }
+            i += 1
+        }
+        return 1
+    }
+    if a == b { return 1 }
+    return 0
+}
+
+fn rx_hash_mix(hash: int, value: int) -> int {
+    var mixed = (hash * 1000003) ^ (value * -7046029254386353131)
+    mixed = mixed ^ (mixed >> 29)
+    return mixed & 9223372036854775807
+}
+
+// A hash consistent with rt_value_eq, for list/struct/optional map keys
+// (float and map keys are rejected by the compiler).
+fn rt_value_hash(v: int, td: int) -> int {
+    let kind = load64(td)
+    if kind == 3 { return rx_hash_str(v) }
+    if kind == 4 {
+        let count = load64(v)
+        let elementTd = load64(td + 8)
+        let data = load64(v + 16)
+        var hash = count
+        var i = 0
+        while i < count {
+            hash = rx_hash_mix(hash, rt_value_hash(load64(data + i * 8), elementTd))
+            i += 1
+        }
+        return hash
+    }
+    if kind == 5 {
+        let fieldCount = load64(td + 16)
+        var hash = fieldCount
+        var i = 0
+        while i < fieldCount {
+            hash = rx_hash_mix(hash, rt_value_hash(load64(v + i * 8), load64(td + 32 + i * 16)))
+            i += 1
+        }
+        return hash
+    }
+    if kind == 8 {
+        if v == 0 { return 0 }
+        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))
+    }
+    if kind == 9 { return rt_value_hash(v, load64(td + 16 + load64(v) * 8)) }
+    if kind == 10 {                       // [u8]; [f32] cannot be a key
+        let count = load64(v)
+        var hash = count
+        var i = 0
+        while i < count {
+            hash = rx_hash_mix(hash, rx_packed_load(v, i, 1))
+            i += 1
+        }
+        return hash
+    }
+    return rx_hash_mix(0, v)
 }
 // slot holding k, or -1
 fn rx_map_lookup(m: int, k: int) -> int {
@@ -1557,6 +1804,35 @@ fn rt_join(l: int) -> int {
     return r
 }
 
+// xs.join(separator)
+fn rt_join_sep(l: int, separator: int) -> int {
+    let n = load64(l)
+    let data = load64(l + 16)
+    let separatorLength = load64(separator)
+    var total = 0
+    var i = 0
+    while i < n {
+        total += load64(load64(data + i * 8))
+        i += 1
+    }
+    if n > 1 { total += separatorLength * (n - 1) }
+    let r = rx_str_alloc(total)
+    var off = 0
+    i = 0
+    while i < n {
+        if i > 0 {
+            rx_mcopy(r + 8 + off, separator + 8, separatorLength)
+            off += separatorLength
+        }
+        let part = load64(data + i * 8)
+        let pl = load64(part)
+        rx_mcopy(r + 8 + off, part + 8, pl)
+        off += pl
+        i += 1
+    }
+    return r
+}
+
 fn rt_str_to_int(s: int) -> int {
     let n = load64(s)
     var i = 0
@@ -1632,33 +1908,47 @@ fn rt_str_to_float(s: int) -> int {
             i += 1
         }
     }
+    // optional exponent: e/E, a sign, digits
+    var exponent = 0
+    if any and i < n and (load8(s + 8 + i) == 101 or load8(s + 8 + i) == 69) {
+        var j = i + 1
+        var exponentNegative = false
+        if j < n and (load8(s + 8 + j) == 43 or load8(s + 8 + j) == 45) {
+            if load8(s + 8 + j) == 45 { exponentNegative = true }
+            j += 1
+        }
+        if j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
+            while j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
+                if exponent < 100000 { exponent = exponent * 10 + load8(s + 8 + j) - 48 }
+                j += 1
+            }
+            if exponentNegative { exponent = 0 - exponent }
+            i = j
+        }
+    }
+    // One multiply or divide by an exact power of ten (10^22 and below are
+    // exact) rounds once, landing on strtod's answer. Larger scales go in
+    // exact 10^22 steps and may be off by an ulp.
     var val = mant as float
-    if extra > 0 {
-        // more integer digits than fit: scale back up (loses exactness, but
-        // such a literal has already lost it)
-        var e = 0
-        while e < extra {
-            val = val * 10.0
-            e += 1
-        }
+    var scale = extra - k + exponent
+    while scale > 22 {
+        val = val * 10000000000000000000000.0
+        scale -= 22
     }
-    if k > 0 {
-        if k <= 22 {
-            var p = 1.0                            // 10^k is exact through 10^22
-            var e2 = 0
-            while e2 < k {
-                p = p * 10.0
-                e2 += 1
-            }
-            val = val / p
-        } else {
-            var e3 = 0
-            while e3 < k {
-                val = val / 10.0
-                e3 += 1
-            }
-        }
+    while scale < -22 {
+        val = val / 10000000000000000000000.0
+        scale += 22
     }
+    var power = 1.0
+    var steps = 0
+    var magnitude = scale
+    if magnitude < 0 { magnitude = 0 - magnitude }
+    while steps < magnitude {
+        power = power * 10.0
+        steps += 1
+    }
+    if scale > 0 { val = val * power }
+    if scale < 0 { val = val / power }
     while i < n and load8(s + 8 + i) == 32 { i += 1 }
     if not any or i != n { rt_die("cannot convert to float") }
     if neg { val = -val }                  // not 0.0 - val: "-0" must parse as -0.0
@@ -1706,6 +1996,167 @@ fn rt_list_pop(l: int) -> int {
     if n == 0 { rt_die("pop from empty list") }
     store64(l, n - 1)
     return load64(load64(l + 16) + (n - 1) * 8)
+}
+
+// ---- packed lists: [u8] and [f32] ----
+// The list header {len, cap, data}, but with 1- or 4-byte elements. An f32 is
+// stored as its 32-bit pattern and enters Zephyr as a float (a double):
+// rx_f32_widen on the way out, rx_f32_narrow (round to nearest even) on the way in.
+fn rt_packed_new(n: int, width: int) -> int {
+    let l = rt_alloc_d(24, __d_list_val)
+    var cap = n
+    if cap < 4 { cap = 4 }
+    store64(l, n)
+    store64(l + 8, cap)
+    store64(l + 16, rt_alloc(cap * width))
+    return l
+}
+
+fn rx_packed_fail(site: str, msg: str) {
+    let h = win("GetStdHandle", 0 - 12)   // stderr
+    rx_out(h, addr("panic: ") + 8, 7)
+    rx_out(h, addr(site) + 8, site.len())
+    rx_out(h, addr(msg) + 8, msg.len())
+    rx_out(h, addr("\n") + 8, 1)
+    let r = win("ExitProcess", 1)
+}
+
+fn rx_f32_widen(bits32: int) -> int {
+    let sign = (bits32 >> 31) & 1
+    var exponent = (bits32 >> 23) & 255
+    var mantissa = bits32 & 8388607
+    if exponent == 255 { return (sign << 63) | (2047 << 52) | (mantissa << 29) }   // inf, nan
+    if exponent == 0 {
+        if mantissa == 0 { return sign << 63 }
+        exponent = 1                      // subnormal: normalize the mantissa
+        while mantissa & 8388608 == 0 {
+            mantissa = mantissa << 1
+            exponent -= 1
+        }
+        mantissa = mantissa & 8388607
+    }
+    return (sign << 63) | ((exponent + 896) << 52) | (mantissa << 29)
+}
+
+fn rx_f32_narrow(bits: int) -> int {
+    let sign = (bits >> 63) & 1
+    let exponent = (bits >> 52) & 2047
+    let mantissa = bits & 4503599627370495
+    if exponent == 2047 {
+        if mantissa == 0 { return (sign << 31) | (255 << 23) }
+        return (sign << 31) | (255 << 23) | 4194304 | (mantissa >> 29)   // a quiet nan
+    }
+    let biased = exponent - 896
+    if biased >= 255 { return (sign << 31) | (255 << 23) }             // too large: infinity
+    if biased <= 0 {                                                    // an f32 subnormal, or zero
+        if biased < 0 - 24 { return sign << 31 }
+        let full = mantissa | 4503599627370496
+        let shift = 30 - biased
+        let kept = full >> shift
+        let dropped = full & ((1 << shift) - 1)
+        let half = 1 << (shift - 1)
+        var rounded = kept
+        if dropped > half or (dropped == half and kept & 1 == 1) { rounded += 1 }
+        return (sign << 31) | rounded
+    }
+    let kept = mantissa >> 29
+    let dropped = mantissa & 536870911
+    var result = (biased << 23) | kept
+    if dropped > 268435456 or (dropped == 268435456 and kept & 1 == 1) { result += 1 }   // may carry to infinity
+    return (sign << 31) | result
+}
+
+fn rx_packed_load(l: int, i: int, width: int) -> int {
+    if width == 1 { return load8(load64(l + 16) + i) }
+    return rx_f32_widen(load32(load64(l + 16) + i * 4) & 4294967295)
+}
+
+fn rx_packed_store(l: int, i: int, v: int, width: int) {
+    if width == 1 { store8(load64(l + 16) + i, v & 255) }
+    else { store32(load64(l + 16) + i * 4, rx_f32_narrow(v)) }
+}
+
+fn rx_packed_get(l: int, i: int, width: int, site: str) -> int {
+    if i < 0 or i >= load64(l) { rx_packed_fail(site, "index out of bounds") }
+    return rx_packed_load(l, i, width)
+}
+
+fn rx_packed_set(l: int, i: int, v: int, width: int, site: str) {
+    if i < 0 or i >= load64(l) { rx_packed_fail(site, "index out of bounds") }
+    rx_packed_store(l, i, v, width)
+}
+
+fn rx_packed_push(l: int, v: int, width: int) {
+    let n = load64(l)
+    let cap = load64(l + 8)
+    if n == cap {
+        let ncap = cap * 2
+        let nd = rt_alloc(ncap * width)
+        let od = load64(l + 16)
+        rx_mcopy(nd, od, n * width)
+        store64(l + 8, ncap)
+        store64(l + 16, nd)
+        rx_drop(od)
+    }
+    store64(l, n + 1)
+    rx_packed_store(l, n, v, width)
+}
+
+fn rx_packed_pop(l: int, width: int, site: str) -> int {
+    let n = load64(l)
+    if n == 0 { rx_packed_fail(site, "pop from empty list") }
+    store64(l, n - 1)
+    return rx_packed_load(l, n - 1, width)
+}
+
+fn rt_u8_get(l: int, i: int, site: str) -> int { return rx_packed_get(l, i, 1, site) }
+fn rt_f32_get(l: int, i: int, site: str) -> int { return rx_packed_get(l, i, 4, site) }
+fn rt_u8_set(l: int, i: int, v: int, site: str) { rx_packed_set(l, i, v, 1, site) }
+fn rt_f32_set(l: int, i: int, v: int, site: str) { rx_packed_set(l, i, v, 4, site) }
+fn rt_u8_push(l: int, v: int) { rx_packed_push(l, v, 1) }
+fn rt_f32_push(l: int, v: int) { rx_packed_push(l, v, 4) }
+fn rt_u8_pop(l: int, site: str) -> int { return rx_packed_pop(l, 1, site) }
+fn rt_f32_pop(l: int, site: str) -> int { return rx_packed_pop(l, 4, site) }
+
+// [int] as [u8] (low 8 bits), [float] as [f32]
+fn rx_packed_from_list(src: int, width: int) -> int {
+    let n = load64(src)
+    let l = rt_packed_new(n, width)
+    var i = 0
+    while i < n {
+        rx_packed_store(l, i, load64(load64(src + 16) + i * 8), width)
+        i += 1
+    }
+    return l
+}
+fn rt_u8_from_list(src: int) -> int { return rx_packed_from_list(src, 1) }
+fn rt_f32_from_list(src: int) -> int { return rx_packed_from_list(src, 4) }
+
+// [u8] as [int], [f32] as [float]
+fn rx_packed_to_list(src: int, width: int) -> int {
+    let n = load64(src)
+    let l = rt_list_new(n)
+    var i = 0
+    while i < n {
+        store64(load64(l + 16) + i * 8, rx_packed_load(src, i, width))
+        i += 1
+    }
+    return l
+}
+fn rt_u8_to_list(src: int) -> int { return rx_packed_to_list(src, 1) }
+fn rt_f32_to_list(src: int) -> int { return rx_packed_to_list(src, 4) }
+
+fn rt_u8_from_str(s: int) -> int {
+    let n = load64(s)
+    let l = rt_packed_new(n, 1)
+    rx_mcopy(load64(l + 16), s + 8, n)
+    return l
+}
+fn rt_u8_to_str(l: int) -> int {
+    let n = load64(l)
+    let s = rx_str_alloc(n)
+    rx_mcopy(s + 8, load64(l + 16), n)
+    return s
 }
 
 // ---- output: unbuffered WriteFile ----
@@ -1891,8 +2342,12 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
     } else if kind == 5 {
         let name = load64(td + 8)
         let nf = load64(td + 16)
-        rx_sb_bytes(name, rx_cstrlen(name))
-        rx_sb_byte(123)
+        let isTuple = load8(name) == 40     // tuples are structs named "(int, str)"
+        if isTuple { rx_sb_byte(40) }
+        else {
+            rx_sb_bytes(name, rx_cstrlen(name))
+            rx_sb_byte(123)
+        }
         var f = 0
         while f < nf {
             if f > 0 {
@@ -1901,13 +2356,34 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
             }
             let fname = load64(td + 24 + f * 16)
             let ftd = load64(td + 32 + f * 16)
-            rx_sb_bytes(fname, rx_cstrlen(fname))
-            rx_sb_byte(58)
-            rx_sb_byte(32)
+            if not isTuple {
+                rx_sb_bytes(fname, rx_cstrlen(fname))
+                rx_sb_byte(58)
+                rx_sb_byte(32)
+            }
             rx_fmt_val(load64(v + f * 8), ftd, 1)
             f += 1
         }
-        rx_sb_byte(125)
+        if isTuple { rx_sb_byte(41) }
+        else { rx_sb_byte(125) }
+    } else if kind == 9 {                 // enum with values: the variant, then its values
+        let variantTd = load64(td + 16 + load64(v) * 8)
+        let variantName = load64(variantTd + 8)
+        let fieldCount = load64(variantTd + 16)
+        rx_sb_bytes(variantName, rx_cstrlen(variantName))
+        if fieldCount > 1 {
+            rx_sb_byte(40)
+            var f = 1
+            while f < fieldCount {
+                if f > 1 {
+                    rx_sb_byte(44)
+                    rx_sb_byte(32)
+                }
+                rx_fmt_val(load64(v + f * 8), load64(variantTd + 32 + f * 16), 1)
+                f += 1
+            }
+            rx_sb_byte(41)
+        }
     } else if kind == 8 {                 // optional: none, or the wrapped value
         if v == 0 {
             rx_sb_bytes(addr("none") + 8, 4)
@@ -1946,6 +2422,22 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
             let nameptr = load64(td + 16 + v * 8)
             rx_sb_bytes(nameptr, rx_cstrlen(nameptr))
         }
+    } else if kind == 10 or kind == 11 {  // packed list: [u8] or [f32]
+        var width = 1
+        if kind == 11 { width = 4 }
+        let n = load64(v)
+        rx_sb_byte(91)
+        var i = 0
+        while i < n {
+            if i > 0 {
+                rx_sb_byte(44)
+                rx_sb_byte(32)
+            }
+            if kind == 10 { rx_sb_int(rx_packed_load(v, i, 1)) }
+            else { rx_sb_float(rx_packed_load(v, i, 4)) }
+            i += 1
+        }
+        rx_sb_byte(93)
     } else {
         rx_sb_float(v)
     }

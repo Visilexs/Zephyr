@@ -313,6 +313,59 @@ $errors = @{
     "bad-cast"       = "let b = true`nlet n = b as int"
     "arity"          = "fn f(a: int) -> int { return a }`nprint(f(1, 2))"
     "void-assign"    = "let xs = [1]`nlet y = xs.push(2)"
+    "int-literal-overflow" = "print(9223372036854775808)"
+    "hex-literal-overflow" = "print(0x1_0000_0000_0000_0000)"
+    "char-literal-long"    = "print('ab')"
+    "bad-escape"           = 'print("\q")'
+    "unterminated-comment" = "/* never closed"
+    "const-not-constant"   = "fn f() -> int { return 1 }`nconst C = f()"
+    "const-assign"         = "const C = 1`nC = 2"
+    "chain-call-middle"    = "fn f() -> int { return 1 }`nprint(1 < f() < 3)"
+    "multiline-dedent"     = "let s = `"`"`"`n  a`n b`n  `"`"`""
+    "match-not-exhaustive" = "enum C { A, B, D }`nlet c = C.A`nmatch c {`n A { print(1) }`n B { print(2) }`n}"
+    "match-duplicate-arm"  = "enum C { A, B }`nlet c = C.A`nmatch c {`n A { print(1) }`n A, B { print(2) }`n}"
+    "match-int-no-else"    = "let n = 3`nmatch n {`n 1 { print(1) }`n}"
+    "if-expr-no-else"      = "let v = if true { 1 }"
+    "if-expr-mixed-types"  = "let v = if true { 1 } else { `"a`" }"
+    "unknown-loop-label"   = "for i in 0..3 { break nope }"
+    "defer-return"         = "fn f() -> int {`n defer { return 1 }`n return 2`n}"
+    "step-zero"            = "for i in 0..3 step 0 { print(i) }"
+    "if-let-not-optional"  = "let v = 5`nif let w = v { print(w) }"
+    "labeled-break-exits"  = "fn g() -> int {`n inner: while true {`n  for i in 0..2 { break inner }`n }`n}"
+    "struct-missing-field" = "struct P { x: int`n y: int }`nlet p = P{x: 1}"
+    "default-param-order"  = "fn f(a: int = 1, b: int) -> int { return a + b }"
+    "alias-cycle"          = "type A = B`ntype B = A`nlet v: A = 1"
+    "enum-cast-from-str"   = "enum C { A }`nlet c = `"A`" as C"
+    "eq-fn-values"         = "fn f() -> int { return 1 }`nlet g = f`nprint(g == g)"
+    "map-key-float"        = "var m: [float: int] = [:]"
+    "map-key-float-field"  = "struct P { x: float }`nvar m: [P: int] = [:]"
+    "tuple-assign"         = "var t = (1, 2)`nt.0 = 5"
+    "tuple-arity"          = "let (a, b) = (1, 2, 3)"
+    "destructure-int"      = "let (a, b) = 5"
+    "tuple-bad-index"      = "let t = (1, 2)`nprint(t.2)"
+    "tuple-type-one"       = "let t: (int) = 1"
+    "tuple-none-element"   = "let t = (1, none)"
+    "generic-struct-bare"  = "struct B[T] { v: T }`nfn f(b: B) -> int { return 1 }"
+    "generic-struct-infer" = "struct B[T] { items: [T] }`nlet b = B{items: []}"
+    "type-args-on-plain"   = "struct P { x: int }`nlet p: P[int] = P{x: 1}"
+    "generic-field-clash"  = "struct B[T] { a: T`n b: T }`nlet x = B{a: 1, b: `"s`"}"
+    "enum-raw-literal"     = "enum S { A(int) }`nlet s = S{__tag: 0}"
+    "variant-arity"        = "enum S { A(int) }`nlet s = S.A(1, 2)"
+    "variant-no-values"    = "enum S { A(int), B }`nlet s = S.B(1)"
+    "match-union-missing"  = "enum S { A(int), B }`nlet s = S.B`nmatch s {`n A(x) { print(x) }`n}"
+    "pattern-arity"        = "enum S { A(int), B }`nlet s = S.B`nmatch s {`n A(x, y) { print(x) }`n else { }`n}"
+    "is-non-enum"          = "let x = 1`nprint(x is A)"
+    "generic-enum-plain"   = "enum E[T] { A, B }"
+    "generic-enum-infer"   = "enum R[T, E] { Ok(T), Err(E) }`nlet r = R.Ok(1)"
+    "float-payload-key"    = "enum S { A(float) }`nvar m: [S: int] = [:]"
+    "u8-scalar"            = "let x: u8 = 1"
+    "packed-method"        = "var b: [u8] = []`nb.sort()"
+    "packed-bad-cast"      = "let b = [1.5] as [u8]"
+    "f32-list-key"         = "var m: [[f32]: int] = [:]"
+    "packed-no-implicit"   = "var b: [u8] = []`nlet c: [int] = b"
+    "pow-str"              = "print(pow(`"a`", 2))"
+    "join-int-separator"   = "print([`"a`"].join(1))"
+    "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
     $r = RunSrc "err_$name" $errors[$name]
@@ -326,6 +379,7 @@ $panics = @{
     "bad-parse"   = 'let n = "abc" as int'
     "empty-pop"   = "var xs: [int] = []`nprint(xs.pop())"
     "user-panic"  = 'panic("boom")'
+    "enum-range"  = "enum C { A, B }`nlet n = 5`nprint(n as C)"
 }
 foreach ($name in $panics.Keys) {
     $r = RunSrc "panic_$name" $panics[$name]
@@ -349,6 +403,9 @@ $locatedPanics = @{
     "write-file"  = @{ src = 'write_file("?:", "x")'; line = 1 }
     "byte"        = @{ src = 'print("a".byte(2))'; line = 1 }
     "index-store" = @{ src = "var xs = [1]`nxs[3] = 4"; line = 2 }
+    "packed-index" = @{ src = "let b = `"ab`" as [u8]`nprint(b[5])"; line = 2 }
+    "packed-store" = @{ src = "var b: [f32] = []`nb[0] = 1.5"; line = 2 }
+    "packed-pop"   = @{ src = "var b: [u8] = []`nprint(b.pop())"; line = 2 }
 }
 foreach ($name in $locatedPanics.Keys) {
     $case = $locatedPanics[$name]
@@ -986,6 +1043,568 @@ Remove-Item "$rgdir\f.exe" -ErrorAction SilentlyContinue
 $fOut = if (Test-Path "$rgdir\f.exe") { (cmd /c "`"$rgdir\f.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 $fWant = @("100000000000000000000", "-100000000000000000000", "9223372036854775808", "1.5") -join "`n"
 Check "float-big-format" ($fOut -eq $fWant) "got: $fOut"
+
+# ---- language: literals, operators, const ----
+$r = RunSrc "lang_literals" @'
+const LIMIT = 1_000
+const HALF = LIMIT / 2
+print(0xFF + 0b1010_1010 + 0o17)
+print(0xFFFFFFFFFFFFFFFF)
+print(1e3 + 2.5e-3)
+print('a' + '\n' + '\x41')
+print("t\tr\r|\x41\0|".len())
+print(r"C:\dir\{raw}")
+let block = """
+    first
+      indented
+    last
+    """
+print(block)
+/* block comment
+   /* nested */ still comment */
+var x = 17
+x %= 5
+x <<= 3
+x |= 1
+x ^= 0b11
+x &= 0xF
+x >>= 1
+print(x)
+print(~0 + ~5)
+let a = 3
+print(1 < a < 5 and not (1 < a <= 2))
+print(later())
+fn later() -> int { return LIMIT + HALF + LATE }
+const LATE = 7
+let maybe: int? = none
+print(maybe == none and not (maybe != none))
+fn forever() -> int {
+    while true { return 7 }
+}
+fn boom() -> int { panic("unreachable") }
+print(forever())
+interface Named { fn name(self) -> str }
+struct Dog { n: str }
+impl Dog { fn name(self) -> str { return self.n } }
+let pack: [Named] = [Dog{n: "rex"}, Dog{n: "fido"}]
+print(pack[1].name())
+'@
+$exp = @("440", "-1", "1000.0025", "172", "8", "C:\dir\{raw}", "first", "  indented", "last", "1", "-7", "true", "1507", "true", "7", "fido") -join [Environment]::NewLine
+Check "lang-literals-operators" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: control flow ----
+$r = RunSrc "lang_control" @'
+enum Color { Red, Green, Blue }
+fn describe(c: Color) -> str {
+    match c {
+        Red { return "warm" }
+        Color.Green, Blue { return "cool" }
+    }
+}
+let c = Color.Green
+let name = match c {
+    Color.Red { "red" }
+    Green { "green" }
+    else { "other" }
+}
+print("{describe(Color.Red)} {describe(Color.Blue)} {name}")
+fn grade(score: int) -> str {
+    return match score {
+        90..101 { "A" }
+        80..90 { "B" }
+        else { "C" }
+    }
+}
+print(grade(95) + grade(85) + grade(12))
+let x = 7
+let size = if x > 10 { 1 } else if x > 5 { 2 } else { 3 }
+print("{if x > 5 { "big" } else { "small" }} {size} {if x % 2 == 0 { x / 2 } else { 3.5 }}")
+fn find(xs: [int], target: int) -> int? {
+    for i, v in xs {
+        if v == target { return i }
+    }
+    return none
+}
+if let at = find([4, 5, 6], 6) { print("found at {at}") } else { print("missing") }
+if let at = find([4, 5, 6], 9) { print("found at {at}") } else { print("missing") }
+let maybe = if x > 0 { x } else { none }
+print(maybe)
+var codes = 0
+for ch in "abc" { codes += ch }
+let ages = ["ann": 30]
+for k, v in ages { print("{codes} {k}={v}") }
+for i in 10..0 step -3 { emit("{i} ") }
+let stride = 4
+for i in 0..10 step stride { emit("{i} ") }
+print("")
+outer: for i in 0..5 {
+    for j in 0..5 {
+        if j == 2 { continue outer }
+        if i == 3 { break outer }
+        emit("{i}{j} ")
+    }
+}
+print("")
+fn work(n: int) -> [int] {
+    defer emit("cleanup ")
+    defer { emit("first ") }
+    if n > 5 { return [n * 2] }
+    return []
+}
+print(work(9))
+print(work(2))
+for i in 0..3 {
+    defer emit("d{i} ")
+    if i == 1 { continue }
+    emit("b{i} ")
+}
+print("")
+'@
+$exp = @("warm cool green", "ABC", "big 2 3.5", "found at 2", "missing", "7", "294 ann=30", "10 7 4 1 0 4 8 ", "00 01 10 11 20 21 ", "first cleanup [18]", "first cleanup []", "b0 d0 d1 b2 d2") -join [Environment]::NewLine
+Check "lang-control-flow" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: types ----
+$r = RunSrc "lang_types" @'
+type Grid = [[int]]
+type Name = str
+struct Config {
+    width: int = 800
+    height: int = 600
+    title: str = "untitled"
+    tags: [str] = []
+    parent: Config?
+}
+let base = Config{title: "main"}
+print("{base.width}x{base.height} {base.title} {base.tags.len()} {base.parent == none}")
+let child = Config{width: 3, parent: base}
+print("{child.width} {child.title} {child.parent != none}")
+let g: Grid = [[1, 2], [3]]
+let who: Name = "zeph"
+print("{g} {who}")
+enum Color { Red, Green, Blue }
+impl Color {
+    fn label(self) -> str {
+        return match self {
+            Red { "warm red" }
+            Green { "leafy green" }
+            Blue { "deep blue" }
+        }
+    }
+    fn from_name(name: str) -> Color {
+        if name == "green" { return Color.Green }
+        return Color.Red
+    }
+}
+print(Color.Blue.label())
+print(Color.from_name("green").label())
+print(Color.count)
+for c in Color.all() { emit("{c} ") }
+print("")
+print(2 as Color)
+fn greet(name: str, greeting: str = "Hello", times: int = 1) -> str {
+    return "{greeting}, {name}".repeat(times)
+}
+print(greet("Ann"))
+print(greet("Bo", "Hi"))
+print(greet("Cy", "Yo! ", 2))
+print("x".greet())
+fn outer(base: int) -> int {
+    fn double(n: int) -> int { return n * 2 + base }
+    return double(10)
+}
+print(outer(1))
+'@
+$exp = @("800x600 main 0 true", "3 untitled true", "[[1, 2], [3]] zeph", "deep blue", "leafy green", "3", "Red Green Blue ", "Blue", "Hello, Ann", "Hi, Bo", "Yo! , CyYo! , Cy", "Hello, x", "21") -join [Environment]::NewLine
+Check "lang-types" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: structural equality, compound map keys ----
+$r = RunSrc "lang_equality" @'
+struct Point { x: int, y: int }
+struct Line { from: Point, to: Point, label: str, weight: float }
+let a = Point{x: 1, y: 2}
+let b = Point{x: 1, y: 2}
+print("{a == b} {a != b} {a == Point{x: 2, y: 2}}")
+print("{[1, 2, 3] == [1, 2, 3]} {[1, 2] == [1, 2, 3]} {[[1], [2]] == [[1], [2]]} {["a", "b"] != ["a", "c"]}")
+let l1 = Line{from: a, to: b, label: "ab", weight: 0.5}
+let l2 = Line{from: b, to: a, label: "ab", weight: 0.5}
+print("{l1 == l2} {l1 == Line{from: a, to: b, label: "ab", weight: 0.25}}")
+let o1: int? = 3
+let o2: int? = 3
+let o3: int? = none
+print("{o1 == o2} {o1 == o3} {o3 == o3}")
+let m1 = ["a": 1, "b": 2]
+let m2 = ["b": 2, "a": 1]
+print("{m1 == m2} {m1 == ["a": 1]}")
+var grid: [Point: str] = [:]
+grid[Point{x: 0, y: 0}] = "origin"
+grid[Point{x: 3, y: 4}] = "far"
+print(grid[Point{x: 3, y: 4}])
+print(grid.has(Point{x: 0, y: 0}))
+print(grid.has(Point{x: 9, y: 0}))
+grid[Point{x: 0, y: 0}] = "zero"
+print(grid.len())
+var seen: [[int]: int] = [:]
+for i in 0..200 { seen[[i % 7, i % 3]] = i }
+print(seen.len())
+print(seen[[6, 2]])
+fn same(p: Point) -> str {
+    return match p {
+        (Point{x: 0, y: 0}) { "origin" }
+        else { "elsewhere" }
+    }
+}
+print(same(Point{x: 0, y: 0}) + " " + same(a))
+print(grid)
+'@
+$exp = @("true false false", "true false true true", "true false", "true false true", "true false", "far", "true", "false", "2", "21", "188", "origin elsewhere", "{Point{x: 3, y: 4}: `"far`", Point{x: 0, y: 0}: `"zero`"}") -join [Environment]::NewLine
+Check "lang-equality" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: tuples ----
+$r = RunSrc "lang_tuples" @'
+fn divmod(a: int, b: int) -> (int, int) {
+    return (a / b, a % b)
+}
+let pair = divmod(17, 5)
+print(pair)
+print("{pair.0} {pair.1}")
+let (q, r) = divmod(23, 4)
+print(q + r)
+var (lo, hi) = (1, 10)
+lo += 1
+print("{lo} {hi}")
+let nested = ((1, "a"), 2.5)
+print(nested.0.1)
+print(nested)
+let scaled: (float, int) = (1, 2)
+print(scaled)
+var seen: [(int, int): str] = [:]
+seen[(0, 0)] = "origin"
+seen[(2, 3)] = "p"
+print(seen[(2, 3)])
+print((1, 2) == (1, 2))
+print((1, "x") != (1, "y"))
+let points = [(0, 1), (2, 3)]
+var total = 0
+for p in points { total += p.0 * p.1 }
+print(total)
+fn describe(p: (int, int)) -> str {
+    return match p {
+        (0, 0) { "origin" }
+        else { "other" }
+    }
+}
+print(describe((0, 0)) + " " + describe(pair))
+let f: fn(int) -> (int, str) = fn(n: int) -> (int, str) { return (n * 2, "d") }
+print(f(4))
+'@
+$exp = @("(3, 2)", "3 2", "8", "2 10", "a", "((1, `"a`"), 2.5)", "(1, 2)", "p", "true", "true", "6", "origin other", "(8, `"d`")") -join [Environment]::NewLine
+Check "lang-tuples" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: generic structs ----
+$r = RunSrc "lang_generic_structs" @'
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+struct Stack[T] {
+    items: [T] = []
+}
+impl Stack[T] {
+    fn push(self, item: T) { self.items.push(item) }
+    fn pop(self) -> T? {
+        if self.items.len() == 0 { return none }
+        return self.items.pop()
+    }
+    fn size(self) -> int { return self.items.len() }
+    fn peek_or(self, fallback: T) -> T {
+        if self.items.len() == 0 { return fallback }
+        return self.items[self.items.len() - 1]
+    }
+    fn map_all[U](self, f: fn(T) -> U) -> Stack[U] {
+        var out: Stack[U] = Stack{}
+        for item in self.items { out.push(f(item)) }
+        return out
+    }
+    fn new() -> Stack[T] { return Stack{} }
+}
+let p = Pair{first: 1, second: "one"}
+print(p)
+print("{p.first} {p.second}")
+let q: Pair[float, [int]] = Pair{first: 2, second: []}
+print(q)
+var s: Stack[int] = Stack{}
+s.push(3)
+s.push(4)
+print("{s.size()} {s.peek_or(0)}")
+print(s.pop())
+let words = s.map_all(fn(n: int) -> str { return "n{n}" })
+print(words)
+let fresh: Stack[str] = Stack.new()
+print(fresh.size())
+fn swap[A, B](pair: Pair[A, B]) -> Pair[B, A] {
+    return Pair{first: pair.second, second: pair.first}
+}
+print(swap(p))
+struct Node[T] {
+    value: T
+    next: Node[T]?
+}
+let chain = Node{value: 1, next: Node{value: 2, next: none}}
+print(chain.next.get().value)
+print(p == Pair{first: 1, second: "one"})
+var byPair: [Pair[int, int]: str] = [:]
+byPair[Pair{first: 1, second: 2}] = "x"
+print(byPair[Pair{first: 1, second: 2}])
+'@
+$exp = @("Pair{first: 1, second: `"one`"}", "1 one", "Pair{first: 2, second: []}", "2 4", "4", "Stack{items: [`"n3`"]}", "0", "Pair{first: `"one`", second: 1}", "2", "true", "x") -join [Environment]::NewLine
+Check "lang-generic-structs" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: enums with values ----
+$r = RunSrc "lang_enum_values" @'
+enum Shape {
+    Circle(float)
+    Rect(float, float)
+    Empty
+}
+impl Shape {
+    fn area(self) -> float {
+        return match self {
+            Circle(r) { 3.0 * r * r }
+            Rect(w, h) { w * h }
+            Empty { 0.0 }
+        }
+    }
+}
+let shapes = [Shape.Circle(2), Shape.Rect(3, 4.5), Shape.Empty]
+for s in shapes { print("{s} {s.area()}") }
+print(shapes[0] is Circle)
+print(shapes[1] is Shape.Circle)
+print(shapes[1] == Shape.Rect(3, 4.5))
+print(shapes[2] == Shape.Empty)
+var total = 0.0
+for s in shapes {
+    match s {
+        Circle(r) { total += r }
+        Rect(_, h) { total += h }
+        else { }
+    }
+}
+print(total)
+enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+impl Result[T, E] {
+    fn is_ok(self) -> bool { return self is Ok }
+    fn unwrap_or(self, fallback: T) -> T {
+        return match self {
+            Ok(value) { value }
+            Err(_) { fallback }
+        }
+    }
+}
+fn parse_digit(text: str) -> Result[int, str] {
+    if text.len() == 1 and text.byte(0) >= 48 and text.byte(0) <= 57 { return Result.Ok(text.byte(0) - 48) }
+    return Result.Err("not a digit: {text}")
+}
+let good = parse_digit("7")
+let bad = parse_digit("x")
+print(good)
+print(bad)
+print("{good.is_ok()} {bad.is_ok()} {good.unwrap_or(0)} {bad.unwrap_or(-1)}")
+let explicit: Result[float, str] = Result.Err("none yet")
+print(explicit)
+enum Tree {
+    Leaf(int)
+    Node(Tree, Tree)
+}
+fn sum_tree(t: Tree) -> int {
+    return match t {
+        Leaf(v) { v }
+        Node(left, right) { sum_tree(left) + sum_tree(right) }
+    }
+}
+let tree = Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))
+print(sum_tree(tree))
+print(tree)
+var tally: [Tree: int] = [:]
+tally[Tree.Leaf(1)] = 1
+tally[tree] = 2
+print("{tally[Tree.Leaf(1)]} {tally[Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))]}")
+enum Color { Red, Green }
+let c = Color.Green
+print(c is Green)
+'@
+$exp = @("Circle(2) 12", "Rect(3, 4.5) 13.5", "Empty 0", "true", "false", "true", "true", "6.5", "Ok(7)", "Err(`"not a digit: x`")", "true false 7 -1", "Err(`"none yet`")", "6", "Node(Leaf(1), Node(Leaf(2), Leaf(3)))", "1 2", "true") -join [Environment]::NewLine
+Check "lang-enum-values" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: packed [u8] / [f32] lists ----
+$r = RunSrc "lang_packed_lists" @'
+var bytes: [u8] = [72, 105, 300]
+print(bytes)
+bytes.push(33)
+bytes[2] = 256 + 33
+print(bytes.len())
+print(bytes as str)
+let text = "Zeph" as [u8]
+var sum = 0
+for b in text { sum += b }
+print("{text} {sum}")
+text[0] += 1
+print(text as str)
+let back = text as [int]
+print(back)
+var samples: [f32] = [0.1, 2.5, -1]
+samples.push(1e39)
+samples.push(1.0e-45)
+print(samples)
+print(samples[0] == 0.1)
+print(samples[0])
+let wide = samples as [float]
+print(wide[1])
+let narrow = [3.14159265358979] as [f32]
+print(narrow)
+print(bytes == ("Hi!!" as [u8]))
+print(samples.pop())
+var counts: [[u8]: int] = [:]
+counts["ab" as [u8]] = 3
+print(counts["ab" as [u8]])
+for i, value in narrow { print("{i}: {value}") }
+fn checksum(data: [u8]) -> int {
+    var total = 0
+    for b in data { total = (total * 31 + b) % 65521 }
+    return total
+}
+print(bytes.checksum())
+let zeroed = zeros(3) as [u8]
+print(zeroed)
+'@
+$exp = @("[72, 105, 44]", "4", "Hi!!", "[90, 101, 112, 104] 407", "[eph", "[91, 101, 112, 104]", "[0.100000001490116, 2.5, -1, inf, 0]", "false", "0.100000001490116", "2.5", "[3.14159274101257]", "true", "0", "3", "0: 3.14159274101257", "19199", "[0, 0, 0]") -join [Environment]::NewLine
+Check "lang-packed-lists" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- builtins: multi-value print, join(sep), float pow ----
+$r = RunSrc "lang_builtins4" @'
+print("x =", 5, [1, 2], "done")
+print()
+print(["a", "b", "c"].join(", "))
+let empty: [str] = []
+print("[{empty.join("+")}]")
+print(pow(2.0, 0.5))
+print(pow(1.5, 3))
+print(pow(-2.0, 3))
+print(pow(-8.0, 1.0 / 3.0))
+print(pow(4, 0.5))
+'@
+$exp = @("x = 5 [1, 2] done", "", "a, b, c", "[]", "1.41421356237309", "3.375", "-8", "nan", "2") -join [Environment]::NewLine
+Check "lang-builtins4" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- modules: import as, private, main(), test blocks ----
+$modDir = Join-Path $tmp "modules"
+New-Item -ItemType Directory -Force "$modDir\lib" | Out-Null
+Set-Content "$modDir\lib\geometry.zeph" @'
+// a namespaced module
+struct Point {
+    x: float
+    y: float
+}
+impl Point {
+    fn length(self) -> float { return sqrt(square(self.x) + square(self.y)) }
+    fn origin() -> Point { return Point{x: 0, y: 0} }
+}
+enum Axis { Horizontal, Vertical }
+enum Shape {
+    Circle(float)
+    Square(float)
+}
+let UNIT = 1.0
+var created = 0
+private fn square(v: float) -> float { return v * v }
+private let SECRET = 42
+fn make(x: float, y: float) -> Point {
+    created += 1
+    return Point{x: x, y: y}
+}
+fn area(shape: Shape) -> float {
+    return match shape {
+        Circle(r) { 3.0 * r * r }
+        Square(side) { side * side }
+    }
+}
+fn secret() -> int { return SECRET }
+type Path = [Point]
+'@ -Encoding ascii
+Set-Content "$modDir\lib\helpers.zeph" @'
+// a plain module with a private helper of the same name as the main file's
+private fn describe() -> str { return "helpers' own describe" }
+fn helper_message() -> str { return describe() }
+'@ -Encoding ascii
+Set-Content "$modDir\main.zeph" @'
+import "lib/geometry.zeph" as geo
+import "lib/helpers.zeph"
+fn square(v: int) -> int { return v * v * v }
+fn describe() -> str { return "main's describe" }
+let p = geo.make(3, 4)
+print(p.length())
+print(p)
+let q: geo.Point = geo.Point{x: 1, y: 0}
+print(q.length() + geo.UNIT)
+print(geo.Point.origin())
+let path: geo.Path = [p, q]
+print(path.len())
+print(geo.Axis.Vertical)
+print(geo.area(geo.Shape.Circle(1)))
+print(geo.created)
+print(geo.secret())
+print(square(2))
+print(describe())
+print(helper_message())
+fn main() {
+    print("main runs last")
+}
+print("top level first")
+test "never in a normal run" { print("nope") }
+'@ -Encoding ascii
+Set-Content "$modDir\tested.zeph" @'
+import "lib/geometry.zeph" as geo
+fn add(a: int, b: int) -> int { return a + b }
+fn main() { print("main should not run under --test") }
+test "adds small numbers" {
+    assert(add(2, 3) == 5, "2 + 3")
+}
+test "uses a module" {
+    assert(geo.make(3, 4).length() == 5.0, "3-4-5")
+}
+test "fails on purpose" {
+    assert(add(1, 1) == 3, "1 + 1 is not 3")
+}
+test "never reached" { print("unreachable") }
+'@ -Encoding ascii
+function RunModule($file, $flags) {
+    $exe = Join-Path $modDir ($file + ".exe")
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $build = (cmd /c ".\zc.exe $flags `"$modDir\$file`" `"$exe`" 2>&1" | Out-String).Trim()
+    if (-not (Test-Path $exe)) { return @{ code = -1; out = $build } }
+    $runOut = (cmd /c "`"$exe`" 2>&1" | Out-String).Trim() -replace "`r", ""
+    return @{ code = $LASTEXITCODE; out = $runOut }
+}
+$r = RunModule "main.zeph" "--rt"
+$exp = @("5", "geo.Point{x: 3, y: 4}", "2", "geo.Point{x: 0, y: 0}", "2", "Vertical", "3", "1", "42", "8", "main's describe", "helpers' own describe", "top level first", "main runs last") -join "`n"
+Check "modules-namespaces" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+$r = RunModule "tested.zeph" "--test"
+$exp = @("test adds small numbers ... ok", "test uses a module ... ok", "test fails on purpose ... panic: tested.zeph:11: 1 + 1 is not 3") -join "`n"
+Check "modules-test-blocks" ($r.code -eq 1 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+$moduleErrors = @{
+    "private-from-outside" = "import `"lib/geometry.zeph`" as geo`nprint(geo.square(2.0))"
+    "unqualified-namespaced" = "import `"lib/geometry.zeph`" as geo`nprint(make(1, 2))"
+    "plain-after-as"       = "import `"lib/geometry.zeph`" as geo`nimport `"lib/geometry.zeph`""
+    "alias-reused"         = "import `"lib/geometry.zeph`" as geo`nimport `"lib/helpers.zeph`" as geo"
+    "main-with-params"     = "fn main(n: int) { }"
+}
+foreach ($name in $moduleErrors.Keys) {
+    Set-Content "$modDir\err_$name.zeph" $moduleErrors[$name] -Encoding ascii
+    $r = RunModule "err_$name.zeph" "--rt"
+    Check "error:$name" ($r.code -eq -1 -and $r.out -match "error:") "expected compile error, got($($r.code)): $($r.out)"
+}
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

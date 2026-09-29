@@ -12,7 +12,8 @@
 // numbers under the strict numeric policy, so this file is what it is
 // measured against.
 import "ml/tensor.zeph"
-import "std/math.zeph"
+// Keep the established math surface: model programs may already define E.
+import "std/math_core.zeph"
 
 fn same_dtype(a: Tensor, b: Tensor, who: str) {
     if a.dt != b.dt {

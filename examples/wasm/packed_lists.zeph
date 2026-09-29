@@ -1,0 +1,39 @@
+// packed [u8] / [f32] lists: literals, conversions, index, push/pop, for, ==, keys
+var bytes: [u8] = [72, 105, 300]
+print(bytes)
+bytes.push(33)
+bytes[2] = 256 + 33
+print(bytes.len())
+print(bytes as str)
+let text = "Zeph" as [u8]
+var sum = 0
+for b in text { sum += b }
+print("{text} {sum}")
+text[0] += 1
+print(text as str)
+let back = text as [int]
+print(back)
+var samples: [f32] = [0.1, 2.5, -1]
+samples.push(1e39)
+samples.push(1.0e-45)
+print(samples)
+print(samples[0] == 0.1)
+print(samples[0])
+let wide = samples as [float]
+print(wide[1])
+let narrow = [3.14159265358979] as [f32]
+print(narrow)
+print(bytes == ("Hi!!" as [u8]))
+print(samples.pop())
+var counts: [[u8]: int] = [:]
+counts["ab" as [u8]] = 3
+print(counts["ab" as [u8]])
+for i, value in narrow { print("{i}: {value}") }
+fn checksum(data: [u8]) -> int {
+    var total = 0
+    for b in data { total = (total * 31 + b) % 65521 }
+    return total
+}
+print(bytes.checksum())
+let zeroed = zeros(3) as [u8]
+print(zeroed)

@@ -171,7 +171,7 @@ compiling a std-importing program there before zipping.
 ## Self-hosting
 
 The compiler exists twice: a bootstrap compiler in C (`bootstrap/zephyr.c`) and
-the self-hosted one in Zephyr (`compiler/zc.zeph`, ~13,500 lines — lexer,
+the self-hosted one in Zephyr (`compiler/zc.zeph`, ~14,000 lines — lexer,
 parser, type checker, optimizer, x86-64 code generator, assembler, PE linker).
 
 A self-hosted compiler needs a starting binary, like rustc or the Go toolchain.
@@ -279,7 +279,11 @@ self-build fixpoint.
 Landed: maps, enums, modules, optionals, closures, generics, interfaces, float
 formatting, reference counting, the inliner, register promotion (integer and
 float), runtime-reciprocal division, a register-based calling convention for
-user functions, and the Linux/ELF and WebAssembly backends.
+user functions, and the Linux/ELF and WebAssembly backends. Then the language
+round: `match`, if-expressions, `if let`, labeled loops, `defer`, `const`,
+richer literals, tuples, structural `==`, generic structs, enums with values
+(`Result[T, E]`), packed `[u8]`/`[f32]`, default parameters, `import ... as`,
+`private`, `fn main()`, test blocks, and Linux threads with sync primitives.
 
 Open, roughly in the order that would move the benchmarks:
 
@@ -293,6 +297,8 @@ Open, roughly in the order that would move the benchmarks:
   collector.
 - **Feature parity across targets.** WebAssembly lacks files, closures,
   interfaces and threads; native interop (`extern fn … from`) is Windows-only.
+- **Generic structs and interfaces.** An instance of a generic struct cannot
+  yet satisfy an interface.
 - **Overloading.** One name, one function. Generics covered the cases that
   mattered; overloading is a convenience.
 - **More vectorizer idioms.** The AVX2 wins cover AXPY, fill and reduction

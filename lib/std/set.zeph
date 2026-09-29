@@ -1,0 +1,74 @@
+// std/set.zeph — Set[T]: distinct values with O(1) add, has and remove.
+//
+//     import "std/set.zeph"
+//     let seen = set_of(["a", "b", "a"])
+//     seen.add("c")
+//     print(seen.len())               // 3
+//
+// A set is a map from its values to true, so T must be a valid map key: int,
+// str, bool, an enum, or a list, struct, tuple or optional of those.
+
+struct Set[T] {
+    entries: [T: bool] = [:]
+}
+
+// A set holding each distinct item once.
+fn set_of[T](items: [T]) -> Set[T] {
+    var result: Set[T] = Set{}
+    for item in items { result.add(item) }
+    return result
+}
+
+impl Set[T] {
+    // An empty set; T comes from the expected type: let s: Set[int] = Set.new().
+    fn new() -> Set[T] { return Set{} }
+
+    // Add item; adding one already present does nothing.
+    fn add(self, item: T) { self.entries[item] = true }
+
+    // Whether item is in the set.
+    fn has(self, item: T) -> bool { return self.entries.has(item) }
+
+    // Remove item, if present.
+    fn remove(self, item: T) { self.entries.remove(item) }
+
+    // How many items the set holds.
+    fn len(self) -> int { return self.entries.len() }
+
+    // The items, in no particular order.
+    fn items(self) -> [T] { return self.entries.keys() }
+
+    // Items in either set.
+    fn union(self, other: Set[T]) -> Set[T] {
+        var result: Set[T] = Set{}
+        for item in self.entries.keys() { result.add(item) }
+        for item in other.entries.keys() { result.add(item) }
+        return result
+    }
+
+    // Items in both sets.
+    fn intersection(self, other: Set[T]) -> Set[T] {
+        var result: Set[T] = Set{}
+        for item in self.entries.keys() {
+            if other.has(item) { result.add(item) }
+        }
+        return result
+    }
+
+    // Items in this set but not the other.
+    fn difference(self, other: Set[T]) -> Set[T] {
+        var result: Set[T] = Set{}
+        for item in self.entries.keys() {
+            if not other.has(item) { result.add(item) }
+        }
+        return result
+    }
+
+    // Whether every item of this set is in the other.
+    fn is_subset(self, other: Set[T]) -> bool {
+        for item in self.entries.keys() {
+            if not other.has(item) { return false }
+        }
+        return true
+    }
+}

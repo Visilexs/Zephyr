@@ -11,34 +11,61 @@ The compiler emits three native targets from the same source: Windows x86-64
 ## 1. Source text
 
 Zephyr source is a sequence of bytes interpreted as ASCII/UTF-8. Comments run
-from `//` to end of line. Statements are terminated by a newline or by the
-closing `}` of their block. Newlines inside `(...)` and `[...]` are ignored,
-so calls and list literals may span lines.
+from `//` to end of line, or from `/*` to the matching `*/`; block comments
+nest, so a commented-out region may itself contain comments. Statements are
+terminated by a newline or by the closing `}` of their block. Newlines inside
+`(...)` and `[...]` are ignored, so calls and list literals may span lines. A
+line whose first token is `.` (but not `..`) continues the previous statement,
+so a method chain can be written one call per line.
 
 ### 1.1 Tokens
 
 Keywords:
 
 ```
-fn let var if else while for in return struct enum impl interface import as
-extern from true false none and or not break continue
+fn let var const if else while for in return struct enum impl interface import
+as extern from true false none and or not break continue match defer
 ```
+
+`from` is only a keyword after an `extern fn` signature, and `step` only after
+a range in a `for` header; elsewhere both are ordinary identifiers.
 
 Identifiers: `[A-Za-z_][A-Za-z0-9_]*`, excluding keywords.
 
 Literals:
 
-- integer: `[0-9]+`, a 64-bit signed value
-- float: `[0-9]+ '.' [0-9]+`
-- string: `"..."` with escapes `\n \t \\ \" \{ \}` and interpolation `{expr}`;
-  strings may not contain raw newlines
+- integer: decimal `[0-9]+`, hex `0x…`, binary `0b…`, octal `0o…`. An `_`
+  may separate digits (`1_000_000`, `0xFF_FF`). A decimal literal above
+  `9223372036854775807` is a compile error; hex, binary and octal literals
+  may use all 64 bits, so `0xFFFFFFFFFFFFFFFF` is `-1`.
+- float: `[0-9]+ '.' [0-9]+`, optionally followed by an exponent (`e` or `E`,
+  an optional sign, digits): `6.02e23`, `2.5E-3`; `1e3` alone is also a
+  float. A leading or trailing dot (`.5`, `5.`) is not a float.
+- character: `'a'`, `'\n'`, `'\x1b'` — one byte, of type `int` (its value).
+  Non-ASCII characters are written as strings.
+- string: `"..."` with interpolation `{expr}` and escapes `\n \t \r \0 \\ \"
+  \' \{ \} \xNN`. A plain string may not contain a raw newline.
+- raw string: `r"..."` — taken verbatim: no escapes, no interpolation
+  (`r"C:\dir\{x}"`).
+- multi-line string: `"""..."""` (or raw `r"""..."""`). When the text starts on
+  the line after the opening quotes and the closing quotes sit alone on their
+  own line, the first newline is dropped and the closing line's indentation is
+  removed from every line, so the literal can be indented with its code:
+
+      let usage = """
+          zc [flags] input.zeph output
+            --rt   link the runtime
+          """
+      // "zc [flags] input.zeph output\n  --rt   link the runtime"
+
+  A line indented less than the closing quotes is a compile error.
 - `true`, `false`, `none`
 
 Operators and punctuation:
 
 ```
-+ - * / % == != < <= > >= = += -= *= /= -> .. . , : ? ( ) [ ] { }
-& | ^ << >>
++ - * / % == != < <= > >= = += -= *= /= %= &= |= ^= <<= >>=
+-> .. . , : ? ( ) [ ] { } & | ^ << >> ~
 ```
 
 ## 2. Grammar
@@ -48,35 +75,52 @@ EBNF; `NL` is one or more newline terminators.
 ```ebnf
 program    = { toplevel } ;
 toplevel   = fndecl | structdecl | enumdecl | impldecl | ifacedecl
-           | externdecl | import | stmt ;
+           | externdecl | import | typealias | private | test | stmt ;
+typealias  = "type" ID "=" type ;
 externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
              [ "->" type ] "from" STRING ;                    (* §3.6, native DLL import *)
 
 fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
              "(" [ param { "," param } ] ")" [ "->" type ] block ;
-param      = ID ":" type | "self" ;                           (* self only in impl/interface *)
-structdecl = "struct" ID "{" { ID ":" type [ "," ] } "}" ;
-enumdecl   = "enum" ID "{" ID { "," ID } "}" ;
-impldecl   = "impl" ID "{" { fndecl } "}" ;                   (* methods on a struct *)
+param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
+structdecl = "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
+             "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
+enumdecl   = "enum" ID [ "[" ID { "," ID } "]" ]
+             "{" member { "," member } "}" ;
+member     = ID [ "(" type { "," type } ")" ] ;              (* Circle(float) *)
+impldecl   = "impl" ID [ "[" ID { "," ID } "]" ] "{" { fndecl } "}" ; (* methods on a struct or enum *)
 ifacedecl  = "interface" ID "{" { fnsig } "}" ;               (* method signatures *)
 fnsig      = "fn" ID "(" [ param { "," param } ] ")" [ "->" type ] ;
-import     = "import" STRING ;
+import     = "import" STRING [ "as" ID ] ;
+private    = "private" ( fndecl | structdecl | enumdecl | ifacedecl | typealias | decl ) ;
+test       = "test" STRING block ;                           (* run by zc --test *)
 
 type       = basetype [ "?" ] ;                              (* T? optional *)
-basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
+basetype   = "int" | "i32" | "float" | "bool" | "str"
+           | ID [ "[" type { "," type } "]" ]                (* Box[int]: generic struct *)
            | "[" type "]"                                    (* list *)
+           | "[" ( "u8" | "f32" ) "]"                        (* packed list *)
            | "[" type ":" type "]"                           (* map *)
-           | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ; (* function value *)
+           | "fn" "(" [ type { "," type } ] ")" [ "->" type ]  (* function value *)
+           | "(" type "," type { "," type } ")" ;             (* tuple *)
 
 block      = "{" { stmt } "}" ;
-stmt       = decl | assign | ifstmt | while | for | return
-           | "break" | "continue" | expr ;
-decl       = ( "let" | "var" ) ID [ ":" type ] "=" expr ;
-assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" ) expr ;
+stmt       = decl | assign | ifstmt | while | for | match | defer | return | fndecl
+           | "break" [ ID ] | "continue" [ ID ] | expr ;
+decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr
+           | ( "let" | "var" ) "(" ID { "," ID } ")" [ ":" type ] "=" expr ;
+assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                    | "&=" | "|=" | "^=" | "<<=" | ">>=" ) expr ;
 target     = ID | postfix "." ID | postfix "[" expr "]" ;
-ifstmt     = "if" expr block [ "else" ( ifstmt | block ) ] ;
-while      = "while" expr block ;
-for        = "for" ID "in" expr [ ".." expr ] block ;
+ifstmt     = "if" [ "let" ID "=" ] expr block [ "else" ( ifstmt | block ) ] ;
+while      = [ ID ":" ] "while" expr block ;
+for        = [ ID ":" ] "for" ID [ "," ID ] "in" expr
+             [ ".." expr [ "step" expr ] ] block ;
+match      = "match" expr "{" { arm } [ "else" block ] "}" ;
+arm        = pattern { "," pattern } block ;
+pattern    = expr [ ".." expr ]                             (* value, range, or member *)
+           | ID "(" ID { "," ID } ")" ;                      (* a member's values, by name *)
+defer      = "defer" ( block | stmt ) ;
 return     = "return" [ expr ] ;
 
 expr       = orexpr ;
@@ -88,9 +132,12 @@ shiftexpr  = addexpr { ( "|" | "^" ) addexpr } ;
 addexpr    = mulexpr { ( "+" | "-" ) mulexpr } ;
 mulexpr    = castexpr { ( "*" | "/" | "%" | "&" | "<<" | ">>" ) castexpr } ;
 castexpr   = unary { "as" type } ;
-unary      = ( "-" | "not" ) unary | postfix ;
+unary      = ( "-" | "not" | "~" ) unary | postfix ;
 postfix    = primary { "(" args ")" | "[" expr "]" | "." ID } ;
 primary    = INT | FLOAT | STRING | "true" | "false" | "none" | ID
+           | "if" expr "{" expr "}" "else" ( "{" expr "}" | primary ) (* if-expression *)
+           | "match" expr "{" { pattern { "," pattern } "{" expr "}" }
+                 [ "else" "{" expr "}" ] "}"                (* match expression *)
            | ID "{" fieldinits "}"                           (* struct literal *)
            | "fn" "(" [ param { "," param } ] ")" [ "->" type ] block  (* closure *)
            | "(" expr ")"
@@ -102,8 +149,10 @@ fieldinits = { ID ":" expr [ "," ] } ;
 
 Binding strength, weakest to tightest: `or`, `and`, `== !=`, `< <= > >=`,
 `| ^`, `+ -`, `* / % & << >>`, `as`, unary `- not`, postfix call/index/member.
-All binary operators are left-associative. (The bitwise levels follow Go:
-`& << >>` bind like `*`, `| ^` bind like `+`.)
+All binary operators are left-associative, except that comparisons chain:
+`a < b <= c` means `a < b and b <= c` (see §3.3). (The bitwise levels follow
+Go: `& << >>` bind like `*`, `| ^` bind like `+`.) `x op= y` means
+`x = x op y`.
 
 Disambiguation: an identifier followed by `{` is a struct literal, except in
 the header expression of `if`/`while`/`for`, where `{` begins the block
@@ -117,7 +166,7 @@ at the top level.
 map), and named struct and enum types. `void` is the type of no value; it
 cannot be named in source.
 
-`i32` is a 32-bit signed integer that exists only as an `extern fn` return type
+`i32` (listed in the grammar above) is a 32-bit signed integer that exists only as an `extern fn` return type
 (§3.6): the low 32 bits of the return register, sign-extended to a Zephyr `int`.
 It is not a general-purpose type — locals, fields and arithmetic all use `int`.
 
@@ -136,6 +185,99 @@ runtime and costs nothing. Enums support `==`/`!=` (only against the *same*
 enum — comparing two different enum types is a type error), `as int` (the
 ordinal) and `as str` (the member name). `print` shows the member name.
 
+`n as Color` converts an int back to a member and panics if `n` is not a
+member's ordinal. `Color.all()` is the list of members in order and
+`Color.count` their number. An `impl Color { ... }` block adds methods and
+associated functions to an enum exactly as to a struct (§3.0.6).
+
+### 3.0.0.2 Enums with values
+
+    enum Shape {
+        Circle(float)
+        Rect(float, float)
+        Empty
+    }
+    let s = Shape.Rect(3, 4.5)
+    let area = match s {
+        Circle(r) { 3.14159 * r * r }
+        Rect(w, h) { w * h }
+        Empty { 0.0 }
+    }
+
+A member may carry values, listed as types in parentheses. Such an enum is a
+tagged union: `Shape.Circle(2.0)` makes one (a member without values is
+written `Shape.Empty`), and a `match` arm `Circle(r)` runs for that member
+with its values bound to the names given; `_` skips one. An arm that binds
+values has a single pattern. The coverage rules of §3.4.1 apply. `x is
+Circle` (or `x is Shape.Circle`) tests the member without binding; `is` also
+works on plain enums.
+
+An enum may take type parameters when its members carry values:
+
+    enum Result[T, E] { Ok(T), Err(E) }
+    fn parse_digit(text: str) -> Result[int, str] { ... return Result.Ok(7) }
+
+The type arguments are inferred from the values, or from the expected type
+(`let r: Result[int, str] = Result.Err("no")`). `impl` blocks work as for
+generic structs (§3.0.5.1). Enums with values are references, like structs;
+they print as `Rect(3, 4.5)`, compare with `==` member and values alike, and
+can be map keys when every value type can.
+
+### 3.0.0 Type aliases and struct defaults
+
+`type Name = T` at the top level gives an existing type a second name; the
+two are the same type and mix freely. Aliases may refer to other aliases,
+but not in a cycle.
+
+    type Grid = [[int]]
+
+A struct field may declare a default, `width: int = 800`, used when a
+literal leaves the field out. An optional field with no default defaults to
+`none`. Any other field a literal leaves out is an error. Defaults are
+evaluated each time a literal uses them, under the same naming rule as
+default parameters (§3.4).
+
+### 3.0.0.1 Tuples
+
+    fn divmod(a: int, b: int) -> (int, int) { return (a / b, a % b) }
+    let (q, r) = divmod(17, 5)
+    let pair = divmod(9, 2)
+    print(pair.0)               // 4
+    print(pair)                 // (4, 1)
+
+`(T, U, ...)` is a tuple type of two or more elements and `(a, b, ...)` a
+tuple value; `(x)` is still just `x` in parentheses. Elements are read with
+`.0`, `.1`, ... and cannot be assigned: a tuple is built whole. Two tuple
+types are the same when their element types are. `let (a, b) = t` (or `var`)
+binds each element to a name; the number of names must match the tuple.
+Tuples compare with `==` element by element, print as `(1, "a")`, and can be
+map keys when their elements can (§3.0.1).
+
+### 3.0.0.3 Packed lists: [u8] and [f32]
+
+    var pixels: [u8] = [255, 128, 0]
+    pixels.push(300)                 // stored as 300 & 255 = 44
+    let bytes = "Zeph" as [u8]
+    var weights: [f32] = [0.1, 2.5]
+    let doubles = weights as [float] // [0.100000001490116, 2.5]
+
+`[u8]` stores one byte per element and `[f32]` four (an IEEE single). They
+are the only places `u8` and `f32` appear: there are no `u8` or `f32`
+values, variables or fields. Reading an element gives an `int` (0 to 255) or
+a `float` (the single widened exactly); storing one keeps the low 8 bits of
+the int, or rounds the float to the nearest single (to infinity when too
+large).
+
+A packed list has `.len()`, `.push(v)`, `.pop()`, indexing, `for` (including
+`for i, x in`), `==`, printing, and `[u8]` can be a map key. Anything else
+(sorting, the std list helpers, generic functions) takes a plain list:
+convert with `as`. The conversions are `[int] as [u8]`, `[u8] as [int]`,
+`[float] as [f32]`, `[f32] as [float]`, `str as [u8]` and `[u8] as str`
+(the bytes, unchanged). A list literal where a packed list is expected is
+converted element by element. Packed lists are for large numeric buffers
+(images, audio, meshes); they use an eighth or a half of a plain list's
+memory, at the cost of a runtime call per element access.
+
 ### 3.0.1 Maps
 
     var ages: [str: int] = ["alice": 30, "bob": 25]
@@ -143,12 +285,16 @@ ordinal) and `as str` (the member name). `print` shows the member name.
     print(ages["alice"])        // panics if the key is absent
     print(ages.has("bob"))
 
-`[K: V]` is a hash map. The key type `K` must be `int`, `str`, `bool`, or an
-enum — types with value equality (`str` compares structurally). `[:]` is the
+`[K: V]` is a hash map. The key type `K` must be `int`, `str`, `bool`, an
+enum, or a list, struct or optional built only from those — types compared by
+value (§3.3). Floats (NaN is not equal to itself) and maps cannot be keys.
+Lists and structs are mutable: changing one after using it as a key leaves it
+filed under its old hash, so lookups of it become unreliable. `[:]` is the
 empty map literal and, like `[]`, needs an annotation to supply its type.
 
-Reading a missing key panics; use `.has(k)` to test first. Methods: `.len()`,
-`.has(k)`, `.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
+Reading a missing key panics; use `.has(k)` to test first, or `.get(k)`,
+which returns `V?` (§3.0.4). Methods: `.len()`, `.has(k)`, `.get(k)` → `V?`,
+`.remove(k)`, `.keys()` → `[K]`, `.values()` → `[V]`. Iterate with
 `for k in m.keys()`. Iteration order is unspecified. Maps are open-addressed
 and rehash at 50% occupied slots (including tombstones), so insert/lookup
 are amortized O(1).
@@ -167,6 +313,35 @@ Each path is included at most once, so importing the same file twice is a
 no-op and mutually-importing files terminate. There is no separate namespace:
 imported names share the one global scope, and a duplicate name across files
 is a redeclaration error.
+
+### 3.0.2.1 Namespaces, private, main, tests
+
+    import "geometry.zeph" as geo
+    let p = geo.make(3, 4)             // a function
+    let q: geo.Point = geo.Point{x: 1, y: 0}
+    print(geo.UNIT, geo.Axis.Vertical, geo.Shape.Circle(1.0))
+
+`import "file" as name` keeps the module's declarations out of the
+importer's namespace: they are reached as `name.thing`, for functions,
+globals, structs, enums, interfaces and type aliases alike. Inside the module
+they keep their plain names. A module imported with `as` anywhere must be
+imported with `as` everywhere (under the same or another alias); an alias
+names one module. A plain `import` is unchanged: its declarations join the
+importer's namespace.
+
+`private` before a top-level `fn`, `struct`, `enum`, `interface`, `type`,
+`let`, `var` or `const` makes it visible only inside its own file. Another
+file may then declare the same name without a clash.
+
+If the main file declares `fn main()` (no parameters) and does not call it
+at the top level, it is called after all top-level statements have run.
+
+`test "name" { ... }` blocks at the top level of the main file are ignored by
+a normal build. `zc --test file.zeph out.exe` (which implies `--rt`) builds a
+program that runs the top-level statements, then each test in order, printing
+`test name ... ok`, and finally the count; `main()` is not called. A failing
+`assert` or panic ends the run at that test with a non-zero exit code. Test
+blocks in imported files are ignored.
 
 ### 3.0.3 Function values
 
@@ -261,6 +436,35 @@ A generic function has no single type, so it cannot be used as a function value.
 
     import "std/list.zeph"
 
+### 3.0.5.1 Generic structs
+
+    struct Pair[A, B] { first: A, second: B }
+    struct Stack[T] { items: [T] = [] }
+
+    impl Stack[T] {
+        fn push(self, item: T) { self.items.push(item) }
+        fn map_all[U](self, f: fn(T) -> U) -> Stack[U] { ... }
+        fn new() -> Stack[T] { return Stack{} }
+    }
+
+    let p = Pair{first: 1, second: "one"}      // Pair[int, str], inferred
+    var s: Stack[int] = Stack{}                // the annotation supplies T
+    let t: Stack[str] = Stack.new()            // so does an expected result
+
+A struct may take type parameters. `Name[T, ...]` names one instance of it;
+each distinct set of type arguments is its own struct type, checked and
+compiled separately, like a generic function (§3.0.5). A literal `Pair{...}`
+infers the arguments from its field values, or takes them from the type the
+context expects; empty `[]`, `[:]` and `none` values infer nothing. A generic
+struct named without its type arguments is an error.
+
+`impl Stack[T] { ... }` gives every instance the methods, which are generic
+over the impl's parameters (and may add their own). A generic function's type
+parameters are inferred from its arguments and, failing that, from the type
+its result is expected to have. Instances print under the template's name
+(`Pair{first: 1, second: "one"}`) and compare and hash structurally (§3.3).
+Instances do not yet satisfy interfaces.
+
 ### 3.0.6 Methods and interfaces
 
 An `impl` block attaches functions to a struct:
@@ -312,6 +516,15 @@ visible inside every function that appears after them in the source, and they
 are roots for the backstop collector (§4). Declarations nested in any block
 (including top-level `if`/`for`/`while` bodies) are locals. Top-level code executes in source order.
 
+`const` declares an immutable binding whose value is known at compile time:
+its initializer may use only literals, other consts declared before it, enum
+members, and operators or `as` conversions over those. A top-level const is
+initialized before any other top-level code, so every function may use it
+regardless of where it is declared. Assigning to a const is an error.
+
+    const MAX_PLAYERS = 8
+    const GRID = MAX_PLAYERS * 4 + 1
+
 ### 3.2 Conversions
 
 A value of type `S` *fits* type `T` if `S = T`, or `S = int` and `T = float`
@@ -340,9 +553,18 @@ panic (§6) on any other malformed input.
   the low 6 bits of the right operand; `>>` is arithmetic (sign-preserving).
   Precedence (Go-style): `& << >>` bind at the `*` level, `| ^` at the `+`
   level.
-- `== !=`: numbers (mixed widens), bools, or strs (byte equality). Not
-  defined for lists or structs.
-- `< <= > >=`: numbers or strs (lexicographic byte order).
+- `~x`: bitwise complement of an int (`x ^ -1`).
+- `== !=`: numbers (mixed widens), bools, strs (byte equality), enums, and
+  — structurally — two lists, structs, optionals or maps of the same type:
+  equal when their elements, fields, wrapped values or entries are equal
+  (maps ignore order). Function and interface values have no `==`.
+  `x == none` / `x != none` on an optional is a presence test, the same as
+  `not x.has()` / `x.has()`. Comparing a structure that contains itself does
+  not terminate.
+- `< <= > >=`: numbers or strs (lexicographic byte order). Consecutive
+  comparisons chain: `lo <= x < hi` is `lo <= x and x < hi`. The middle
+  operand appears twice, so it may not contain a call; store a call's result
+  in a variable first.
 - `and or not`: bools only; `and`/`or` short-circuit.
 - Unary `-`: numeric.
 - Conditions of `if`/`while` must be `bool`.
@@ -350,19 +572,110 @@ panic (§6) on any other malformed input.
 ### 3.4 Functions
 
 Parameter and return types are declared; a function with a non-void return
-type must provably return on every path (a `return`, or an `if`/`else` whose
-branches both return). Top-level code runs in order; functions and structs
+type must provably return on every path: a `return`, a `panic(...)`, a
+`while true` loop with no `break`, or an `if`/`else` whose branches both do. Top-level code runs in order; functions and structs
 may be referenced before their declaration. Function and variable namespaces
 are shared: a call resolves builtins first, then declared functions.
 
 Method syntax is universal function call syntax: `a.f(b)` is exactly
 `f(a, b)` for any declared function `f` whose first parameter accepts `a`.
 
+A parameter may declare a default, `greeting: str = "Hello"`; a call may then
+leave it out. Once one parameter has a default, every later one must too. The
+default is evaluated at each call that uses it. It may use globals, consts and
+functions but not the other parameters, and a call site where one of the names
+it uses is a local variable is an error (rename the local).
+
+A `fn` declared inside a function body is a local function: it is a closure
+(§3.0.3) bound to a `let` of that name, so it captures by value and is visible
+from its declaration to the end of the block. Local functions cannot be
+generic or take default parameters.
+
+### 3.4.1 Control flow
+
+**If-expressions.** `if c { a } else { b }` is also an expression, which is
+how Zephyr spells a conditional value (there is no `?:`). Each branch holds a
+single expression, `else` is required, and `else if` chains:
+
+    let size = if n > 100 { "big" } else if n > 10 { "medium" } else { "small" }
+
+Both branches must have the same type (an `int` branch widens to `float` to
+match a `float` one). If one branch is `none`, the result is the other
+branch's type made optional: `if found { i } else { none }` is an `int?`.
+
+**match.** A `match` compares one value against each arm's patterns in order
+and runs the first arm that matches:
+
+    match shape {
+        Circle { area = PI * r * r }
+        Square, Rect { area = w * h }
+        else { area = 0.0 }
+    }
+
+A pattern is a value compared with `==` (a literal, a const, any expression),
+a half-open range `lo..hi` (matches `lo <= x < hi`), or, when the subject is
+an enum, a member name — bare (`Red`) or qualified (`Color.Red`). Commas list
+several patterns for one arm. The subject is evaluated once. The optional
+`else` arm comes last.
+
+A match on an enum must cover every member (or have an `else` arm), and a
+match on a `bool` must cover both values; a match on any other type needs an
+`else` arm. Covering the same member twice is an error. Arms are written
+`pattern { ... }` — there is no `=>`.
+
+A match is also an expression. Each arm then holds a single expression, as an
+if-expression's branches do, and the same coverage rules apply:
+
+    let name = match c {
+        Red { "red" }
+        Green, Blue { "cool" }
+    }
+
+**if let.** `if let name = optional { ... } else { ... }` runs the first block
+with `name` bound to the unwrapped value when the optional holds one, and the
+`else` block (optional) when it is `none`.
+
+**Loops.** Beyond `for i in lo..hi` and `for x in list`:
+
+| Form | Iterates |
+|------|----------|
+| `for i in lo..hi step s` | from `lo` toward `hi` (excluded) in steps of `s`; a negative `s` counts down (`for i in 10..0 step -1` is 10 to 1). `s` may be any int expression; 0 panics. |
+| `for i, x in list` | index and element |
+| `for b in text` | the bytes of a `str`, as `int`s (`'a'` is also an `int`) |
+| `for i, b in text` | index and byte |
+| `for key in map` | the keys (same as `map.keys()`) |
+| `for key, value in map` | keys and their values |
+
+**Labeled loops.** A loop may carry a label, `name: for ...` or
+`name: while ...`, and `break name` / `continue name` then act on that loop
+instead of the innermost one:
+
+    outer: for row in grid {
+        for cell in row {
+            if cell == 0 { continue outer }
+            if cell < 0 { break outer }
+        }
+    }
+
+**defer.** `defer stmt` or `defer { ... }` schedules code to run when control
+leaves the enclosing block: at its end, and before every `return`, `break` or
+`continue` that exits it. Several defers in one block run in reverse order.
+A `return` value is computed before the deferred code runs. Deferred code may
+not itself return, break or continue out; a panic ends the program without
+running it.
+
+    fn save(path: str, data: str) {
+        let log = open_log()
+        defer log.close()
+        ...
+    }
+
 ### 3.5 Builtins
 
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
 | `print(v)` | any → void | formats like §5, appends newline |
+| `print(a, b, ...)` | any... → void | prints `"{a} {b} ..."`: each value formatted as in interpolation, separated by spaces; `print()` prints an empty line |
 | `panic(m)` | str → (no return) | §6 |
 | `sqrt(x)`  | float → float | int argument widens |
 | `l.len()`  | [T] or str → int | |
@@ -371,9 +684,11 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 | `emit(s)`  | str → void | write to stdout without a newline |
 | `chr(c)`   | int → str | one byte, 0..255; panics outside |
 | `bits(x)`  | float → int | IEEE 754 bit pattern, zero cost |
+| `frombits(n)` | int → float | the inverse of `bits`, zero cost |
 | `s.byte(i)`| str, int → int | byte value 0..255, bounds-checked |
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
+| `l.join(sep)` | [str], str → str | concatenation with `sep` between elements |
 | `args()`   | → [str] | process arguments, `args()[0]` is the program |
 | `read_file(p)` | str → str | whole file; panics if unreadable |
 | `write_file(p, d)` | str, str → void | create/overwrite; panics on failure |
@@ -381,7 +696,8 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |
-| `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 |
+| `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 (integer division of 1 by `b^-e`) |
+| `pow(b, e)` | float or int, float or int → float | when either operand is a float: exact repeated squaring for whole exponents (below 2^31), `e^(e·ln b)` otherwise; a negative base with a fractional exponent is NaN |
 
 **String methods** (all byte-oriented, half-open ranges):
 
@@ -400,12 +716,11 @@ Method syntax is universal function call syntax: `a.f(b)` is exactly
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `l.contains(x)` | T → bool | value equality (structural for `[str]`) |
-| `l.index_of(x)` | T → int | first index, or −1 |
 | `l.sort()` | → void | in place, ascending; `[int]`, `[float]`, `[str]`, `[bool]`, or `[enum]`. A native introsort (quicksort with a heapsort fallback and an insertion-sort finish) — for a custom order use `sort_by(cmp)` from `std/list.zeph`. |
 
-`contains`, `index_of`, `reverse` and `slice` are **not** builtins — they are
-generic library functions in `std/list.zeph` (§3.0.5).
+`contains`, `index_of`, `reverse`, `slice` and `count` are **not** builtins —
+they are generic library functions in `std/list.zeph` (§3.0.5), called with
+method syntax once imported: `xs.contains(3)`.
 
 `sqrt` is the only transcendental builtin, because it is one instruction.
 Everything else lives in `std/math.zeph`, written in ordinary Zephyr for a
@@ -526,8 +841,9 @@ or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 
 ## 6. Panics
 
-A panic prints `panic: <message>` to stderr and terminates the process with
-exit code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
+A panic prints `panic: <file>:<line>: <message>` to stderr (the source
+location of the panicking operation) and terminates the process with exit
+code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
 (int), `.pop()` on an empty list, failed `as int`/`as float` parse, and heap
 exhaustion. Panics are not catchable.
 
@@ -552,6 +868,8 @@ The same source compiles to three targets, selected by a flag:
 Not every feature reaches every target. WebAssembly currently omits file I/O,
 closures, interfaces and threads; native interop (§3.6) via `extern fn … from`
 is Windows-only, and non-kernel32 `win()` prefixes are Windows-only.
+Threads and synchronization primitives are available on both Windows and Linux
+x86-64 with `--rt` (§8).
 `scripts/crosscheck-linux.ps1` and `crosscheck-wasm.ps1` compile the same
 sources for two targets and require byte-identical program output.
 
@@ -574,14 +892,14 @@ linked module.
 
 ## 8. Concurrency
 
-Threads are available on the Windows target through `lib/std/thread.zeph`
+Threads are available on Windows and Linux x86-64 through `lib/std/thread.zeph`
 (`import "std/thread.zeph"`), and require `--rt`.
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
 | `thread_spawn(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
 | `t.join()` | `Thread` → void | Block until the thread finishes. |
-| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across `cpu_count()` workers, then join. |
+| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
 | `cpu_count()` | → int | Logical processor count. |
 
 The worker argument is an `int` — a worker index or a raw buffer address — and
@@ -591,9 +909,22 @@ threads adjusting the same count would race and free an object still in use.
 Share data by passing an off-heap buffer address (§3.6) and partitioning it by
 index.
 
-There is no user-facing mutex or atomics API, and none is needed while that rule
-holds, because threads then share no counted object. The backstop collector is
-stop-the-world: it suspends every registered thread and scans each one's register
-context and stack, so the rare collection is safe under concurrency without
-locking in user code. String interpolation is thread-safe, using a per-thread
-builder. Threads are not available on `--linux` or `--wasm`.
+`import "std/sync.zeph"` provides `Mutex`, `Atomic`, bounded FIFO `Channel`, and
+`WaitGroup` wrappers over off-heap storage. Atomics and channels carry `int`
+values; use `bits`/`frombits` for floats. Pass the integer `address` field to a
+worker and construct its own local wrapper: the wrappers themselves are counted
+heap objects and must not be shared. Their native storage lasts until process
+exit. Synchronization does not make shared reference counts safe.
+
+Linux starts threads with a machine-code `clone` trampoline on mapped stacks.
+Futexes implement the startup gate, join, recursive critical sections, and
+condition variables. Each thread has its own TLS table selected by stack range;
+string interpolation uses a per-thread builder on both native targets.
+
+On Windows the backstop collector remains stop-the-world: it suspends every
+other registered thread and scans its register context and stack. Linux cannot
+suspend threads without signal handlers, so collection is deferred while any
+worker remains unjoined, including a worker requesting collection itself.
+Reference counting continues to reclaim acyclic objects; cyclic garbage may grow
+until the workers are joined and a later collection runs. Join every worker. Threads
+are not available on `--wasm`.

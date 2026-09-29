@@ -1,0 +1,84 @@
+// std/result.zeph — Result[T, E]: a value, or the error that stopped it.
+//
+//     import "std/result.zeph"
+//     fn parse_port(text: str) -> Result[int, str] {
+//         let port = text as int
+//         if port < 1 or port > 65535 { return Result.Err("not a port: {text}") }
+//         return Result.Ok(port)
+//     }
+//     match parse_port("8080") {
+//         Ok(port) { print("listening on {port}") }
+//         Err(message) { print(message) }
+//     }
+//
+// Zephyr has no exceptions: a function that can fail returns a Result, or an
+// optional when there is nothing to say about the failure.
+
+enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+
+impl Result[T, E] {
+    // Whether this holds a value.
+    fn is_ok(self) -> bool { return self is Ok }
+
+    // Whether this holds an error.
+    fn is_err(self) -> bool { return self is Err }
+
+    // The value; panics with the error on Err.
+    fn unwrap(self) -> T {
+        match self {
+            Ok(value) { return value }
+            Err(error) { panic("unwrap on an Err: {error}") }
+        }
+    }
+
+    // The value, or fallback on Err.
+    fn unwrap_or(self, fallback: T) -> T {
+        match self {
+            Ok(value) { return value }
+            Err(_) { return fallback }
+        }
+    }
+
+    // The value as an optional; none on Err.
+    fn ok(self) -> T? {
+        match self {
+            Ok(value) { return value }
+            Err(_) { return none }
+        }
+    }
+
+    // The error as an optional; none on Ok.
+    fn err(self) -> E? {
+        match self {
+            Ok(_) { return none }
+            Err(error) { return error }
+        }
+    }
+
+    // Transform the value, keeping an error as it is.
+    fn map[U](self, transform: fn(T) -> U) -> Result[U, E] {
+        match self {
+            Ok(value) { return Result.Ok(transform(value)) }
+            Err(error) { return Result.Err(error) }
+        }
+    }
+
+    // Transform the error, keeping a value as it is.
+    fn map_err[F](self, transform: fn(E) -> F) -> Result[T, F] {
+        match self {
+            Ok(value) { return Result.Ok(value) }
+            Err(error) { return Result.Err(transform(error)) }
+        }
+    }
+
+    // Chain a step that can itself fail; the first error wins.
+    fn and_then[U](self, next: fn(T) -> Result[U, E]) -> Result[U, E] {
+        match self {
+            Ok(value) { return next(value) }
+            Err(error) { return Result.Err(error) }
+        }
+    }
+}

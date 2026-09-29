@@ -9,7 +9,7 @@ own assembler + PE linker, and depends only on `kernel32.dll`. `.zeph` sources.
 - `docs/spec.md` — grammar, type rules, conversion table, runtime semantics. **Authoritative.**
 - `docs/tour.md` — the language in ten minutes.
 - `lib/std/list.zeph` — the standard library, written in ordinary Zephyr (not compiler builtins).
-- `compiler/zc.zeph` — the compiler itself (~6,200 lines): lexer, parser, typechecker, optimizer, codegen, assembler, PE linker.
+- `compiler/zc.zeph` — the compiler itself (~14,000 hand-written lines plus a generated `>>>EMBED` section holding runtime.zeph and lib/std): lexer, parser, typechecker, optimizer, x86-64 and wasm codegen, assembler, PE/ELF linkers. Never hand-edit the EMBED section; `scripts/embed-gen.ps1` rewrites it.
 
 Zephyr *looks* like Rust/Swift but is its own language. When behavior isn't
 obvious from a `.zeph` file, check `docs/spec.md` — don't assume Rust semantics.
@@ -32,7 +32,10 @@ node scripts\wasm-run.js app.wasm
 ```
 
 `--rt` links the Zephyr-written runtime; output imports `kernel32.dll` only.
-Editing the compiler = editing `compiler\zc.zeph` then `.\scripts\selfbuild.ps1`.
+Editing the compiler = editing `compiler\zc.zeph` then `.\scripts\selfbuild.ps1`. A change to the
+code the compiler generates needs one more stage (build with the new compiler, then require
+the next two stages to match). New syntax cannot be used inside `zc.zeph` or `runtime.zeph`
+until an installed `zc.exe` understands it — stage 1 is always built by the old compiler.
 
 ## Language facts that differ from the Rust/Swift default assumption
 
@@ -58,8 +61,21 @@ Editing the compiler = editing `compiler\zc.zeph` then `.\scripts\selfbuild.ps1`
 - **Collections:** lists `[T]`, maps `[K: V]` (`["alice": 30]`, `.has`, `.keys`, `.remove`).
 - **Strings** interpolate with braces: `"len = {p.len()}"`. Methods: `.upper`,
   `.split`, `.replace`, `.contains`, `.trim`, `.repeat`, `.starts_with`, `.index_of`.
-- **Multi-file:** `import "std/list.zeph"` â€” library paths resolve relative to zc.exe (it looks in `lib/`), so they work from any directory.
+- **Multi-file:** `import "std/list.zeph"` — library paths resolve relative to zc.exe (it looks in `lib/`), so they work from any directory.
 - **`assert(cond)` / `assert(cond, msg)`** is built in.
+- **Literals:** `0xFF`, `0b1010`, `1_000`, `6.02e23`, `'a'` (an int byte), raw `r"C:\dir"`,
+  multi-line `"""..."""` (indentation stripped). Comments: `//` and nesting `/* */`.
+- **`const`** is a compile-time constant, usable from any function regardless of order.
+- **Comparisons chain:** `0 <= i < n`. `x == none` tests an optional. `==` on lists,
+  structs, tuples, optionals and maps compares by value.
+- **Control flow:** `match x { A { } B, C { } else { } }` (no `=>`, also an expression),
+  `if c { a } else { b }` as an expression (no `?:`), `if let v = opt { }`, `for i, x in xs`,
+  `for i in a..b step s`, `label: for`/`break label`, `defer`.
+- **Types:** tuples `(int, str)` / `t.0` / `let (a, b) = t`, `type Alias = T`, struct field
+  defaults, default parameters, `struct Box[T]`, enums with values `Circle(float)` matched as
+  `Circle(r)`, `x is Member`, packed `[u8]`/`[f32]` (convert with `as`).
+- **Modules:** `import "m.zeph" as m` (qualified `m.name`), `private` declarations,
+  `fn main()` auto-called, `test "name" { }` run by `zc --test`.
 
 ## Layout
 
@@ -69,13 +85,13 @@ Roughly the order you meet things in:
 |------|------|
 | `zc.exe` | the compiler. Must stay at the root: it resolves `lib/` and `compiler/runtime.zeph` relative to itself |
 | `examples/` | `basics/` `graphics/` `vulkan/` `threads/`, plus `shaders/` (GLSL + `.zsh` + compiled `.spv`) |
-| `lib/` | libraries importable as `std/â€¦`, `vk/â€¦`, `ui/â€¦`; `os/linux.zeph` is the syscall shim `--linux` links in |
+| `lib/` | libraries importable as `std/…`, `vk/…`, `ui/…`; `os/linux.zeph` is the syscall shim `--linux` links in |
 | `compiler/` | `zc.zeph` (the compiler, in Zephyr) and `runtime.zeph` (allocation + counting, strings, threads) |
 | `scripts/` | `selfbuild` `package` `clean` `embed-gen` `build-shaders` |
-| `tools/` | `vkgen.c` (Vulkan bindings from the SDK headers), `zspv.zeph` (Zephyr â†’ SPIR-V) |
+| `tools/` | `vkgen.c` (Vulkan bindings from the SDK headers), `zspv.zeph` (Zephyr → SPIR-V) |
 | `tests/` `bench/` `docs/` | suite, benchmarks vs C/Rust, spec and tour |
 | `bootstrap/` | the C seed. Rebuilds `zc.exe` from nothing; not part of the normal loop |
-| `archive/` `dist/` `zide/` | superseded work, packaging, the separate IDE project |
+| `dist/` | packaging output |
 
 Imports are written library-relative (`import "vk/gfx.zeph"`) and resolve
 against `zc.exe`'s directory, so nesting an example deeper does not change them.
@@ -83,8 +99,8 @@ against `zc.exe`'s directory, so nesting an example deeper does not change them.
 ## Constraints
 
 - **Three targets.** Windows x86-64 (PE, kernel32), Linux x86-64 (static ELF, raw
-  syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Not yet on any
-  non-native target: threads. Not on wasm: files, closures and interfaces.
+  syscalls), and WebAssembly (`--wasm`, runtime included; no counting emitted). Threads run on
+  Windows and Linux. Not on wasm: files, closures, interfaces and threads.
   wasm frames live in a shadow stack in linear memory so the conservative GC can
   scan them — see the memory-map comment above `write_wasm` in `zc.zeph`.
 - One name, one function — **no overloading** (generics cover the real cases).

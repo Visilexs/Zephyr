@@ -70,7 +70,10 @@ Bitwise precedence follows Go: `& << >>` bind like `*`, `| ^` bind like `+`.
 Conditions must be `bool` — `if 1 { ... }` is a compile error, not a truthiness
 puzzle. `/` and `%` on two ints are integer operations (and panic on zero);
 involve a float and you get float division. `+` also concatenates strings.
-Compound assignment `+= -= *= /=` works on any assignable target.
+Compound assignment `+= -= *= /= %= &= |= ^= <<= >>=` works on any assignable
+target; `~x` is the bitwise complement. Comparisons chain: `0 <= i < n`. `==`
+compares lists, structs, tuples, optionals and maps by value. There is no `?:`
+or `**`: use an if-expression and `pow(b, e)` (ints, or floats).
 
 ## Control flow
 
@@ -91,6 +94,29 @@ for i in 0..5 {          // 0, 1, 2, 3, 4 — half-open range
 for word in ["a", "b"] {  // iterate any list
     print(word)
 }
+
+for i, word in ["a", "b"] { print("{i}: {word}") }   // index and element
+for i in 10..0 step -2 { print(i) }                  // 10, 8, 6, 4, 2
+for key, value in ages { print("{key}={value}") }    // maps; `for b in text` gives bytes
+
+let size = if n > 100 { "big" } else { "small" }     // if is also an expression
+
+match grade {                    // no fallthrough, no =>
+    90..101 { print("A") }
+    80..90 { print("B") }
+    else { print("C") }
+}
+
+if let found = lookup(key) { print(found) }          // unwrap an optional
+
+outer: for row in grid {         // labeled loops
+    for cell in row { if cell < 0 { break outer } }
+}
+
+fn save(path: str) {
+    let log = open_log()
+    defer log.close()            // runs however the block is left
+}
 ```
 
 ## Functions
@@ -105,7 +131,8 @@ fn clamp(x: int, lo: int, hi: int) -> int {
 
 Parameter and return types are required (omit `->` for no return value). The
 compiler verifies that every path returns. Functions can be called before
-they're defined.
+they're defined. Parameters may have defaults (`greeting: str = "Hello"`), and a
+`fn` declared inside a function is a local closure.
 
 ## Lists
 
@@ -170,8 +197,38 @@ fn first_even(xs: [int]) -> int? {   // T? holds a value or `none`
 print(first_even([1, 3, 4]).or(-1))  // 4
 ```
 
-An optional must be unwrapped (`.or(default)`, `.get()`, `.has()`) before use —
-it is not a plain `T`.
+An optional must be unwrapped (`.or(default)`, `.get()`, `.has()`, `if let`)
+before use — it is not a plain `T`.
+
+```zephyr
+enum Shape {                      // members can carry values
+    Circle(float)
+    Rect(float, float)
+}
+let area = match shape {
+    Circle(r) { 3.14159 * r * r }
+    Rect(w, h) { w * h }
+}
+print(shape is Circle)
+
+fn divmod(a: int, b: int) -> (int, int) { return (a / b, a % b) }   // tuples
+let (q, r) = divmod(17, 5)
+
+struct Config {
+    width: int = 800              // field defaults
+    title: str = "untitled"
+}
+type Grid = [[int]]               // type alias
+
+struct Pair[A, B] { first: A, second: B }     // generic struct
+let p = Pair{first: 1, second: "one"}          // Pair[int, str], inferred
+
+var pixels: [u8] = [255, 0, 128]  // packed: one byte per element ([f32]: four)
+let text = pixels as str
+```
+
+`std/result.zeph` has `Result[T, E]` (`Ok`/`Err`) for functions that can fail;
+`std/set.zeph` has `Set[T]`.
 
 ## Closures and generics
 
@@ -202,7 +259,17 @@ import "sub/mathx.zeph"    // paths are relative to the importing file
 
 `std/list.zeph` is the standard library — `map`, `filter`, `fold`, `sort_by`,
 `contains` and friends — written as ordinary generic Zephyr, not baked into the
-compiler.
+compiler. See [docs/std.md](std.md) for the rest (strings, math, random, io,
+sync, result, set).
+
+```zephyr
+import "geometry.zeph" as geo    // qualified: geo.Point, geo.area(...)
+private fn helper() { }          // visible in this file only
+fn main() { ... }                // called after the top-level statements
+test "area of a unit square" {   // run by `zc --test file.zeph out.exe`
+    assert(geo.area(geo.Shape.Square(1.0)) == 1.0)
+}
+```
 
 ## Errors
 
@@ -212,15 +279,15 @@ division by zero, popping an empty list, or a failed `str` parse in `as`.
 
 ## Builtins
 
-Functions: `print(v)`, `emit(s)` (stdout without a newline — use it to stream
+Functions: `print(v)` (or `print(a, b, ...)`, space-separated), `emit(s)` (stdout without a newline — use it to stream
 large output instead of assembling one huge string), `panic(msg)`, `sqrt(x)`,
 `chr(code)` (byte → 1-char str), `bits(f)` (float → its IEEE bit pattern as
 int), `args()` (command-line arguments as `[str]`), `read_file(path)`,
 `write_file(path, data)`.
 
 Methods: `.len()` (list or str), `.push(v)`, `.pop()`, `.byte(i)` (str byte
-as int, bounds-checked), `.sub(lo, hi)` (substring, half-open), `.join()`
-(concatenate a `[str]` in one pass — use this instead of `+` in loops).
+as int, bounds-checked), `.sub(lo, hi)` (substring, half-open), `.join()` /
+`.join(sep)` (concatenate a `[str]` in one pass — use this instead of `+` in loops).
 
 These are enough to write real programs — the Zephyr compiler itself
 ([compiler/zc.zeph](../compiler/zc.zeph)) is written with them.

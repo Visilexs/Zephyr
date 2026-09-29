@@ -1,0 +1,169 @@
+// Off-heap synchronization for Windows and Linux x86-64.
+// Only ints cross threads: reference counts are not atomic. Use bits/frombits
+// for floats. Pass address fields, then construct a local wrapper in each worker;
+// never share the heap-allocated wrapper itself. Storage lasts until process exit.
+
+struct Mutex { address: int }
+struct Atomic { address: int }
+struct Channel { address: int }
+struct WaitGroup { address: int }
+
+// Allocate zeroed native storage, stopping on allocation failure.
+fn sync_alloc(byteCount: int) -> int {
+    let memoryAddress = win("VirtualAlloc", 0, byteCount, 12288, 4)
+    assert(memoryAddress != 0, "sync: allocation failed")
+    return memoryAddress
+}
+
+// Create a recursive mutex.
+fn mutex_new() -> Mutex {
+    let memoryAddress = sync_alloc(40)
+    let initialized = win("InitializeCriticalSection", memoryAddress)
+    return Mutex{address: memoryAddress}
+}
+
+impl Mutex {
+    // Block until this thread owns the mutex.
+    fn lock(self) { let acquired = win("EnterCriticalSection", self.address) }
+    // Release one level of ownership.
+    fn unlock(self) { let released = win("LeaveCriticalSection", self.address) }
+    // Acquire without waiting, returning whether ownership was obtained.
+    fn try_lock(self) -> bool { return win("TryEnterCriticalSection", self.address) != 0 }
+}
+
+// Create an aligned atomic cell and its native operations in one executable page.
+fn atomic_new(initial: int) -> Atomic {
+    let memoryAddress = win("VirtualAlloc", 0, 4096, 12288, 64)
+    assert(memoryAddress != 0, "atomic: allocation failed")
+    store64(memoryAddress, initial)
+    // add: mov rax,rdx; lock xadd [rcx],rax; add rax,rdx; ret
+    let addCode = [72,137,208,240,72,15,193,1,72,1,208,195]
+    // swap: mov rax,rdx; xchg [rcx],rax; ret
+    let swapCode = [72,137,208,72,135,1,195]
+    // CAS: mov rax,rdx; lock cmpxchg [rcx],r8; sete al; movzx eax,al; ret
+    let compareCode = [72,137,208,240,76,15,177,1,15,148,192,15,182,192,195]
+    for i in 0..addCode.len() { store8(memoryAddress + 16 + i, addCode[i]) }
+    for i in 0..swapCode.len() { store8(memoryAddress + 32 + i, swapCode[i]) }
+    for i in 0..compareCode.len() { store8(memoryAddress + 48 + i, compareCode[i]) }
+    return Atomic{address: memoryAddress}
+}
+
+impl Atomic {
+    // Read the aligned cell atomically (x86 acquire ordering).
+    fn load(self) -> int { return load64(self.address) }
+    // Write the aligned cell atomically (x86 release ordering).
+    fn store(self, value: int) { store64(self.address, value) }
+    // Add delta atomically and return the new value, wrapping on overflow.
+    fn add(self, delta: int) -> int { return callptr(self.address + 16, self.address, delta) }
+    // Replace the value atomically and return the old value.
+    fn swap(self, value: int) -> int { return callptr(self.address + 32, self.address, value) }
+    // Replace expected with replacement atomically, returning success.
+    fn compare_exchange(self, expected: int, replacement: int) -> bool {
+        return callptr(self.address + 48, self.address, expected, replacement) != 0
+    }
+}
+
+// Create a bounded FIFO; capacity must be positive and fit its allocation.
+fn channel_new(capacity: int) -> Channel {
+    assert(capacity > 0 and capacity <= (9223372036854775807 - 96) / 8, "channel: invalid capacity")
+    let memoryAddress = sync_alloc(96 + capacity * 8)
+    let initialized = win("InitializeCriticalSection", memoryAddress)
+    let readersReady = win("InitializeConditionVariable", memoryAddress + 40)
+    let writersReady = win("InitializeConditionVariable", memoryAddress + 48)
+    // 56 capacity, 64 head, 72 count, 80 closed; ring at 96.
+    store64(memoryAddress + 56, capacity)
+    return Channel{address: memoryAddress}
+}
+
+impl Channel {
+    // Send one value, waiting for space; sending after close panics.
+    fn send(self, value: int) {
+        let memoryAddress = self.address
+        let acquired = win("EnterCriticalSection", memoryAddress)
+        while load64(memoryAddress + 72) == load64(memoryAddress + 56) and load64(memoryAddress + 80) == 0 {
+            let waited = win("SleepConditionVariableCS", memoryAddress + 48, memoryAddress, 4294967295)
+        }
+        if load64(memoryAddress + 80) != 0 {
+            let released = win("LeaveCriticalSection", memoryAddress)
+            panic("channel: send after close")
+        }
+        let tailIndex = (load64(memoryAddress + 64) + load64(memoryAddress + 72)) % load64(memoryAddress + 56)
+        store64(memoryAddress + 96 + tailIndex * 8, value)
+        store64(memoryAddress + 72, load64(memoryAddress + 72) + 1)
+        let awakened = win("WakeConditionVariable", memoryAddress + 40)
+        let released = win("LeaveCriticalSection", memoryAddress)
+    }
+    // Wait for a value, returning none once closed and drained.
+    fn receive(self) -> int? { return sync_receive(self.address, true) }
+    // Return an available value, or none immediately if empty or contended.
+    fn try_receive(self) -> int? { return sync_receive(self.address, false) }
+    // Close idempotently and wake all blocked senders and receivers.
+    fn close(self) {
+        let acquired = win("EnterCriticalSection", self.address)
+        store64(self.address + 80, 1)
+        let readersAwakened = win("WakeAllConditionVariable", self.address + 40)
+        let writersAwakened = win("WakeAllConditionVariable", self.address + 48)
+        let released = win("LeaveCriticalSection", self.address)
+    }
+    // Return a snapshot of the number of queued values.
+    fn len(self) -> int {
+        let acquired = win("EnterCriticalSection", self.address)
+        let messageCount = load64(self.address + 72)
+        let released = win("LeaveCriticalSection", self.address)
+        return messageCount
+    }
+}
+
+// Remove the oldest value under the channel lock, optionally waiting.
+fn sync_receive(memoryAddress: int, shouldWait: bool) -> int? {
+    if shouldWait {
+        let acquired = win("EnterCriticalSection", memoryAddress)
+    } else {
+        if win("TryEnterCriticalSection", memoryAddress) == 0 { return none }
+    }
+    while shouldWait and load64(memoryAddress + 72) == 0 and load64(memoryAddress + 80) == 0 {
+        let waited = win("SleepConditionVariableCS", memoryAddress + 40, memoryAddress, 4294967295)
+    }
+    if load64(memoryAddress + 72) == 0 {
+        let released = win("LeaveCriticalSection", memoryAddress)
+        return none
+    }
+    let headIndex = load64(memoryAddress + 64)
+    let value = load64(memoryAddress + 96 + headIndex * 8)
+    store64(memoryAddress + 64, (headIndex + 1) % load64(memoryAddress + 56))
+    store64(memoryAddress + 72, load64(memoryAddress + 72) - 1)
+    let awakened = win("WakeConditionVariable", memoryAddress + 48)
+    let released = win("LeaveCriticalSection", memoryAddress)
+    return value
+}
+
+// Create a zero-count group; add work before launching workers or waiting.
+fn wait_group_new() -> WaitGroup {
+    let memoryAddress = sync_alloc(56)
+    let initialized = win("InitializeCriticalSection", memoryAddress)
+    let ready = win("InitializeConditionVariable", memoryAddress + 40)
+    return WaitGroup{address: memoryAddress}
+}
+
+impl WaitGroup {
+    // Adjust outstanding work, rejecting underflow and overflow.
+    fn add(self, amount: int) {
+        let acquired = win("EnterCriticalSection", self.address)
+        let previousCount = load64(self.address + 48)
+        assert(amount >= 0 - previousCount and amount <= 9223372036854775807 - previousCount, "wait_group: invalid count")
+        let nextCount = previousCount + amount
+        store64(self.address + 48, nextCount)
+        if nextCount == 0 { let awakened = win("WakeAllConditionVariable", self.address + 40) }
+        let released = win("LeaveCriticalSection", self.address)
+    }
+    // Mark one unit of work complete.
+    fn done(self) { self.add(-1) }
+    // Block until all outstanding work completes.
+    fn wait(self) {
+        let acquired = win("EnterCriticalSection", self.address)
+        while load64(self.address + 48) != 0 {
+            let waited = win("SleepConditionVariableCS", self.address + 40, self.address, 4294967295)
+        }
+        let released = win("LeaveCriticalSection", self.address)
+    }
+}
