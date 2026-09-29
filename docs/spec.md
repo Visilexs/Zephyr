@@ -83,15 +83,17 @@ externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
 fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
              "(" [ param { "," param } ] ")" [ "->" type ] block ;
 param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
-structdecl = "struct" ID "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
+structdecl = "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
+             "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
 enumdecl   = "enum" ID "{" ID { "," ID } "}" ;
-impldecl   = "impl" ID "{" { fndecl } "}" ;                   (* methods on a struct or enum *)
+impldecl   = "impl" ID [ "[" ID { "," ID } "]" ] "{" { fndecl } "}" ; (* methods on a struct or enum *)
 ifacedecl  = "interface" ID "{" { fnsig } "}" ;               (* method signatures *)
 fnsig      = "fn" ID "(" [ param { "," param } ] ")" [ "->" type ] ;
 import     = "import" STRING ;
 
 type       = basetype [ "?" ] ;                              (* T? optional *)
-basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
+basetype   = "int" | "i32" | "float" | "bool" | "str"
+           | ID [ "[" type { "," type } "]" ]                (* Box[int]: generic struct *)
            | "[" type "]"                                    (* list *)
            | "[" type ":" type "]"                           (* map *)
            | "fn" "(" [ type { "," type } ] ")" [ "->" type ]  (* function value *)
@@ -340,6 +342,35 @@ A generic function has no single type, so it cannot be used as a function value.
 `sort_by`. They were compiler builtins before generics existed. `import` it:
 
     import "std/list.zeph"
+
+### 3.0.5.1 Generic structs
+
+    struct Pair[A, B] { first: A, second: B }
+    struct Stack[T] { items: [T] = [] }
+
+    impl Stack[T] {
+        fn push(self, item: T) { self.items.push(item) }
+        fn map_all[U](self, f: fn(T) -> U) -> Stack[U] { ... }
+        fn new() -> Stack[T] { return Stack{} }
+    }
+
+    let p = Pair{first: 1, second: "one"}      // Pair[int, str], inferred
+    var s: Stack[int] = Stack{}                // the annotation supplies T
+    let t: Stack[str] = Stack.new()            // so does an expected result
+
+A struct may take type parameters. `Name[T, ...]` names one instance of it;
+each distinct set of type arguments is its own struct type, checked and
+compiled separately, like a generic function (§3.0.5). A literal `Pair{...}`
+infers the arguments from its field values, or takes them from the type the
+context expects; empty `[]`, `[:]` and `none` values infer nothing. A generic
+struct named without its type arguments is an error.
+
+`impl Stack[T] { ... }` gives every instance the methods, which are generic
+over the impl's parameters (and may add their own). A generic function's type
+parameters are inferred from its arguments and, failing that, from the type
+its result is expected to have. Instances print under the template's name
+(`Pair{first: 1, second: "one"}`) and compare and hash structurally (§3.3).
+Instances do not yet satisfy interfaces.
 
 ### 3.0.6 Methods and interfaces
 

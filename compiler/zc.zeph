@@ -118,7 +118,7 @@ let N_BIN = 28
 let N_CAST = 29
 let N_INDEX = 30
 let N_MEMBER = 31
-let N_CALL = 32
+let N_CALL = 32      // ival: before checking, 1 + the type the context expects (0 = none)
 let N_TYNAME = 33
 let N_TYLIST = 34
 let N_ENUMDEF = 35
@@ -269,7 +269,10 @@ struct Node {
     file: str    // source file this node was parsed from (for -g debug info)
 }
 struct VarInfo { name: str, ty: int, mut: bool, kind: int, idx: int, isConst: bool }
-struct SDef { name: str, fnames: [str], ftypes: [int], line: int, defaults: [Node] }
+// A generic struct (tparams set) is a template: its ftypes are placeholders, and
+// each use with type arguments makes an instance named "Box[int]" (template, typeArgs).
+struct SDef { name: str, fnames: [str], ftypes: [int], line: int, defaults: [Node],
+              tparams: [str], node: Node, template: int, typeArgs: [int] }
 struct EDef { name: str, members: [str], line: int }
 // an interface: method names + their signatures (K_FN types, self excluded)
 struct IDef { name: str, mnames: [str], msigs: [int], line: int }
@@ -1038,6 +1041,15 @@ fn p_type_base() -> Node {
     let id = expect(T_IDENT, "a type")
     var n = nnode(N_TYNAME, id.line)
     n.name = id.s
+    if at(T_LS) {                        // Box[int]: type arguments of a generic struct
+        let ls = pnext()
+        n.kids.push(p_type())
+        while at(T_COMMA) {
+            let c = pnext()
+            n.kids.push(p_type())
+        }
+        let rs = expect(T_RS, "']'")
+    }
     return n
 }
 
@@ -1061,11 +1073,9 @@ fn p_header_expr() -> Node {
     return e
 }
 
-fn p_fn() -> Node {
-    let start = pnext()
-    var n = nnode(N_FN, start.line)
-    n.name = expect(T_IDENT, "function name").s
-    var tparams = nnode(N_PROG, start.line)      // fn name[T, U](...) -- type parameters
+// [T, U] after a fn, struct or impl name: the type parameters (an empty N_PROG if none)
+fn p_type_params() -> Node {
+    var tparams = nnode(N_PROG, peek().line)
     if at(T_LS) {
         let ls = pnext()
         var more = true
@@ -1079,6 +1089,14 @@ fn p_fn() -> Node {
         }
         let rs = expect(T_RS, "']'")
     }
+    return tparams
+}
+
+fn p_fn() -> Node {
+    let start = pnext()
+    var n = nnode(N_FN, start.line)
+    n.name = expect(T_IDENT, "function name").s
+    let tparams = p_type_params()                // fn name[T, U](...) -- type parameters
     let a = expect(T_LP, "'('")
     var params = nnode(N_PROG, start.line)
     if not at(T_RP) {
@@ -1128,6 +1146,7 @@ fn p_impl() -> Node {
     let start = pnext()
     var n = nnode(N_IMPL, start.line)
     n.name = expect(T_IDENT, "type name").s
+    let typeParams = p_type_params()              // impl Stack[T] { ... }
     let a = expect(T_LB, "'\{'")
     skip_nl()
     while not at(T_RB) {
@@ -1136,6 +1155,7 @@ fn p_impl() -> Node {
         skip_nl()
     }
     let d = expect(T_RB, "'\}'")
+    if typeParams.kids.len() > 0 { n.kids.push(typeParams) }   // last kid: an N_PROG
     return n
 }
 
@@ -1275,6 +1295,7 @@ fn p_structdef() -> Node {
     let start = pnext()
     var n = nnode(N_STRUCTDEF, start.line)
     n.name = expect(T_IDENT, "struct name").s
+    let typeParams = p_type_params()              // struct Pair[A, B] { ... }
     let a = expect(T_LB, "'\{'")
     skip_nl()
     while not at(T_RB) {
@@ -1292,6 +1313,7 @@ fn p_structdef() -> Node {
         skip_nl()
     }
     let d = expect(T_RB, "'\}'")
+    for t in typeParams.kids { n.kids.push(t) }   // type params follow the fields, as N_TYNAMEs
     return n
 }
 
@@ -2138,9 +2160,134 @@ fn tuple_type(elementTypes: [int]) -> int {
         fieldTypes.push(elementTypes[i])
         defaults.push(nnode(N_NONE, 0))
     }
-    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: 0, defaults: defaults})
+    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: 0, defaults: defaults,
+                        tparams: no_names(), node: nnode(N_NONE, 0), template: -1, typeArgs: emptyIntList()})
     g_struct_names[name] = g_structs.len() - 1
     return struct_of(g_structs.len() - 1)
+}
+
+fn no_names() -> [str] {
+    var names: [str] = []
+    return names
+}
+
+// Box[int] from the template Box: resolve its field types with the type parameters
+// bound. Registered before the fields resolve, so Node[T] { next: Node[T]? } terminates.
+fn instantiate_struct(templateIndex: int, typeArgs: [int]) -> int {
+    let template = g_structs[templateIndex]
+    var name = template.name + "["
+    for i in 0..typeArgs.len() {
+        if i > 0 { name = name + ", " }
+        name = name + type_str(typeArgs[i])
+    }
+    name = name + "]"
+    let existing = find_struct(name)
+    if existing >= 0 { return struct_of(existing) }
+    var fieldNames: [str] = []
+    var fieldTypes: [int] = []
+    var defaults: [Node] = []
+    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: template.line, defaults: defaults,
+                        tparams: no_names(), node: template.node, template: templateIndex, typeArgs: typeArgs})
+    let index = g_structs.len() - 1
+    g_struct_names[name] = index
+    for i in 0..template.tparams.len() {
+        g_tbind_names.push(template.tparams[i])
+        g_tbind_types.push(typeArgs[i])
+    }
+    for f in template.node.kids {
+        if f.k != N_FIELDDEF { continue }
+        fieldNames.push(f.name)
+        fieldTypes.push(resolve_type(f.kids[0]))
+        if f.kids.len() > 1 { defaults.push(f.kids[1]) }
+        else { defaults.push(nnode(N_NONE, f.line)) }
+    }
+    for i in 0..template.tparams.len() {
+        let boundName = g_tbind_names.pop()
+        let boundType = g_tbind_types.pop()
+    }
+    return struct_of(index)
+}
+
+// the declared type (AST) of a template's field
+fn field_type_node(template: SDef, fieldIndex: int) -> Node {
+    var seen = 0
+    for f in template.node.kids {
+        if f.k == N_FIELDDEF {
+            if seen == fieldIndex { return f.kids[0] }
+            seen += 1
+        }
+    }
+    return nnode(N_NONE, 0)
+}
+
+// the name impl methods are filed under, and print shows: the template's for an instance
+fn struct_base_name(sd: SDef) -> str {
+    if sd.template >= 0 { return g_structs[sd.template].name }
+    return sd.name
+}
+
+fn method_scope(t: int) -> str {
+    if ty_kind[t] == K_STRUCT { return struct_base_name(g_structs[ty_sd[t]]) }
+    return type_str(t)
+}
+
+// Box{value: 1} of a generic struct: infer the type arguments from the field values,
+// then check the literal as that instance. Each value is checked once, into a hidden
+// local, so the instance literal only reads names.
+fn check_generic_slit(e: Node, templateIndex: int) -> int {
+    let template = g_structs[templateIndex]
+    var names: [str] = []
+    var types: [int] = []
+    var holders: [Node] = []
+    for f in e.kids {
+        var fieldIndex = -1
+        for j in 0..template.fnames.len() {
+            if template.fnames[j] == f.name { fieldIndex = j }
+        }
+        if fieldIndex < 0 { die(f.line, "struct '{template.name}' has no field '{f.name}'") }
+        let value = f.kids[0]
+        let emptyLiteral = (value.k == N_LIST or value.k == N_MAPLIT) and value.kids.len() == 0
+        if not emptyLiteral and value.k != N_NONELIT {
+            let valueType = ce(value)
+            if not unify_tp(field_type_node(template, fieldIndex), valueType, template.tparams, names, types) {
+                die(f.line, "field '{f.name}' of '{template.name}' cannot hold {type_str(valueType)}")
+            }
+            g_lower_count += 1
+            var holder = nnode(N_DECL, f.line)
+            holder.name = "__z{g_lower_count}_field"
+            holder.op = DECL_PRECHECKED
+            holder.kids.push(value)
+            holder.kids.push(nnode(N_NONE, f.line))
+            holders.push(holder)
+            f.kids[0] = name_node(holder.name, f.line)
+        }
+    }
+    var typeArgs: [int] = []
+    for parameter in template.tparams {
+        var found = -1
+        for j in 0..names.len() {
+            if names[j] == parameter { found = j }
+        }
+        if found < 0 {
+            die(e.line, "cannot infer '{parameter}' of '{template.name}' from these fields; annotate, e.g. let x: {template.name}[int] = ...")
+        }
+        typeArgs.push(types[found])
+    }
+    let instance = instantiate_struct(templateIndex, typeArgs)
+    var literal = nnode(N_SLIT, e.line)
+    literal.name = g_structs[ty_sd[instance]].name
+    literal.kids = e.kids
+    var lowered = literal
+    var i = holders.len() - 1
+    while i >= 0 {
+        var wrap = nnode(N_LETEXPR, e.line)
+        wrap.kids.push(holders[i])
+        wrap.kids.push(lowered)
+        lowered = wrap
+        i -= 1
+    }
+    node_become(e, lowered)
+    return ce_inner(e)
 }
 
 fn is_tuple(t: int) -> bool {
@@ -2310,6 +2457,7 @@ fn resolve_type(te: Node) -> int {
         return map_of(kt, resolve_type(te.kids[1]))
     }
     let n = te.name
+    if te.kids.len() > 0 and find_struct(n) < 0 { die(te.line, "'{n}' takes no type arguments") }
     if n == "int" { return TI_INT }
     if n == "float" { return TI_FLOAT }
     if n == "bool" { return TI_BOOL }
@@ -2333,6 +2481,16 @@ fn resolve_type(te: Node) -> int {
     if ifc >= 0 { return iface_of(ifc) }
     let sd = find_struct(n)
     if sd < 0 { die(te.line, "unknown type '{n}'") }
+    let expectedCount = g_structs[sd].tparams.len()
+    if te.kids.len() != expectedCount {
+        if expectedCount == 0 { die(te.line, "'{n}' takes no type arguments") }
+        die(te.line, "'{n}' needs {expectedCount} type argument(s), e.g. {n}[int]")
+    }
+    if expectedCount > 0 {
+        var typeArgs: [int] = []
+        for kid in te.kids { typeArgs.push(resolve_type(kid)) }
+        return instantiate_struct(sd, typeArgs)
+    }
     return struct_of(sd)
 }
 
@@ -2523,6 +2681,7 @@ fn check_method(e: Node) -> int {
         if fi < 0 { die(e.line, "'{recv.name}' has no associated function '{c.name}'") }
         let f = g_fns[fi]
         fill_defaults(e, f.node, e.kids.len() - 1)
+        if f.tparams.len() > 0 { return check_generic_call(e, fi, nnode(N_NONE, e.line)) }   // Stack.new()
         let nargs = e.kids.len() - 1
         if nargs != f.ptypes.len() { die(e.line, "'{mname}' expects {f.ptypes.len()} argument(s), got {nargs}") }
         for i in 0..nargs {
@@ -2565,11 +2724,16 @@ fn check_method(e: Node) -> int {
     // A method defined in an `impl` block shadows any builtin method name (len,
     // push, contains, ...) for that struct or enum type.
     if ty_kind[ot] == K_STRUCT or ty_kind[ot] == K_ENUM {
-        let mi = find_fn(type_str(ot) + "." + c.name)
+        let mi = find_fn(method_scope(ot) + "." + c.name)
         if mi >= 0 {
             let f = g_fns[mi]
             fill_defaults(e, f.node, nargs + 1)
             nargs = e.kids.len() - 1
+            if f.tparams.len() > 0 {                 // a method of a generic struct
+                let result = check_generic_call(e, mi, c.kids[0])
+                e.op = 1
+                return result
+            }
             if nargs + 1 != f.ptypes.len() {
                 die(e.line, "'{f.name}' expects {f.ptypes.len()} argument(s), got {nargs + 1}")
             }
@@ -2773,7 +2937,7 @@ fn check_method(e: Node) -> int {
     // Method lookup: a type-scoped method (`Struct.f` from an impl block) wins;
     // otherwise fall back to plain UFCS -- obj.f(a) == f(obj, a).
     var fi = 0 - 1
-    if ty_kind[ot] == K_STRUCT or ty_kind[ot] == K_ENUM { fi = find_fn(type_str(ot) + "." + c.name) }
+    if ty_kind[ot] == K_STRUCT or ty_kind[ot] == K_ENUM { fi = find_fn(method_scope(ot) + "." + c.name) }
     if fi < 0 { fi = find_fn(c.name) }
     if fi < 0 { die(e.line, "unknown method or function '{c.name}'") }
     let f = g_fns[fi]
@@ -2917,6 +3081,16 @@ fn clone_node(n: Node) -> Node {
 // Unify a declared type AST against a concrete type, recording type-parameter
 // bindings into names/types. Returns false if the shapes don't match.
 fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> bool {
+    if te.k == N_TYNAME and te.kids.len() > 0 {    // Box[T] against an instance of Box
+        if ty_kind[got] != K_STRUCT { return false }
+        let instance = g_structs[ty_sd[got]]
+        if instance.template < 0 or g_structs[instance.template].name != te.name { return false }
+        if instance.typeArgs.len() != te.kids.len() { return false }
+        for i in 0..te.kids.len() {
+            if not unify_tp(te.kids[i], instance.typeArgs[i], tparams, names, types) { return false }
+        }
+        return true
+    }
     if te.k == N_TYNAME {
         for i in 0..tparams.len() {
             if tparams[i] == te.name {
@@ -2928,7 +3102,7 @@ fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> b
                 return true
             }
         }
-        return type_eq(resolve_type(te), got)          // a concrete name
+        return fits(resolve_type(te), got)             // a concrete name (int widens to float)
     }
     if te.k == N_TYLIST {
         if ty_kind[got] != K_LIST { return false }
@@ -2940,7 +3114,8 @@ fn unify_tp(te: Node, got: int, tparams: [str], names: [str], types: [int]) -> b
         return unify_tp(te.kids[1], ty_el[got], tparams, names, types)
     }
     if te.k == N_TYOPT {
-        if ty_kind[got] != K_OPT { return false }
+        if ty_kind[got] == K_NONE { return true }          // none fits any optional; binds nothing
+        if ty_kind[got] != K_OPT { return unify_tp(te.kids[0], got, tparams, names, types) }   // T fits T?
         return unify_tp(te.kids[0], ty_el[got], tparams, names, types)
     }
     if te.k == N_TYFN {
@@ -3023,10 +3198,19 @@ fn check_generic_call(e: Node, fi: int, recv: Node) -> int {
             die(e.line, "'{f.name}': argument {i + 1} is {type_str(argt)}, which does not match the declared type")
         }
     }
-    if names.len() != f.tparams.len() {
-        die(e.line, "cannot infer every type parameter of '{f.name}' from the arguments")
+    if names.len() != f.tparams.len() and e.ival > 0 and f.node.kids[1].k != N_NONE {
+        let unified = unify_tp(f.node.kids[1], e.ival - 1, f.tparams, names, types)   // from the expected result
     }
-    let ii = instantiate(fi, names, types)
+    if names.len() != f.tparams.len() {
+        die(e.line, "cannot infer every type parameter of '{f.name}' from the arguments; annotate the result, e.g. let x: T = ...")
+    }
+    var orderedTypes: [int] = []                 // declaration order, so one instance per binding
+    for parameter in f.tparams {
+        for j in 0..names.len() {
+            if names[j] == parameter { orderedTypes.push(types[j]) }
+        }
+    }
+    let ii = instantiate(fi, f.tparams, orderedTypes)
     let g = g_fns[ii]
     if recv.k != N_NONE {
         e.kids[0].kids[0] = coerce(recv, g.ptypes[0], "argument 1")
@@ -3452,6 +3636,7 @@ fn ce_inner(e: Node) -> int {
     if e.k == N_SLIT {
         let si = find_struct(e.name)
         if si < 0 { die(e.line, "unknown struct '{e.name}'") }
+        if g_structs[si].tparams.len() > 0 { return check_generic_slit(e, si) }
         let sd = g_structs[si]
         var seen: [bool] = []
         for i in 0..sd.fnames.len() { seen.push(false) }
@@ -3590,6 +3775,11 @@ fn ce(e: Node) -> int {
 // of a list literal each coerce to the expected element type, which is what lets
 // a `[Shape]` argument hold a mix of implementing structs.
 fn ce_expect(e: Node, want: int) -> int {
+    if e.k == N_SLIT and ty_kind[want] == K_STRUCT {        // Box{...} where a Box[int] is expected
+        let wanted = g_structs[ty_sd[want]]
+        if wanted.template >= 0 and g_structs[wanted.template].name == e.name { e.name = wanted.name }
+    }
+    if e.k == N_CALL { e.ival = want + 1 }                   // lets a generic call infer from it
     if e.k == N_TUPLE and is_tuple(want) and g_structs[ty_sd[want]].fnames.len() == e.kids.len() {
         return check_tuple(e, g_structs[ty_sd[want]].ftypes)
     }
@@ -4401,12 +4591,20 @@ fn desugar_oop(prog: Node) {
     var out: [Node] = []
     for n in prog.kids {
         if n.k == N_IMPL {
+            var implParams: [Node] = []
+            if n.kids.len() > 0 and n.kids[n.kids.len() - 1].k == N_PROG { implParams = n.kids[n.kids.len() - 1].kids }
             for m in n.kids {
+                if m.k != N_FN { continue }
                 m.name = n.name + "." + m.name       // "Point.dist"
                 let params = m.kids[0]
                 if params.kids.len() > 0 and params.kids[0].name == "self" {
                     params.kids[0].kids[0].name = n.name   // self: Point
+                    for t in implParams { params.kids[0].kids[0].kids.push(clone_node(t)) }   // self: Stack[T]
                 }
+                var methodParams: [Node] = []        // the impl's type params come first
+                for t in implParams { methodParams.push(clone_node(t)) }
+                for t in m.kids[3].kids { methodParams.push(t) }
+                m.kids[3].kids = methodParams
                 out.push(m)
             }
         } else {
@@ -4504,7 +4702,12 @@ fn check(prog: Node) {
             var fnames: [str] = []
             var ftypes: [int] = []
             var defaults: [Node] = []
-            g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line, defaults: defaults})
+            var tparams: [str] = []
+            for t in n.kids {
+                if t.k == N_TYNAME { tparams.push(t.name) }
+            }
+            g_structs.push(SDef{name: n.name, fnames: fnames, ftypes: ftypes, line: n.line, defaults: defaults,
+                                tparams: tparams, node: n, template: -1, typeArgs: emptyIntList()})
             if not g_struct_names.has(n.name) { g_struct_names[n.name] = g_structs.len() - 1 }
             n.refi = g_structs.len() - 1
         }
@@ -4544,13 +4747,15 @@ fn check(prog: Node) {
         if n.k == N_STRUCTDEF {
             let sd = g_structs[n.refi]
             for f in n.kids {
+                if f.k != N_FIELDDEF { continue }
                 for k in 0..sd.fnames.len() {
                     if sd.fnames[k] == f.name {
                         die(f.line, "duplicate field '{f.name}' in struct '{sd.name}'")
                     }
                 }
                 sd.fnames.push(f.name)
-                sd.ftypes.push(resolve_type(f.kids[0]))
+                if sd.tparams.len() > 0 { sd.ftypes.push(TI_VOID) }       // a template: resolved per instance
+                else { sd.ftypes.push(resolve_type(f.kids[0])) }
                 if f.kids.len() > 1 { sd.defaults.push(f.kids[1]) }       // field: T = default
                 else { sd.defaults.push(nnode(N_NONE, f.line)) }
             }
@@ -9435,7 +9640,7 @@ fn gen_program(prog: Node) {
         } else if k == K_STRUCT {
             let sd = g_structs[ty_sd[t]]
             o(".quad 5")
-            o(".quad __c{add_cstr(sd.name)}")
+            o(".quad __c{add_cstr(struct_base_name(sd))}")
             o(".quad {sd.fnames.len()}")
             for j in 0..sd.fnames.len() {
                 o(".quad __c{add_cstr(sd.fnames[j])}")
@@ -16759,7 +16964,7 @@ fn wlayout() {
         } else if k == K_STRUCT {
             let sd = g_structs[ty_sd[t]]
             wd64(5)
-            wpatch(1, add_cstr(sd.name))
+            wpatch(1, add_cstr(struct_base_name(sd)))
             wd64(sd.fnames.len())
             for j in 0..sd.fnames.len() {
                 wpatch(1, add_cstr(sd.fnames[j]))

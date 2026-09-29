@@ -345,6 +345,10 @@ $errors = @{
     "tuple-bad-index"      = "let t = (1, 2)`nprint(t.2)"
     "tuple-type-one"       = "let t: (int) = 1"
     "tuple-none-element"   = "let t = (1, none)"
+    "generic-struct-bare"  = "struct B[T] { v: T }`nfn f(b: B) -> int { return 1 }"
+    "generic-struct-infer" = "struct B[T] { items: [T] }`nlet b = B{items: []}"
+    "type-args-on-plain"   = "struct P { x: int }`nlet p: P[int] = P{x: 1}"
+    "generic-field-clash"  = "struct B[T] { a: T`n b: T }`nlet x = B{a: 1, b: `"s`"}"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -1276,6 +1280,65 @@ print(f(4))
 '@
 $exp = @("(3, 2)", "3 2", "8", "2 10", "a", "((1, `"a`"), 2.5)", "(1, 2)", "p", "true", "true", "6", "origin other", "(8, `"d`")") -join [Environment]::NewLine
 Check "lang-tuples" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: generic structs ----
+$r = RunSrc "lang_generic_structs" @'
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+struct Stack[T] {
+    items: [T] = []
+}
+impl Stack[T] {
+    fn push(self, item: T) { self.items.push(item) }
+    fn pop(self) -> T? {
+        if self.items.len() == 0 { return none }
+        return self.items.pop()
+    }
+    fn size(self) -> int { return self.items.len() }
+    fn peek_or(self, fallback: T) -> T {
+        if self.items.len() == 0 { return fallback }
+        return self.items[self.items.len() - 1]
+    }
+    fn map_all[U](self, f: fn(T) -> U) -> Stack[U] {
+        var out: Stack[U] = Stack{}
+        for item in self.items { out.push(f(item)) }
+        return out
+    }
+    fn new() -> Stack[T] { return Stack{} }
+}
+let p = Pair{first: 1, second: "one"}
+print(p)
+print("{p.first} {p.second}")
+let q: Pair[float, [int]] = Pair{first: 2, second: []}
+print(q)
+var s: Stack[int] = Stack{}
+s.push(3)
+s.push(4)
+print("{s.size()} {s.peek_or(0)}")
+print(s.pop())
+let words = s.map_all(fn(n: int) -> str { return "n{n}" })
+print(words)
+let fresh: Stack[str] = Stack.new()
+print(fresh.size())
+fn swap[A, B](pair: Pair[A, B]) -> Pair[B, A] {
+    return Pair{first: pair.second, second: pair.first}
+}
+print(swap(p))
+struct Node[T] {
+    value: T
+    next: Node[T]?
+}
+let chain = Node{value: 1, next: Node{value: 2, next: none}}
+print(chain.next.get().value)
+print(p == Pair{first: 1, second: "one"})
+var byPair: [Pair[int, int]: str] = [:]
+byPair[Pair{first: 1, second: 2}] = "x"
+print(byPair[Pair{first: 1, second: 2}])
+'@
+$exp = @("Pair{first: 1, second: `"one`"}", "1 one", "Pair{first: 2, second: []}", "2 4", "4", "Stack{items: [`"n3`"]}", "0", "Pair{first: `"one`", second: 1}", "2", "true", "x") -join [Environment]::NewLine
+Check "lang-generic-structs" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

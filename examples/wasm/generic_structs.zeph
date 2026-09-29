@@ -1,0 +1,43 @@
+// generic structs: inference from fields and annotations, impl Stack[T], generic methods
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+struct Stack[T] {
+    items: [T] = []
+}
+impl Stack[T] {
+    fn push(self, item: T) { self.items.push(item) }
+    fn size(self) -> int { return self.items.len() }
+    fn peek_or(self, fallback: T) -> T {
+        if self.items.len() == 0 { return fallback }
+        return self.items[self.items.len() - 1]
+    }
+    fn map_all[U](self, f: fn(T) -> U) -> Stack[U] {
+        var out: Stack[U] = Stack{}
+        for item in self.items { out.push(f(item)) }
+        return out
+    }
+    fn new() -> Stack[T] { return Stack{} }
+}
+let p = Pair{first: 1, second: "one"}
+print(p)
+print("{p.first} {p.second}")
+let q: Pair[float, [int]] = Pair{first: 2, second: []}
+print(q)
+var s: Stack[int] = Stack{}
+s.push(3)
+s.push(4)
+print("{s.size()} {s.peek_or(0)}")
+let words = s.map_all(fn(n: int) -> str { return "n{n}" })
+print(words)
+let fresh: Stack[str] = Stack.new()
+print(fresh.size())
+fn swap[A, B](pair: Pair[A, B]) -> Pair[B, A] {
+    return Pair{first: pair.second, second: pair.first}
+}
+print(swap(p))
+print(p == Pair{first: 1, second: "one"})
+var byPair: [Pair[int, int]: str] = [:]
+byPair[Pair{first: 1, second: 2}] = "x"
+print(byPair[Pair{first: 1, second: 2}])
