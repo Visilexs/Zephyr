@@ -16578,6 +16578,116 @@ fn writePe(path: str) {
     writeFile(path, peOutput)
 }
 
+// ---------------- in-memory loader (zc run) ----------------
+//
+// The same image writePe lays out, placed in this process instead of a file:
+// .text, then .rdata (the import address table first, then the program's data),
+// then .bss, at the same relative offsets. Fixups resolve against wherever
+// VirtualAlloc put the block, the import table is filled by GetProcAddress, and
+// the entry stub (call zephyrMain; ExitProcess) runs on this thread. The guest
+// has its own copy of the runtime, so its heap and globals are separate from the
+// compiler's. It sees its own command line: GetCommandLineA is answered by a
+// stub returning the line zc run was given, not zc's.
+fn copyBytesToMemory(buffer: [int], byteCount: int, destinationAddress: int) {
+    let sourceAddress = load64(addr(buffer) + 16)
+    var index = 0
+    while index + 8 <= byteCount {
+        store64(destinationAddress + index, load64(sourceAddress + index))
+        index += 8
+    }
+    while index < byteCount {
+        store8(destinationAddress + index, load8(sourceAddress + index))
+        index += 1
+    }
+}
+
+fn nulTerminatedCopy(text: str) -> int {
+    let address = win("VirtualAlloc", 0, text.len() + 1, 12288, 4)
+    for i in 0..text.len() { store8(address + i, text.byte(i)) }
+    store8(address + text.len(), 0)
+    return address
+}
+
+fn runInMemory(guestCommandLine: str) {
+    if not symbolIsLocal("runtimeAllocateObject") { panic("zc run: the program must link the Zephyr runtime") }
+    // entry stub, as writePe emits it in runtime mode
+    let entryOffset = textSectionLength
+    currentAssemblySection = sectionText
+    writeTextByte(72)                                   // sub rsp, 40
+    writeTextByte(131)
+    writeTextByte(236)
+    writeTextByte(40)
+    writeTextByte(232)                                  // call zephyrMain
+    addFix(fixupRelative32, internAssemblySymbol("zephyrMain"), 0)
+    writeText32Bits(0)
+    writeTextByte(49)                                   // xor ecx, ecx
+    writeTextByte(201)
+    writeTextByte(255)                                  // call [rip+ExitProcess]
+    writeTextByte(21)
+    addFix(fixupImportAddress32, internLibraryImport("ExitProcess", 1), 0)
+    writeText32Bits(0)
+    writeTextByte(204)
+
+    let importCount = assemblyImports.len()
+    let importTableSize = peAlign(8 * importCount + 16, 16)   // + a 16-byte GetCommandLineA stub
+    let textSize = textSectionLength
+    let readOnlyDataStart = peAlign(textSize, 4096)
+    let dataOffset = importTableSize
+    let zeroDataStart = peAlign(readOnlyDataStart + importTableSize + readOnlySectionLength, 4096)
+    let imageSize = peAlign(zeroDataStart + zeroSectionSize + 1, 4096)
+    let base = win("VirtualAlloc", 0, imageSize, 12288, 4)            // MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE
+    if base == 0 { panic("zc run: cannot allocate {imageSize} bytes for the program image") }
+
+    for i in 0..assemblyFixups.len() {
+        let fixup = assemblyFixups[i]
+        var target = 0
+        if fixup.kind == fixupImportAddress32 {
+            target = readOnlyDataStart + 8 * fixup.symbol
+        } else {
+            let symbol = assemblySymbols[fixup.symbol]
+            if not symbol.defined { assemblyFail("undefined symbol {symbol.name}") }
+            if symbol.section == sectionText { target = symbol.offset }
+            else if symbol.section == sectionReadOnlyData { target = readOnlyDataStart + dataOffset + symbol.offset }
+            else { target = zeroDataStart + symbol.offset }
+        }
+        if fixup.kind == fixupAbsolute64 {
+            patch64Bits(readOnlySectionBytes, fixup.offset, base + target)
+        } else {
+            patch32Bits(textSectionBytes, fixup.offset, target + fixup.addend - (fixup.offset + 4))
+        }
+    }
+    copyBytesToMemory(textSectionBytes, textSize, base)
+    copyBytesToMemory(readOnlySectionBytes, readOnlySectionLength, base + readOnlyDataStart + dataOffset)
+
+    // import address table
+    let libraryNames = ["zephyr_rt.dll", "kernel32.dll", "user32.dll", "gdi32.dll", "opengl32.dll"]
+    var libraryHandles: [int] = [0, 0, 0, 0, 0]
+    let commandLineStub = base + readOnlyDataStart + 8 * importCount
+    store8(commandLineStub, 72)                          // mov rax, imm64
+    store8(commandLineStub + 1, 184)
+    store64(commandLineStub + 2, nulTerminatedCopy(guestCommandLine))
+    store8(commandLineStub + 10, 195)                    // ret
+    for i in 0..importCount {
+        let libraryIndex = importLibraryIndices[i]
+        if libraryIndex == 0 { panic("zc run: '{assemblyImports[i]}' needs zephyr_rt.dll; zc run links the Zephyr runtime") }
+        if libraryHandles[libraryIndex] == 0 {
+            libraryHandles[libraryIndex] = win("LoadLibraryA", nulTerminatedCopy(libraryNames[libraryIndex]))
+            if libraryHandles[libraryIndex] == 0 { panic("zc run: cannot load {libraryNames[libraryIndex]}") }
+        }
+        var procedure = win("GetProcAddress", libraryHandles[libraryIndex], nulTerminatedCopy(assemblyImports[i]))
+        if assemblyImports[i] == "GetCommandLineA" { procedure = commandLineStub }
+        if procedure == 0 { panic("zc run: {libraryNames[libraryIndex]} has no '{assemblyImports[i]}'") }
+        store64(base + readOnlyDataStart + 8 * i, procedure)
+    }
+
+    // code becomes execute-read; the stub page stays read-write-execute-free except the stub itself
+    let oldProtection = win("VirtualAlloc", 0, 8, 12288, 4)
+    if win("VirtualProtect", base, readOnlyDataStart, 32, oldProtection) == 0 { panic("zc run: VirtualProtect failed on the code") }
+    if win("VirtualProtect", base + readOnlyDataStart, 4096, 32, oldProtection) == 0 { panic("zc run: VirtualProtect failed on the import table") }
+    win("FlushInstructionCache", win("GetCurrentProcess"), base, imageSize)
+    callPointer(base + entryOffset)
+}
+
 // ---------------- ELF writer (--linux) ----------------
 //
 // A static ET_EXEC with two PT_LOAD segments and nothing else: no interpreter,
@@ -18656,9 +18766,22 @@ var runTests = false
 var inputPath = ""
 var outputPath = ""
 var argumentIndex = 1
+// zc run [flags] program.zeph [arguments...]: compile into memory and run it here;
+// everything after the program path belongs to the program
+var runInProcess = false
+var guestCommandLine = ""
+if commandLineArguments.len() > 1 and commandLineArguments[1] == "run" {
+    runInProcess = true
+    includeRuntime = true
+    argumentIndex = 2
+}
 while argumentIndex < commandLineArguments.len() {
     let argument = commandLineArguments[argumentIndex]
-    if argument == "--rt" { includeRuntime = true }
+    if runInProcess and inputPath != "" {
+        if argument.indexOf(" ") >= 0 { guestCommandLine += " \"" + argument + "\"" }
+        else { guestCommandLine += " " + argument }
+    }
+    else if argument == "--rt" { includeRuntime = true }
     else if argument == "--linux" { linuxTargetEnabled = true }
     else if argument == "--wasm" { wasmTargetEnabled = true }
     else if argument == "--version" { showVersion = true }
@@ -18677,9 +18800,10 @@ if showVersion {
 if inputPath == "" and showVersion {
     // --version alone: nothing to compile
 } else {
-    if inputPath == "" or outputPath == "" {
-        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>")
+    if inputPath == "" or (outputPath == "" and not runInProcess) {
+        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>\n       zc run [--test] <input.zeph> [program arguments...]")
     }
+    if runInProcess and (linuxTargetEnabled or wasmTargetEnabled) { panic("zc run: runs Windows x86-64 code in this process; --linux and --wasm do not apply") }
     currentSourceFile = baseName(inputPath)
     cachedExecutableDirectory = executableDirectory()
     var program = parse(tokenizeSource(readFile(inputPath), 1))
@@ -18772,6 +18896,10 @@ if inputPath == "" and showVersion {
         generateProgram(program)
         if isAssemblyOutput {
             writeFile(outputPath, assemblyLines.join())
+        } else if runInProcess {
+            currentAssemblySection = sectionText
+            for line in assemblyLines { assembleLine(line) }
+            runInMemory("\"" + inputPath + "\"" + guestCommandLine)
         } else {
             assembleAndLink(outputPath)
         }
