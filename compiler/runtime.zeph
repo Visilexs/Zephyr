@@ -12,172 +12,172 @@
 //   [obj-24] reference count
 //   [obj-16] shape descriptor address, or 0 for an object with no children
 //   [obj-8]  payload size (a multiple of 8, so the low 3 bits are free) | flags
-// Objects die when their count reaches zero (rx_drop); the descriptor says
+// Objects die when their count reaches zero (runtimeReleaseReference); the descriptor says
 // which payload words are references so their counts fall too. The
 // conservative collector below is kept as a backstop for cycles and for
 // anything the compiler's dup/drop insertion misses: a start bit marks each
 // payload address, which is how a conservatively-scanned word is recognised
 // as a real object pointer. Roots are the machine stack and the globals array.
-let HEAP_RESERVE = 4294967296       // 4 GiB of address space (reserved, not committed)
-let COMMIT_STEP = 4194304           // commit 4 MiB at a time
-let F_MARK = 1
-let F_FREE = 2
-let HDR = 24                        // header bytes before every payload
+let runtimeHeapReserve = 4294967296       // 4 GiB of address space (reserved, not committed)
+let runtimeCommitStep = 4194304           // commit 4 MiB at a time
+let runtimeHeapFlagMarked = 1
+let runtimeHeapFlagFree = 2
+let runtimeObjectHeaderBytes = 24                        // header bytes before every payload
 
-var __hbase = 0      // heap base
-var __hbump = 0      // next never-yet-used address
-var __hcommit = 0    // committed end
-var __startb = 0     // start bitmap
-var __markb = 0      // mark bitmap
-var __bcommit = 0    // committed bytes in each bitmap
+var runtimeHeapBaseAddress = 0      // heap base
+var runtimeHeapBumpAddress = 0      // next never-yet-used address
+var runtimeHeapCommittedEnd = 0    // committed end
+var runtimeObjectStartBitmap = 0     // start bitmap
+var runtimeObjectMarkBitmap = 0      // mark bitmap
+var runtimeBitmapCommittedBytes = 0    // committed bytes in each bitmap
 // Free blocks are held in size-segregated lists so allocation is O(1): one
 // list per 8-byte size class up to 1 KiB (exact fit, no search, no splitting)
 // plus a first-fit list for anything larger. A single first-fit list made
 // allocation O(n) and the compiler 11x slower.
-let NCLASS = 128     // classes 1..128 => payloads of 8..1024 bytes
-var __fl = 0         // array of NCLASS+1 list heads (off-heap)
-var __flbig = 0      // blocks larger than 1 KiB
-var __gc_at = 8388608    // collect once the bump pointer reaches this absolute address
-var __live = 0       // bytes surviving the last collection
-var __gc_growth = 1  // headroom before the next collection, in multiples of __live
-var __groots = 0     // globals array (roots)
-var __ngroots = 0
-var __wl = 0         // mark worklist
-var __wlcommit = 0
-var __wltop = 0
-var __gc_on = 0      // 1 once the heap is initialised
-var __leaked = 0     // objects the backstop collector found that counting missed
+let runtimeSmallAllocationClassCount = 128     // classes 1..128 => payloads of 8..1024 bytes
+var runtimeFreeListHeads = 0         // array of runtimeSmallAllocationClassCount+1 list heads (off-heap)
+var runtimeLargeFreeBlocks = 0      // blocks larger than 1 KiB
+var runtimeNextCollectionAddress = 8388608    // collect once the bump pointer reaches this absolute address
+var runtimeLiveHeapBytes = 0       // bytes surviving the last collection
+var runtimeCollectionGrowthFactor = 1  // headroom before the next collection, in multiples of runtimeLiveHeapBytes
+var runtimeGlobalRootsAddress = 0     // globals array (roots)
+var runtimeGlobalRootCount = 0
+var runtimeMarkWorklist = 0         // mark worklist
+var runtimeWorklistCommittedBytes = 0
+var runtimeWorklistCount = 0
+var runtimeHeapInitialized = 0      // 1 once the heap is initialised
+var runtimeUnreleasedObjectCount = 0     // objects the backstop collector found that counting missed
 
-fn rx_bit_set(base: int, idx: int) {
-    let b = base + (idx >> 3)
-    store8(b, load8(b) | (1 << (idx & 7)))
+fn runtimeSetBitmapBit(base: int, bitIndex: int) {
+    let byteAddress = base + (bitIndex >> 3)
+    store8(byteAddress, load8(byteAddress) | (1 << (bitIndex & 7)))
 }
-fn rx_bit_get(base: int, idx: int) -> int {
-    return (load8(base + (idx >> 3)) >> (idx & 7)) & 1
+fn runtimeGetBitmapBit(base: int, bitIndex: int) -> int {
+    return (load8(base + (bitIndex >> 3)) >> (bitIndex & 7)) & 1
 }
-fn rx_bit_clr(base: int, idx: int) {
-    let b = base + (idx >> 3)
-    store8(b, load8(b) & (255 - (1 << (idx & 7))))
+fn runtimeClearBitmapBit(base: int, bitIndex: int) {
+    let byteAddress = base + (bitIndex >> 3)
+    store8(byteAddress, load8(byteAddress) & (255 - (1 << (bitIndex & 7))))
 }
 
-fn rx_reserve(n: int) -> int {
+fn runtimeReserveMemory(byteCount: int) -> int {
     // VirtualAlloc(NULL, n, MEM_RESERVE, PAGE_READWRITE)
-    let p = win("VirtualAlloc", 0, n, 8192, 4)
-    if p == 0 { rt_die("out of memory (reserve)") }
-    return p
+    let reservedAddress = win("VirtualAlloc", 0, byteCount, 8192, 4)
+    if reservedAddress == 0 { runtimeFail("out of memory (reserve)") }
+    return reservedAddress
 }
-fn rx_commit(base: int, n: int) {
+fn runtimeCommitMemory(base: int, byteCount: int) {
     // VirtualAlloc(base, n, MEM_COMMIT, PAGE_READWRITE)
-    if win("VirtualAlloc", base, n, 4096, 4) == 0 { rt_die("out of memory (commit)") }
+    if win("VirtualAlloc", base, byteCount, 4096, 4) == 0 { runtimeFail("out of memory (commit)") }
 }
 
-fn rx_free_push(obj: int, size: int) {
-    let cls = size >> 3
-    if cls <= NCLASS {
-        store64(obj, load64(__fl + cls * 8))
-        store64(__fl + cls * 8, obj)
+fn runtimePushFreeBlock(object: int, size: int) {
+    let sizeClass = size >> 3
+    if sizeClass <= runtimeSmallAllocationClassCount {
+        store64(object, load64(runtimeFreeListHeads + sizeClass * 8))
+        store64(runtimeFreeListHeads + sizeClass * 8, object)
     } else {
-        store64(obj, __flbig)
-        __flbig = obj
+        store64(object, runtimeLargeFreeBlocks)
+        runtimeLargeFreeBlocks = object
     }
 }
 
-fn rx_heap_init() {
-    rx_thr_init()                                     // the collector's scratch pages; rt_lock no longer does this first
-    __fl = win("VirtualAlloc", 0, 4096, 12288, 4)     // (NCLASS+1) heads, off-heap
-    if __fl == 0 { rt_die("out of memory") }
-    rx_desc_init()
-    __hbase = rx_reserve(HEAP_RESERVE)
-    __hbump = __hbase
-    __hcommit = __hbase
-    __gc_at = __hbase + 8388608                   // first collection after 8 MiB of growth
-    __startb = rx_reserve(HEAP_RESERVE >> 6)     // 1 bit per 8-byte word
-    __markb = rx_reserve(HEAP_RESERVE >> 6)
-    __bcommit = 0
-    __wl = rx_reserve(HEAP_RESERVE >> 3)   // mark worklist: up to 16M pending objects
-    __wlcommit = 0                         // (reserve is address space only -- free)
-    rx_sb_init()                           // before any formatting can happen
-    __gc_on = 1
+fn runtimeInitializeHeap() {
+    runtimeInitializeThreadRegistry()                                     // the collector's scratch pages; runtimeLockHeap no longer does this first
+    runtimeFreeListHeads = win("VirtualAlloc", 0, 4096, 12288, 4)     // (runtimeSmallAllocationClassCount+1) heads, off-heap
+    if runtimeFreeListHeads == 0 { runtimeFail("out of memory") }
+    runtimeInitializeShapeDescriptors()
+    runtimeHeapBaseAddress = runtimeReserveMemory(runtimeHeapReserve)
+    runtimeHeapBumpAddress = runtimeHeapBaseAddress
+    runtimeHeapCommittedEnd = runtimeHeapBaseAddress
+    runtimeNextCollectionAddress = runtimeHeapBaseAddress + 8388608                   // first collection after 8 MiB of growth
+    runtimeObjectStartBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word
+    runtimeObjectMarkBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)
+    runtimeBitmapCommittedBytes = 0
+    runtimeMarkWorklist = runtimeReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to 16M pending objects
+    runtimeWorklistCommittedBytes = 0                         // (reserve is address space only -- free)
+    runtimeInitializeStringBuilders()                           // before any formatting can happen
+    runtimeHeapInitialized = 1
 }
 
 // make sure the heap is committed through `upto`, with bitmaps to match
-fn rx_grow(upto: int) {
-    if upto <= __hcommit { return }
-    var want = upto - __hbase
-    want = ((want + COMMIT_STEP - 1) / COMMIT_STEP) * COMMIT_STEP
-    if want > HEAP_RESERVE { rt_die("out of memory (heap full)") }
-    rx_commit(__hbase, want)
-    __hcommit = __hbase + want
-    let bwant = ((want >> 6) + 65535) & (0 - 65536)
-    if bwant > __bcommit {
-        rx_commit(__startb, bwant)
-        rx_commit(__markb, bwant)
-        __bcommit = bwant
+fn runtimeGrowHeap(endAddress: int) {
+    if endAddress <= runtimeHeapCommittedEnd { return }
+    var want = endAddress - runtimeHeapBaseAddress
+    want = ((want + runtimeCommitStep - 1) / runtimeCommitStep) * runtimeCommitStep
+    if want > runtimeHeapReserve { runtimeFail("out of memory (heap full)") }
+    runtimeCommitMemory(runtimeHeapBaseAddress, want)
+    runtimeHeapCommittedEnd = runtimeHeapBaseAddress + want
+    let bitmapBytesNeeded = ((want >> 6) + 65535) & (0 - 65536)
+    if bitmapBytesNeeded > runtimeBitmapCommittedBytes {
+        runtimeCommitMemory(runtimeObjectStartBitmap, bitmapBytesNeeded)
+        runtimeCommitMemory(runtimeObjectMarkBitmap, bitmapBytesNeeded)
+        runtimeBitmapCommittedBytes = bitmapBytesNeeded
     }
 }
 
-fn rx_wl_push(obj: int) {
-    let need = (__wltop + 1) * 8
-    if need > __wlcommit {
-        let want = ((need + COMMIT_STEP - 1) / COMMIT_STEP) * COMMIT_STEP
-        if want > HEAP_RESERVE >> 3 { rt_die("out of memory (mark worklist)") }
-        rx_commit(__wl, want)
-        __wlcommit = want
+fn runtimePushMarkWorklist(object: int) {
+    let need = (runtimeWorklistCount + 1) * 8
+    if need > runtimeWorklistCommittedBytes {
+        let want = ((need + runtimeCommitStep - 1) / runtimeCommitStep) * runtimeCommitStep
+        if want > runtimeHeapReserve >> 3 { runtimeFail("out of memory (mark worklist)") }
+        runtimeCommitMemory(runtimeMarkWorklist, want)
+        runtimeWorklistCommittedBytes = want
     }
-    store64(__wl + __wltop * 8, obj)
-    __wltop += 1
+    store64(runtimeMarkWorklist + runtimeWorklistCount * 8, object)
+    runtimeWorklistCount += 1
 }
 
 // scan a word range conservatively, marking anything that looks like a pointer
-fn rx_scan_range(lo: int, hi: int) {
-    var p = lo
-    while p + 8 <= hi {
-        rx_try_mark(load64(p))
-        p += 8
+fn runtimeScanRootRange(lowerBound: int, upperBound: int) {
+    var address = lowerBound
+    while address + 8 <= upperBound {
+        runtimeTryMarkObject(load64(address))
+        address += 8
     }
 }
 
-fn rx_try_mark(cand: int) {
-    if cand < __hbase { return }
-    if cand >= __hbump { return }
-    if (cand & 7) != 0 { return }
-    let idx = (cand - __hbase) >> 3
-    if rx_bit_get(__startb, idx) == 0 { return }     // not an object payload
-    if rx_bit_get(__markb, idx) == 1 { return }      // already marked
-    let h = load64(cand - 8)
-    if (h & F_FREE) != 0 { return }
-    rx_bit_set(__markb, idx)
-    rx_wl_push(cand)
+fn runtimeTryMarkObject(candidate: int) {
+    if candidate < runtimeHeapBaseAddress { return }
+    if candidate >= runtimeHeapBumpAddress { return }
+    if (candidate & 7) != 0 { return }
+    let index = (candidate - runtimeHeapBaseAddress) >> 3
+    if runtimeGetBitmapBit(runtimeObjectStartBitmap, index) == 0 { return }     // not an object payload
+    if runtimeGetBitmapBit(runtimeObjectMarkBitmap, index) == 1 { return }      // already marked
+    let objectHeader = load64(candidate - 8)
+    if (objectHeader & runtimeHeapFlagFree) != 0 { return }
+    runtimeSetBitmapBit(runtimeObjectMarkBitmap, index)
+    runtimePushMarkWorklist(candidate)
 }
 
 // ---------------- threads ----------------
 // The collector is stop-the-world and conservative, so it must see every
-// thread's stack and registers. Threads register themselves here; rx_collect
+// thread's stack and registers. Threads register themselves here; runtimeCollectGarbage
 // suspends them all, reads each one's CONTEXT (which carries the integer
 // registers) and scans from its Rsp to its stack base.
 //
 // Slot layout, 32 bytes: [0] handle  [8] stack base (0 = not yet registered)
 //                        [16] thread id  [24] spare
-let MAXTHR = 64
-var __thr = 0
-var __gcpad = 0        // collector's own scratch: rx_scratch() is shared
-var __nthr = 0
-var __lock = 0
-var __ctx = 0
-var __threads_unsuspendable = 0   // Linux workers not yet joined (under rt_lock)
+let runtimeMaximumThreadCount = 64
+var runtimeThreadRecords = 0
+var runtimeCollectorScratchAddress = 0        // collector's own scratch: runtimeGetScratchPage() is shared
+var runtimeRegisteredThreadCount = 0
+var runtimeHeapLockAddress = 0
+var runtimeThreadContextAddress = 0
+var runtimeUnsuspendableThreadCount = 0   // Linux workers not yet joined (under runtimeLockHeap)
 
-// Linux calls this under rt_lock when a native worker is created or joined.
-fn rt_unsuspendable_add(threadDelta: int) {
-    __threads_unsuspendable += threadDelta
+// Linux calls this under runtimeLockHeap when a native worker is created or joined.
+fn runtimeAdjustUnsuspendableThreads(threadDelta: int) {
+    runtimeUnsuspendableThreadCount += threadDelta
 }
 
-fn rx_thr_init() {
-    if __lock != 0 { return }
-    __lock = win("VirtualAlloc", 0, 4096, 12288, 4)
-    let a = win("InitializeCriticalSection", __lock)
-    __thr = win("VirtualAlloc", 0, MAXTHR * 32, 12288, 4)
-    __ctx = win("VirtualAlloc", 0, 4096, 12288, 4)      // CONTEXT, page-aligned
-    __gcpad = win("VirtualAlloc", 0, 4096, 12288, 4)
+fn runtimeInitializeThreadRegistry() {
+    if runtimeHeapLockAddress != 0 { return }
+    runtimeHeapLockAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
+    let initializationResult = win("InitializeCriticalSection", runtimeHeapLockAddress)
+    runtimeThreadRecords = win("VirtualAlloc", 0, runtimeMaximumThreadCount * 32, 12288, 4)
+    runtimeThreadContextAddress = win("VirtualAlloc", 0, 4096, 12288, 4)      // CONTEXT, page-aligned
+    runtimeCollectorScratchAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
 }
 
 // Allocation is only locked once a second thread exists, so single-threaded
@@ -185,481 +185,481 @@ fn rx_thr_init() {
 // were a fifth of a zc self-compile. A thread is registered before it is
 // resumed, and registration touches the registry rather than the heap, so a
 // racing allocator on the main thread cannot corrupt anything.
-// Testing __nthr at both ends agrees, because leaving a critical section that
-// was never entered corrupts it: __nthr only grows (registry slots are reused,
+// Testing runtimeRegisteredThreadCount at both ends agrees, because leaving a critical section that
+// was never entered corrupts it: runtimeRegisteredThreadCount only grows (registry slots are reused,
 // never removed), and it leaves 0 only when the main thread -- then the only
-// thread -- registers its first worker in rt_thread_add, which is never inside
-// an rt_lock .. rt_unlock region. Whatever rt_lock saw, its rt_unlock sees too.
-fn rt_lock() {
-    if __nthr == 0 { return }
-    rx_thr_init()
-    let a = win("EnterCriticalSection", __lock)
+// thread -- registers its first worker in runtimeRegisterThread, which is never inside
+// an runtimeLockHeap .. runtimeUnlockHeap region. Whatever runtimeLockHeap saw, its runtimeUnlockHeap sees too.
+fn runtimeLockHeap() {
+    if runtimeRegisteredThreadCount == 0 { return }
+    runtimeInitializeThreadRegistry()
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
 }
-fn rt_unlock() {
-    if __nthr == 0 { return }
-    let a = win("LeaveCriticalSection", __lock)
+fn runtimeUnlockHeap() {
+    if runtimeRegisteredThreadCount == 0 { return }
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
 
 // called by the parent, before the new thread is resumed.
 // Slots are reused: a program that spawns threads in a loop -- parallel_for
 // inside an outer loop is the obvious case -- would otherwise walk off the end
-// of the registry after MAXTHR spawns and corrupt whatever follows it. A free
-// slot is one whose handle is 0, which rt_thread_done sets on the way out; a
+// of the registry after runtimeMaximumThreadCount spawns and corrupt whatever follows it. A free
+// slot is one whose handle is 0, which runtimeMarkThreadDone sets on the way out; a
 // registered-but-not-yet-running thread keeps its handle and so is never taken,
 // which matters because its stack base is still 0 too.
-fn rt_thread_add(handle: int, tid: int) -> int {
-    rx_thr_init()
-    let a = win("EnterCriticalSection", __lock)
-    var ix = -1
-    var i = 0
-    while i < __nthr {
-        if load64(__thr + i * 32) == 0 {
-            ix = i
-            i = __nthr
+fn runtimeRegisterThread(handle: int, threadId: int) -> int {
+    runtimeInitializeThreadRegistry()
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    var indexLocal = -1
+    var index = 0
+    while index < runtimeRegisteredThreadCount {
+        if load64(runtimeThreadRecords + index * 32) == 0 {
+            indexLocal = index
+            index = runtimeRegisteredThreadCount
         } else {
-            i += 1
+            index += 1
         }
     }
-    if ix < 0 {
-        if __nthr >= MAXTHR {
-            let c = win("LeaveCriticalSection", __lock)
+    if indexLocal < 0 {
+        if runtimeRegisteredThreadCount >= runtimeMaximumThreadCount {
+            let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
             panic("thread: more than 64 live threads")
         }
-        ix = __nthr
-        __nthr += 1
+        indexLocal = runtimeRegisteredThreadCount
+        runtimeRegisteredThreadCount += 1
     }
-    let slot = __thr + ix * 32
+    let slot = runtimeThreadRecords + indexLocal * 32
     store64(slot, handle)
     store64(slot + 8, 0)
-    store64(slot + 16, tid)
-    let b = win("LeaveCriticalSection", __lock)
-    return ix
+    store64(slot + 16, threadId)
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+    return indexLocal
 }
 
 // called by the new thread as its first act: publish where its stack lives
-fn rt_thread_ready() {
-    rx_thr_init()
-    let a0 = win("EnterCriticalSection", __lock)
-    let lo = __gcpad + 64          // private to registration, which holds the lock
-    let hi = lo + 8
-    let ig = win("GetCurrentThreadStackLimits", lo, hi)
-    let me = win("GetCurrentThreadId")
-    var i = 0
-    while i < __nthr {
-        if load64(__thr + i * 32 + 16) == me { store64(__thr + i * 32 + 8, load64(hi)) }
-        i += 1
+fn runtimeMarkThreadReady() {
+    runtimeInitializeThreadRegistry()
+    let leftValue0 = win("EnterCriticalSection", runtimeHeapLockAddress)
+    let lowerBound = runtimeCollectorScratchAddress + 64          // private to registration, which holds the lock
+    let upperBound = lowerBound + 8
+    let gradientIndex = win("GetCurrentThreadStackLimits", lowerBound, upperBound)
+    let entryAddress = win("GetCurrentThreadId")
+    var index = 0
+    while index < runtimeRegisteredThreadCount {
+        if load64(runtimeThreadRecords + index * 32 + 16) == entryAddress { store64(runtimeThreadRecords + index * 32 + 8, load64(upperBound)) }
+        index += 1
     }
-    let b = win("LeaveCriticalSection", __lock)
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
 
-fn rt_thread_done() {
-    let me = win("GetCurrentThreadId")
-    let a = win("EnterCriticalSection", __lock)
-    var i = 0
-    while i < __nthr {
-        if load64(__thr + i * 32 + 16) == me {
-            store64(__thr + i * 32 + 8, 0)     // no stack: the collector skips it
-            store64(__thr + i * 32, 0)         // no handle: the slot is reusable
+fn runtimeMarkThreadDone() {
+    let entryAddress = win("GetCurrentThreadId")
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    var index = 0
+    while index < runtimeRegisteredThreadCount {
+        if load64(runtimeThreadRecords + index * 32 + 16) == entryAddress {
+            store64(runtimeThreadRecords + index * 32 + 8, 0)     // no stack: the collector skips it
+            store64(runtimeThreadRecords + index * 32, 0)         // no handle: the slot is reusable
         }
-        i += 1
+        index += 1
     }
-    let b = win("LeaveCriticalSection", __lock)
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
 
 // Suspend every other registered thread, scan it, then resume. All of them are
 // suspended before any is scanned: a thread allowed to run mid-scan could move
 // the only reference to an object past a region already visited.
-fn rx_scan_threads() {
-    if __nthr == 0 { return }
-    let me = win("GetCurrentThreadId")
-    var i = 0
-    while i < __nthr {
-        let slot = __thr + i * 32
-        if load64(slot + 16) != me and load64(slot + 8) != 0 {
-            let s = win("SuspendThread", load64(slot))
+fn runtimeScanThreadRoots() {
+    if runtimeRegisteredThreadCount == 0 { return }
+    let entryAddress = win("GetCurrentThreadId")
+    var index = 0
+    while index < runtimeRegisteredThreadCount {
+        let slot = runtimeThreadRecords + index * 32
+        if load64(slot + 16) != entryAddress and load64(slot + 8) != 0 {
+            let suspendResult = win("SuspendThread", load64(slot))
         }
-        i += 1
+        index += 1
     }
-    i = 0
-    while i < __nthr {
-        let slot = __thr + i * 32
+    index = 0
+    while index < runtimeRegisteredThreadCount {
+        let slot = runtimeThreadRecords + index * 32
         let base = load64(slot + 8)
-        if load64(slot + 16) != me and base != 0 {
-            store32(__ctx + 48, 1048587)                  // ContextFlags = CONTEXT_FULL
-            let ok = win("GetThreadContext", load64(slot), __ctx)
+        if load64(slot + 16) != entryAddress and base != 0 {
+            store32(runtimeThreadContextAddress + 48, 1048587)                  // ContextFlags = CONTEXT_FULL
+            let ok = win("GetThreadContext", load64(slot), runtimeThreadContextAddress)
             if ok != 0 {
                 // Rax..R15 live at 0x78..0xF8 in the x64 CONTEXT; scanning that
                 // span covers the registers a value could be sitting in.
-                rx_scan_range(__ctx + 120, __ctx + 248)
-                rx_scan_range(load64(__ctx + 152), base)  // Rsp .. stack base
+                runtimeScanRootRange(runtimeThreadContextAddress + 120, runtimeThreadContextAddress + 248)
+                runtimeScanRootRange(load64(runtimeThreadContextAddress + 152), base)  // Rsp .. stack base
             }
         }
-        i += 1
+        index += 1
     }
-    i = 0
-    while i < __nthr {
-        let slot = __thr + i * 32
-        if load64(slot + 16) != me and load64(slot + 8) != 0 {
-            let r = win("ResumeThread", load64(slot))
+    index = 0
+    while index < runtimeRegisteredThreadCount {
+        let slot = runtimeThreadRecords + index * 32
+        if load64(slot + 16) != entryAddress and load64(slot + 8) != 0 {
+            let resumeResult = win("ResumeThread", load64(slot))
         }
-        i += 1
+        index += 1
     }
 }
 
-fn rx_collect() {
+fn runtimeCollectGarbage() {
     // ponytail: Linux cannot suspend stacks yet, including the unregistered
     // main thread. Defer cyclic garbage until all workers are joined; add signal
     // safepoints if long-lived workers need bounded cyclic-heap growth.
-    if __threads_unsuspendable != 0 { return }
+    if runtimeUnsuspendableThreadCount != 0 { return }
     // clear marks
-    var i = 0
-    while i < __bcommit {
-        store64(__markb + i, 0)
-        i += 8
+    var index = 0
+    while index < runtimeBitmapCommittedBytes {
+        store64(runtimeObjectMarkBitmap + index, 0)
+        index += 8
     }
-    __wltop = 0
+    runtimeWorklistCount = 0
     // roots: globals, then the machine stack (current rsp .. stack base)
-    if __ngroots > 0 { rx_scan_range(__groots, __groots + __ngroots * 8) }
-    let lo = __gcpad
-    let hi = lo + 8
-    let ignored = win("GetCurrentThreadStackLimits", lo, hi)   // returns VOID
-    rx_scan_range(stackptr(), load64(hi))
-    rx_scan_threads()
+    if runtimeGlobalRootCount > 0 { runtimeScanRootRange(runtimeGlobalRootsAddress, runtimeGlobalRootsAddress + runtimeGlobalRootCount * 8) }
+    let lowerBound = runtimeCollectorScratchAddress
+    let upperBound = lowerBound + 8
+    let ignored = win("GetCurrentThreadStackLimits", lowerBound, upperBound)   // returns VOID
+    runtimeScanRootRange(stackptr(), load64(upperBound))
+    runtimeScanThreadRoots()
     // trace
-    while __wltop > 0 {
-        __wltop -= 1
-        let obj = load64(__wl + __wltop * 8)
-        let size = load64(obj - 8) & (0 - 8)
-        rx_scan_range(obj, obj + size)
+    while runtimeWorklistCount > 0 {
+        runtimeWorklistCount -= 1
+        let object = load64(runtimeMarkWorklist + runtimeWorklistCount * 8)
+        let size = load64(object - 8) & (0 - 8)
+        runtimeScanRootRange(object, object + size)
     }
     // sweep: rebuild the free lists from unmarked objects
-    var c = 0
-    while c <= NCLASS {
-        store64(__fl + c * 8, 0)
-        c += 1
+    var sizeClass = 0
+    while sizeClass <= runtimeSmallAllocationClassCount {
+        store64(runtimeFreeListHeads + sizeClass * 8, 0)
+        sizeClass += 1
     }
-    __flbig = 0
-    __live = 0
-    __leaked = 0
+    runtimeLargeFreeBlocks = 0
+    runtimeLiveHeapBytes = 0
+    runtimeUnreleasedObjectCount = 0
     // The sweep coalesces. It already walks the heap in address order, so a
     // run of consecutive dead objects can be merged into one free block
     // instead of being pushed as many small ones.
     //
     // Without this the allocator fragments without bound on a workload that
     // repeatedly allocates the same set of shapes -- a training step being
-    // exactly that. rx_take_free splits a large block and pushes the
+    // exactly that. runtimeTakeFreeBlock splits a large block and pushes the
     // remainder back, nothing ever merges two neighbours again, and the free
     // pool degrades into slivers that no longer fit the sizes still being
     // asked for. Measured on a reverse-pass loop before this change: at the
     // point of death the free list held 965 MB across 263,568 blocks -- 98%
-    // of the heap free and unusable -- while __live sat flat at ~10 MB and
-    // __leaked was 0. Nothing was leaking; the heap had been shredded.
+    // of the heap free and unusable -- while runtimeLiveHeapBytes sat flat at ~10 MB and
+    // runtimeUnreleasedObjectCount was 0. Nothing was leaking; the heap had been shredded.
     //
     // Merging absorbs the interior objects' headers into the payload, so
     // their start bits must be cleared: after the merge those addresses are
-    // no longer object starts, and rx_try_mark uses __startb to decide
-    // whether a conservatively scanned word points at one. rx_take_free's
+    // no longer object starts, and runtimeTryMarkObject uses runtimeObjectStartBitmap to decide
+    // whether a conservatively scanned word points at one. runtimeTakeFreeBlock's
     // split path already re-sets the bit for any remainder it carves off, so
     // the two stay consistent.
-    var obj = __hbase + HDR
+    var object = runtimeHeapBaseAddress + runtimeObjectHeaderBytes
     var run = 0                                      // payload of the open run, 0 if none
     var runsz = 0
-    while obj < __hbump {
-        let h = load64(obj - 8)
-        let size = h & (0 - 8)
-        let idx = (obj - __hbase) >> 3
-        if rx_bit_get(__markb, idx) == 0 {
+    while object < runtimeHeapBumpAddress {
+        let objectHeader = load64(object - 8)
+        let size = objectHeader & (0 - 8)
+        let indexLocal = (object - runtimeHeapBaseAddress) >> 3
+        if runtimeGetBitmapBit(runtimeObjectMarkBitmap, indexLocal) == 0 {
             // Unreachable but not yet freed: under reference counting that is
             // either a cycle or a missed drop. Counted so it can be reported.
-            if (h & F_FREE) == 0 { __leaked += 1 }
+            if (objectHeader & runtimeHeapFlagFree) == 0 { runtimeUnreleasedObjectCount += 1 }
             if run == 0 {
-                run = obj
+                run = object
                 runsz = size
             } else {
-                rx_bit_clr(__startb, idx)            // no longer an object start
-                runsz = runsz + HDR + size
+                runtimeClearBitmapBit(runtimeObjectStartBitmap, indexLocal)            // no longer an object start
+                runsz = runsz + runtimeObjectHeaderBytes + size
             }
         } else {
             if run != 0 {
-                store64(run - 8, runsz | F_FREE)
-                rx_free_push(run, runsz)
+                store64(run - 8, runsz | runtimeHeapFlagFree)
+                runtimePushFreeBlock(run, runsz)
                 run = 0
                 runsz = 0
             }
-            store64(obj - 8, size)                   // clear mark/free flags
-            __live += size + HDR
+            store64(object - 8, size)                   // clear mark/free flags
+            runtimeLiveHeapBytes += size + runtimeObjectHeaderBytes
         }
-        obj = obj + HDR + size
+        object = object + runtimeObjectHeaderBytes + size
     }
     if run != 0 {
-        store64(run - 8, runsz | F_FREE)
-        rx_free_push(run, runsz)
+        store64(run - 8, runsz | runtimeHeapFlagFree)
+        runtimePushFreeBlock(run, runsz)
     }
 }
 
 // ---- reference counting ----
 // Every reference-typed value the compiler holds carries one count. Locals and
-// stored fields own theirs; parameters borrow the caller's. rx_dup and rx_drop
+// stored fields own theirs; parameters borrow the caller's. runtimeRetainReference and runtimeReleaseReference
 // are what the compiler emits; nothing else touches the count. Both ignore
 // addresses outside the heap, because a `str` may point at a literal in the
 // data section and a closure's env may be 0.
-fn rx_dup(v: int) -> int {
-    if v < __hbase or v >= __hbump { return v }
-    store64(v - 24, load64(v - 24) + 1)
-    return v
+fn runtimeRetainReference(value: int) -> int {
+    if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress { return value }
+    store64(value - 24, load64(value - 24) + 1)
+    return value
 }
 
 // `*addr = v` for a reference slot: the old holder's count goes away with it.
-// rx_drop's body is inlined rather than called -- this runs 37M times in a
+// runtimeReleaseReference's body is inlined rather than called -- this runs 37M times in a
 // self-build, and the old value is very often 0 (a slot's first store) or a
 // string literal outside the heap, where the whole job is one compare.
-fn rx_assign(addr: int, v: int) {
-    let old = load64(addr)
-    store64(addr, v)
-    if old >= __hbase and old < __hbump {
-        let rc = load64(old - 24)
-        if rc > 1 {
-            store64(old - 24, rc - 1)
+fn runtimeAssignReference(address: int, value: int) {
+    let old = load64(address)
+    store64(address, value)
+    if old >= runtimeHeapBaseAddress and old < runtimeHeapBumpAddress {
+        let referenceCount = load64(old - 24)
+        if referenceCount > 1 {
+            store64(old - 24, referenceCount - 1)
         } else {
-            if rc < 1 { rt_die("reference count underflow") }
+            if referenceCount < 1 { runtimeFail("reference count underflow") }
             store64(old - 24, 0)
-            rx_release(old)
+            runtimeReleaseObject(old)
         }
     }
 }
 
 // whether a container's keys / values / elements are references, per its descriptor
-fn rx_kref(m: int) -> int {
-    let d = load64(m - 16)
-    if d == 0 { return 0 }
-    return load64(d + 8)
+fn runtimeMapKeyIsReference(mapAddress: int) -> int {
+    let descriptor = load64(mapAddress - 16)
+    if descriptor == 0 { return 0 }
+    return load64(descriptor + 8)
 }
-fn rx_vref(m: int) -> int {
-    let d = load64(m - 16)
-    if d == 0 { return 0 }
-    return load64(d + 16)
+fn runtimeMapValueIsReference(mapAddress: int) -> int {
+    let descriptor = load64(mapAddress - 16)
+    if descriptor == 0 { return 0 }
+    return load64(descriptor + 16)
 }
 
-fn rx_drop(v: int) {
-    if v < __hbase or v >= __hbump { return }
-    let rc = load64(v - 24)
-    if rc > 1 {
-        store64(v - 24, rc - 1)
+fn runtimeReleaseReference(value: int) {
+    if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress { return }
+    let referenceCount = load64(value - 24)
+    if referenceCount > 1 {
+        store64(value - 24, referenceCount - 1)
         return
     }
-    if rc < 1 { rt_die("reference count underflow") }
-    store64(v - 24, 0)
-    rx_release(v)
+    if referenceCount < 1 { runtimeFail("reference count underflow") }
+    store64(value - 24, 0)
+    runtimeReleaseObject(value)
 }
 
 // Releasing a frame's reference slots. A function with several of them used to
 // pay a call per slot on every single return, which measured at 403M calls --
 // 80% of all counting work -- to free something only 2.5% of the time. The
 // compiler emits the slot offsets as a static table instead, so a return costs
-// one call and a loop, with rx_drop's body inlined here.
-fn rx_drop_slots(fp: int, tbl: int, n: int) {
-    var i = 0
-    while i < n {
-        let v = load64(fp - load64(tbl + i * 8))
-        if v >= __hbase and v < __hbump {
-            let rc = load64(v - 24)
-            if rc > 1 {
-                store64(v - 24, rc - 1)
+// one call and a loop, with runtimeReleaseReference's body inlined here.
+fn runtimeReleaseFrameSlots(framePointer: int, table: int, slotCount: int) {
+    var index = 0
+    while index < slotCount {
+        let value = load64(framePointer - load64(table + index * 8))
+        if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress {
+            let referenceCount = load64(value - 24)
+            if referenceCount > 1 {
+                store64(value - 24, referenceCount - 1)
             } else {
-                if rc < 1 { rt_die("reference count underflow") }
-                store64(v - 24, 0)
-                rx_release(v)
+                if referenceCount < 1 { runtimeFail("reference count underflow") }
+                store64(value - 24, 0)
+                runtimeReleaseObject(value)
             }
         }
-        i += 1
+        index += 1
     }
 }
 
 // A child reference losing its holder: decrement, and queue it for release
 // when that was the last one. Queuing instead of recursing is what keeps a
 // million-element linked structure from overflowing the stack.
-fn rx_drop_child(c: int) {
-    if c < __hbase or c >= __hbump { return }
-    let rc = load64(c - 24)
-    if rc > 1 {
-        store64(c - 24, rc - 1)
+fn runtimeReleaseChildReference(childAddress: int) {
+    if childAddress < runtimeHeapBaseAddress or childAddress >= runtimeHeapBumpAddress { return }
+    let referenceCount = load64(childAddress - 24)
+    if referenceCount > 1 {
+        store64(childAddress - 24, referenceCount - 1)
         return
     }
-    if rc < 1 { rt_die("reference count underflow") }
-    store64(c - 24, 0)
-    rx_wl_push(c)
+    if referenceCount < 1 { runtimeFail("reference count underflow") }
+    store64(childAddress - 24, 0)
+    runtimePushMarkWorklist(childAddress)
 }
 
 // Frees `v` and, transitively, everything only it kept alive. Shares the
 // collector's worklist; the two never run at once because the collector is only
 // ever entered from allocation, which release never performs.
-fn rx_release(v: int) {
-    rt_lock()
-    rx_wl_push(v)
-    while __wltop > 0 {
-        __wltop -= 1
-        let obj = load64(__wl + __wltop * 8)
-        let desc = load64(obj - 16)
-        if desc != 0 { rx_drop_children(obj, desc) }
-        let size = load64(obj - 8) & (0 - 8)
-        store64(obj - 8, size | F_FREE)
-        rx_free_push(obj, size)
+fn runtimeReleaseObject(value: int) {
+    runtimeLockHeap()
+    runtimePushMarkWorklist(value)
+    while runtimeWorklistCount > 0 {
+        runtimeWorklistCount -= 1
+        let object = load64(runtimeMarkWorklist + runtimeWorklistCount * 8)
+        let descriptor = load64(object - 16)
+        if descriptor != 0 { runtimeReleaseObjectChildren(object, descriptor) }
+        let size = load64(object - 8) & (0 - 8)
+        store64(object - 8, size | runtimeHeapFlagFree)
+        runtimePushFreeBlock(object, size)
     }
-    rt_unlock()
+    runtimeUnlockHeap()
 }
 
 // Shape descriptors. The compiler emits one per type into the data section; the
-// runtime keeps a few of its own (rx_desc_init) for the objects it builds itself.
+// runtime keeps a few of its own (runtimeInitializeShapeDescriptors) for the objects it builds itself.
 //   [0] kind   1 = fixed slots: [8] slot count, [16..] bitmask, bit i = slot i is a reference
 //              2 = list cell {len, cap, data}: [8] 1 if the elements are references
 //              3 = map: [8] 1 if keys are references, [16] 1 if values are
-fn rx_drop_children(obj: int, desc: int) {
-    let kind = load64(desc)
+fn runtimeReleaseObjectChildren(object: int, descriptor: int) {
+    let kind = load64(descriptor)
     if kind == 1 {
-        let n = load64(desc + 8)
-        var i = 0
-        while i < n {
-            if (load64(desc + 16 + (i >> 6) * 8) >> (i & 63)) & 1 == 1 {
-                rx_drop_child(load64(obj + i * 8))
+        let count = load64(descriptor + 8)
+        var index = 0
+        while index < count {
+            if (load64(descriptor + 16 + (index >> 6) * 8) >> (index & 63)) & 1 == 1 {
+                runtimeReleaseChildReference(load64(object + index * 8))
             }
-            i += 1
+            index += 1
         }
     } else if kind == 2 {
-        let data = load64(obj + 16)
-        if load64(desc + 8) == 1 {
-            let n = load64(obj)
-            var i = 0
-            while i < n {
-                rx_drop_child(load64(data + i * 8))
-                i += 1
+        let data = load64(object + 16)
+        if load64(descriptor + 8) == 1 {
+            let count = load64(object)
+            var index = 0
+            while index < count {
+                runtimeReleaseChildReference(load64(data + index * 8))
+                index += 1
             }
         }
-        rx_drop_child(data)
+        runtimeReleaseChildReference(data)
     } else if kind == 3 {
-        let cap = load64(obj + 8)
-        let slots = load64(obj + 16)
-        let kref = load64(desc + 8)
-        let vref = load64(desc + 16)
-        var i = 0
-        while i < cap {
-            let slot = slots + i * 24
+        let capacity = load64(object + 8)
+        let slots = load64(object + 16)
+        let mapKeyIsReference = load64(descriptor + 8)
+        let mapValueIsReference = load64(descriptor + 16)
+        var index = 0
+        while index < capacity {
+            let slot = slots + index * 24
             if load64(slot) == 1 {
-                if kref == 1 { rx_drop_child(load64(slot + 8)) }
-                if vref == 1 { rx_drop_child(load64(slot + 16)) }
+                if mapKeyIsReference == 1 { runtimeReleaseChildReference(load64(slot + 8)) }
+                if mapValueIsReference == 1 { runtimeReleaseChildReference(load64(slot + 16)) }
             }
-            i += 1
+            index += 1
         }
-        rx_drop_child(slots)
+        runtimeReleaseChildReference(slots)
     }
 }
 
 // The runtime's own descriptors, on one off-heap page.
-var __d_list_val = 0
-var __d_list_ref = 0
-var __d_box_val = 0
-var __d_box_ref = 0
-var __d_map_val = 0
-fn rx_desc_init() {
+var runtimeValueListDescriptor = 0
+var runtimeReferenceListDescriptor = 0
+var runtimeValueBoxDescriptor = 0
+var runtimeReferenceBoxDescriptor = 0
+var runtimeValueMapDescriptor = 0
+fn runtimeInitializeShapeDescriptors() {
     let page = win("VirtualAlloc", 0, 4096, 12288, 4)
-    if page == 0 { rt_die("out of memory") }
-    __d_map_val = page + 128         // kind 3, plain keys and values
+    if page == 0 { runtimeFail("out of memory") }
+    runtimeValueMapDescriptor = page + 128         // kind 3, plain keys and values
     store64(page + 128, 3)
-    __d_list_val = page              // kind 2, elements are values
+    runtimeValueListDescriptor = page              // kind 2, elements are values
     store64(page, 2)
-    __d_list_ref = page + 32         // kind 2, elements are references
+    runtimeReferenceListDescriptor = page + 32         // kind 2, elements are references
     store64(page + 32, 2)
     store64(page + 40, 1)
-    __d_box_val = page + 64          // kind 1, one slot, not a reference
+    runtimeValueBoxDescriptor = page + 64          // kind 1, one slot, not a reference
     store64(page + 64, 1)
     store64(page + 72, 1)
-    __d_box_ref = page + 96          // kind 1, one slot, a reference
+    runtimeReferenceBoxDescriptor = page + 96          // kind 1, one slot, a reference
     store64(page + 96, 1)
     store64(page + 104, 1)
     store64(page + 112, 1)
 }
 
 // a small scratch page for out-params (never freed, not on the GC heap)
-var __scratchp = 0
-fn rx_scratch() -> int {
-    if __scratchp == 0 {
-        __scratchp = win("VirtualAlloc", 0, 4096, 12288, 4)
-        if __scratchp == 0 { rt_die("out of memory") }
+var runtimeScratchPageAddress = 0
+fn runtimeGetScratchPage() -> int {
+    if runtimeScratchPageAddress == 0 {
+        runtimeScratchPageAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
+        if runtimeScratchPageAddress == 0 { runtimeFail("out of memory") }
     }
-    return __scratchp
+    return runtimeScratchPageAddress
 }
 
 // Take a block off the free lists, or 0 if none fits. Small sizes come off
 // their exact-size class in O(1); large ones use first fit with splitting.
-fn rx_take_free(need: int) -> int {
-    let cls = need >> 3
-    if cls <= NCLASS {
-        let head = load64(__fl + cls * 8)
+fn runtimeTakeFreeBlock(need: int) -> int {
+    let sizeClass = need >> 3
+    if sizeClass <= runtimeSmallAllocationClassCount {
+        let head = load64(runtimeFreeListHeads + sizeClass * 8)
         if head == 0 { return 0 }
-        store64(__fl + cls * 8, load64(head))        // pop
+        store64(runtimeFreeListHeads + sizeClass * 8, load64(head))        // pop
         store64(head - 8, need)                      // live again, flags cleared
-        rx_zero(head, need)
+        runtimeZeroMemory(head, need)
         return head
     }
-    var prev = 0
-    var cur = __flbig
-    while cur != 0 {
-        let sz = load64(cur - 8) & (0 - 8)
-        let nxt = load64(cur)
-        if sz >= need {
-            if prev == 0 { __flbig = nxt } else { store64(prev, nxt) }
-            if sz >= need + HDR + 8 {                // split off the tail
-                let rest = sz - need - HDR
-                store64(cur - 8, need)
-                let nb = cur + need + HDR            // payload of the remainder
-                store64(nb - 8, rest | F_FREE)
-                rx_bit_set(__startb, (nb - __hbase) >> 3)
-                rx_free_push(nb, rest)
+    var previous = 0
+    var current = runtimeLargeFreeBlocks
+    while current != 0 {
+        let size = load64(current - 8) & (0 - 8)
+        let nextValue = load64(current)
+        if size >= need {
+            if previous == 0 { runtimeLargeFreeBlocks = nextValue } else { store64(previous, nextValue) }
+            if size >= need + runtimeObjectHeaderBytes + 8 {                // split off the tail
+                let rest = size - need - runtimeObjectHeaderBytes
+                store64(current - 8, need)
+                let byteCount = current + need + runtimeObjectHeaderBytes            // payload of the remainder
+                store64(byteCount - 8, rest | runtimeHeapFlagFree)
+                runtimeSetBitmapBit(runtimeObjectStartBitmap, (byteCount - runtimeHeapBaseAddress) >> 3)
+                runtimePushFreeBlock(byteCount, rest)
             } else {
-                store64(cur - 8, sz)
+                store64(current - 8, size)
             }
-            rx_zero(cur, load64(cur - 8) & (0 - 8))
-            return cur
+            runtimeZeroMemory(current, load64(current - 8) & (0 - 8))
+            return current
         }
-        prev = cur
-        cur = nxt
+        previous = current
+        current = nextValue
     }
     return 0
 }
 
 // An object with no children (a string, a list's data buffer). The compiler
 // still calls this by name, so the signature must not change.
-fn rt_alloc(size: int) -> int {
-    return rt_alloc_d(size, 0)
+fn runtimeAllocateObject(size: int) -> int {
+    return runtimeAllocateDescribedObject(size, 0)
 }
 
-// An object whose payload holds references: `desc` (see rx_drop_children) says
+// An object whose payload holds references: `desc` (see runtimeReleaseObjectChildren) says
 // which words, so dropping it can drop them. Count starts at 1 - the caller
 // owns the fresh object.
-fn rt_alloc_d(size: int, desc: int) -> int {
-    rt_lock()
-    let r = rx_alloc_body(size)
-    store64(r - 24, 1)
-    store64(r - 16, desc)
-    rt_unlock()
-    return r
+fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
+    runtimeLockHeap()
+    let result = runtimeAllocateObjectPayload(size)
+    store64(result - 24, 1)
+    store64(result - 16, descriptor)
+    runtimeUnlockHeap()
+    return result
 }
 
-fn rx_alloc_body(size: int) -> int {
-    if __gc_on == 0 { rx_heap_init() }
+fn runtimeAllocateObjectPayload(size: int) -> int {
+    if runtimeHeapInitialized == 0 { runtimeInitializeHeap() }
     var need = (size + 7) & (0 - 8)
     if need == 0 { need = 8 }
-    let a = rx_take_free(need)
-    if a != 0 { return a }
+    let freeBlock = runtimeTakeFreeBlock(need)
+    if freeBlock != 0 { return freeBlock }
     // free list exhausted and the heap has doubled: collect, then retry.
     // ponytail: first-fit over one free list; size-segregated lists would let
     // us collect more often without the O(n) search, but this is correct and
     // halves peak memory as is.
-    if __hbump >= __gc_at {
-        rx_collect()
+    if runtimeHeapBumpAddress >= runtimeNextCollectionAddress {
+        runtimeCollectGarbage()
         // Proportional trigger (Go-style): allow the bump pointer to advance by
         // another `live` bytes before the next collection, so the heap peaks at
         // ~2x the live set. The target is measured from the CURRENT bump, i.e.
-        // from growth-since-this-collection -- NOT from __hbase, which is the
+        // from growth-since-this-collection -- NOT from runtimeHeapBaseAddress, which is the
         // all-time high-water extent and never shrinks. Keying on the extent
         // meant that once it passed 2x live, every free-list miss collected
         // (a full mark that reclaimed nothing new), which is O(live) per
@@ -676,143 +676,143 @@ fn rx_alloc_body(size: int) -> int {
         // under a quarter of the heap free doubles the growth allowed before
         // the next one, up to 4x live. One that frees more -- cyclic garbage,
         // or a fragmented heap worth coalescing -- resets it to 1x.
-        let extent = __hbump - __hbase
-        if (extent - __live) * 4 < extent {
-            if __gc_growth < 4 { __gc_growth = __gc_growth * 2 }
+        let extent = runtimeHeapBumpAddress - runtimeHeapBaseAddress
+        if (extent - runtimeLiveHeapBytes) * 4 < extent {
+            if runtimeCollectionGrowthFactor < 4 { runtimeCollectionGrowthFactor = runtimeCollectionGrowthFactor * 2 }
         } else {
-            __gc_growth = 1
+            runtimeCollectionGrowthFactor = 1
         }
-        var headroom = __live * __gc_growth
+        var headroom = runtimeLiveHeapBytes * runtimeCollectionGrowthFactor
         if headroom < 262144 { headroom = 262144 }
-        __gc_at = __hbump + headroom
-        let b = rx_take_free(need)
-        if b != 0 { return b }
+        runtimeNextCollectionAddress = runtimeHeapBumpAddress + headroom
+        let reclaimedBlock = runtimeTakeFreeBlock(need)
+        if reclaimedBlock != 0 { return reclaimedBlock }
     }
     // bump
-    rx_grow(__hbump + HDR + need)
-    let obj = __hbump + HDR
-    store64(obj - 8, need)
-    __hbump = obj + need
-    rx_bit_set(__startb, (obj - __hbase) >> 3)
-    return obj                                       // committed pages start zeroed
+    runtimeGrowHeap(runtimeHeapBumpAddress + runtimeObjectHeaderBytes + need)
+    let object = runtimeHeapBumpAddress + runtimeObjectHeaderBytes
+    store64(object - 8, need)
+    runtimeHeapBumpAddress = object + need
+    runtimeSetBitmapBit(runtimeObjectStartBitmap, (object - runtimeHeapBaseAddress) >> 3)
+    return object                                       // committed pages start zeroed
 }
 
-fn rx_zero(p: int, n: int) {
-    var i = 0
-    while i < n {
-        store64(p + i, 0)
-        i += 8
+fn runtimeZeroMemory(address: int, byteCount: int) {
+    var index = 0
+    while index < byteCount {
+        store64(address + index, 0)
+        index += 8
     }
 }
 
 // records the globals array so the collector can scan it as a root set
-fn rt_set_globals(p: int, n: int) {
-    __groots = p
-    __ngroots = n
+fn runtimeSetGlobalRoots(rootsAddress: int, rootCount: int) {
+    runtimeGlobalRootsAddress = rootsAddress
+    runtimeGlobalRootCount = rootCount
 }
 
 // ---- raw byte copy ----
-fn rx_mcopy(dst: int, src: int, n: int) {
-    var i = 0
-    while i + 8 <= n {
-        store64(dst + i, load64(src + i))
-        i += 8
+fn runtimeCopyMemory(destination: int, source: int, byteCount: int) {
+    var index = 0
+    while index + 8 <= byteCount {
+        store64(destination + index, load64(source + index))
+        index += 8
     }
-    while i < n {
-        store8(dst + i, load8(src + i))
-        i += 1
+    while index < byteCount {
+        store8(destination + index, load8(source + index))
+        index += 1
     }
 }
 
 // ---- strings ----  (a str value is a pointer to {i64 len; bytes})
-fn rx_str_alloc(slen: int) -> int {
-    let p = rt_alloc(8 + slen)
-    store64(p, slen)
-    return p
+fn runtimeAllocateString(stringLength: int) -> int {
+    let address = runtimeAllocateObject(8 + stringLength)
+    store64(address, stringLength)
+    return address
 }
 
-fn rt_str_concat(a: int, b: int) -> int {
-    let la = load64(a)
-    let lb = load64(b)
-    let s = rx_str_alloc(la + lb)
-    rx_mcopy(s + 8, a + 8, la)
-    rx_mcopy(s + 8 + la, b + 8, lb)
-    return s
+fn runtimeConcatenateStrings(leftStringAddress: int, rightStringAddress: int) -> int {
+    let leftAddress = load64(leftStringAddress)
+    let leftBase = load64(rightStringAddress)
+    let text = runtimeAllocateString(leftAddress + leftBase)
+    runtimeCopyMemory(text + 8, leftStringAddress + 8, leftAddress)
+    runtimeCopyMemory(text + 8 + leftAddress, rightStringAddress + 8, leftBase)
+    return text
 }
 
-fn rt_str_eq(a: int, b: int) -> int {
-    let la = load64(a)
-    if la != load64(b) { return 0 }
-    var i = 0
-    while i < la {
-        if load8(a + 8 + i) != load8(b + 8 + i) { return 0 }
-        i += 1
+fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int {
+    let leftAddress = load64(leftStringAddress)
+    if leftAddress != load64(rightStringAddress) { return 0 }
+    var index = 0
+    while index < leftAddress {
+        if load8(leftStringAddress + 8 + index) != load8(rightStringAddress + 8 + index) { return 0 }
+        index += 1
     }
     return 1
 }
 
-fn rt_str_cmp(a: int, b: int) -> int {
-    let la = load64(a)
-    let lb = load64(b)
-    var n = la
-    if lb < n { n = lb }
-    var i = 0
-    while i < n {
-        let ca = load8(a + 8 + i)
-        let cb = load8(b + 8 + i)
-        if ca < cb { return 0 - 1 }
-        if ca > cb { return 1 }
-        i += 1
+fn runtimeCompareStrings(leftStringAddress: int, rightStringAddress: int) -> int {
+    let leftAddress = load64(leftStringAddress)
+    let leftBase = load64(rightStringAddress)
+    var count = leftAddress
+    if leftBase < count { count = leftBase }
+    var index = 0
+    while index < count {
+        let callAddress = load8(leftStringAddress + 8 + index)
+        let commandBuffer = load8(rightStringAddress + 8 + index)
+        if callAddress < commandBuffer { return 0 - 1 }
+        if callAddress > commandBuffer { return 1 }
+        index += 1
     }
-    if la < lb { return 0 - 1 }
-    if la > lb { return 1 }
+    if leftAddress < leftBase { return 0 - 1 }
+    if leftAddress > leftBase { return 1 }
     return 0
 }
 
-fn rt_str_sub(s: int, lo: int, hi: int) -> int {
-    let n = load64(s)
-    if lo < 0 or hi < lo or hi > n { rt_die("invalid substring") }
-    let r = rx_str_alloc(hi - lo)
-    rx_mcopy(r + 8, s + 8 + lo, hi - lo)
-    return r
+fn runtimeSubstringValue(stringAddress: int, lowerBound: int, upperBound: int) -> int {
+    let count = load64(stringAddress)
+    if lowerBound < 0 or upperBound < lowerBound or upperBound > count { runtimeFail("invalid substring") }
+    let result = runtimeAllocateString(upperBound - lowerBound)
+    runtimeCopyMemory(result + 8, stringAddress + 8 + lowerBound, upperBound - lowerBound)
+    return result
 }
 
-fn rt_chr(c: int) -> int {
-    if c < 0 or c > 255 { rt_die("chr out of range") }
-    let s = rx_str_alloc(1)
-    store8(s + 8, c)
-    return s
+fn runtimeCharacterFromCode(character: int) -> int {
+    if character < 0 or character > 255 { runtimeFail("chr out of range") }
+    let text = runtimeAllocateString(1)
+    store8(text + 8, character)
+    return text
 }
 
 // ---- stdlib: string / list / math helpers ----
 // pow() with a float operand: exact repeated squaring for whole exponents below
-// 2^31, e^(y ln x) otherwise. Bits in and out. rx_fexp / rx_fln are the
+// 2^31, e^(y ln x) otherwise. Bits in and out. runtimeFloatExponentialCore / runtimeFloatNaturalLogCore are the
 // algorithms of std/math_core.zeph's fexp / fln, which stay usable without --rt.
-fn rt_fpow(baseBits: int, exponentBits: int) -> int {
-    return bits(rx_fpow(frombits(baseBits), frombits(exponentBits)))
+fn runtimeFloatBitsPower(baseBits: int, exponentBits: int) -> int {
+    return bits(runtimeFloatPowerCore(frombits(baseBits), frombits(exponentBits)))
 }
 
-fn rx_fabs(x: float) -> float {
-    if x < 0.0 { return 0.0 - x }
-    return x
+fn runtimeFloatAbsoluteCore(value: float) -> float {
+    if value < 0.0 { return 0.0 - value }
+    return value
 }
 
-fn rx_fpow(base: float, exponent: float) -> float {
+fn runtimeFloatPowerCore(base: float, exponent: float) -> float {
     if exponent == 0.0 or base == 1.0 { return 1.0 }
     if base != base or exponent != exponent { return base + exponent }   // nan
     let infinity = frombits(2047 << 52)
-    if rx_fabs(exponent) == infinity {
-        let magnitude = rx_fabs(base)
+    if runtimeFloatAbsoluteCore(exponent) == infinity {
+        let magnitude = runtimeFloatAbsoluteCore(base)
         if magnitude == 1.0 { return 1.0 }
         if (magnitude > 1.0) == (exponent > 0.0) { return infinity }
         return 0.0
     }
-    var whole = rx_fabs(exponent) >= 9007199254740992.0     // every float this large is even
+    var whole = runtimeFloatAbsoluteCore(exponent) >= 9007199254740992.0     // every float this large is even
     var odd = false
     if not whole and ((exponent as int) as float) == exponent {
         whole = true
         odd = (exponent as int) & 1 == 1
-        if rx_fabs(exponent) < 2147483648.0 {
+        if runtimeFloatAbsoluteCore(exponent) < 2147483648.0 {
             var remaining = exponent as int
             var factor = base
             if remaining < 0 {
@@ -837,224 +837,224 @@ fn rx_fpow(base: float, exponent: float) -> float {
         if exponent < 0.0 { return infinity }
         return 0.0
     }
-    let result = rx_fexp(exponent * rx_fln(magnitudeBase))
+    let result = runtimeFloatExponentialCore(exponent * runtimeFloatNaturalLogCore(magnitudeBase))
     if base < 0.0 and odd { return 0.0 - result }
     return result
 }
 
-fn rx_fexp(x: float) -> float {
-    if x != x { return x }
-    if x < 0.0 - 745.2 { return 0.0 }
-    if x > 709.782712893384 { return frombits(2047 << 52) }
-    let scaled = x / 0.6931471805599453
-    var n = 0
-    if scaled >= 0.0 { n = (scaled + 0.5) as int }
-    else { n = 0 - ((0.5 - scaled) as int) }
-    if n > 1023 { n = 1023 }
-    let nf = n as float
-    let r = (x - nf * 0.6931471803691238) - nf * 0.00000000019082149292705877
+fn runtimeFloatExponentialCore(value: float) -> float {
+    if value != value { return value }
+    if value < 0.0 - 745.2 { return 0.0 }
+    if value > 709.782712893384 { return frombits(2047 << 52) }
+    let scaled = value / 0.6931471805599453
+    var count = 0
+    if scaled >= 0.0 { count = (scaled + 0.5) as int }
+    else { count = 0 - ((0.5 - scaled) as int) }
+    if count > 1023 { count = 1023 }
+    let functionCount = count as float
+    let result = (value - functionCount * 0.6931471803691238) - functionCount * 0.00000000019082149292705877
     var term = 1.0
     var sum = 1.0
-    var i = 1
-    while i < 15 {
-        term = term * r / (i as float)
+    var index = 1
+    while index < 15 {
+        term = term * result / (index as float)
         sum += term
-        i += 1
+        index += 1
     }
-    if n < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + n + 1022) << 52) }
-    return sum * frombits((1023 + n) << 52)
+    if count < 0 - 1022 { return sum * frombits(1 << 52) * frombits((1023 + count + 1022) << 52) }
+    return sum * frombits((1023 + count) << 52)
 }
 
-fn rx_fln(x: float) -> float {
-    if x < 0.0 { return frombits((2047 << 52) | (1 << 51)) }
-    if x == 0.0 { return 0.0 - frombits(2047 << 52) }
-    if x != x or x == frombits(2047 << 52) { return x }
-    if x < frombits(1 << 52) { return rx_fln(x * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
-    let b = bits(x)
-    let e = ((b >> 52) & 2047) - 1023
-    let m = frombits((b & ((1 << 52) - 1)) | (1023 << 52))
-    let t = (m - 1.0) / (m + 1.0)
-    let t2 = t * t
-    var term = t
-    var sum = t
-    var i = 1
-    while i < 20 {
-        term = term * t2
-        sum += term / ((2 * i + 1) as float)
-        i += 1
+fn runtimeFloatNaturalLogCore(value: float) -> float {
+    if value < 0.0 { return frombits((2047 << 52) | (1 << 51)) }
+    if value == 0.0 { return 0.0 - frombits(2047 << 52) }
+    if value != value or value == frombits(2047 << 52) { return value }
+    if value < frombits(1 << 52) { return runtimeFloatNaturalLogCore(value * 4503599627370496.0) - 52.0 * 0.6931471805599453 }
+    let floatBits = bits(value)
+    let exponent = ((floatBits >> 52) & 2047) - 1023
+    let significand = frombits((floatBits & ((1 << 52) - 1)) | (1023 << 52))
+    let seriesArgument = (significand - 1.0) / (significand + 1.0)
+    let seriesArgumentSquared = seriesArgument * seriesArgument
+    var term = seriesArgument
+    var sum = seriesArgument
+    var index = 1
+    while index < 20 {
+        term = term * seriesArgumentSquared
+        sum += term / ((2 * index + 1) as float)
+        index += 1
     }
-    return (e as float) * 0.6931471805599453 + 2.0 * sum
+    return (exponent as float) * 0.6931471805599453 + 2.0 * sum
 }
 
-fn rt_ipow(base: int, exp: int) -> int {
-    if exp < 0 { return 0 }
-    var r = 1
-    var b = base
-    var e = exp
-    while e > 0 {
-        if e & 1 == 1 { r = r * b }
-        b = b * b
-        e = e >> 1
+fn runtimeIntegerPower(base: int, exponent: int) -> int {
+    if exponent < 0 { return 0 }
+    var result = 1
+    var powerBase = base
+    var remainingExponent = exponent
+    while remainingExponent > 0 {
+        if remainingExponent & 1 == 1 { result = result * powerBase }
+        powerBase = powerBase * powerBase
+        remainingExponent = remainingExponent >> 1
     }
-    return r
+    return result
 }
 
-fn rt_str_index_of(s: int, sub: int) -> int {
-    let n = load64(s)
-    let m = load64(sub)
-    if m == 0 { return 0 }
-    var i = 0
-    while i + m <= n {
-        var j = 0
-        while j < m and load8(s + 8 + i + j) == load8(sub + 8 + j) { j += 1 }
-        if j == m { return i }
-        i += 1
+fn runtimeStringIndexOf(stringAddress: int, substring: int) -> int {
+    let count = load64(stringAddress)
+    let substringLength = load64(substring)
+    if substringLength == 0 { return 0 }
+    var index = 0
+    while index + substringLength <= count {
+        var otherIndex = 0
+        while otherIndex < substringLength and load8(stringAddress + 8 + index + otherIndex) == load8(substring + 8 + otherIndex) { otherIndex += 1 }
+        if otherIndex == substringLength { return index }
+        index += 1
     }
     return 0 - 1
 }
-fn rt_str_contains(s: int, sub: int) -> int {
-    if rt_str_index_of(s, sub) >= 0 { return 1 }
+fn runtimeStringContains(stringAddress: int, substring: int) -> int {
+    if runtimeStringIndexOf(stringAddress, substring) >= 0 { return 1 }
     return 0
 }
-fn rt_str_starts_with(s: int, p: int) -> int {
-    let n = load64(s)
-    let m = load64(p)
-    if m > n { return 0 }
-    var j = 0
-    while j < m {
-        if load8(s + 8 + j) != load8(p + 8 + j) { return 0 }
-        j += 1
+fn runtimeStringStartsWith(stringAddress: int, prefix: int) -> int {
+    let count = load64(stringAddress)
+    let prefixLength = load64(prefix)
+    if prefixLength > count { return 0 }
+    var otherIndex = 0
+    while otherIndex < prefixLength {
+        if load8(stringAddress + 8 + otherIndex) != load8(prefix + 8 + otherIndex) { return 0 }
+        otherIndex += 1
     }
     return 1
 }
-fn rt_str_ends_with(s: int, p: int) -> int {
-    let n = load64(s)
-    let m = load64(p)
-    if m > n { return 0 }
-    var j = 0
-    while j < m {
-        if load8(s + 8 + n - m + j) != load8(p + 8 + j) { return 0 }
-        j += 1
+fn runtimeStringEndsWith(stringAddress: int, suffix: int) -> int {
+    let count = load64(stringAddress)
+    let suffixLength = load64(suffix)
+    if suffixLength > count { return 0 }
+    var otherIndex = 0
+    while otherIndex < suffixLength {
+        if load8(stringAddress + 8 + count - suffixLength + otherIndex) != load8(suffix + 8 + otherIndex) { return 0 }
+        otherIndex += 1
     }
     return 1
 }
-fn rt_str_split(s: int, sep: int) -> int {
-    let n = load64(s)
-    let m = load64(sep)
-    let out = rt_list_new_d(0, __d_list_ref)
-    if m == 0 {
-        var i = 0
-        while i < n {
-            let piece = rx_str_alloc(1)
-            store8(piece + 8, load8(s + 8 + i))
-            rt_list_push(out, piece)
-            i += 1
+fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
+    let count = load64(stringAddress)
+    let separatorLength = load64(separator)
+    let output = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
+    if separatorLength == 0 {
+        var index = 0
+        while index < count {
+            let piece = runtimeAllocateString(1)
+            store8(piece + 8, load8(stringAddress + 8 + index))
+            runtimeListPush(output, piece)
+            index += 1
         }
-        return out
+        return output
     }
     var start = 0
-    var i = 0
-    while i + m <= n {
-        var j = 0
-        while j < m and load8(s + 8 + i + j) == load8(sep + 8 + j) { j += 1 }
-        if j == m {
-            rt_list_push(out, rt_str_sub(s, start, i))
-            i += m
-            start = i
+    var index = 0
+    while index + separatorLength <= count {
+        var otherIndex = 0
+        while otherIndex < separatorLength and load8(stringAddress + 8 + index + otherIndex) == load8(separator + 8 + otherIndex) { otherIndex += 1 }
+        if otherIndex == separatorLength {
+            runtimeListPush(output, runtimeSubstringValue(stringAddress, start, index))
+            index += separatorLength
+            start = index
         } else {
-            i += 1
+            index += 1
         }
     }
-    rt_list_push(out, rt_str_sub(s, start, n))
-    return out
+    runtimeListPush(output, runtimeSubstringValue(stringAddress, start, count))
+    return output
 }
-fn rt_str_replace(s: int, old: int, rep: int) -> int {
-    let n = load64(s)
-    let m = load64(old)
-    if m == 0 { return s }
-    var out = rx_str_alloc(0)
+fn runtimeStringReplace(stringAddress: int, old: int, replacement: int) -> int {
+    let count = load64(stringAddress)
+    let matchedLength = load64(old)
+    if matchedLength == 0 { return stringAddress }
+    var output = runtimeAllocateString(0)
     var start = 0
-    var i = 0
-    while i + m <= n {
-        var j = 0
-        while j < m and load8(s + 8 + i + j) == load8(old + 8 + j) { j += 1 }
-        if j == m {
-            out = rt_str_concat(out, rt_str_sub(s, start, i))
-            out = rt_str_concat(out, rep)
-            i += m
-            start = i
+    var index = 0
+    while index + matchedLength <= count {
+        var otherIndex = 0
+        while otherIndex < matchedLength and load8(stringAddress + 8 + index + otherIndex) == load8(old + 8 + otherIndex) { otherIndex += 1 }
+        if otherIndex == matchedLength {
+            output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, index))
+            output = runtimeConcatenateStrings(output, replacement)
+            index += matchedLength
+            start = index
         } else {
-            i += 1
+            index += 1
         }
     }
-    out = rt_str_concat(out, rt_str_sub(s, start, n))
-    return out
+    output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, count))
+    return output
 }
-fn rt_str_upper(s: int) -> int {
-    let n = load64(s)
-    let r = rx_str_alloc(n)
-    var i = 0
-    while i < n {
-        var c = load8(s + 8 + i)
-        if c >= 97 and c <= 122 { c -= 32 }
-        store8(r + 8 + i, c)
-        i += 1
+fn runtimeUppercaseString(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    let result = runtimeAllocateString(count)
+    var index = 0
+    while index < count {
+        var character = load8(stringAddress + 8 + index)
+        if character >= 97 and character <= 122 { character -= 32 }
+        store8(result + 8 + index, character)
+        index += 1
     }
-    return r
+    return result
 }
-fn rt_str_lower(s: int) -> int {
-    let n = load64(s)
-    let r = rx_str_alloc(n)
-    var i = 0
-    while i < n {
-        var c = load8(s + 8 + i)
-        if c >= 65 and c <= 90 { c += 32 }
-        store8(r + 8 + i, c)
-        i += 1
+fn runtimeLowercaseString(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    let result = runtimeAllocateString(count)
+    var index = 0
+    while index < count {
+        var character = load8(stringAddress + 8 + index)
+        if character >= 65 and character <= 90 { character += 32 }
+        store8(result + 8 + index, character)
+        index += 1
     }
-    return r
+    return result
 }
-fn rx_is_ws(c: int) -> int {
-    if c == 32 or c == 9 or c == 10 or c == 13 { return 1 }
+fn runtimeIsWhitespaceByte(character: int) -> int {
+    if character == 32 or character == 9 or character == 10 or character == 13 { return 1 }
     return 0
 }
-fn rt_str_trim(s: int) -> int {
-    let n = load64(s)
-    var lo = 0
-    while lo < n and rx_is_ws(load8(s + 8 + lo)) == 1 { lo += 1 }
-    var hi = n
-    while hi > lo and rx_is_ws(load8(s + 8 + hi - 1)) == 1 { hi -= 1 }
-    return rt_str_sub(s, lo, hi)
+fn runtimeStringTrim(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    var lowerBound = 0
+    while lowerBound < count and runtimeIsWhitespaceByte(load8(stringAddress + 8 + lowerBound)) == 1 { lowerBound += 1 }
+    var upperBound = count
+    while upperBound > lowerBound and runtimeIsWhitespaceByte(load8(stringAddress + 8 + upperBound - 1)) == 1 { upperBound -= 1 }
+    return runtimeSubstringValue(stringAddress, lowerBound, upperBound)
 }
-fn rt_str_repeat(s: int, k: int) -> int {
-    let n = load64(s)
-    var cnt = k
-    if cnt < 0 { cnt = 0 }
-    let r = rx_str_alloc(n * cnt)
-    var i = 0
-    while i < cnt {
-        rx_mcopy(r + 8 + i * n, s + 8, n)
-        i += 1
+fn runtimeStringRepeat(stringAddress: int, repetitionCount: int) -> int {
+    let textLength = load64(stringAddress)
+    var effectiveCount = repetitionCount
+    if effectiveCount < 0 { effectiveCount = 0 }
+    let result = runtimeAllocateString(textLength * effectiveCount)
+    var index = 0
+    while index < effectiveCount {
+        runtimeCopyMemory(result + 8 + index * textLength, stringAddress + 8, textLength)
+        index += 1
     }
-    return r
+    return result
 }
-fn rt_list_contains(l: int, v: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
-    var i = 0
-    while i < n {
-        if load64(data + i * 8) == v { return 1 }
-        i += 1
+fn runtimeListContains(listAddress: int, value: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
+    var index = 0
+    while index < count {
+        if load64(data + index * 8) == value { return 1 }
+        index += 1
     }
     return 0
 }
-fn rt_list_contains_str(l: int, v: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
-    var i = 0
-    while i < n {
-        if rt_str_eq(load64(data + i * 8), v) == 1 { return 1 }
-        i += 1
+fn runtimeListContainsString(listAddress: int, value: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
+    var index = 0
+    while index < count {
+        if runtimeStringsEqual(load64(data + index * 8), value) == 1 { return 1 }
+        index += 1
     }
     return 0
 }
@@ -1065,49 +1065,49 @@ fn rt_list_contains_str(l: int, v: int) -> int {
 // Keeping state beside the key preserves the full integer key domain. Counting
 // tombstones toward the load limit guarantees an empty slot ends every probe.
 // Called by name from the compiler; a map whose keys and values it will not drop.
-fn rt_map_new(keykind: int) -> int {
-    return rt_map_new_d(keykind, 0)
+fn runtimeMapNew(keyKind: int) -> int {
+    return runtimeNewDescribedMap(keyKind, 0)
 }
 
 // `desc` is a kind-3 descriptor saying whether keys and values are references.
-fn rt_map_new_d(keykind: int, desc: int) -> int {
-    var d = desc
-    if d == 0 { d = __d_map_val }     // the buffers still have to go when the map does
-    let m = rt_alloc_d(48, d)
-    let cap = 8
-    store64(m, 0)
-    store64(m + 8, cap)
-    store64(m + 16, rt_alloc(cap * 24))
-    store64(m + 24, keykind)
-    store64(m + 32, 0)
-    store64(m + 40, 61)               // high 3 bits of a 64-bit multiplicative hash
-    return m
+fn runtimeNewDescribedMap(keyKind: int, descriptor: int) -> int {
+    var shapeDescriptor = descriptor
+    if shapeDescriptor == 0 { shapeDescriptor = runtimeValueMapDescriptor }     // the buffers still have to go when the map does
+    let mapValue = runtimeAllocateDescribedObject(48, shapeDescriptor)
+    let capacity = 8
+    store64(mapValue, 0)
+    store64(mapValue + 8, capacity)
+    store64(mapValue + 16, runtimeAllocateObject(capacity * 24))
+    store64(mapValue + 24, keyKind)
+    store64(mapValue + 32, 0)
+    store64(mapValue + 40, 61)               // high 3 bits of a 64-bit multiplicative hash
+    return mapValue
 }
-fn rx_hash_int(k: int) -> int {
-    return k * -7046029254386353131    // 64-bit golden ratio; callers take high bits
+fn runtimeHashInteger(key: int) -> int {
+    return key * -7046029254386353131    // 64-bit golden ratio; callers take high bits
 }
-fn rx_hash_str(s: int) -> int {
-    let n = load64(s)
-    var h = 2166136261
-    var i = 0
-    while i < n {
-        h = h ^ load8(s + 8 + i)
-        h = h * 16777619
-        i += 1
+fn runtimeHashString(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    var hashValue = 2166136261
+    var index = 0
+    while index < count {
+        hashValue = hashValue ^ load8(stringAddress + 8 + index)
+        hashValue = hashValue * 16777619
+        index += 1
     }
-    return h & 9223372036854775807
+    return hashValue & 9223372036854775807
 }
-fn rx_map_hash(m: int, k: int) -> int {
-    let keyKind = load64(m + 24)
-    if keyKind == 1 { return rx_hash_str(k) }
-    if keyKind != 0 { return rt_value_hash(k, keyKind) }   // a type descriptor
-    return rx_hash_int(k) >> load64(m + 40)
+fn runtimeMapHash(mapAddress: int, key: int) -> int {
+    let keyKind = load64(mapAddress + 24)
+    if keyKind == 1 { return runtimeHashString(key) }
+    if keyKind != 0 { return runtimeHashTypedValue(key, keyKind) }   // a type descriptor
+    return runtimeHashInteger(key) >> load64(mapAddress + 40)
 }
-fn rx_key_eq(m: int, a: int, b: int) -> int {
-    let keyKind = load64(m + 24)
-    if keyKind == 1 { return rt_str_eq(a, b) }
-    if keyKind != 0 { return rt_value_eq(a, b, keyKind) }
-    if a == b { return 1 }
+fn runtimeKeyEquals(mapAddress: int, leftValue: int, rightValue: int) -> int {
+    let keyKind = load64(mapAddress + 24)
+    if keyKind == 1 { return runtimeStringsEqual(leftValue, rightValue) }
+    if keyKind != 0 { return runtimeValueEquals(leftValue, rightValue, keyKind) }
+    if leftValue == rightValue { return 1 }
     return 0
 }
 
@@ -1115,547 +1115,547 @@ fn rx_key_eq(m: int, a: int, b: int) -> int {
 // descriptors print uses (kinds: 0 int, 1 float, 2 bool, 3 str, 4 list,
 // 5 struct, 6 enum, 7 map, 8 optional).
 // ponytail: recursion follows the data, so a cyclic structure never returns.
-fn rt_value_eq(a: int, b: int, td: int) -> int {
-    let kind = load64(td)
-    if kind == 3 { return rt_str_eq(a, b) }
+fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> int {
+    let kind = load64(typeDescriptor)
+    if kind == 3 { return runtimeStringsEqual(leftValue, rightValue) }
     if kind == 1 {
-        if frombits(a) == frombits(b) { return 1 }
+        if frombits(leftValue) == frombits(rightValue) { return 1 }
         return 0
     }
     if kind == 4 {
-        let count = load64(a)
-        if count != load64(b) { return 0 }
-        let elementTd = load64(td + 8)
-        let dataA = load64(a + 16)
-        let dataB = load64(b + 16)
-        var i = 0
-        while i < count {
-            if rt_value_eq(load64(dataA + i * 8), load64(dataB + i * 8), elementTd) == 0 { return 0 }
-            i += 1
+        let count = load64(leftValue)
+        if count != load64(rightValue) { return 0 }
+        let elementTypeDescriptor = load64(typeDescriptor + 8)
+        let dataAlpha = load64(leftValue + 16)
+        let dataBlue = load64(rightValue + 16)
+        var index = 0
+        while index < count {
+            if runtimeValueEquals(load64(dataAlpha + index * 8), load64(dataBlue + index * 8), elementTypeDescriptor) == 0 { return 0 }
+            index += 1
         }
         return 1
     }
     if kind == 5 {
-        let fieldCount = load64(td + 16)
-        var i = 0
-        while i < fieldCount {
-            if rt_value_eq(load64(a + i * 8), load64(b + i * 8), load64(td + 32 + i * 16)) == 0 { return 0 }
-            i += 1
+        let fieldCount = load64(typeDescriptor + 16)
+        var index = 0
+        while index < fieldCount {
+            if runtimeValueEquals(load64(leftValue + index * 8), load64(rightValue + index * 8), load64(typeDescriptor + 32 + index * 16)) == 0 { return 0 }
+            index += 1
         }
         return 1
     }
     if kind == 8 {
-        if a == 0 or b == 0 {
-            if a == b { return 1 }
+        if leftValue == 0 or rightValue == 0 {
+            if leftValue == rightValue { return 1 }
             return 0
         }
-        return rt_value_eq(load64(a), load64(b), load64(td + 8))
+        return runtimeValueEquals(load64(leftValue), load64(rightValue), load64(typeDescriptor + 8))
     }
     if kind == 9 {                        // same variant, then its fields
-        if load64(a) != load64(b) { return 0 }
-        return rt_value_eq(a, b, load64(td + 16 + load64(a) * 8))
+        if load64(leftValue) != load64(rightValue) { return 0 }
+        return runtimeValueEquals(leftValue, rightValue, load64(typeDescriptor + 16 + load64(leftValue) * 8))
     }
     if kind == 10 or kind == 11 {         // packed lists, element by element
-        let count = load64(a)
-        if count != load64(b) { return 0 }
+        let count = load64(leftValue)
+        if count != load64(rightValue) { return 0 }
         var width = 1
         if kind == 11 { width = 4 }
-        var i = 0
-        while i < count {
+        var index = 0
+        while index < count {
             if kind == 10 {
-                if rx_packed_load(a, i, 1) != rx_packed_load(b, i, 1) { return 0 }
+                if runtimePackedLoad(leftValue, index, 1) != runtimePackedLoad(rightValue, index, 1) { return 0 }
             } else {
-                if frombits(rx_packed_load(a, i, 4)) != frombits(rx_packed_load(b, i, 4)) { return 0 }
+                if frombits(runtimePackedLoad(leftValue, index, 4)) != frombits(runtimePackedLoad(rightValue, index, 4)) { return 0 }
             }
-            i += 1
+            index += 1
         }
         return 1
     }
     if kind == 7 {
-        if load64(a) != load64(b) { return 0 }
-        let valueTd = load64(td + 16)
-        let capacity = load64(a + 8)
-        let slots = load64(a + 16)
-        var i = 0
-        while i < capacity {
-            let slot = slots + i * 24
+        if load64(leftValue) != load64(rightValue) { return 0 }
+        let valueTypeDescriptor = load64(typeDescriptor + 16)
+        let capacity = load64(leftValue + 8)
+        let slots = load64(leftValue + 16)
+        var index = 0
+        while index < capacity {
+            let slot = slots + index * 24
             if load64(slot) == 1 {
-                let found = rx_lookup(b, load64(slot + 8))
+                let found = runtimeFindMapEntry(rightValue, load64(slot + 8))
                 if found < 0 { return 0 }
-                if rt_value_eq(load64(slot + 16), load64(load64(b + 16) + found * 24 + 16), valueTd) == 0 { return 0 }
+                if runtimeValueEquals(load64(slot + 16), load64(load64(rightValue + 16) + found * 24 + 16), valueTypeDescriptor) == 0 { return 0 }
             }
-            i += 1
+            index += 1
         }
         return 1
     }
-    if a == b { return 1 }
+    if leftValue == rightValue { return 1 }
     return 0
 }
 
-fn rx_hash_mix(hash: int, value: int) -> int {
+fn runtimeHashMix(hash: int, value: int) -> int {
     var mixed = (hash * 1000003) ^ (value * -7046029254386353131)
     mixed = mixed ^ (mixed >> 29)
     return mixed & 9223372036854775807
 }
 
-// A hash consistent with rt_value_eq, for list/struct/optional map keys
+// A hash consistent with runtimeValueEquals, for list/struct/optional map keys
 // (float and map keys are rejected by the compiler).
-fn rt_value_hash(v: int, td: int) -> int {
-    let kind = load64(td)
-    if kind == 3 { return rx_hash_str(v) }
+fn runtimeHashTypedValue(value: int, typeDescriptor: int) -> int {
+    let kind = load64(typeDescriptor)
+    if kind == 3 { return runtimeHashString(value) }
     if kind == 4 {
-        let count = load64(v)
-        let elementTd = load64(td + 8)
-        let data = load64(v + 16)
+        let count = load64(value)
+        let elementTypeDescriptor = load64(typeDescriptor + 8)
+        let data = load64(value + 16)
         var hash = count
-        var i = 0
-        while i < count {
-            hash = rx_hash_mix(hash, rt_value_hash(load64(data + i * 8), elementTd))
-            i += 1
+        var index = 0
+        while index < count {
+            hash = runtimeHashMix(hash, runtimeHashTypedValue(load64(data + index * 8), elementTypeDescriptor))
+            index += 1
         }
         return hash
     }
     if kind == 5 {
-        let fieldCount = load64(td + 16)
+        let fieldCount = load64(typeDescriptor + 16)
         var hash = fieldCount
-        var i = 0
-        while i < fieldCount {
-            hash = rx_hash_mix(hash, rt_value_hash(load64(v + i * 8), load64(td + 32 + i * 16)))
-            i += 1
+        var index = 0
+        while index < fieldCount {
+            hash = runtimeHashMix(hash, runtimeHashTypedValue(load64(value + index * 8), load64(typeDescriptor + 32 + index * 16)))
+            index += 1
         }
         return hash
     }
     if kind == 8 {
-        if v == 0 { return 0 }
-        return rx_hash_mix(1, rt_value_hash(load64(v), load64(td + 8)))
+        if value == 0 { return 0 }
+        return runtimeHashMix(1, runtimeHashTypedValue(load64(value), load64(typeDescriptor + 8)))
     }
-    if kind == 9 { return rt_value_hash(v, load64(td + 16 + load64(v) * 8)) }
+    if kind == 9 { return runtimeHashTypedValue(value, load64(typeDescriptor + 16 + load64(value) * 8)) }
     if kind == 10 {                       // [u8]; [f32] cannot be a key
-        let count = load64(v)
+        let count = load64(value)
         var hash = count
-        var i = 0
-        while i < count {
-            hash = rx_hash_mix(hash, rx_packed_load(v, i, 1))
-            i += 1
+        var index = 0
+        while index < count {
+            hash = runtimeHashMix(hash, runtimePackedLoad(value, index, 1))
+            index += 1
         }
         return hash
     }
-    return rx_hash_mix(0, v)
+    return runtimeHashMix(0, value)
 }
 // slot holding k, or -1
-fn rx_map_lookup(m: int, k: int) -> int {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    var i = rx_map_hash(m, k) & (cap - 1)
+fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
     while true {
-        let slot = slots + i * 24
-        let st = load64(slot)
-        if st == 0 { return 0 - 1 }
-        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 { return i }
-        i = (i + 1) & (cap - 1)
+        let slot = slots + index * 24
+        let sourceType = load64(slot)
+        if sourceType == 0 { return 0 - 1 }
+        if sourceType == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
+        index = (index + 1) & (capacity - 1)
     }
     return 0 - 1
 }
-fn rx_map_insert(m: int, k: int, v: int) {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    var i = rx_map_hash(m, k) & (cap - 1)
+fn runtimeInsertGenericMapEntry(mapAddress: int, key: int, value: int) {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
     var tomb = 0 - 1
     while true {
-        let slot = slots + i * 24
-        let st = load64(slot)
-        if st == 1 and rx_key_eq(m, load64(slot + 8), k) == 1 {
-            if rx_vref(m) == 1 { rx_assign(slot + 16, v) }   // update in place
-            else { store64(slot + 16, v) }
-            if rx_kref(m) == 1 { rx_drop(k) }                    // the old key stays
+        let slot = slots + index * 24
+        let sourceType = load64(slot)
+        if sourceType == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 {
+            if runtimeMapValueIsReference(mapAddress) == 1 { runtimeAssignReference(slot + 16, value) }   // update in place
+            else { store64(slot + 16, value) }
+            if runtimeMapKeyIsReference(mapAddress) == 1 { runtimeReleaseReference(key) }                    // the old key stays
             return
         }
-        if st == 2 and tomb < 0 { tomb = i }
-        if st == 0 {
-            var dest = slot
+        if sourceType == 2 and tomb < 0 { tomb = index }
+        if sourceType == 0 {
+            var destination = slot
             if tomb >= 0 {
-                dest = slots + tomb * 24
-                store64(m + 32, load64(m + 32) - 1)
+                destination = slots + tomb * 24
+                store64(mapAddress + 32, load64(mapAddress + 32) - 1)
             }
-            store64(dest + 8, k)
-            store64(dest + 16, v)
-            store64(dest, 1)
-            store64(m, load64(m) + 1)
+            store64(destination + 8, key)
+            store64(destination + 16, value)
+            store64(destination, 1)
+            store64(mapAddress, load64(mapAddress) + 1)
             return
         }
-        i = (i + 1) & (cap - 1)
+        index = (index + 1) & (capacity - 1)
     }
 }
 // Move every live entry into a fresh buffer, dropping tombstones, not references.
-fn rx_map_rehash(m: int, ncap: int) {
-    let oldcap = load64(m + 8)
-    let oldslots = load64(m + 16)
+fn runtimeMapRehash(mapAddress: int, newCapacity: int) {
+    let oldcap = load64(mapAddress + 8)
+    let oldslots = load64(mapAddress + 16)
     // Allocate before changing the header; the collector still sees the old buffer.
-    let slots = rt_alloc(ncap * 24)
-    store64(m + 8, ncap)
-    store64(m + 16, slots)              // zeroed = all empty
-    store64(m, 0)
-    store64(m + 32, 0)
+    let slots = runtimeAllocateObject(newCapacity * 24)
+    store64(mapAddress + 8, newCapacity)
+    store64(mapAddress + 16, slots)              // zeroed = all empty
+    store64(mapAddress, 0)
+    store64(mapAddress + 32, 0)
     var shift = 64
-    var n = ncap
-    while n > 1 {
+    var count = newCapacity
+    while count > 1 {
         shift -= 1
-        n = n >> 1
+        count = count >> 1
     }
-    store64(m + 40, shift)
-    let isint = load64(m + 24) == 0
-    var i = 0
-    while i < oldcap {
-        let slot = oldslots + i * 24
+    store64(mapAddress + 40, shift)
+    let isInteger = load64(mapAddress + 24) == 0
+    var index = 0
+    while index < oldcap {
+        let slot = oldslots + index * 24
         if load64(slot) == 1 {
-            if isint { rx_iinsert(m, load64(slot + 8), load64(slot + 16)) }
-            else { rx_map_insert(m, load64(slot + 8), load64(slot + 16)) }
+            if isInteger { runtimeIntegerMapInsert(mapAddress, load64(slot + 8), load64(slot + 16)) }
+            else { runtimeInsertGenericMapEntry(mapAddress, load64(slot + 8), load64(slot + 16)) }
         }
-        i += 1
+        index += 1
     }
-    rx_drop(oldslots)
+    runtimeReleaseReference(oldslots)
 }
 // ---- int-key fast paths: hash and == inlined, no call per probe ----
-fn rx_ilookup(m: int, k: int) -> int {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)
+fn runtimeIntegerMapLookup(mapAddress: int, key: int) -> int {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    var index = ((key * -7046029254386353131) >> load64(mapAddress + 40)) & (capacity - 1)
     while true {
-        let slot = slots + i * 24
-        let st = load64(slot)
-        if st == 0 { return 0 - 1 }
-        if st == 1 and load64(slot + 8) == k { return i }
-        i = (i + 1) & (cap - 1)
+        let slot = slots + index * 24
+        let sourceType = load64(slot)
+        if sourceType == 0 { return 0 - 1 }
+        if sourceType == 1 and load64(slot + 8) == key { return index }
+        index = (index + 1) & (capacity - 1)
     }
     return 0 - 1
 }
-fn rx_iinsert(m: int, k: int, v: int) {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    var i = ((k * -7046029254386353131) >> load64(m + 40)) & (cap - 1)
+fn runtimeIntegerMapInsert(mapAddress: int, key: int, value: int) {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    var index = ((key * -7046029254386353131) >> load64(mapAddress + 40)) & (capacity - 1)
     var tomb = 0 - 1
     while true {
-        let slot = slots + i * 24
-        let st = load64(slot)
-        if st == 1 and load64(slot + 8) == k {
-            if rx_vref(m) == 1 { rx_assign(slot + 16, v) }
-            else { store64(slot + 16, v) }
+        let slot = slots + index * 24
+        let sourceType = load64(slot)
+        if sourceType == 1 and load64(slot + 8) == key {
+            if runtimeMapValueIsReference(mapAddress) == 1 { runtimeAssignReference(slot + 16, value) }
+            else { store64(slot + 16, value) }
             return
         }
-        if st == 2 and tomb < 0 { tomb = i }
-        if st == 0 {
-            var dest = slot
+        if sourceType == 2 and tomb < 0 { tomb = index }
+        if sourceType == 0 {
+            var destination = slot
             if tomb >= 0 {
-                dest = slots + tomb * 24
-                store64(m + 32, load64(m + 32) - 1)
+                destination = slots + tomb * 24
+                store64(mapAddress + 32, load64(mapAddress + 32) - 1)
             }
-            store64(dest + 8, k)
-            store64(dest + 16, v)
-            store64(dest, 1)
-            store64(m, load64(m) + 1)
+            store64(destination + 8, key)
+            store64(destination + 16, value)
+            store64(destination, 1)
+            store64(mapAddress, load64(mapAddress) + 1)
             return
         }
-        i = (i + 1) & (cap - 1)
+        index = (index + 1) & (capacity - 1)
     }
 }
-fn rt_map_set(m: int, k: int, v: int) {
+fn runtimeMapSet(mapAddress: int, key: int, value: int) {
     // Rehash at 50% of slots in use, tombstones included. Double when the live
     // entries alone would fill over 25%; otherwise it is mostly tombstones, and
     // rebuilding at the same size clears them.
-    let cap = load64(m + 8)
-    if (load64(m) + load64(m + 32) + 1) * 2 >= cap {
-        if (load64(m) + 1) * 4 >= cap { rx_map_rehash(m, cap * 2) }
-        else { rx_map_rehash(m, cap) }
+    let capacity = load64(mapAddress + 8)
+    if (load64(mapAddress) + load64(mapAddress + 32) + 1) * 2 >= capacity {
+        if (load64(mapAddress) + 1) * 4 >= capacity { runtimeMapRehash(mapAddress, capacity * 2) }
+        else { runtimeMapRehash(mapAddress, capacity) }
     }
-    if load64(m + 24) == 0 {
-        rx_iinsert(m, k, v)
+    if load64(mapAddress + 24) == 0 {
+        runtimeIntegerMapInsert(mapAddress, key, value)
         return
     }
-    rx_map_insert(m, k, v)
+    runtimeInsertGenericMapEntry(mapAddress, key, value)
 }
 // Lookups hand back a +1 of their own when the values are references: the
-// caller owns what it gets, the map keeps what it holds. rt_map_set and
-// rt_list_push are the only runtime entry points that take ownership of an
+// caller owns what it gets, the map keeps what it holds. runtimeMapSet and
+// runtimeListPush are the only runtime entry points that take ownership of an
 // argument; everything else borrows.
-fn rt_map_get(m: int, k: int) -> int {
-    let i = rx_lookup(m, k)
-    if i < 0 { rt_die("map key not found") }
-    let v = load64(load64(m + 16) + i * 24 + 16)
-    if rx_vref(m) == 1 { let d = rx_dup(v) }
-    return v
+fn runtimeMapGet(mapAddress: int, key: int) -> int {
+    let index = runtimeFindMapEntry(mapAddress, key)
+    if index < 0 { runtimeFail("map key not found") }
+    let value = load64(load64(mapAddress + 16) + index * 24 + 16)
+    if runtimeMapValueIsReference(mapAddress) == 1 { let retainedValue = runtimeRetainReference(value) }
+    return value
 }
 // fused m.get(k).or(d): the value or the default, no optional cell allocated
-fn rt_map_get_or(m: int, k: int, d: int) -> int {
-    let i = rx_lookup(m, k)
-    var v = d
-    if i >= 0 { v = load64(load64(m + 16) + i * 24 + 16) }
-    if rx_vref(m) == 1 { let d = rx_dup(v) }
-    return v
+fn runtimeMapGetOrReference(mapAddress: int, key: int, fallbackValue: int) -> int {
+    let index = runtimeFindMapEntry(mapAddress, key)
+    var value = fallbackValue
+    if index >= 0 { value = load64(load64(mapAddress + 16) + index * 24 + 16) }
+    if runtimeMapValueIsReference(mapAddress) == 1 { let fallbackValue = runtimeRetainReference(value) }
+    return value
 }
 // The compiler selects this when neither keys nor values need reference handling.
-fn rt_map_get_or_val(m: int, k: int, d: int) -> int {
-    let i = rx_ilookup(m, k)
-    if i < 0 { return d }
-    return load64(load64(m + 16) + i * 24 + 16)
+fn runtimeMapGetOrValue(mapAddress: int, key: int, fallbackValue: int) -> int {
+    let index = runtimeIntegerMapLookup(mapAddress, key)
+    if index < 0 { return fallbackValue }
+    return load64(load64(mapAddress + 16) + index * 24 + 16)
 }
 // dispatch: int-keyed maps take the inlined fast path
-fn rx_lookup(m: int, k: int) -> int {
-    if load64(m + 24) == 0 { return rx_ilookup(m, k) }
-    return rx_map_lookup(m, k)
+fn runtimeFindMapEntry(mapAddress: int, key: int) -> int {
+    if load64(mapAddress + 24) == 0 { return runtimeIntegerMapLookup(mapAddress, key) }
+    return runtimeFindGenericMapEntry(mapAddress, key)
 }
 // safe lookup: returns an optional cell (0 = none)
-fn rt_map_get_opt(m: int, k: int) -> int {
-    let i = rx_lookup(m, k)
-    if i < 0 { return 0 }
-    let v = load64(load64(m + 16) + i * 24 + 16)
+fn runtimeMapGetOptional(mapAddress: int, key: int) -> int {
+    let index = runtimeFindMapEntry(mapAddress, key)
+    if index < 0 { return 0 }
+    let value = load64(load64(mapAddress + 16) + index * 24 + 16)
     var cell = 0
-    if rx_vref(m) == 1 {
-        cell = rt_alloc_d(8, __d_box_ref)
-        let d = rx_dup(v)
+    if runtimeMapValueIsReference(mapAddress) == 1 {
+        cell = runtimeAllocateDescribedObject(8, runtimeReferenceBoxDescriptor)
+        let retainedValue = runtimeRetainReference(value)
     } else {
-        cell = rt_alloc_d(8, __d_box_val)
+        cell = runtimeAllocateDescribedObject(8, runtimeValueBoxDescriptor)
     }
-    store64(cell, v)
+    store64(cell, value)
     return cell
 }
-fn rt_map_has(m: int, k: int) -> int {
-    if rx_lookup(m, k) >= 0 { return 1 }
+fn runtimeMapHas(mapAddress: int, key: int) -> int {
+    if runtimeFindMapEntry(mapAddress, key) >= 0 { return 1 }
     return 0
 }
-fn rt_map_remove(m: int, k: int) {
-    let i = rx_lookup(m, k)
-    if i < 0 { return }
-    let slot = load64(m + 16) + i * 24
+fn runtimeMapRemove(mapAddress: int, key: int) {
+    let index = runtimeFindMapEntry(mapAddress, key)
+    if index < 0 { return }
+    let slot = load64(mapAddress + 16) + index * 24
     store64(slot, 2)                     // tombstone
-    store64(m, load64(m) - 1)
-    store64(m + 32, load64(m + 32) + 1)
-    if rx_kref(m) == 1 { rx_drop(load64(slot + 8)) }
-    if rx_vref(m) == 1 { rx_drop(load64(slot + 16)) }
+    store64(mapAddress, load64(mapAddress) - 1)
+    store64(mapAddress + 32, load64(mapAddress + 32) + 1)
+    if runtimeMapKeyIsReference(mapAddress) == 1 { runtimeReleaseReference(load64(slot + 8)) }
+    if runtimeMapValueIsReference(mapAddress) == 1 { runtimeReleaseReference(load64(slot + 16)) }
     // The conservative collector must not retain deleted keys or values.
     store64(slot + 8, 0)
     store64(slot + 16, 0)
 }
-fn rt_map_keys(m: int) -> int {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    let kref = rx_kref(m)
-    var ld = __d_list_val
-    if kref == 1 { ld = __d_list_ref }
-    let out = rt_list_new_d(0, ld)
-    var i = 0
-    while i < cap {
-        let slot = slots + i * 24
+fn runtimeMapKeys(mapAddress: int) -> int {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    let mapKeyIsReferenceLocal = runtimeMapKeyIsReference(mapAddress)
+    var dataAddress = runtimeValueListDescriptor
+    if mapKeyIsReferenceLocal == 1 { dataAddress = runtimeReferenceListDescriptor }
+    let output = runtimeNewDescribedList(0, dataAddress)
+    var index = 0
+    while index < capacity {
+        let slot = slots + index * 24
         if load64(slot) == 1 {
-            let k = load64(slot + 8)
-            if kref == 1 { let d = rx_dup(k) }
-            rt_list_push(out, k)
+            let key = load64(slot + 8)
+            if mapKeyIsReferenceLocal == 1 { let retainedKey = runtimeRetainReference(key) }
+            runtimeListPush(output, key)
         }
-        i += 1
+        index += 1
     }
-    return out
+    return output
 }
-fn rt_map_values(m: int) -> int {
-    let cap = load64(m + 8)
-    let slots = load64(m + 16)
-    let vref = rx_vref(m)
-    var ld = __d_list_val
-    if vref == 1 { ld = __d_list_ref }
-    let out = rt_list_new_d(0, ld)
-    var i = 0
-    while i < cap {
-        let slot = slots + i * 24
+fn runtimeMapValues(mapAddress: int) -> int {
+    let capacity = load64(mapAddress + 8)
+    let slots = load64(mapAddress + 16)
+    let mapValueIsReferenceLocal = runtimeMapValueIsReference(mapAddress)
+    var dataAddress = runtimeValueListDescriptor
+    if mapValueIsReferenceLocal == 1 { dataAddress = runtimeReferenceListDescriptor }
+    let output = runtimeNewDescribedList(0, dataAddress)
+    var index = 0
+    while index < capacity {
+        let slot = slots + index * 24
         if load64(slot) == 1 {
-            let v = load64(slot + 16)
-            if vref == 1 { let d = rx_dup(v) }
-            rt_list_push(out, v)
+            let value = load64(slot + 16)
+            if mapValueIsReferenceLocal == 1 { let retainedValue = runtimeRetainReference(value) }
+            runtimeListPush(output, value)
         }
-        i += 1
+        index += 1
     }
-    return out
+    return output
 }
 
 // ---- sorting (heapsort: in place, O(n log n), no recursion) ----
 // kind: 0 = by value (int/bool/enum), 1 = str, 2 = float.  Kept free of
 // function values so the C seed can still compile this file.
-fn rx_cmp_kind(kind: int, a: int, b: int) -> int {
-    if kind == 1 { return rt_str_cmp(a, b) }
+fn runtimeCompareValuesByKind(kind: int, leftValue: int, rightValue: int) -> int {
+    if kind == 1 { return runtimeCompareStrings(leftValue, rightValue) }
     if kind == 2 {
-        let x = frombits(a)
-        let y = frombits(b)
-        if x < y { return 0 - 1 }
-        if x > y { return 1 }
+        let value = frombits(leftValue)
+        let otherValue = frombits(rightValue)
+        if value < otherValue { return 0 - 1 }
+        if value > otherValue { return 1 }
         return 0
     }
-    if a < b { return 0 - 1 }
-    if a > b { return 1 }
+    if leftValue < rightValue { return 0 - 1 }
+    if leftValue > rightValue { return 1 }
     return 0
 }
-fn rx_sift(data: int, n: int, start: int, kind: int) {
+fn runtimeSiftHeap(data: int, count: int, start: int, kind: int) {
     var root = start
     var going = true
     while going {
         let child = 2 * root + 1
-        if child >= n {
+        if child >= count {
             going = false
             continue
         }
         var big = root
-        if rx_cmp_kind(kind, load64(data + big * 8), load64(data + child * 8)) < 0 { big = child }
-        if child + 1 < n {
-            if rx_cmp_kind(kind, load64(data + big * 8), load64(data + child * 8 + 8)) < 0 { big = child + 1 }
+        if runtimeCompareValuesByKind(kind, load64(data + big * 8), load64(data + child * 8)) < 0 { big = child }
+        if child + 1 < count {
+            if runtimeCompareValuesByKind(kind, load64(data + big * 8), load64(data + child * 8 + 8)) < 0 { big = child + 1 }
         }
         if big == root {
             going = false
             continue
         }
-        let t = load64(data + root * 8)
+        let savedValue = load64(data + root * 8)
         store64(data + root * 8, load64(data + big * 8))
-        store64(data + big * 8, t)
+        store64(data + big * 8, savedValue)
         root = big
     }
 }
-fn rx_swap(data: int, i: int, j: int) {
-    let t = load64(data + i * 8)
-    store64(data + i * 8, load64(data + j * 8))
-    store64(data + j * 8, t)
+fn runtimeSwapSortElements(data: int, index: int, otherIndex: int) {
+    let savedValue = load64(data + index * 8)
+    store64(data + index * 8, load64(data + otherIndex * 8))
+    store64(data + otherIndex * 8, savedValue)
 }
 // heapsort restricted to [lo, hi] -- the introsort depth-limit fallback that
 // keeps the worst case O(n log n).
-fn rx_heapsort_range(data: int, lo: int, hi: int, kind: int) {
-    let base = data + lo * 8
-    let n = hi - lo + 1
-    var i = n / 2 - 1
-    while i >= 0 {
-        rx_sift(base, n, i, kind)
-        i -= 1
+fn runtimeHeapSortRange(data: int, lowerBound: int, upperBound: int, kind: int) {
+    let base = data + lowerBound * 8
+    let count = upperBound - lowerBound + 1
+    var index = count / 2 - 1
+    while index >= 0 {
+        runtimeSiftHeap(base, count, index, kind)
+        index -= 1
     }
-    var e = n - 1
-    while e > 0 {
-        let t = load64(base)
-        store64(base, load64(base + e * 8))
-        store64(base + e * 8, t)
-        rx_sift(base, e, 0, kind)
-        e -= 1
+    var heapEnd = count - 1
+    while heapEnd > 0 {
+        let savedValue = load64(base)
+        store64(base, load64(base + heapEnd * 8))
+        store64(base + heapEnd * 8, savedValue)
+        runtimeSiftHeap(base, heapEnd, 0, kind)
+        heapEnd -= 1
     }
 }
 // median-of-three Hoare partition; pivot is an element value so it always
 // terminates. Returns the split index j: [lo, j] and [j+1, hi].
-fn rx_partition(data: int, lo: int, hi: int, kind: int) -> int {
-    let mid = lo + (hi - lo) / 2
-    if rx_cmp_kind(kind, load64(data + mid * 8), load64(data + lo * 8)) < 0 { rx_swap(data, lo, mid) }
-    if rx_cmp_kind(kind, load64(data + hi * 8), load64(data + lo * 8)) < 0 { rx_swap(data, lo, hi) }
-    if rx_cmp_kind(kind, load64(data + hi * 8), load64(data + mid * 8)) < 0 { rx_swap(data, mid, hi) }
+fn runtimePartition(data: int, lowerBound: int, upperBound: int, kind: int) -> int {
+    let mid = lowerBound + (upperBound - lowerBound) / 2
+    if runtimeCompareValuesByKind(kind, load64(data + mid * 8), load64(data + lowerBound * 8)) < 0 { runtimeSwapSortElements(data, lowerBound, mid) }
+    if runtimeCompareValuesByKind(kind, load64(data + upperBound * 8), load64(data + lowerBound * 8)) < 0 { runtimeSwapSortElements(data, lowerBound, upperBound) }
+    if runtimeCompareValuesByKind(kind, load64(data + upperBound * 8), load64(data + mid * 8)) < 0 { runtimeSwapSortElements(data, mid, upperBound) }
     let pivot = load64(data + mid * 8)
-    var i = lo - 1
-    var j = hi + 1
-    var res = 0
+    var index = lowerBound - 1
+    var otherIndex = upperBound + 1
+    var result = 0
     var done = false
     while not done {
-        i += 1
-        while rx_cmp_kind(kind, load64(data + i * 8), pivot) < 0 { i += 1 }
-        j -= 1
-        while rx_cmp_kind(kind, load64(data + j * 8), pivot) > 0 { j -= 1 }
-        if i >= j {
-            res = j
+        index += 1
+        while runtimeCompareValuesByKind(kind, load64(data + index * 8), pivot) < 0 { index += 1 }
+        otherIndex -= 1
+        while runtimeCompareValuesByKind(kind, load64(data + otherIndex * 8), pivot) > 0 { otherIndex -= 1 }
+        if index >= otherIndex {
+            result = otherIndex
             done = true
         } else {
-            rx_swap(data, i, j)
+            runtimeSwapSortElements(data, index, otherIndex)
         }
     }
-    return res
+    return result
 }
 // introsort: quicksort, recursing into the smaller partition and looping on the
 // larger (stack depth O(log n)); drop to heapsort when recursion gets too deep.
-fn rx_introsort(data: int, lo0: int, hi0: int, depth0: int, kind: int) {
-    var lo = lo0
-    var hi = hi0
+fn runtimeIntrospectiveSort(data: int, initialLowerBound: int, initialUpperBound: int, depth0: int, kind: int) {
+    var lowerBound = initialLowerBound
+    var upperBound = initialUpperBound
     var depth = depth0
-    while hi - lo > 16 {
+    while upperBound - lowerBound > 16 {
         if depth <= 0 {
-            rx_heapsort_range(data, lo, hi, kind)
+            runtimeHeapSortRange(data, lowerBound, upperBound, kind)
             return
         }
         depth -= 1
-        let p = rx_partition(data, lo, hi, kind)
-        if p - lo < hi - p - 1 {
-            rx_introsort(data, lo, p, depth, kind)
-            lo = p + 1
+        let partitionIndex = runtimePartition(data, lowerBound, upperBound, kind)
+        if partitionIndex - lowerBound < upperBound - partitionIndex - 1 {
+            runtimeIntrospectiveSort(data, lowerBound, partitionIndex, depth, kind)
+            lowerBound = partitionIndex + 1
         } else {
-            rx_introsort(data, p + 1, hi, depth, kind)
-            hi = p
+            runtimeIntrospectiveSort(data, partitionIndex + 1, upperBound, depth, kind)
+            upperBound = partitionIndex
         }
     }
 }
 // finishing pass: ranges left <= 16 wide by introsort are nearly sorted, so one
 // insertion sort over the whole array is O(n) with a tiny constant.
-fn rx_insertion(data: int, lo: int, hi: int, kind: int) {
-    var i = lo + 1
-    while i <= hi {
-        let v = load64(data + i * 8)
-        var j = i - 1
+fn runtimeInsertionSort(data: int, lowerBound: int, upperBound: int, kind: int) {
+    var index = lowerBound + 1
+    while index <= upperBound {
+        let value = load64(data + index * 8)
+        var otherIndex = index - 1
         var going = true
-        while going and j >= lo {
-            if rx_cmp_kind(kind, load64(data + j * 8), v) > 0 {
-                store64(data + (j + 1) * 8, load64(data + j * 8))
-                j -= 1
+        while going and otherIndex >= lowerBound {
+            if runtimeCompareValuesByKind(kind, load64(data + otherIndex * 8), value) > 0 {
+                store64(data + (otherIndex + 1) * 8, load64(data + otherIndex * 8))
+                otherIndex -= 1
             } else {
                 going = false
             }
         }
-        store64(data + (j + 1) * 8, v)
-        i += 1
+        store64(data + (otherIndex + 1) * 8, value)
+        index += 1
     }
 }
 // ---- int-specialized introsort: same structure, but comparisons are inline
-// `<`/`>` on loaded values instead of a call to rx_cmp_kind per compare. The
+// `<`/`>` on loaded values instead of a call to runtimeCompareValuesByKind per compare. The
 // call overhead dominates a generic sort, so this is the path that matters. ----
-fn rx_heapsort_range_int(data: int, lo: int, hi: int) {
-    let base = data + lo * 8
-    let n = hi - lo + 1
-    var i = n / 2 - 1
-    while i >= 0 {
-        var root = i
+fn runtimeHeapSortIntegerRange(data: int, lowerBound: int, upperBound: int) {
+    let base = data + lowerBound * 8
+    let count = upperBound - lowerBound + 1
+    var index = count / 2 - 1
+    while index >= 0 {
+        var root = index
         var going = true
         while going {
             let child = 2 * root + 1
-            if child >= n {
+            if child >= count {
                 going = false
             } else {
                 var big = root
                 if load64(base + big * 8) < load64(base + child * 8) { big = child }
-                if child + 1 < n and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
+                if child + 1 < count and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
                 if big == root {
                     going = false
                 } else {
-                    rx_swap(base, root, big)
+                    runtimeSwapSortElements(base, root, big)
                     root = big
                 }
             }
         }
-        i -= 1
+        index -= 1
     }
-    var e = n - 1
-    while e > 0 {
-        rx_swap(base, 0, e)
+    var heapEnd = count - 1
+    while heapEnd > 0 {
+        runtimeSwapSortElements(base, 0, heapEnd)
         var root = 0
         var going = true
         while going {
             let child = 2 * root + 1
-            if child >= e {
+            if child >= heapEnd {
                 going = false
             } else {
                 var big = root
                 if load64(base + big * 8) < load64(base + child * 8) { big = child }
-                if child + 1 < e and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
+                if child + 1 < heapEnd and load64(base + big * 8) < load64(base + child * 8 + 8) { big = child + 1 }
                 if big == root {
                     going = false
                 } else {
-                    rx_swap(base, root, big)
+                    runtimeSwapSortElements(base, root, big)
                     root = big
                 }
             }
         }
-        e -= 1
+        heapEnd -= 1
     }
 }
 // Branchless Lomuto partition (the pdqsort / Alexandrescu technique). The
@@ -1666,228 +1666,228 @@ fn rx_heapsort_range_int(data: int, lo: int, hi: int) {
 // data-dependent branches: random data costs no branch mispredictions, which
 // is where a classic Hoare scan loses half its time. Returns w with the pivot
 // fixed at a[w]: [lo, w-1] < pivot, [w+1, hi] >= pivot.
-fn rx_partition_int(data: int, lo: int, hi: int) -> int {
-    let mid = lo + (hi - lo) / 2
-    if load64(data + mid * 8) < load64(data + lo * 8) { rx_swap(data, lo, mid) }
-    if load64(data + hi * 8) < load64(data + lo * 8) { rx_swap(data, lo, hi) }
-    if load64(data + hi * 8) < load64(data + mid * 8) { rx_swap(data, mid, hi) }
-    rx_swap(data, mid, hi)               // park the median at hi
-    let p = load64(data + hi * 8)
-    var w = lo
-    var r = lo
-    while r < hi {
+fn runtimePartitionInteger(data: int, lowerBound: int, upperBound: int) -> int {
+    let mid = lowerBound + (upperBound - lowerBound) / 2
+    if load64(data + mid * 8) < load64(data + lowerBound * 8) { runtimeSwapSortElements(data, lowerBound, mid) }
+    if load64(data + upperBound * 8) < load64(data + lowerBound * 8) { runtimeSwapSortElements(data, lowerBound, upperBound) }
+    if load64(data + upperBound * 8) < load64(data + mid * 8) { runtimeSwapSortElements(data, mid, upperBound) }
+    runtimeSwapSortElements(data, mid, upperBound)               // park the median at hi
+    let pivotValue = load64(data + upperBound * 8)
+    var writeIndex = lowerBound
+    var readIndex = lowerBound
+    while readIndex < upperBound {
         // one temp only, so register promotion covers every hot value here
         // (data, w, r, p, x, hi -> six callee-saved registers, zero spills)
-        let x = load64(data + r * 8)
-        store64(data + r * 8, load64(data + w * 8))
-        store64(data + w * 8, x)
-        w += ((((x - p) ^ ((x ^ p) & ((x - p) ^ x))) >> 63) & 1)   // w += (x < p)
-        r += 1
+        let value = load64(data + readIndex * 8)
+        store64(data + readIndex * 8, load64(data + writeIndex * 8))
+        store64(data + writeIndex * 8, value)
+        writeIndex += ((((value - pivotValue) ^ ((value ^ pivotValue) & ((value - pivotValue) ^ value))) >> 63) & 1)   // w += (x < p)
+        readIndex += 1
     }
-    rx_swap(data, w, hi)                 // pivot into its final slot
-    return w
+    runtimeSwapSortElements(data, writeIndex, upperBound)                 // pivot into its final slot
+    return writeIndex
 }
-fn rx_introsort_int(data: int, lo0: int, hi0: int, depth0: int) {
-    var lo = lo0
-    var hi = hi0
+fn runtimeIntrospectiveSortIntegers(data: int, initialLowerBound: int, initialUpperBound: int, depth0: int) {
+    var lowerBound = initialLowerBound
+    var upperBound = initialUpperBound
     var depth = depth0
-    while hi - lo > 24 {
+    while upperBound - lowerBound > 24 {
         if depth <= 0 {
-            rx_heapsort_range_int(data, lo, hi)
+            runtimeHeapSortIntegerRange(data, lowerBound, upperBound)
             return
         }
         depth -= 1
-        let w = rx_partition_int(data, lo, hi)     // pivot is FIXED at a[w]
+        let pivotIndex = runtimePartitionInteger(data, lowerBound, upperBound)     // pivot is FIXED at a[w]
         // skip the run of pivot-equal elements after w: with many duplicates
         // (or an all-equal range) this is what keeps the right side shrinking
-        let p = load64(data + w * 8)
-        var rl = w + 1
-        while rl <= hi and load64(data + rl * 8) == p { rl += 1 }
-        if w - lo < hi - rl {
-            rx_introsort_int(data, lo, w - 1, depth)
-            lo = rl
+        let pivotValue = load64(data + pivotIndex * 8)
+        var rightLength = pivotIndex + 1
+        while rightLength <= upperBound and load64(data + rightLength * 8) == pivotValue { rightLength += 1 }
+        if pivotIndex - lowerBound < upperBound - rightLength {
+            runtimeIntrospectiveSortIntegers(data, lowerBound, pivotIndex - 1, depth)
+            lowerBound = rightLength
         } else {
-            rx_introsort_int(data, rl, hi, depth)
-            hi = w - 1
+            runtimeIntrospectiveSortIntegers(data, rightLength, upperBound, depth)
+            upperBound = pivotIndex - 1
         }
     }
 }
-fn rx_insertion_int(data: int, lo: int, hi: int) {
-    var i = lo + 1
-    while i <= hi {
-        let v = load64(data + i * 8)
-        var j = i - 1
+fn runtimeInsertionSortIntegers(data: int, lowerBound: int, upperBound: int) {
+    var index = lowerBound + 1
+    while index <= upperBound {
+        let value = load64(data + index * 8)
+        var otherIndex = index - 1
         var going = true
-        while going and j >= lo {
-            if load64(data + j * 8) > v {
-                store64(data + (j + 1) * 8, load64(data + j * 8))
-                j -= 1
+        while going and otherIndex >= lowerBound {
+            if load64(data + otherIndex * 8) > value {
+                store64(data + (otherIndex + 1) * 8, load64(data + otherIndex * 8))
+                otherIndex -= 1
             } else {
                 going = false
             }
         }
-        store64(data + (j + 1) * 8, v)
-        i += 1
+        store64(data + (otherIndex + 1) * 8, value)
+        index += 1
     }
 }
-fn rx_sort(l: int, kind: int) {
-    let n = load64(l)
-    if n < 2 { return }
-    let data = load64(l + 16)
+fn runtimeSortListValues(listAddress: int, kind: int) {
+    let count = load64(listAddress)
+    if count < 2 { return }
+    let data = load64(listAddress + 16)
     var depth = 0
-    var t = n
-    while t > 0 {
+    var remainingLength = count
+    while remainingLength > 0 {
         depth += 1
-        t = t / 2
+        remainingLength = remainingLength / 2
     }
     depth = depth * 2
     if kind == 0 {
-        rx_introsort_int(data, 0, n - 1, depth)
-        rx_insertion_int(data, 0, n - 1)
+        runtimeIntrospectiveSortIntegers(data, 0, count - 1, depth)
+        runtimeInsertionSortIntegers(data, 0, count - 1)
     } else {
-        rx_introsort(data, 0, n - 1, depth, kind)
-        rx_insertion(data, 0, n - 1, kind)
+        runtimeIntrospectiveSort(data, 0, count - 1, depth, kind)
+        runtimeInsertionSort(data, 0, count - 1, kind)
     }
 }
-fn rt_list_sort_int(l: int) { rx_sort(l, 0) }
-fn rt_list_sort_str(l: int) { rx_sort(l, 1) }
-fn rt_list_sort_float(l: int) { rx_sort(l, 2) }
+fn runtimeListSortInteger(listAddress: int) { runtimeSortListValues(listAddress, 0) }
+fn runtimeListSortString(listAddress: int) { runtimeSortListValues(listAddress, 1) }
+fn runtimeListSortFloat(listAddress: int) { runtimeSortListValues(listAddress, 2) }
 
-fn rt_list_index_of(l: int, v: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
-    var i = 0
-    while i < n {
-        if load64(data + i * 8) == v { return i }
-        i += 1
+fn runtimeListIndexOf(listAddress: int, value: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
+    var index = 0
+    while index < count {
+        if load64(data + index * 8) == value { return index }
+        index += 1
     }
     return 0 - 1
 }
-fn rt_list_index_of_str(l: int, v: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
-    var i = 0
-    while i < n {
-        if rt_str_eq(load64(data + i * 8), v) == 1 { return i }
-        i += 1
+fn runtimeListIndexOfString(listAddress: int, value: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
+    var index = 0
+    while index < count {
+        if runtimeStringsEqual(load64(data + index * 8), value) == 1 { return index }
+        index += 1
     }
     return 0 - 1
 }
-fn rt_list_reverse(l: int) {
-    let n = load64(l)
-    let data = load64(l + 16)
-    var i = 0
-    var j = n - 1
-    while i < j {
-        let a = load64(data + i * 8)
-        let b = load64(data + j * 8)
-        store64(data + i * 8, b)
-        store64(data + j * 8, a)
-        i += 1
-        j -= 1
+fn runtimeListReverse(listAddress: int) {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
+    var index = 0
+    var otherIndex = count - 1
+    while index < otherIndex {
+        let leftValue = load64(data + index * 8)
+        let rightValue = load64(data + otherIndex * 8)
+        store64(data + index * 8, rightValue)
+        store64(data + otherIndex * 8, leftValue)
+        index += 1
+        otherIndex -= 1
     }
 }
-fn rt_list_slice(l: int, lo: int, hi: int) -> int {
-    let n = load64(l)
-    if lo < 0 or hi < lo or hi > n { rt_die("invalid slice") }
-    let data = load64(l + 16)
-    let out = rt_list_new_d(hi - lo, load64(l - 16))
-    rx_mcopy(load64(out + 16), data + lo * 8, (hi - lo) * 8)
-    if rx_kref(l) == 1 {                  // kind 2: [8] is the element flag
-        var i = lo
-        while i < hi {
-            let d = rx_dup(load64(data + i * 8))
-            i += 1
+fn runtimeListSlice(listAddress: int, lowerBound: int, upperBound: int) -> int {
+    let count = load64(listAddress)
+    if lowerBound < 0 or upperBound < lowerBound or upperBound > count { runtimeFail("invalid slice") }
+    let data = load64(listAddress + 16)
+    let output = runtimeNewDescribedList(upperBound - lowerBound, load64(listAddress - 16))
+    runtimeCopyMemory(load64(output + 16), data + lowerBound * 8, (upperBound - lowerBound) * 8)
+    if runtimeMapKeyIsReference(listAddress) == 1 {                  // kind 2: [8] is the element flag
+        var index = lowerBound
+        while index < upperBound {
+            let retainedValue = runtimeRetainReference(load64(data + index * 8))
+            index += 1
         }
     }
-    return out
+    return output
 }
 
-fn rt_join(l: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
+fn runtimeJoinStringList(listAddress: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
     var total = 0
-    var i = 0
-    while i < n {
-        total += load64(load64(data + i * 8))
-        i += 1
+    var index = 0
+    while index < count {
+        total += load64(load64(data + index * 8))
+        index += 1
     }
-    let r = rx_str_alloc(total)
-    var off = 0
-    i = 0
-    while i < n {
-        let part = load64(data + i * 8)
-        let pl = load64(part)
-        rx_mcopy(r + 8 + off, part + 8, pl)
-        off += pl
-        i += 1
+    let result = runtimeAllocateString(total)
+    var offset = 0
+    index = 0
+    while index < count {
+        let part = load64(data + index * 8)
+        let leftPointer = load64(part)
+        runtimeCopyMemory(result + 8 + offset, part + 8, leftPointer)
+        offset += leftPointer
+        index += 1
     }
-    return r
+    return result
 }
 
 // xs.join(separator)
-fn rt_join_sep(l: int, separator: int) -> int {
-    let n = load64(l)
-    let data = load64(l + 16)
+fn runtimeJoinStringListWithSeparator(listAddress: int, separator: int) -> int {
+    let count = load64(listAddress)
+    let data = load64(listAddress + 16)
     let separatorLength = load64(separator)
     var total = 0
-    var i = 0
-    while i < n {
-        total += load64(load64(data + i * 8))
-        i += 1
+    var index = 0
+    while index < count {
+        total += load64(load64(data + index * 8))
+        index += 1
     }
-    if n > 1 { total += separatorLength * (n - 1) }
-    let r = rx_str_alloc(total)
-    var off = 0
-    i = 0
-    while i < n {
-        if i > 0 {
-            rx_mcopy(r + 8 + off, separator + 8, separatorLength)
-            off += separatorLength
+    if count > 1 { total += separatorLength * (count - 1) }
+    let result = runtimeAllocateString(total)
+    var offset = 0
+    index = 0
+    while index < count {
+        if index > 0 {
+            runtimeCopyMemory(result + 8 + offset, separator + 8, separatorLength)
+            offset += separatorLength
         }
-        let part = load64(data + i * 8)
-        let pl = load64(part)
-        rx_mcopy(r + 8 + off, part + 8, pl)
-        off += pl
-        i += 1
+        let part = load64(data + index * 8)
+        let leftPointer = load64(part)
+        runtimeCopyMemory(result + 8 + offset, part + 8, leftPointer)
+        offset += leftPointer
+        index += 1
     }
-    return r
+    return result
 }
 
-fn rt_str_to_int(s: int) -> int {
-    let n = load64(s)
-    var i = 0
-    while i < n and load8(s + 8 + i) == 32 { i += 1 }
-    var neg = false
-    if i < n and (load8(s + 8 + i) == 43 or load8(s + 8 + i) == 45) {
-        if load8(s + 8 + i) == 45 { neg = true }
-        i += 1
+fn runtimeStringToInteger(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    var index = 0
+    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    var negate = false
+    if index < count and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
+        if load8(stringAddress + 8 + index) == 45 { negate = true }
+        index += 1
     }
-    var v = 0
+    var value = 0
     var any = false
-    while i < n {
-        let c = load8(s + 8 + i)
-        if c < 48 or c > 57 { break }
-        v = v * 10 + (c - 48)
+    while index < count {
+        let character = load8(stringAddress + 8 + index)
+        if character < 48 or character > 57 { break }
+        value = value * 10 + (character - 48)
         any = true
-        i += 1
+        index += 1
     }
-    while i < n and load8(s + 8 + i) == 32 { i += 1 }
-    if not any or i != n { rt_die("cannot convert to int") }
-    if neg { return 0 - v }
-    return v
+    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    if not any or index != count { runtimeFail("cannot convert to int") }
+    if negate { return 0 - value }
+    return value
 }
 
 // decimal float parser (sign, integer part, fraction; no exponent yet).
 // returns the IEEE-754 bit pattern, which is what a float value is.
-fn rt_str_to_float(s: int) -> int {
-    let n = load64(s)
-    var i = 0
-    while i < n and load8(s + 8 + i) == 32 { i += 1 }
-    var neg = false
-    if i < n and (load8(s + 8 + i) == 43 or load8(s + 8 + i) == 45) {
-        if load8(s + 8 + i) == 45 { neg = true }
-        i += 1
+fn runtimeStringToFloat(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    var index = 0
+    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    var negate = false
+    if index < count and (load8(stringAddress + 8 + index) == 43 or load8(stringAddress + 8 + index) == 45) {
+        if load8(stringAddress + 8 + index) == 45 { negate = true }
+        index += 1
     }
     // Collect every digit into an integer mantissa and count the fractional
     // ones, then divide ONCE. Both the mantissa (< 2^53) and 10^k (k <= 22)
@@ -1895,69 +1895,69 @@ fn rt_str_to_float(s: int) -> int {
     // strtod would produce -- accumulating digit-by-digit with a 0.1 scale
     // instead lets a rounding error compound per digit, which put literals
     // like 1.72 and 0.09 one or two ulp off every other language's value.
-    var mant = 0
-    var nd = 0                                     // digits kept in mant
-    var k = 0                                      // fractional digits
+    var mantissa = 0
+    var mantissaDigitCount = 0                                     // digits kept in mant
+    var fractionalDigitCount = 0                                      // fractional digits
     var extra = 0                                  // integer digits dropped
     var any = false
-    while i < n and load8(s + 8 + i) >= 48 and load8(s + 8 + i) <= 57 {
-        let d0 = load8(s + 8 + i) - 48
-        if mant == 0 and d0 == 0 {
+    while index < count and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
+        let integerDigit = load8(stringAddress + 8 + index) - 48
+        if mantissa == 0 and integerDigit == 0 {
             // a leading zero carries no information; spending mantissa budget on
             // it would push real digits off the end
-        } else if nd < 17 {
-            mant = mant * 10 + d0
-            nd += 1
+        } else if mantissaDigitCount < 17 {
+            mantissa = mantissa * 10 + integerDigit
+            mantissaDigitCount += 1
         } else {
             extra += 1                             // too big for exact mantissa
         }
         any = true
-        i += 1
+        index += 1
     }
-    if i < n and load8(s + 8 + i) == 46 {          // '.'
-        i += 1
-        while i < n and load8(s + 8 + i) >= 48 and load8(s + 8 + i) <= 57 {
-            let d1 = load8(s + 8 + i) - 48
-            if mant == 0 and d1 == 0 {
-                k += 1                             // shifts the value, adds no digit
-            } else if nd < 17 {
-                mant = mant * 10 + d1
-                nd += 1
-                k += 1
+    if index < count and load8(stringAddress + 8 + index) == 46 {          // '.'
+        index += 1
+        while index < count and load8(stringAddress + 8 + index) >= 48 and load8(stringAddress + 8 + index) <= 57 {
+            let fractionDigit = load8(stringAddress + 8 + index) - 48
+            if mantissa == 0 and fractionDigit == 0 {
+                fractionalDigitCount += 1                             // shifts the value, adds no digit
+            } else if mantissaDigitCount < 17 {
+                mantissa = mantissa * 10 + fractionDigit
+                mantissaDigitCount += 1
+                fractionalDigitCount += 1
             }
             any = true
-            i += 1
+            index += 1
         }
     }
     // optional exponent: e/E, a sign, digits
     var exponent = 0
-    if any and i < n and (load8(s + 8 + i) == 101 or load8(s + 8 + i) == 69) {
-        var j = i + 1
+    if any and index < count and (load8(stringAddress + 8 + index) == 101 or load8(stringAddress + 8 + index) == 69) {
+        var otherIndex = index + 1
         var exponentNegative = false
-        if j < n and (load8(s + 8 + j) == 43 or load8(s + 8 + j) == 45) {
-            if load8(s + 8 + j) == 45 { exponentNegative = true }
-            j += 1
+        if otherIndex < count and (load8(stringAddress + 8 + otherIndex) == 43 or load8(stringAddress + 8 + otherIndex) == 45) {
+            if load8(stringAddress + 8 + otherIndex) == 45 { exponentNegative = true }
+            otherIndex += 1
         }
-        if j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
-            while j < n and load8(s + 8 + j) >= 48 and load8(s + 8 + j) <= 57 {
-                if exponent < 100000 { exponent = exponent * 10 + load8(s + 8 + j) - 48 }
-                j += 1
+        if otherIndex < count and load8(stringAddress + 8 + otherIndex) >= 48 and load8(stringAddress + 8 + otherIndex) <= 57 {
+            while otherIndex < count and load8(stringAddress + 8 + otherIndex) >= 48 and load8(stringAddress + 8 + otherIndex) <= 57 {
+                if exponent < 100000 { exponent = exponent * 10 + load8(stringAddress + 8 + otherIndex) - 48 }
+                otherIndex += 1
             }
             if exponentNegative { exponent = 0 - exponent }
-            i = j
+            index = otherIndex
         }
     }
     // One multiply or divide by an exact power of ten (10^22 and below are
     // exact) rounds once, landing on strtod's answer. Larger scales go in
     // exact 10^22 steps and may be off by an ulp.
-    var val = mant as float
-    var scale = extra - k + exponent
+    var value = mantissa as float
+    var scale = extra - fractionalDigitCount + exponent
     while scale > 22 {
-        val = val * 10000000000000000000000.0
+        value = value * 10000000000000000000000.0
         scale -= 22
     }
     while scale < -22 {
-        val = val / 10000000000000000000000.0
+        value = value / 10000000000000000000000.0
         scale += 22
     }
     var power = 1.0
@@ -1968,81 +1968,81 @@ fn rt_str_to_float(s: int) -> int {
         power = power * 10.0
         steps += 1
     }
-    if scale > 0 { val = val * power }
-    if scale < 0 { val = val / power }
-    while i < n and load8(s + 8 + i) == 32 { i += 1 }
-    if not any or i != n { rt_die("cannot convert to float") }
-    if neg { val = -val }                  // not 0.0 - val: "-0" must parse as -0.0
-    return bits(val)
+    if scale > 0 { value = value * power }
+    if scale < 0 { value = value / power }
+    while index < count and load8(stringAddress + 8 + index) == 32 { index += 1 }
+    if not any or index != count { runtimeFail("cannot convert to float") }
+    if negate { value = -value }                  // not 0.0 - val: "-0" must parse as -0.0
+    return bits(value)
 }
 
 // ---- lists ----  (a list value points to {i64 len; i64 cap; i64 data})
 // Called by name from the compiler; a list whose elements it will not drop.
-fn rt_list_new(n: int) -> int {
-    return rt_list_new_d(n, 0)
+fn runtimeListNew(initialLength: int) -> int {
+    return runtimeNewDescribedList(initialLength, 0)
 }
 
 // `desc` is a kind-2 descriptor saying whether the elements are references.
-fn rt_list_new_d(n: int, desc: int) -> int {
-    var d = desc
-    if d == 0 { d = __d_list_val }    // the data buffer still has to go when the list does
-    let l = rt_alloc_d(24, d)
-    var cap = n
-    if cap < 4 { cap = 4 }
-    let data = rt_alloc(cap * 8)
-    store64(l, n)
-    store64(l + 8, cap)
-    store64(l + 16, data)
-    return l
+fn runtimeNewDescribedList(initialLength: int, descriptor: int) -> int {
+    var shapeDescriptor = descriptor
+    if shapeDescriptor == 0 { shapeDescriptor = runtimeValueListDescriptor }    // the data buffer still has to go when the list does
+    let listValue = runtimeAllocateDescribedObject(24, shapeDescriptor)
+    var capacity = initialLength
+    if capacity < 4 { capacity = 4 }
+    let data = runtimeAllocateObject(capacity * 8)
+    store64(listValue, initialLength)
+    store64(listValue + 8, capacity)
+    store64(listValue + 16, data)
+    return listValue
 }
 
-fn rt_list_push(l: int, v: int) {
-    let n = load64(l)
-    let cap = load64(l + 8)
-    if n == cap {
-        let ncap = cap * 2
-        let nd = rt_alloc(ncap * 8)
-        let od = load64(l + 16)
-        rx_mcopy(nd, od, n * 8)
-        store64(l + 8, ncap)
-        store64(l + 16, nd)
-        rx_drop(od)                       // the cell was the buffer's only holder
+fn runtimeListPush(listAddress: int, value: int) {
+    let count = load64(listAddress)
+    let capacity = load64(listAddress + 8)
+    if count == capacity {
+        let newCapacity = capacity * 2
+        let expandedData = runtimeAllocateObject(newCapacity * 8)
+        let outputDimension = load64(listAddress + 16)
+        runtimeCopyMemory(expandedData, outputDimension, count * 8)
+        store64(listAddress + 8, newCapacity)
+        store64(listAddress + 16, expandedData)
+        runtimeReleaseReference(outputDimension)                       // the cell was the buffer's only holder
     }
-    store64(load64(l + 16) + n * 8, v)
-    store64(l, n + 1)
+    store64(load64(listAddress + 16) + count * 8, value)
+    store64(listAddress, count + 1)
 }
 
-fn rt_list_pop(l: int) -> int {
-    let n = load64(l)
-    if n == 0 { rt_die("pop from empty list") }
-    store64(l, n - 1)
-    return load64(load64(l + 16) + (n - 1) * 8)
+fn runtimeListPop(listAddress: int) -> int {
+    let count = load64(listAddress)
+    if count == 0 { runtimeFail("pop from empty list") }
+    store64(listAddress, count - 1)
+    return load64(load64(listAddress + 16) + (count - 1) * 8)
 }
 
 // ---- packed lists: [u8] and [f32] ----
 // The list header {len, cap, data}, but with 1- or 4-byte elements. An f32 is
 // stored as its 32-bit pattern and enters Zephyr as a float (a double):
-// rx_f32_widen on the way out, rx_f32_narrow (round to nearest even) on the way in.
-fn rt_packed_new(n: int, width: int) -> int {
-    let l = rt_alloc_d(24, __d_list_val)
-    var cap = n
-    if cap < 4 { cap = 4 }
-    store64(l, n)
-    store64(l + 8, cap)
-    store64(l + 16, rt_alloc(cap * width))
-    return l
+// runtimeWidenFloat32Bits on the way out, runtimeNarrowFloat32Bits (round to nearest even) on the way in.
+fn runtimeNewPackedList(elementCount: int, width: int) -> int {
+    let listValue = runtimeAllocateDescribedObject(24, runtimeValueListDescriptor)
+    var capacity = elementCount
+    if capacity < 4 { capacity = 4 }
+    store64(listValue, elementCount)
+    store64(listValue + 8, capacity)
+    store64(listValue + 16, runtimeAllocateObject(capacity * width))
+    return listValue
 }
 
-fn rx_packed_fail(site: str, msg: str) {
-    let h = win("GetStdHandle", 0 - 12)   // stderr
-    rx_out(h, addr("panic: ") + 8, 7)
-    rx_out(h, addr(site) + 8, site.len())
-    rx_out(h, addr(msg) + 8, msg.len())
-    rx_out(h, addr("\n") + 8, 1)
-    let r = win("ExitProcess", 1)
+fn runtimeFailPackedAccess(site: str, message: str) {
+    let handle = win("GetStdHandle", 0 - 12)   // stderr
+    runtimeWriteOutputBytes(handle, addr("panic: ") + 8, 7)
+    runtimeWriteOutputBytes(handle, addr(site) + 8, site.len())
+    runtimeWriteOutputBytes(handle, addr(message) + 8, message.len())
+    runtimeWriteOutputBytes(handle, addr("\n") + 8, 1)
+    let result = win("ExitProcess", 1)
 }
 
-fn rx_f32_widen(bits32: int) -> int {
+fn runtimeWidenFloat32Bits(bits32: int) -> int {
     let sign = (bits32 >> 31) & 1
     var exponent = (bits32 >> 23) & 255
     var mantissa = bits32 & 8388607
@@ -2059,7 +2059,7 @@ fn rx_f32_widen(bits32: int) -> int {
     return (sign << 63) | ((exponent + 896) << 52) | (mantissa << 29)
 }
 
-fn rx_f32_narrow(bits: int) -> int {
+fn runtimeNarrowFloat32Bits(bits: int) -> int {
     let sign = (bits >> 63) & 1
     let exponent = (bits >> 52) & 2047
     let mantissa = bits & 4503599627370495
@@ -2087,391 +2087,391 @@ fn rx_f32_narrow(bits: int) -> int {
     return (sign << 31) | result
 }
 
-fn rx_packed_load(l: int, i: int, width: int) -> int {
-    if width == 1 { return load8(load64(l + 16) + i) }
-    return rx_f32_widen(load32(load64(l + 16) + i * 4) & 4294967295)
+fn runtimePackedLoad(listAddress: int, index: int, width: int) -> int {
+    if width == 1 { return load8(load64(listAddress + 16) + index) }
+    return runtimeWidenFloat32Bits(load32(load64(listAddress + 16) + index * 4) & 4294967295)
 }
 
-fn rx_packed_store(l: int, i: int, v: int, width: int) {
-    if width == 1 { store8(load64(l + 16) + i, v & 255) }
-    else { store32(load64(l + 16) + i * 4, rx_f32_narrow(v)) }
+fn runtimePackedStore(listAddress: int, index: int, value: int, width: int) {
+    if width == 1 { store8(load64(listAddress + 16) + index, value & 255) }
+    else { store32(load64(listAddress + 16) + index * 4, runtimeNarrowFloat32Bits(value)) }
 }
 
-fn rx_packed_get(l: int, i: int, width: int, site: str) -> int {
-    if i < 0 or i >= load64(l) { rx_packed_fail(site, "index out of bounds") }
-    return rx_packed_load(l, i, width)
+fn runtimePackedGet(listAddress: int, index: int, width: int, site: str) -> int {
+    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, "index out of bounds") }
+    return runtimePackedLoad(listAddress, index, width)
 }
 
-fn rx_packed_set(l: int, i: int, v: int, width: int, site: str) {
-    if i < 0 or i >= load64(l) { rx_packed_fail(site, "index out of bounds") }
-    rx_packed_store(l, i, v, width)
+fn runtimePackedSet(listAddress: int, index: int, value: int, width: int, site: str) {
+    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, "index out of bounds") }
+    runtimePackedStore(listAddress, index, value, width)
 }
 
-fn rx_packed_push(l: int, v: int, width: int) {
-    let n = load64(l)
-    let cap = load64(l + 8)
-    if n == cap {
-        let ncap = cap * 2
-        let nd = rt_alloc(ncap * width)
-        let od = load64(l + 16)
-        rx_mcopy(nd, od, n * width)
-        store64(l + 8, ncap)
-        store64(l + 16, nd)
-        rx_drop(od)
+fn runtimePackedPush(listAddress: int, value: int, width: int) {
+    let count = load64(listAddress)
+    let capacity = load64(listAddress + 8)
+    if count == capacity {
+        let newCapacity = capacity * 2
+        let expandedData = runtimeAllocateObject(newCapacity * width)
+        let outputDimension = load64(listAddress + 16)
+        runtimeCopyMemory(expandedData, outputDimension, count * width)
+        store64(listAddress + 8, newCapacity)
+        store64(listAddress + 16, expandedData)
+        runtimeReleaseReference(outputDimension)
     }
-    store64(l, n + 1)
-    rx_packed_store(l, n, v, width)
+    store64(listAddress, count + 1)
+    runtimePackedStore(listAddress, count, value, width)
 }
 
-fn rx_packed_pop(l: int, width: int, site: str) -> int {
-    let n = load64(l)
-    if n == 0 { rx_packed_fail(site, "pop from empty list") }
-    store64(l, n - 1)
-    return rx_packed_load(l, n - 1, width)
+fn runtimePackedPop(listAddress: int, width: int, site: str) -> int {
+    let count = load64(listAddress)
+    if count == 0 { runtimeFailPackedAccess(site, "pop from empty list") }
+    store64(listAddress, count - 1)
+    return runtimePackedLoad(listAddress, count - 1, width)
 }
 
-fn rt_u8_get(l: int, i: int, site: str) -> int { return rx_packed_get(l, i, 1, site) }
-fn rt_f32_get(l: int, i: int, site: str) -> int { return rx_packed_get(l, i, 4, site) }
-fn rt_u8_set(l: int, i: int, v: int, site: str) { rx_packed_set(l, i, v, 1, site) }
-fn rt_f32_set(l: int, i: int, v: int, site: str) { rx_packed_set(l, i, v, 4, site) }
-fn rt_u8_push(l: int, v: int) { rx_packed_push(l, v, 1) }
-fn rt_f32_push(l: int, v: int) { rx_packed_push(l, v, 4) }
-fn rt_u8_pop(l: int, site: str) -> int { return rx_packed_pop(l, 1, site) }
-fn rt_f32_pop(l: int, site: str) -> int { return rx_packed_pop(l, 4, site) }
+fn runtimeU8Get(listAddress: int, index: int, site: str) -> int { return runtimePackedGet(listAddress, index, 1, site) }
+fn runtimeF32Get(listAddress: int, index: int, site: str) -> int { return runtimePackedGet(listAddress, index, 4, site) }
+fn runtimeU8Set(listAddress: int, index: int, value: int, site: str) { runtimePackedSet(listAddress, index, value, 1, site) }
+fn runtimeF32Set(listAddress: int, index: int, value: int, site: str) { runtimePackedSet(listAddress, index, value, 4, site) }
+fn runtimeU8Push(listAddress: int, value: int) { runtimePackedPush(listAddress, value, 1) }
+fn runtimeF32Push(listAddress: int, value: int) { runtimePackedPush(listAddress, value, 4) }
+fn runtimeU8Pop(listAddress: int, site: str) -> int { return runtimePackedPop(listAddress, 1, site) }
+fn runtimeF32Pop(listAddress: int, site: str) -> int { return runtimePackedPop(listAddress, 4, site) }
 
 // [int] as [u8] (low 8 bits), [float] as [f32]
-fn rx_packed_from_list(src: int, width: int) -> int {
-    let n = load64(src)
-    let l = rt_packed_new(n, width)
-    var i = 0
-    while i < n {
-        rx_packed_store(l, i, load64(load64(src + 16) + i * 8), width)
-        i += 1
+fn runtimePackedFromList(source: int, width: int) -> int {
+    let count = load64(source)
+    let listValue = runtimeNewPackedList(count, width)
+    var index = 0
+    while index < count {
+        runtimePackedStore(listValue, index, load64(load64(source + 16) + index * 8), width)
+        index += 1
     }
-    return l
+    return listValue
 }
-fn rt_u8_from_list(src: int) -> int { return rx_packed_from_list(src, 1) }
-fn rt_f32_from_list(src: int) -> int { return rx_packed_from_list(src, 4) }
+fn runtimeU8FromList(source: int) -> int { return runtimePackedFromList(source, 1) }
+fn runtimeF32FromList(source: int) -> int { return runtimePackedFromList(source, 4) }
 
 // [u8] as [int], [f32] as [float]
-fn rx_packed_to_list(src: int, width: int) -> int {
-    let n = load64(src)
-    let l = rt_list_new(n)
-    var i = 0
-    while i < n {
-        store64(load64(l + 16) + i * 8, rx_packed_load(src, i, width))
-        i += 1
+fn runtimePackedToList(source: int, width: int) -> int {
+    let count = load64(source)
+    let listValue = runtimeListNew(count)
+    var index = 0
+    while index < count {
+        store64(load64(listValue + 16) + index * 8, runtimePackedLoad(source, index, width))
+        index += 1
     }
-    return l
+    return listValue
 }
-fn rt_u8_to_list(src: int) -> int { return rx_packed_to_list(src, 1) }
-fn rt_f32_to_list(src: int) -> int { return rx_packed_to_list(src, 4) }
+fn runtimeU8ToList(source: int) -> int { return runtimePackedToList(source, 1) }
+fn runtimeF32ToList(source: int) -> int { return runtimePackedToList(source, 4) }
 
-fn rt_u8_from_str(s: int) -> int {
-    let n = load64(s)
-    let l = rt_packed_new(n, 1)
-    rx_mcopy(load64(l + 16), s + 8, n)
-    return l
+fn runtimeU8FromString(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    let listValue = runtimeNewPackedList(count, 1)
+    runtimeCopyMemory(load64(listValue + 16), stringAddress + 8, count)
+    return listValue
 }
-fn rt_u8_to_str(l: int) -> int {
-    let n = load64(l)
-    let s = rx_str_alloc(n)
-    rx_mcopy(s + 8, load64(l + 16), n)
-    return s
+fn runtimeU8ToString(listAddress: int) -> int {
+    let count = load64(listAddress)
+    let text = runtimeAllocateString(count)
+    runtimeCopyMemory(text + 8, load64(listAddress + 16), count)
+    return text
 }
 
 // ---- output: unbuffered WriteFile ----
-var __scratch = 0
-var __stdout = 0
+var runtimeOutputScratchAddress = 0
+var runtimeStandardOutputHandle = 0
 
-fn rx_out(fd: int, ptr: int, n: int) {
-    if __scratch == 0 { __scratch = rt_alloc(16) }
-    let r = win("WriteFile", fd, ptr, n, __scratch, 0)
+fn runtimeWriteOutputBytes(fileDescriptor: int, pointer: int, byteCount: int) {
+    if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
+    let result = win("WriteFile", fileDescriptor, pointer, byteCount, runtimeOutputScratchAddress, 0)
 }
 
-fn rx_stdout_h() -> int {
-    if __stdout == 0 { __stdout = win("GetStdHandle", 0 - 11) }
-    return __stdout
+fn runtimeGetStandardOutputHandle() -> int {
+    if runtimeStandardOutputHandle == 0 { runtimeStandardOutputHandle = win("GetStdHandle", 0 - 11) }
+    return runtimeStandardOutputHandle
 }
 
-fn rx_out_str(s: int) {
-    rx_out(rx_stdout_h(), s + 8, load64(s))
+fn runtimeWriteOutputString(stringAddress: int) {
+    runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), stringAddress + 8, load64(stringAddress))
 }
 
 // ---- panics ----
-fn rt_die(msg: str) {
-    let h = win("GetStdHandle", 0 - 12)   // stderr
-    rx_out(h, addr("panic: ") + 8, 7)
-    rx_out(h, addr(msg) + 8, msg.len())
-    rx_out(h, addr("\n") + 8, 1)
-    let r = win("ExitProcess", 1)
+fn runtimeFail(message: str) {
+    let handle = win("GetStdHandle", 0 - 12)   // stderr
+    runtimeWriteOutputBytes(handle, addr("panic: ") + 8, 7)
+    runtimeWriteOutputBytes(handle, addr(message) + 8, message.len())
+    runtimeWriteOutputBytes(handle, addr("\n") + 8, 1)
+    let result = win("ExitProcess", 1)
 }
 
-fn rt_panic_str(s: str) {
-    rt_die(s)                             // a str value already is its pointer
+fn runtimePanicWithString(text: str) {
+    runtimeFail(text)                             // a str value already is its pointer
 }
 
-fn rt_bounds_fail(i: int, n: int) {
-    rt_die("index out of bounds")
+fn runtimeFailBoundsCheck(index: int, count: int) {
+    runtimeFail("index out of bounds")
 }
 
-fn rt_div_zero() {
-    rt_die("division by zero")
+fn runtimeFailDivisionByZero() {
+    runtimeFail("division by zero")
 }
 
-fn rt_mod_zero() {
-    rt_die("modulo by zero")
+fn runtimeFailRemainderByZero() {
+    runtimeFail("modulo by zero")
 }
 
 // ---- formatting into the interpolation buffer ----
 // The builder is per-thread. Its state is a 24-byte block -- [0] buffer,
 // [8] length, [16] capacity -- reached through TLS once a second thread exists.
-// The single-threaded fast path returns __sbmain, which is also what the main
+// The single-threaded fast path returns runtimeMainStringBuilder, which is also what the main
 // thread's TLS slot holds, so the two paths cannot disagree about which block a
 // half-finished interpolation is building into.
-var __sbmain = 0
-var __tlsidx = 0
+var runtimeMainStringBuilder = 0
+var runtimeStringBuilderThreadLocalIndex = 0
 
-fn rx_sb_init() {
-    if __sbmain != 0 { return }
-    __sbmain = win("VirtualAlloc", 0, 64, 12288, 4)
-    store64(__sbmain, win("VirtualAlloc", 0, 65536, 12288, 4))
-    store64(__sbmain + 8, 0)
-    store64(__sbmain + 16, 65536)
-    __tlsidx = win("TlsAlloc")
-    let r = win("TlsSetValue", __tlsidx, __sbmain)
+fn runtimeInitializeStringBuilders() {
+    if runtimeMainStringBuilder != 0 { return }
+    runtimeMainStringBuilder = win("VirtualAlloc", 0, 64, 12288, 4)
+    store64(runtimeMainStringBuilder, win("VirtualAlloc", 0, 65536, 12288, 4))
+    store64(runtimeMainStringBuilder + 8, 0)
+    store64(runtimeMainStringBuilder + 16, 65536)
+    runtimeStringBuilderThreadLocalIndex = win("TlsAlloc")
+    let result = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, runtimeMainStringBuilder)
 }
 
-fn rx_sb_p() -> int {
+fn runtimeGetStringBuilder() -> int {
     // Formatting can happen before the first allocation (print(5) reaches the
-    // builder without ever calling rt_alloc), so this guard cannot be dropped
-    // in favour of initialising from rx_heap_init alone.
-    if __sbmain == 0 { rx_sb_init() }
-    if __nthr == 0 { return __sbmain }
-    var p = win("TlsGetValue", __tlsidx)
-    if p == 0 {
-        p = win("VirtualAlloc", 0, 64, 12288, 4)
-        store64(p, win("VirtualAlloc", 0, 65536, 12288, 4))
-        store64(p + 8, 0)
-        store64(p + 16, 65536)
-        let r = win("TlsSetValue", __tlsidx, p)
+    // builder without ever calling runtimeAllocateObject), so this guard cannot be dropped
+    // in favour of initialising from runtimeInitializeHeap alone.
+    if runtimeMainStringBuilder == 0 { runtimeInitializeStringBuilders() }
+    if runtimeRegisteredThreadCount == 0 { return runtimeMainStringBuilder }
+    var address = win("TlsGetValue", runtimeStringBuilderThreadLocalIndex)
+    if address == 0 {
+        address = win("VirtualAlloc", 0, 64, 12288, 4)
+        store64(address, win("VirtualAlloc", 0, 65536, 12288, 4))
+        store64(address + 8, 0)
+        store64(address + 16, 65536)
+        let result = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, address)
     }
-    return p
+    return address
 }
 
-fn rx_sb_ensure(p: int, extra: int) {
-    let cur = load64(p + 8)
-    let cap = load64(p + 16)
-    if cur + extra <= cap { return }
-    var ncap = cap * 2
-    if ncap < 65536 { ncap = 65536 }
-    while ncap < cur + extra { ncap = ncap * 2 }
-    // VirtualAlloc, not rt_alloc: the builder must not itself allocate on the
+fn runtimeEnsureStringBuilderCapacity(address: int, extra: int) {
+    let current = load64(address + 8)
+    let capacity = load64(address + 16)
+    if current + extra <= capacity { return }
+    var newCapacity = capacity * 2
+    if newCapacity < 65536 { newCapacity = 65536 }
+    while newCapacity < current + extra { newCapacity = newCapacity * 2 }
+    // VirtualAlloc, not runtimeAllocateObject: the builder must not itself allocate on the
     // GC heap, or formatting could trigger a collection mid-interpolation.
-    let nb = win("VirtualAlloc", 0, ncap, 12288, 4)
-    rx_mcopy(nb, load64(p), cur)
-    store64(p, nb)
-    store64(p + 16, ncap)
+    let byteCount = win("VirtualAlloc", 0, newCapacity, 12288, 4)
+    runtimeCopyMemory(byteCount, load64(address), current)
+    store64(address, byteCount)
+    store64(address + 16, newCapacity)
 }
 
-fn rx_sb_byte(c: int) {
-    let p = rx_sb_p()
-    rx_sb_ensure(p, 1)
-    store8(load64(p) + load64(p + 8), c)
-    store64(p + 8, load64(p + 8) + 1)
+fn runtimeAppendStringBuilderByte(character: int) {
+    let address = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(address, 1)
+    store8(load64(address) + load64(address + 8), character)
+    store64(address + 8, load64(address + 8) + 1)
 }
 
-fn rx_sb_bytes(ptr: int, n: int) {
-    let p = rx_sb_p()
-    rx_sb_ensure(p, n)
-    rx_mcopy(load64(p) + load64(p + 8), ptr, n)
-    store64(p + 8, load64(p + 8) + n)
+fn runtimeAppendStringBuilderBytes(pointer: int, byteCount: int) {
+    let address = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(address, byteCount)
+    runtimeCopyMemory(load64(address) + load64(address + 8), pointer, byteCount)
+    store64(address + 8, load64(address + 8) + byteCount)
 }
 
-fn rx_sb_int(v: int) {
-    if v == 0 {
-        rx_sb_byte(48)
+fn runtimeAppendStringBuilderInteger(value: int) {
+    if value == 0 {
+        runtimeAppendStringBuilderByte(48)
         return
     }
-    let neg = v < 0
+    let negate = value < 0
     // work in the non-positive domain so i64 MIN never overflows a negate
-    var x = v
-    if x > 0 { x = 0 - x }
+    var remainingValue = value
+    if remainingValue > 0 { remainingValue = 0 - remainingValue }
     var digits = 0
-    var t = x
-    while t < 0 {
+    var remainingDigits = remainingValue
+    while remainingDigits < 0 {
         digits += 1
-        t = t / 10
+        remainingDigits = remainingDigits / 10
     }
     var total = digits
-    if neg { total += 1 }
-    let p = rx_sb_p()
-    rx_sb_ensure(p, total)
-    let buf = load64(p)
-    let cur = load64(p + 8)
-    var pos = cur + total - 1
-    while x < 0 {
-        store8(buf + pos, 48 - x % 10)      // x%10 is <= 0, so -(x%10) is the digit
-        pos -= 1
-        x = x / 10
+    if negate { total += 1 }
+    let address = runtimeGetStringBuilder()
+    runtimeEnsureStringBuilderCapacity(address, total)
+    let buffer = load64(address)
+    let current = load64(address + 8)
+    var position = current + total - 1
+    while remainingValue < 0 {
+        store8(buffer + position, 48 - remainingValue % 10)      // x%10 is <= 0, so -(x%10) is the digit
+        position -= 1
+        remainingValue = remainingValue / 10
     }
-    if neg { store8(buf + cur, 45) }
-    store64(p + 8, cur + total)
+    if negate { store8(buffer + current, 45) }
+    store64(address + 8, current + total)
 }
 
 // td kinds: 0 int, 1 float, 2 bool, 3 str, 4 list, 5 struct
-fn rx_fmt_val(v: int, td: int, repr: int) {
-    let kind = load64(td)
+fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation: int) {
+    let kind = load64(typeDescriptor)
     if kind == 0 {
-        rx_sb_int(v)
+        runtimeAppendStringBuilderInteger(value)
     } else if kind == 2 {
-        if v != 0 { rx_sb_bytes(addr("true") + 8, 4) }
-        else { rx_sb_bytes(addr("false") + 8, 5) }
+        if value != 0 { runtimeAppendStringBuilderBytes(addr("true") + 8, 4) }
+        else { runtimeAppendStringBuilderBytes(addr("false") + 8, 5) }
     } else if kind == 3 {
-        if repr != 0 { rx_sb_byte(34) }
-        let n = load64(v)
-        var i = 0
-        while i < n {
-            let c = load8(v + 8 + i)
-            if repr != 0 and (c == 34 or c == 92) {
-                rx_sb_byte(92)
-                rx_sb_byte(c)
-            } else if repr != 0 and c == 10 {
-                rx_sb_byte(92)
-                rx_sb_byte(110)
+        if representation != 0 { runtimeAppendStringBuilderByte(34) }
+        let count = load64(value)
+        var index = 0
+        while index < count {
+            let character = load8(value + 8 + index)
+            if representation != 0 and (character == 34 or character == 92) {
+                runtimeAppendStringBuilderByte(92)
+                runtimeAppendStringBuilderByte(character)
+            } else if representation != 0 and character == 10 {
+                runtimeAppendStringBuilderByte(92)
+                runtimeAppendStringBuilderByte(110)
             } else {
-                rx_sb_byte(c)
+                runtimeAppendStringBuilderByte(character)
             }
-            i += 1
+            index += 1
         }
-        if repr != 0 { rx_sb_byte(34) }
+        if representation != 0 { runtimeAppendStringBuilderByte(34) }
     } else if kind == 4 {
-        let eltd = load64(td + 8)
-        let n = load64(v)
-        let data = load64(v + 16)
-        rx_sb_byte(91)
-        var i = 0
-        while i < n {
-            if i > 0 {
-                rx_sb_byte(44)
-                rx_sb_byte(32)
+        let elementDescriptor = load64(typeDescriptor + 8)
+        let count = load64(value)
+        let data = load64(value + 16)
+        runtimeAppendStringBuilderByte(91)
+        var index = 0
+        while index < count {
+            if index > 0 {
+                runtimeAppendStringBuilderByte(44)
+                runtimeAppendStringBuilderByte(32)
             }
-            rx_fmt_val(load64(data + i * 8), eltd, 1)
-            i += 1
+            runtimeFormatValueIntoBuilder(load64(data + index * 8), elementDescriptor, 1)
+            index += 1
         }
-        rx_sb_byte(93)
+        runtimeAppendStringBuilderByte(93)
     } else if kind == 5 {
-        let name = load64(td + 8)
-        let nf = load64(td + 16)
+        let name = load64(typeDescriptor + 8)
+        let functionCount = load64(typeDescriptor + 16)
         let isTuple = load8(name) == 40     // tuples are structs named "(int, str)"
-        if isTuple { rx_sb_byte(40) }
+        if isTuple { runtimeAppendStringBuilderByte(40) }
         else {
-            rx_sb_bytes(name, rx_cstrlen(name))
-            rx_sb_byte(123)
+            runtimeAppendStringBuilderBytes(name, runtimeCStringLength(name))
+            runtimeAppendStringBuilderByte(123)
         }
-        var f = 0
-        while f < nf {
-            if f > 0 {
-                rx_sb_byte(44)
-                rx_sb_byte(32)
+        var fieldIndex = 0
+        while fieldIndex < functionCount {
+            if fieldIndex > 0 {
+                runtimeAppendStringBuilderByte(44)
+                runtimeAppendStringBuilderByte(32)
             }
-            let fname = load64(td + 24 + f * 16)
-            let ftd = load64(td + 32 + f * 16)
+            let fname = load64(typeDescriptor + 24 + fieldIndex * 16)
+            let fieldDescriptor = load64(typeDescriptor + 32 + fieldIndex * 16)
             if not isTuple {
-                rx_sb_bytes(fname, rx_cstrlen(fname))
-                rx_sb_byte(58)
-                rx_sb_byte(32)
+                runtimeAppendStringBuilderBytes(fname, runtimeCStringLength(fname))
+                runtimeAppendStringBuilderByte(58)
+                runtimeAppendStringBuilderByte(32)
             }
-            rx_fmt_val(load64(v + f * 8), ftd, 1)
-            f += 1
+            runtimeFormatValueIntoBuilder(load64(value + fieldIndex * 8), fieldDescriptor, 1)
+            fieldIndex += 1
         }
-        if isTuple { rx_sb_byte(41) }
-        else { rx_sb_byte(125) }
+        if isTuple { runtimeAppendStringBuilderByte(41) }
+        else { runtimeAppendStringBuilderByte(125) }
     } else if kind == 9 {                 // enum with values: the variant, then its values
-        let variantTd = load64(td + 16 + load64(v) * 8)
-        let variantName = load64(variantTd + 8)
-        let fieldCount = load64(variantTd + 16)
-        rx_sb_bytes(variantName, rx_cstrlen(variantName))
+        let variantTypeDescriptor = load64(typeDescriptor + 16 + load64(value) * 8)
+        let variantName = load64(variantTypeDescriptor + 8)
+        let fieldCount = load64(variantTypeDescriptor + 16)
+        runtimeAppendStringBuilderBytes(variantName, runtimeCStringLength(variantName))
         if fieldCount > 1 {
-            rx_sb_byte(40)
-            var f = 1
-            while f < fieldCount {
-                if f > 1 {
-                    rx_sb_byte(44)
-                    rx_sb_byte(32)
+            runtimeAppendStringBuilderByte(40)
+            var fieldIndex = 1
+            while fieldIndex < fieldCount {
+                if fieldIndex > 1 {
+                    runtimeAppendStringBuilderByte(44)
+                    runtimeAppendStringBuilderByte(32)
                 }
-                rx_fmt_val(load64(v + f * 8), load64(variantTd + 32 + f * 16), 1)
-                f += 1
+                runtimeFormatValueIntoBuilder(load64(value + fieldIndex * 8), load64(variantTypeDescriptor + 32 + fieldIndex * 16), 1)
+                fieldIndex += 1
             }
-            rx_sb_byte(41)
+            runtimeAppendStringBuilderByte(41)
         }
     } else if kind == 8 {                 // optional: none, or the wrapped value
-        if v == 0 {
-            rx_sb_bytes(addr("none") + 8, 4)
+        if value == 0 {
+            runtimeAppendStringBuilderBytes(addr("none") + 8, 4)
         } else {
-            rx_fmt_val(load64(v), load64(td + 8), repr)
+            runtimeFormatValueIntoBuilder(load64(value), load64(typeDescriptor + 8), representation)
         }
     } else if kind == 7 {                 // map: {k: v, ...}
-        let ktd = load64(td + 8)
-        let vtd = load64(td + 16)
-        let cap = load64(v + 8)
-        let slots = load64(v + 16)
-        rx_sb_byte(123)
+        let keyDescriptor = load64(typeDescriptor + 8)
+        let valueDescriptor = load64(typeDescriptor + 16)
+        let capacity = load64(value + 8)
+        let slots = load64(value + 16)
+        runtimeAppendStringBuilderByte(123)
         var shown = 0
-        var i = 0
-        while i < cap {
-            let slot = slots + i * 24
+        var index = 0
+        while index < capacity {
+            let slot = slots + index * 24
             if load64(slot) == 1 {
                 if shown > 0 {
-                    rx_sb_byte(44)
-                    rx_sb_byte(32)
+                    runtimeAppendStringBuilderByte(44)
+                    runtimeAppendStringBuilderByte(32)
                 }
-                rx_fmt_val(load64(slot + 8), ktd, 1)
-                rx_sb_byte(58)
-                rx_sb_byte(32)
-                rx_fmt_val(load64(slot + 16), vtd, 1)
+                runtimeFormatValueIntoBuilder(load64(slot + 8), keyDescriptor, 1)
+                runtimeAppendStringBuilderByte(58)
+                runtimeAppendStringBuilderByte(32)
+                runtimeFormatValueIntoBuilder(load64(slot + 16), valueDescriptor, 1)
                 shown += 1
             }
-            i += 1
+            index += 1
         }
-        rx_sb_byte(125)
+        runtimeAppendStringBuilderByte(125)
     } else if kind == 6 {                 // enum: print the member name
-        let nm = load64(td + 8)
-        if v < 0 or v >= nm {
-            rx_sb_int(v)
+        let memberCount = load64(typeDescriptor + 8)
+        if value < 0 or value >= memberCount {
+            runtimeAppendStringBuilderInteger(value)
         } else {
-            let nameptr = load64(td + 16 + v * 8)
-            rx_sb_bytes(nameptr, rx_cstrlen(nameptr))
+            let nameptr = load64(typeDescriptor + 16 + value * 8)
+            runtimeAppendStringBuilderBytes(nameptr, runtimeCStringLength(nameptr))
         }
     } else if kind == 10 or kind == 11 {  // packed list: [u8] or [f32]
         var width = 1
         if kind == 11 { width = 4 }
-        let n = load64(v)
-        rx_sb_byte(91)
-        var i = 0
-        while i < n {
-            if i > 0 {
-                rx_sb_byte(44)
-                rx_sb_byte(32)
+        let count = load64(value)
+        runtimeAppendStringBuilderByte(91)
+        var index = 0
+        while index < count {
+            if index > 0 {
+                runtimeAppendStringBuilderByte(44)
+                runtimeAppendStringBuilderByte(32)
             }
-            if kind == 10 { rx_sb_int(rx_packed_load(v, i, 1)) }
-            else { rx_sb_float(rx_packed_load(v, i, 4)) }
-            i += 1
+            if kind == 10 { runtimeAppendStringBuilderInteger(runtimePackedLoad(value, index, 1)) }
+            else { runtimeAppendStringBuilderFloat(runtimePackedLoad(value, index, 4)) }
+            index += 1
         }
-        rx_sb_byte(93)
+        runtimeAppendStringBuilderByte(93)
     } else {
-        rx_sb_float(v)
+        runtimeAppendStringBuilderFloat(value)
     }
 }
 
-fn rx_pow10(k: int) -> int {
-    var r = 1
-    var i = 0
-    while i < k {
-        r = r * 10
-        i += 1
+fn runtimeIntegerPowerOfTen(exponent: int) -> int {
+    var result = 1
+    var index = 0
+    while index < exponent {
+        result = result * 10
+        index += 1
     }
-    return r
+    return result
 }
 
 // Format a double (given as its bit pattern) with up to 16 significant
@@ -2482,238 +2482,238 @@ fn rx_pow10(k: int) -> int {
 // generated negative digits (1e20 printed as "0.-).0-*(+,))+(0("). Peel powers
 // of two off until the mantissa fits, then double the decimal digits back k
 // times. Exact for every finite double, including 1e300.
-fn rx_sb_bigint_float(yin: float) {
-    var m = yin
-    var k = 0
-    while m >= 9223372036854775808.0 {
-        m = m / 2.0                       // exact: halving a normal double
-        k += 1
+fn runtimeFormatLargeIntegerFloat(inputValue: float) {
+    var scaledValue = inputValue
+    var binaryExponent = 0
+    while scaledValue >= 9223372036854775808.0 {
+        scaledValue = scaledValue / 2.0                       // exact: halving a normal double
+        binaryExponent += 1
     }
-    var dg: [int] = []
-    var t = m as int
-    while t > 0 {
-        dg.push(t % 10)
-        t = t / 10
+    var decimalDigits: [int] = []
+    var integerDigits = scaledValue as int
+    while integerDigits > 0 {
+        decimalDigits.push(integerDigits % 10)
+        integerDigits = integerDigits / 10
     }
-    if dg.len() == 0 { dg.push(0) }
-    var i = 0
-    while i < k {
+    if decimalDigits.len() == 0 { decimalDigits.push(0) }
+    var index = 0
+    while index < binaryExponent {
         var carry = 0
-        var j = 0
-        while j < dg.len() {
-            let v = dg[j] * 2 + carry
-            dg[j] = v % 10
-            carry = v / 10
-            j += 1
+        var otherIndex = 0
+        while otherIndex < decimalDigits.len() {
+            let value = decimalDigits[otherIndex] * 2 + carry
+            decimalDigits[otherIndex] = value % 10
+            carry = value / 10
+            otherIndex += 1
         }
         while carry > 0 {
-            dg.push(carry % 10)
+            decimalDigits.push(carry % 10)
             carry = carry / 10
         }
-        i += 1
+        index += 1
     }
-    var p = dg.len() - 1
-    while p >= 0 {
-        rx_sb_byte(48 + dg[p])
-        p -= 1
+    var digitIndex = decimalDigits.len() - 1
+    while digitIndex >= 0 {
+        runtimeAppendStringBuilderByte(48 + decimalDigits[digitIndex])
+        digitIndex -= 1
     }
 }
 
-fn rx_sb_float(bitpat: int) {
-    let x = frombits(bitpat)
-    if x != x {                          // NaN
-        rx_sb_byte(110)
-        rx_sb_byte(97)
-        rx_sb_byte(110)
+fn runtimeAppendStringBuilderFloat(bitPattern: int) {
+    let value = frombits(bitPattern)
+    if value != value {                          // NaN
+        runtimeAppendStringBuilderByte(110)
+        runtimeAppendStringBuilderByte(97)
+        runtimeAppendStringBuilderByte(110)
         return
     }
-    var y = x
-    if y < 0.0 {
-        rx_sb_byte(45)                   // '-'
-        y = 0.0 - y
+    var otherValue = value
+    if otherValue < 0.0 {
+        runtimeAppendStringBuilderByte(45)                   // '-'
+        otherValue = 0.0 - otherValue
     }
-    let INF = frombits(9218868437227405312)   // 0x7FF0000000000000
-    if y == INF {
-        rx_sb_byte(105)
-        rx_sb_byte(110)
-        rx_sb_byte(102)
+    let infinity = frombits(9218868437227405312)   // 0x7FF0000000000000
+    if otherValue == infinity {
+        runtimeAppendStringBuilderByte(105)
+        runtimeAppendStringBuilderByte(110)
+        runtimeAppendStringBuilderByte(102)
         return
     }
-    if y >= 9223372036854775808.0 {      // integer part too large for i64
-        rx_sb_bigint_float(y)
+    if otherValue >= 9223372036854775808.0 {      // integer part too large for i64
+        runtimeFormatLargeIntegerFloat(otherValue)
         return
     }
-    var ip = y as int
-    var frac = y - (ip as float)
-    var di = 0                            // integer-part digit count
-    var tmp = ip
-    while tmp > 0 {
-        tmp = tmp / 10
-        di += 1
+    var internetAddress = otherValue as int
+    var fraction = otherValue - (internetAddress as float)
+    var destinationIndex = 0                            // integer-part digit count
+    var temporary = internetAddress
+    while temporary > 0 {
+        temporary = temporary / 10
+        destinationIndex += 1
     }
-    var nfrac = 15 - di                   // ~15 significant figures total (like %.15g)
-    if nfrac < 1 { nfrac = 1 }
-    if nfrac > 16 { nfrac = 16 }
-    var fd = 0
-    var f = frac
-    var i = 0
-    while i < nfrac {
-        f = f * 10.0
-        let d = f as int
-        fd = fd * 10 + d
-        f = f - (d as float)
-        i += 1
+    var fractionCount = 15 - destinationIndex                   // ~15 significant figures total (like %.15g)
+    if fractionCount < 1 { fractionCount = 1 }
+    if fractionCount > 16 { fractionCount = 16 }
+    var fileDescriptor = 0
+    var fractionRemainder = fraction
+    var index = 0
+    while index < fractionCount {
+        fractionRemainder = fractionRemainder * 10.0
+        let digitValue = fractionRemainder as int
+        fileDescriptor = fileDescriptor * 10 + digitValue
+        fractionRemainder = fractionRemainder - (digitValue as float)
+        index += 1
     }
-    f = f * 10.0                          // round on the next digit
-    if (f as int) >= 5 { fd = fd + 1 }
-    let cap = rx_pow10(nfrac)
-    if fd >= cap {                        // carry rounded past the fraction
-        fd = fd - cap
-        ip = ip + 1
+    fractionRemainder = fractionRemainder * 10.0                          // round on the next digit
+    if (fractionRemainder as int) >= 5 { fileDescriptor = fileDescriptor + 1 }
+    let capacity = runtimeIntegerPowerOfTen(fractionCount)
+    if fileDescriptor >= capacity {                        // carry rounded past the fraction
+        fileDescriptor = fileDescriptor - capacity
+        internetAddress = internetAddress + 1
     }
-    rx_sb_int(ip)
-    if fd == 0 { return }                 // no fractional part (matches %g)
-    rx_sb_byte(46)                        // '.'
-    var last = nfrac - 1
-    var t = fd
-    while last > 0 and t % 10 == 0 {      // trim trailing zeros
-        t = t / 10
+    runtimeAppendStringBuilderInteger(internetAddress)
+    if fileDescriptor == 0 { return }                 // no fractional part (matches %g)
+    runtimeAppendStringBuilderByte(46)                        // '.'
+    var last = fractionCount - 1
+    var remainingFraction = fileDescriptor
+    while last > 0 and remainingFraction % 10 == 0 {      // trim trailing zeros
+        remainingFraction = remainingFraction / 10
         last -= 1
     }
-    var p = 0
-    while p <= last {                     // emit MSD-first, keeping leading zeros
-        let digit = (fd / rx_pow10(nfrac - 1 - p)) % 10
-        rx_sb_byte(48 + digit)
-        p += 1
+    var digitIndex = 0
+    while digitIndex <= last {                     // emit MSD-first, keeping leading zeros
+        let digit = (fileDescriptor / runtimeIntegerPowerOfTen(fractionCount - 1 - digitIndex)) % 10
+        runtimeAppendStringBuilderByte(48 + digit)
+        digitIndex += 1
     }
 }
 
-fn rx_cstrlen(p: int) -> int {
-    var n = 0
-    while load8(p + n) != 0 { n += 1 }
-    return n
+fn runtimeCStringLength(address: int) -> int {
+    var count = 0
+    while load8(address + count) != 0 { count += 1 }
+    return count
 }
 
 // ---- runtime entry points the code generator calls ----
-fn rt_to_str(v: int, td: int) -> int {
-    let p = rx_sb_p()
-    let mark = load64(p + 8)
-    rx_fmt_val(v, td, 0)
-    let outlen = load64(p + 8) - mark
-    let s = rx_str_alloc(outlen)
-    rx_mcopy(s + 8, load64(p) + mark, outlen)
-    store64(p + 8, mark)
-    return s
+fn runtimeFormatTypedValue(value: int, typeDescriptor: int) -> int {
+    let address = runtimeGetStringBuilder()
+    let mark = load64(address + 8)
+    runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
+    let outputLength = load64(address + 8) - mark
+    let text = runtimeAllocateString(outputLength)
+    runtimeCopyMemory(text + 8, load64(address) + mark, outputLength)
+    store64(address + 8, mark)
+    return text
 }
 
-fn rt_print_val(v: int, td: int) {
-    if load64(td) == 3 {                  // plain str: straight to stdout
-        rx_out_str(v)
-        rx_out(rx_stdout_h(), addr("\n") + 8, 1)
+fn runtimePrintTypedValue(value: int, typeDescriptor: int) {
+    if load64(typeDescriptor) == 3 {                  // plain str: straight to stdout
+        runtimeWriteOutputString(value)
+        runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), addr("\n") + 8, 1)
         return
     }
-    let p = rx_sb_p()
-    let mark = load64(p + 8)
-    rx_fmt_val(v, td, 0)
-    rx_out(rx_stdout_h(), load64(p) + mark, load64(p + 8) - mark)
-    store64(p + 8, mark)
-    rx_out(rx_stdout_h(), addr("\n") + 8, 1)
+    let address = runtimeGetStringBuilder()
+    let mark = load64(address + 8)
+    runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
+    runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), load64(address) + mark, load64(address + 8) - mark)
+    store64(address + 8, mark)
+    runtimeWriteOutputBytes(runtimeGetStandardOutputHandle(), addr("\n") + 8, 1)
 }
 
-fn rt_emit(s: int) {
-    rx_out_str(s)
+fn runtimeEmitString(text: int) {
+    runtimeWriteOutputString(text)
 }
 
-fn rt_sb_begin() -> int {
-    return load64(rx_sb_p() + 8)
+fn runtimeBeginStringInterpolation() -> int {
+    return load64(runtimeGetStringBuilder() + 8)
 }
-fn rt_sb_txt(s: int) {
-    rx_sb_bytes(s + 8, load64(s))
+fn runtimeAppendInterpolationText(stringAddress: int) {
+    runtimeAppendStringBuilderBytes(stringAddress + 8, load64(stringAddress))
 }
-fn rt_sb_val(v: int, td: int) {
-    rx_fmt_val(v, td, 0)
+fn runtimeAppendInterpolationValue(value: int, typeDescriptor: int) {
+    runtimeFormatValueIntoBuilder(value, typeDescriptor, 0)
 }
-fn rt_sb_end(mark: int) -> int {
-    let p = rx_sb_p()
-    let outlen = load64(p + 8) - mark
-    let s = rx_str_alloc(outlen)
-    rx_mcopy(s + 8, load64(p) + mark, outlen)
-    store64(p + 8, mark)
-    return s
+fn runtimeEndStringInterpolation(mark: int) -> int {
+    let address = runtimeGetStringBuilder()
+    let outputLength = load64(address + 8) - mark
+    let text = runtimeAllocateString(outputLength)
+    runtimeCopyMemory(text + 8, load64(address) + mark, outputLength)
+    store64(address + 8, mark)
+    return text
 }
 
 // ---- command-line args ----
-fn rt_args() -> int {
-    let cl = win("GetCommandLineA")       // LPSTR
-    let l = rt_list_new_d(0, __d_list_ref)
-    var i = 0
+fn runtimeArguments() -> int {
+    let classIndex = win("GetCommandLineA")       // LPSTR
+    let listValue = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
+    var index = 0
     var going = true
     while going {
-        while load8(cl + i) == 32 or load8(cl + i) == 9 { i += 1 }
-        if load8(cl + i) == 0 {
+        while load8(classIndex + index) == 32 or load8(classIndex + index) == 9 { index += 1 }
+        if load8(classIndex + index) == 0 {
             going = false
         } else {
-            let start = i
+            let start = index
             var quoted = false
-            let buf = rt_alloc(2048)
-            var bl = 0
+            let buffer = runtimeAllocateObject(2048)
+            var bestLocal = 0
             var scanning = true
             while scanning {
-                let c = load8(cl + i)
-                if c == 0 { scanning = false }
-                else if c == 34 {
+                let character = load8(classIndex + index)
+                if character == 0 { scanning = false }
+                else if character == 34 {
                     if quoted { quoted = false } else { quoted = true }
-                    i += 1
-                } else if (c == 32 or c == 9) and not quoted {
+                    index += 1
+                } else if (character == 32 or character == 9) and not quoted {
                     scanning = false
                 } else {
-                    store8(buf + bl, c)
-                    bl += 1
-                    i += 1
+                    store8(buffer + bestLocal, character)
+                    bestLocal += 1
+                    index += 1
                 }
             }
-            let s = rx_str_alloc(bl)
-            rx_mcopy(s + 8, buf, bl)
-            rt_list_push(l, s)
+            let text = runtimeAllocateString(bestLocal)
+            runtimeCopyMemory(text + 8, buffer, bestLocal)
+            runtimeListPush(listValue, text)
         }
     }
-    return l
+    return listValue
 }
 
 // null-terminated copy of a str's bytes into fresh memory, for the Win32 *A apis
-fn rx_cstr(s: int) -> int {
-    let n = load64(s)
-    let p = rt_alloc(n + 1)
-    rx_mcopy(p, s + 8, n)
-    store8(p + n, 0)
-    return p
+fn runtimeAllocateCString(stringAddress: int) -> int {
+    let count = load64(stringAddress)
+    let address = runtimeAllocateObject(count + 1)
+    runtimeCopyMemory(address, stringAddress + 8, count)
+    store8(address + count, 0)
+    return address
 }
 
-// rt_read_file(path) -> str with the whole file
-fn rt_read_file(path: int) -> int {
-    let cp = rx_cstr(path)
+// runtimeReadFile(path) -> str with the whole file
+fn runtimeReadFile(path: int) -> int {
+    let cStringPointer = runtimeAllocateCString(path)
     // CreateFileA(name, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0)
-    let h = win("CreateFileA", cp, 2147483648, 1, 0, 3, 0, 0)
-    if h == 0 - 1 { rt_die("cannot read file") }
-    let size = win("GetFileSize", h, 0)
-    let s = rx_str_alloc(size)
-    if __scratch == 0 { __scratch = rt_alloc(16) }
+    let handle = win("CreateFileA", cStringPointer, 2147483648, 1, 0, 3, 0, 0)
+    if handle == 0 - 1 { runtimeFail("cannot read file") }
+    let size = win("GetFileSize", handle, 0)
+    let text = runtimeAllocateString(size)
+    if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
     var got = 0
     while got < size {
-        let r = win("ReadFile", h, s + 8 + got, size - got, __scratch, 0)
-        let n = load64(__scratch) & 4294967295
-        if r == 0 or n == 0 { got = size }
-        else { got += n }
+        let result = win("ReadFile", handle, text + 8 + got, size - got, runtimeOutputScratchAddress, 0)
+        let count = load64(runtimeOutputScratchAddress) & 4294967295
+        if result == 0 or count == 0 { got = size }
+        else { got += count }
     }
-    let c = win("CloseHandle", h)
-    return s
+    let closeResult = win("CloseHandle", handle)
+    return text
 }
 
-fn rt_write_file(path: int, data: int) {
-    let cp = rx_cstr(path)
+fn runtimeWriteFile(path: int, data: int) {
+    let cStringPointer = runtimeAllocateCString(path)
     // CreateFileA(name, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
-    let h = win("CreateFileA", cp, 1073741824, 0, 0, 2, 0, 0)
-    if h == 0 - 1 { rt_die("cannot write file") }
-    rx_out(h, data + 8, load64(data))
-    let c = win("CloseHandle", h)
+    let handle = win("CreateFileA", cStringPointer, 1073741824, 0, 0, 2, 0, 0)
+    if handle == 0 - 1 { runtimeFail("cannot write file") }
+    runtimeWriteOutputBytes(handle, data + 8, load64(data))
+    let closeResult = win("CloseHandle", handle)
 }

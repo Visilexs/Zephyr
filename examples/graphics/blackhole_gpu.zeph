@@ -88,7 +88,7 @@ let TDECAY = 1.0                    // turbulent decorrelation rate, in orbits
 // the visible band. Everything downstream follows from real blackbody physics.
 let T_PEAK = 4200.0                 // K at the profile peak, r = 8.17 r_g
 let T_REF = 4200.0
-let EXPO = 0.075                    // HDR exposure, applied before tone mapping
+let EXPO = 0.075                    // runtimeObjectHeaderBytes exposure, applied before tone mapping
 
 // ---- GL constants ----
 let GL_ARRAY_BUFFER = 34962
@@ -423,7 +423,7 @@ fn hole_fs_src() -> str {
     return p.join()
 }
 
-// ---- tone mapping: HDR accumulation -> displayable sRGB ----
+// ---- tone mapping: runtimeObjectHeaderBytes accumulation -> displayable sRGB ----
 fn tone_vs_src() -> str {
     var p: [str] = []
     p.push("#version 330\n")
@@ -510,7 +510,7 @@ fn set4(loc: int, x: float, y: float, z: float, w: float) {
 }
 fn uloc(prog: int, name: str) -> int { return callptr(pGetUniformLocation, prog, cstr(name)) }
 
-// ---- HDR framebuffer ----
+// ---- runtimeObjectHeaderBytes framebuffer ----
 var fbo = 0
 var fbtex = 0
 var fbdepth = 0
@@ -817,7 +817,7 @@ while running == 1 {
             let rd2 = win("opengl32!glDisable", GL_RASTERIZER_DISCARD)
             let bb0 = callptr(pBindBufferBase, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0)
 
-            // ---- render the scene into the HDR buffer ----
+            // ---- render the scene into the runtimeObjectHeaderBytes buffer ----
             let fb1 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, fbo)
             let vp = win("opengl32!glViewport", 0, 0, cw, ch)
             let cl = win("opengl32!glClear", GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -853,7 +853,7 @@ while running == 1 {
             let dr2 = win("opengl32!glDrawArrays", GL_POINTS, 0, COUNT)
             let dm2 = win("opengl32!glDepthMask", 1)
 
-            // ---- pass 4: tone-map the HDR buffer to the window ----
+            // ---- pass 4: tone-map the runtimeObjectHeaderBytes buffer to the window ----
             let fb2 = callptr(pBindFramebuffer, GL_FRAMEBUFFER, 0)
             let bd = win("opengl32!glDisable", GL_BLEND)
             let de2 = win("opengl32!glDisable", GL_DEPTH_TEST)

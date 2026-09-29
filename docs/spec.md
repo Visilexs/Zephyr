@@ -788,7 +788,7 @@ so a raw address stays valid exactly as long as some Zephyr variable still holds
 the value.
 
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
-to the kernel shim `k32_Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
+to the kernel shim `kernel32Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
 prefix (`user32!…`) is a compile error, and `extern fn … from` (which needs an
 import table) is unavailable. Additional builtins on those targets:
 `syscall(n, args…)` (raw Linux syscall, 1–7 args), and wasm-only `memgrow`,
@@ -862,7 +862,7 @@ The same source compiles to three targets, selected by a flag:
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
-| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `k32_*` |
+| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*` |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 
 Not every feature reaches every target. WebAssembly currently omits file I/O,

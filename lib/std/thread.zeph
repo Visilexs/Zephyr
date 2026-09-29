@@ -10,7 +10,7 @@
 //     validation (a settings file did). A thread entry has no such escape.
 //
 //  2. The collector is stop-the-world and finds its roots by scanning stacks.
-//     runtime.zeph keeps a registry. On Windows rx_collect suspends every other
+//     runtime.zeph keeps a registry. On Windows runtimeCollectGarbage suspends every other
 //     registered thread, reads its CONTEXT for the integer registers, and scans
 //     from its Rsp to its stack base. A thread
 //     is registered before it is resumed, so it cannot allocate unseen. Linux
@@ -73,9 +73,9 @@ fn tx_thunk() -> int {
 fn thread_spawn(threadFunction: fn(int), argument: int) -> Thread {
     // wrap the caller's function so registration cannot be forgotten
     let threadBody = fn(workerArgument: int) {
-        rt_thread_ready()
+        runtimeMarkThreadReady()
         threadFunction(workerArgument)
-        rt_thread_done()
+        runtimeMarkThreadDone()
     }
     let bodySlot = body_slot(threadBody)
 
@@ -89,7 +89,7 @@ fn thread_spawn(threadFunction: fn(int), argument: int) -> Thread {
     // CREATE_SUSPENDED so the thread is in the registry before it can allocate
     let threadHandle = win("CreateThread", 0, 0, tx_thunk(), recordAddress, 4, threadIdAddress)
     if threadHandle == 0 { panic("thread: CreateThread failed") }
-    let registrySlot = rt_thread_add(threadHandle, load64(threadIdAddress) & 4294967295)
+    let registrySlot = runtimeRegisterThread(threadHandle, load64(threadIdAddress) & 4294967295)
     let resumeResult = win("ResumeThread", threadHandle)
     let threadIdReleased = win("VirtualFree", threadIdAddress, 0, 32768) // MEM_RELEASE
     return Thread{handle: threadHandle, rec: recordAddress, slot: bodySlot}
