@@ -501,13 +501,6 @@ fn floatOpcodeForToken(operator: int) -> int {
     return 0 - 1
 }
 
-// the text of a string literal with no interpolation, or "" with a bail
-fn literalText(expression: Node) -> str {
-    if expression.nodeKind == nodeStringLiteral and expression.children.len() == 1 and expression.children[0].nodeKind == nodeStringText { return expression.children[0].name }
-    optimizerBail("non-literal panic message")
-    return ""
-}
-
 fn identifierVariable(expression: Node) -> int {
     let kind = expression.auxiliary
     if kind != identifierKindLocal and kind != identifierKindParameter and kind != identifierKindGlobal {
@@ -575,6 +568,7 @@ fn lowerExpression(expression: Node) -> int {
     let kind = expression.nodeKind
     if kind == nodeInteger or kind == nodeBoolean { return integerConstant(expression.integerValue) }
     if kind == nodeFloat { return emitIr0(irFloatConstant, classFloat, bits(expression.floatValue)) }
+    if isPlainLiteral(expression) { return emitIr0(irDataAddress, classInteger, addDataString(expression.children[0].name)) }   // static: never freed, safe anywhere
     if kind == nodeIdentifier {
         let variable = identifierVariable(expression)
         if optimizerBailed { return 0 }
@@ -665,10 +659,7 @@ fn lowerBinary(expression: Node) -> int {
         return readVariableValue(result)
     }
     let category = expression.auxiliary
-    if category == binaryCategoryString {
-        optimizerBail("string operator")
-        return 0
-    }
+    if category == binaryCategoryString { return lowerStringComparison(expression) }
     let left = lowerExpression(expression.children[0])
     let right = lowerExpression(expression.children[1])
     if optimizerBailed { return 0 }
@@ -691,6 +682,47 @@ fn lowerBinary(expression: Node) -> int {
     if opcode == irDivide { let checked = emitIr1(irZeroCheck, classInteger, right, panicStringIndex(expression, "division by zero")) }
     if opcode == irModulo { let checked = emitIr1(irZeroCheck, classInteger, right, panicStringIndex(expression, "modulo by zero")) }
     return emitIr2(opcode, classInteger, left, right, 0)
+}
+
+// runtime functions that only read their arguments: borrowed references may be
+// passed to them and stay live across them
+fn isReadOnlyRuntimeFunction(name: str) -> bool {
+    return name == "runtimeStringsEqual" or name == "runtimeCompareStrings"
+}
+
+fn callOnlyReads(instruction: int) -> bool {
+    let functionIndex = irImmediates[instruction]
+    return functionIndex >= 0 and isReadOnlyRuntimeFunction(functionDefinitions[functionIndex].name)
+}
+
+fn lowerReadOnlyRuntimeCall(name: str, operands: [int]) -> int {
+    if not functionNameIndices.has(name) {
+        optimizerBail("no {name}")
+        return 0
+    }
+    let result = emitIr(irCall, classInteger, operands, functionNameIndices[name])
+    irReferenceArguments[result] = 0
+    return result
+}
+
+// str == != < <= > >=: the runtime compares; concatenation allocates and stays with the baseline
+fn lowerStringComparison(expression: Node) -> int {
+    let operator = expression.operator
+    let condition = conditionForToken(operator)
+    if condition < 0 or expression.slot > 0 {
+        optimizerBail("string operator")
+        return 0
+    }
+    let left = lowerExpression(expression.children[0])
+    let right = lowerExpression(expression.children[1])
+    if optimizerBailed { return 0 }
+    if operator == tokenEquals or operator == tokenNotEquals {
+        let equal = lowerReadOnlyRuntimeCall("runtimeStringsEqual", [left, right])
+        if operator == tokenEquals { return equal }
+        return emitIr2(irBitXor, classInteger, equal, integerConstant(1), 0)
+    }
+    let order = lowerReadOnlyRuntimeCall("runtimeCompareStrings", [left, right])
+    return emitIr2(irCompare, classInteger, order, integerConstant(0), condition)
 }
 
 // element type of a list the tier can address with 8-byte strides, or -1
@@ -729,10 +761,15 @@ fn lowerIndexRead(expression: Node) -> int {
     return value
 }
 
+fn isPlainLiteral(expression: Node) -> bool {
+    return expression.nodeKind == nodeStringLiteral and expression.children.len() == 1 and expression.children[0].nodeKind == nodeStringText
+}
+
 fn lowerPanicAt(expression: Node, message: Node) {
-    let text = literalText(message)
+    var messageValue = 0
+    if isPlainLiteral(message) { messageValue = emitIr0(irDataAddress, classInteger, addDataString(message.children[0].name)) }
+    else { messageValue = lowerExpression(message) }       // a str the panic only reads
     if optimizerBailed { return }
-    let messageValue = emitIr0(irDataAddress, classInteger, addDataString(text))
     var noOperands: [int] = []
     terminate(irPanicAt, [messageValue], addDataString(panicSite(expression)), noOperands)
 }
@@ -854,8 +891,8 @@ fn lowerCall(expression: Node) -> int {
     var callArguments: [Node] = []
     if expression.operator == 1 { callArguments.push(expression.children[0].children[0]) }        // UFCS receiver
     for i in 1..expression.children.len() { callArguments.push(expression.children[i]) }
-    if functionDefinition.name == "runtimeFail" and callArguments.len() == 1 {
-        lowerFixedPanic(panicStringIndex(expression, literalText(callArguments[0])))
+    if functionDefinition.name == "runtimeFail" and callArguments.len() == 1 and isPlainLiteral(callArguments[0]) {
+        lowerFixedPanic(panicStringIndex(expression, callArguments[0].children[0].name))
         return 0
     }
     if functionDefinition.hasEnvironment {
@@ -1491,6 +1528,7 @@ var blockStartPositions: [int] = []
 var blockEndPositions: [int] = []
 var instructionPositions: [int] = []
 var callPositions: [int] = []
+var freeingCallPositions: [int] = []      // calls that may release memory a borrowed reference points into
 var liveIn: [[int]] = []
 var liveOut: [[int]] = []
 var liveWordCount = 0
@@ -1628,6 +1666,8 @@ fn numberPositions() {
     }
     var noCalls: [int] = []
     callPositions = noCalls
+    var noFreeingCalls: [int] = []
+    freeingCallPositions = noFreeingCalls
     var position = 0
     for block in blockOrder {
         blockStarts[block] = position
@@ -1637,6 +1677,7 @@ fn numberPositions() {
             else {
                 instructionPositions[instruction] = position
                 if irOpcodes[instruction] == irCall { callPositions.push(position) }
+                if irOpcodes[instruction] == irCall and not callOnlyReads(instruction) { freeingCallPositions.push(position) }
                 position += 2
             }
         }
@@ -1811,10 +1852,10 @@ fn lastRangeEnd(value: int) -> int {
     return ends[ends.len() - 1]
 }
 
-fn crossesCall(value: int) -> bool {
+fn crossesAnyPosition(value: int, positions: [int]) -> bool {
     let starts = rangeStarts[value]
     let ends = rangeEnds[value]
-    for position in callPositions {
+    for position in positions {
         for i in 0..starts.len() {
             if starts[i] < position and position < ends[i] { return true }
         }
@@ -1970,8 +2011,8 @@ fn allocateRegisters() {
         let valueClass = irClasses[current]
         var registerCount = integerRegisterNames.len()
         if valueClass == classFloat { registerCount = floatRegisterNames.len() }
-        let needsCalleeSaved = crossesCall(current)
-        if needsCalleeSaved and irBorrowed[current] { optimizerBail("unpinned reference live across a call") }
+        let needsCalleeSaved = crossesAnyPosition(current, callPositions)
+        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call") }
         var blocked: [bool] = []
         for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
         for other in active {
@@ -3320,7 +3361,7 @@ fn scanMemoryEffects() {
     for block in blockOrder {
         for instruction in blockInstructions[block] {
             let opcode = irOpcodes[instruction]
-            if opcode == irCall or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { regionClobbersMemory = true }
+            if (opcode == irCall and not callOnlyReads(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { regionClobbersMemory = true }
             if opcode == irStore or opcode == irFloatStore { storedFieldOffsets.push(irImmediates[instruction]) }
         }
     }
