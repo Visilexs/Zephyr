@@ -1,0 +1,2603 @@
+// ================= optimizing tier (-O2 / the JIT's top tier) =================
+//
+// A second backend for hot code. The baseline generator walks the checked AST
+// straight to accumulator-style x86: every value passes through rax, only six
+// ints and six floats per function get a register, and nothing is known about
+// a value beyond its type. This tier lowers the same checked AST into SSA form,
+// optimizes it, allocates registers across the whole region, and emits x86
+// through the same assembler.
+//
+// Unit of compilation: a REGION. Either a whole function, or one hot loop
+// statement that is outlined into its own function and called from the
+// baseline code of its parent. An outlined loop receives the parent's frame
+// pointer in rcx and reads and writes the parent's slots in place; the parent
+// keeps those slots out of registers (see optimizerExcludeSlots) so both
+// sides agree where every variable lives. This is also the unit on-stack
+// replacement uses: a loop header with every variable in a known frame slot.
+//
+// Anything the tier does not handle makes it back out (optimizerBail), and
+// the baseline code is used instead, so correctness never depends on how much
+// of the language this file covers.
+//
+// Reference-counting contract, as the baseline's (see isReferenceType): values
+// of reference type are only ever BORROWED here. A reference is PINNED when
+// something outside the region keeps it alive for the region's whole run -- a
+// parameter, or a slot of the parent frame -- and merely borrowed when it was
+// loaded out of a container or a global, which a callee could release. The
+// tier never stores a reference anywhere the baseline would own it, never
+// keeps an unpinned one live across a call, never passes one to a call, and
+// never calls a function returning one, so it performs no count operations
+// and the baseline's ownership invariants hold across the boundary.
+
+// ---- IR opcodes ----
+let irConstant = 1              // immediate
+let irParameter = 2             // immediate = parameter index (whole-function) or 0 = parent frame (region)
+let irPhi = 3                   // operands align with the block's predecessors
+let irAdd = 4
+let irSubtract = 5
+let irMultiply = 6
+let irDivide = 7
+let irModulo = 8
+let irBitAnd = 9
+let irBitOr = 10
+let irBitXor = 11
+let irShiftLeft = 12
+let irShiftRight = 13
+let irNegate = 14
+let irCompare = 15              // immediate = condition; int/bool operands -> 0/1
+let irFloatAdd = 16
+let irFloatSubtract = 17
+let irFloatMultiply = 18
+let irFloatDivide = 19
+let irFloatNegate = 20
+let irFloatCompare = 21         // immediate = condition; float operands -> 0/1
+let irFloatSquareRoot = 22
+let irFloatMinimum = 23
+let irFloatMaximum = 24
+let irFloatAbsolute = 25
+let irIntegerToFloat = 26
+let irFloatToInteger = 27       // truncating
+let irFloatFromBits = 28        // GPR bits -> xmm
+let irBitsFromFloat = 29        // xmm -> GPR bits
+let irLoad = 30                 // [a + immediate]
+let irLoadIndexed = 31          // [a + b*8 + immediate]
+let irStore = 32                // [a + immediate] = b
+let irStoreIndexed = 33         // [a + b*8 + immediate] = c
+let irLoadGlobal = 34           // immediate = global index
+let irStoreGlobal = 35          // immediate = global index, a = value
+let irBoundsCheck = 36          // a = list, b = index; immediate = panic string index
+let irZeroCheck = 37            // a = divisor; immediate = panic string index
+let irCall = 38                 // immediate = functionDefinitions index; operands = arguments
+let irIntegerMinimum = 39
+let irIntegerMaximum = 40
+let irIntegerAbsolute = 41
+let irLoadFrame = 42            // parent frame slot: a = frame, immediate = byte offset from rbp
+let irStoreFrame = 43           // a = frame, b = value, immediate = byte offset
+let irFloatLoad = 44            // float loads/stores (movsd), same addressing as the int ones
+let irFloatLoadIndexed = 45
+let irFloatStore = 46
+let irFloatStoreIndexed = 47
+let irFloatLoadGlobal = 48
+let irFloatStoreGlobal = 49
+let irFloatLoadFrame = 50
+let irFloatStoreFrame = 51
+let irFloatConstant = 52        // immediate = bits
+let irCopy = 53                 // a (optimizations forward it away; never emitted)
+let irDataAddress = 54          // immediate = data string index: lea of a string literal
+// terminators
+let irJump = 60                 // successors[0]
+let irBranch = 61               // a != 0 -> successors[0] else successors[1]
+let irBranchCompare = 62        // a cond b -> successors[0] else successors[1]; immediate = condition
+let irBranchFloatCompare = 63
+let irReturn = 64               // operands = [value] or []
+let irUnreachable = 65          // panic with a fixed text: immediate = data string index
+let irPanicAt = 66              // panic: a = message string, immediate = site string index
+
+// conditions (shared by compares and branches)
+let conditionEqual = 0
+let conditionNotEqual = 1
+let conditionLess = 2
+let conditionLessOrEqual = 3
+let conditionGreater = 4
+let conditionGreaterOrEqual = 5
+
+// value classes
+let classInteger = 0            // int, bool, enum, pointer: a GPR
+let classFloat = 1              // float: an xmm register
+
+let identifierKindTemporary = 0 - 1        // a variable the lowering made up (join values, hidden indices)
+
+// ---- IR storage (one region at a time) ----
+var irOpcodes: [int] = []
+var irClasses: [int] = []
+var irOperands: [[int]] = []
+var irImmediates: [int] = []
+var irBlockOf: [int] = []
+var irBorrowed: [bool] = []     // an unpinned reference: must not live across a call
+var irReferenceArguments: [int] = []       // irCall: bit i set = argument i is a reference
+var irUseCounts: [int] = []
+
+var blockInstructions: [[int]] = []
+var blockPredecessors: [[int]] = []
+var blockSuccessors: [[int]] = []
+var blockSealed: [bool] = []
+var blockTerminated: [bool] = []
+var blockLoopDepth: [int] = []
+
+// SSA construction (Braun et al.): current definition of each variable per block
+var variableKeys: [str: int] = [:]        // "l5" / "p2" / "g7" / "t3" -> variable number
+var variableClasses: [int] = []
+var variableHomeKind: [int] = []           // identifierKindLocal / Parameter / Global / Temporary
+var variableHomeIndex: [int] = []
+var variableWritten: [bool] = []
+var variableIsReference: [bool] = []
+var variableDeclaredInside: [bool] = []    // declared by the region itself (never written back if a reference)
+var currentDefinitions: [[int]] = []       // [block][variable] -> value, -1 = none
+var incompletePhis: [[int]] = []           // [block] -> phi values awaiting sealing
+var incompletePhiVariables: [[int]] = []
+var temporaryVariableCount = 0
+
+var optimizerBailed = false
+var optimizerBailReason = ""
+var currentIrBlock = 0
+var currentLoopDepth = 0
+var regionIsFunction = true                // whole function, or an outlined loop
+var regionFunctionIndex = 0 - 1
+var regionParentSlotCount = 0
+var regionParentParameterCount = 0
+var regionParentRegisterCall = false
+var regionFrameValue = 0 - 1               // the parent frame pointer (outlined loops)
+var regionHasUserCall = false
+var regionGlobalsInMemory = false          // a callee may read or write globals: keep them in memory
+var regionBreakTargets: [int] = []
+var regionContinueTargets: [int] = []
+var regionInlineEnds: [int] = []
+var regionInlineSlots: [int] = []
+var regionInlineTypes: [int] = []
+var regionReturnBlock = 0
+var regionReturnVariable = 0 - 1
+var regionReturnType = 4
+var parameterValues: [int] = []
+
+fn optimizerBail(reason: str) {
+    if not optimizerBailed {
+        optimizerBailed = true
+        optimizerBailReason = reason
+    }
+}
+
+fn resetIr() {
+    var emptyIntegers: [int] = []
+    irOpcodes = [0]                          // value 0 is a placeholder: operands never name it
+    irClasses = [0]
+    irOperands = [emptyIntegers]
+    irImmediates = [0]
+    irBlockOf = [0]
+    irBorrowed = [false]
+    irReferenceArguments = [0]
+    irUseCounts = [0]
+    var noLists: [[int]] = []
+    blockInstructions = noLists
+    var noPredecessors: [[int]] = []
+    blockPredecessors = noPredecessors
+    var noSuccessors: [[int]] = []
+    blockSuccessors = noSuccessors
+    var noSealed: [bool] = []
+    blockSealed = noSealed
+    var noTerminated: [bool] = []
+    blockTerminated = noTerminated
+    var noDepths: [int] = []
+    blockLoopDepth = noDepths
+    var noKeys: [str: int] = [:]
+    variableKeys = noKeys
+    var noClasses: [int] = []
+    variableClasses = noClasses
+    var noKinds: [int] = []
+    variableHomeKind = noKinds
+    var noIndices: [int] = []
+    variableHomeIndex = noIndices
+    var noWritten: [bool] = []
+    variableWritten = noWritten
+    var noReferences: [bool] = []
+    variableIsReference = noReferences
+    var noDeclared: [bool] = []
+    variableDeclaredInside = noDeclared
+    var noDefinitions: [[int]] = []
+    currentDefinitions = noDefinitions
+    var noPhis: [[int]] = []
+    incompletePhis = noPhis
+    var noPhiVariables: [[int]] = []
+    incompletePhiVariables = noPhiVariables
+    temporaryVariableCount = 0
+    optimizerBailed = false
+    optimizerBailReason = ""
+    currentLoopDepth = 0
+    regionHasUserCall = false
+    var noBreaks: [int] = []
+    regionBreakTargets = noBreaks
+    var noContinues: [int] = []
+    regionContinueTargets = noContinues
+    var noEnds: [int] = []
+    regionInlineEnds = noEnds
+    var noSlots: [int] = []
+    regionInlineSlots = noSlots
+    var noTypes: [int] = []
+    regionInlineTypes = noTypes
+    regionFrameValue = 0 - 1
+    regionReturnVariable = 0 - 1
+    var noParameters: [int] = []
+    parameterValues = noParameters
+}
+
+fn newBlock() -> int {
+    var noIntegers: [int] = []
+    blockInstructions.push(noIntegers)
+    var noPredecessors: [int] = []
+    blockPredecessors.push(noPredecessors)
+    var noSuccessors: [int] = []
+    blockSuccessors.push(noSuccessors)
+    blockSealed.push(false)
+    blockTerminated.push(false)
+    blockLoopDepth.push(currentLoopDepth)
+    var definitions: [int] = []
+    for i in 0..variableClasses.len() { definitions.push(0 - 1) }
+    currentDefinitions.push(definitions)
+    var phis: [int] = []
+    incompletePhis.push(phis)
+    var phiVariables: [int] = []
+    incompletePhiVariables.push(phiVariables)
+    return blockInstructions.len() - 1
+}
+
+// append an instruction to a block (before its terminator if it has one)
+fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], immediate: int) -> int {
+    irOpcodes.push(opcode)
+    irClasses.push(valueClass)
+    irOperands.push(operands)
+    irImmediates.push(immediate)
+    irBlockOf.push(block)
+    irBorrowed.push(false)
+    irReferenceArguments.push(0)
+    irUseCounts.push(0)
+    let value = irOpcodes.len() - 1
+    if opcode == irPhi {
+        // phis go first, ahead of every ordinary instruction
+        let instructions = blockInstructions[block]
+        var position = 0
+        while position < instructions.len() and irOpcodes[instructions[position]] == irPhi { position += 1 }
+        var reordered: [int] = []
+        for i in 0..position { reordered.push(instructions[i]) }
+        reordered.push(value)
+        for i in position..instructions.len() { reordered.push(instructions[i]) }
+        blockInstructions[block] = reordered
+    } else if blockTerminated[block] {
+        let instructions = blockInstructions[block]
+        let terminator = instructions.pop()
+        instructions.push(value)
+        instructions.push(terminator)
+    } else {
+        blockInstructions[block].push(value)
+    }
+    return value
+}
+
+// code after a return/break/panic: give it a block nobody reaches
+fn ensureOpenBlock() {
+    if blockTerminated[currentIrBlock] {
+        currentIrBlock = newBlock()
+        blockSealed[currentIrBlock] = true
+    }
+}
+
+fn emitIr(opcode: int, valueClass: int, operands: [int], immediate: int) -> int {
+    ensureOpenBlock()
+    return addInstruction(currentIrBlock, opcode, valueClass, operands, immediate)
+}
+
+fn emitIr0(opcode: int, valueClass: int, immediate: int) -> int {
+    var noOperands: [int] = []
+    return emitIr(opcode, valueClass, noOperands, immediate)
+}
+fn emitIr1(opcode: int, valueClass: int, first: int, immediate: int) -> int {
+    return emitIr(opcode, valueClass, [first], immediate)
+}
+fn emitIr2(opcode: int, valueClass: int, first: int, second: int, immediate: int) -> int {
+    return emitIr(opcode, valueClass, [first, second], immediate)
+}
+fn integerConstant(value: int) -> int { return emitIr0(irConstant, classInteger, value) }
+
+fn addEdge(from: int, to: int) {
+    blockSuccessors[from].push(to)
+    blockPredecessors[to].push(from)
+}
+
+fn terminate(opcode: int, operands: [int], immediate: int, successors: [int]) {
+    if blockTerminated[currentIrBlock] { return }       // already left (break/return): nothing to add
+    let terminator = addInstruction(currentIrBlock, opcode, classInteger, operands, immediate)
+    blockTerminated[currentIrBlock] = true
+    for successor in successors { addEdge(currentIrBlock, successor) }
+}
+
+fn jumpTo(target: int) {
+    var noOperands: [int] = []
+    terminate(irJump, noOperands, 0, [target])
+}
+
+// ---- SSA variables ----
+fn variableForKey(key: str, kind: int, index: int, valueClass: int, isReference: bool) -> int {
+    if variableKeys.has(key) {
+        let existing = variableKeys[key]
+        // the inliner can type one hidden slot two ways; a slot read as both an
+        // int and a float is not something registers can model
+        if variableClasses[existing] != valueClass { optimizerBail("slot {key} used as int and float") }
+        if isReference { variableIsReference[existing] = true }
+        return existing
+    }
+    let number = variableClasses.len()
+    variableKeys[key] = number
+    variableClasses.push(valueClass)
+    variableHomeKind.push(kind)
+    variableHomeIndex.push(index)
+    variableWritten.push(false)
+    variableIsReference.push(isReference)
+    variableDeclaredInside.push(false)
+    for block in 0..currentDefinitions.len() { currentDefinitions[block].push(0 - 1) }
+    return number
+}
+
+fn variableNumber(kind: int, index: int, valueClass: int, isReference: bool) -> int {
+    var key = "l{index}"
+    if kind == identifierKindParameter { key = "p{index}" }
+    else if kind == identifierKindGlobal { key = "g{index}" }
+    return variableForKey(key, kind, index, valueClass, isReference)
+}
+
+fn variableForSlot(kind: int, index: int, typeIndex: int) -> int {
+    return variableNumber(kind, index, classOfType(typeIndex), isReferenceType(typeIndex))
+}
+
+fn temporaryVariable(valueClass: int, isReference: bool) -> int {
+    temporaryVariableCount += 1
+    let variable = variableForKey("t{temporaryVariableCount}", identifierKindTemporary, 0, valueClass, isReference)
+    variableDeclaredInside[variable] = true
+    return variable
+}
+
+fn writeVariable(variable: int, block: int, value: int) {
+    currentDefinitions[block][variable] = value
+}
+
+fn readVariable(variable: int, block: int) -> int {
+    let known = currentDefinitions[block][variable]
+    if known >= 0 { return known }
+    return readVariableRecursive(variable, block)
+}
+
+fn readVariableRecursive(variable: int, block: int) -> int {
+    var value = 0
+    var noOperands: [int] = []
+    if not blockSealed[block] {
+        value = addInstruction(block, irPhi, variableClasses[variable], noOperands, 0)
+        incompletePhis[block].push(value)
+        incompletePhiVariables[block].push(variable)
+    } else if blockPredecessors[block].len() == 0 {
+        value = loadVariableHome(variable, block)
+    } else if blockPredecessors[block].len() == 1 {
+        value = readVariable(variable, blockPredecessors[block][0])
+    } else {
+        value = addInstruction(block, irPhi, variableClasses[variable], noOperands, 0)
+        writeVariable(variable, block, value)
+        addPhiOperands(variable, value)
+    }
+    writeVariable(variable, block, value)
+    return value
+}
+
+fn addPhiOperands(variable: int, phi: int) {
+    let block = irBlockOf[phi]
+    var operands: [int] = []
+    for predecessor in blockPredecessors[block] { operands.push(readVariable(variable, predecessor)) }
+    irOperands[phi] = operands
+}
+
+fn sealBlock(block: int) {
+    if blockSealed[block] { return }
+    for i in 0..incompletePhis[block].len() { addPhiOperands(incompletePhiVariables[block][i], incompletePhis[block][i]) }
+    var noOperands: [int] = []
+    incompletePhis[block] = noOperands
+    var noVariables: [int] = []
+    incompletePhiVariables[block] = noVariables
+    blockSealed[block] = true
+}
+
+// The value a variable has on entry to the region: a parameter, a slot of the
+// parent frame, or a global. Locals of a whole-function region have no value
+// before their declaration; a phi may still ask (a loop-header phi for a
+// variable first declared inside the loop), and gets a zero it never uses.
+fn loadVariableHome(variable: int, block: int) -> int {
+    let kind = variableHomeKind[variable]
+    let index = variableHomeIndex[variable]
+    let valueClass = variableClasses[variable]
+    var noOperands: [int] = []
+    var value = 0
+    if kind == identifierKindGlobal {
+        if valueClass == classFloat { value = addInstruction(block, irFloatLoadGlobal, classFloat, noOperands, index) }
+        else { value = addInstruction(block, irLoadGlobal, classInteger, noOperands, index) }
+        if variableIsReference[variable] { irBorrowed[value] = true }     // a callee may reassign the global
+    } else if kind == identifierKindTemporary or (regionIsFunction and kind == identifierKindLocal) {
+        if valueClass == classFloat { value = addInstruction(block, irFloatConstant, classFloat, noOperands, 0) }
+        else { value = addInstruction(block, irConstant, classInteger, noOperands, 0) }
+    } else if regionIsFunction {
+        value = parameterValues[index]
+    } else {
+        let offset = parentSlotOffset(kind, index)
+        if valueClass == classFloat { value = addInstruction(block, irFloatLoadFrame, classFloat, [regionFrameValue], offset) }
+        else { value = addInstruction(block, irLoadFrame, classInteger, [regionFrameValue], offset) }
+    }
+    return value
+}
+
+// byte offset of a parent-frame variable from the parent's rbp
+fn parentSlotOffset(kind: int, index: int) -> int {
+    if kind == identifierKindLocal { return 0 - (16 + 8 * index) }
+    if regionParentRegisterCall { return 0 - (16 + 8 * regionParentSlotCount + 8 * index) }
+    return 16 + 8 * (regionParentParameterCount - 1 - index)
+}
+
+fn classOfType(typeIndex: int) -> int {
+    if typeKinds[typeIndex] == kindFloat { return classFloat }
+    return classInteger
+}
+
+// ================= lowering: checked AST -> SSA =================
+
+fn panicStringIndex(expression: Node, message: str) -> int { return addDataString(panicSite(expression) + message) }
+
+fn conditionForToken(operator: int) -> int {
+    if operator == tokenEquals { return conditionEqual }
+    if operator == tokenNotEquals { return conditionNotEqual }
+    if operator == tokenLessThan { return conditionLess }
+    if operator == tokenLessOrEqual { return conditionLessOrEqual }
+    if operator == tokenGreaterThan { return conditionGreater }
+    if operator == tokenGreaterOrEqual { return conditionGreaterOrEqual }
+    return 0 - 1
+}
+
+fn integerOpcodeForToken(operator: int) -> int {
+    if operator == tokenPlus { return irAdd }
+    if operator == tokenMinus { return irSubtract }
+    if operator == tokenStar { return irMultiply }
+    if operator == tokenSlash { return irDivide }
+    if operator == tokenPercent { return irModulo }
+    if operator == tokenAmpersand { return irBitAnd }
+    if operator == tokenPipe { return irBitOr }
+    if operator == tokenCaret { return irBitXor }
+    if operator == tokenShiftLeft { return irShiftLeft }
+    if operator == tokenShiftRight { return irShiftRight }
+    return 0 - 1
+}
+
+fn floatOpcodeForToken(operator: int) -> int {
+    if operator == tokenPlus { return irFloatAdd }
+    if operator == tokenMinus { return irFloatSubtract }
+    if operator == tokenStar { return irFloatMultiply }
+    if operator == tokenSlash { return irFloatDivide }
+    return 0 - 1
+}
+
+// the text of a string literal with no interpolation, or "" with a bail
+fn literalText(expression: Node) -> str {
+    if expression.nodeKind == nodeStringLiteral and expression.children.len() == 1 and expression.children[0].nodeKind == nodeStringText { return expression.children[0].name }
+    optimizerBail("non-literal panic message")
+    return ""
+}
+
+fn identifierVariable(expression: Node) -> int {
+    let kind = expression.auxiliary
+    if kind != identifierKindLocal and kind != identifierKindParameter and kind != identifierKindGlobal {
+        optimizerBail("identifier kind {kind}")
+        return 0
+    }
+    return variableForSlot(kind, expression.slot, expression.typeIndex)
+}
+
+fn readVariableValue(variable: int) -> int {
+    if variableHomeKind[variable] == identifierKindGlobal and regionGlobalsInMemory {
+        ensureOpenBlock()
+        return loadVariableHome(variable, currentIrBlock)
+    }
+    ensureOpenBlock()
+    return readVariable(variable, currentIrBlock)
+}
+
+fn writeVariableValue(variable: int, value: int) {
+    if irClasses[value] != variableClasses[variable] {
+        optimizerBail("store of the wrong class")
+        return
+    }
+    if variableHomeKind[variable] == identifierKindGlobal {
+        if variableIsReference[variable] {
+            optimizerBail("reference store to a global")
+            return
+        }
+        if regionGlobalsInMemory {
+            if variableClasses[variable] == classFloat { let stored = emitIr1(irFloatStoreGlobal, classFloat, value, variableHomeIndex[variable]) }
+            else { let stored = emitIr1(irStoreGlobal, classInteger, value, variableHomeIndex[variable]) }
+            return
+        }
+    }
+    ensureOpenBlock()
+    writeVariable(variable, currentIrBlock, value)
+    variableWritten[variable] = true
+}
+
+// a region-declared variable: a reference one is SSA-only, never written back
+fn declareVariable(variable: int, value: int) {
+    if variableHomeKind[variable] != identifierKindGlobal { variableDeclaredInside[variable] = true }
+    writeVariableValue(variable, value)
+}
+
+fn assignVariable(target: Node, value: int) {
+    let variable = identifierVariable(target)
+    if optimizerBailed { return }
+    if variableIsReference[variable] and not regionIsFunction and not variableDeclaredInside[variable] {
+        optimizerBail("reference store to a parent slot")
+        return
+    }
+    writeVariableValue(variable, value)
+}
+
+fn lowerBlock(block: Node) {
+    for statement in block.children {
+        if optimizerBailed { return }
+        lowerStatement(statement)
+    }
+}
+
+fn lowerExpression(expression: Node) -> int {
+    if optimizerBailed { return 0 }
+    let kind = expression.nodeKind
+    if kind == nodeInteger or kind == nodeBoolean { return integerConstant(expression.integerValue) }
+    if kind == nodeFloat { return emitIr0(irFloatConstant, classFloat, bits(expression.floatValue)) }
+    if kind == nodeIdentifier {
+        let variable = identifierVariable(expression)
+        if optimizerBailed { return 0 }
+        return readVariableValue(variable)
+    }
+    if kind == nodeNegate {
+        let operand = lowerExpression(expression.children[0])
+        if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatNegate, classFloat, operand, 0) }
+        return emitIr1(irNegate, classInteger, operand, 0)
+    }
+    if kind == nodeNot {
+        let operand = lowerExpression(expression.children[0])
+        return emitIr2(irBitXor, classInteger, operand, integerConstant(1), 0)
+    }
+    if kind == nodeBinary { return lowerBinary(expression) }
+    if kind == nodeCast {
+        let castKind = expression.auxiliary
+        if castKind != castKindNoOperation and castKind != castKindIntegerToFloat and castKind != castKindTruncate {
+            optimizerBail("cast kind {castKind}")
+            return 0
+        }
+        let operand = lowerExpression(expression.children[0])
+        if optimizerBailed { return 0 }
+        if castKind == castKindIntegerToFloat { return emitIr1(irIntegerToFloat, classFloat, operand, 0) }
+        if castKind == castKindTruncate { return emitIr1(irFloatToInteger, classInteger, operand, 0) }
+        if irClasses[operand] != classOfType(expression.typeIndex) { optimizerBail("reinterpreting cast") }
+        return operand
+    }
+    if kind == nodeIfExpression {
+        let result = temporaryVariable(classOfType(expression.typeIndex), isReferenceType(expression.typeIndex))
+        let thenBlock = newBlock()
+        let elseBlock = newBlock()
+        let joinBlock = newBlock()
+        lowerCondition(expression.children[0], thenBlock, elseBlock)
+        sealBlock(thenBlock)
+        sealBlock(elseBlock)
+        currentIrBlock = thenBlock
+        writeVariableValue(result, lowerExpression(expression.children[1]))
+        jumpTo(joinBlock)
+        currentIrBlock = elseBlock
+        writeVariableValue(result, lowerExpression(expression.children[2]))
+        jumpTo(joinBlock)
+        sealBlock(joinBlock)
+        currentIrBlock = joinBlock
+        return readVariableValue(result)
+    }
+    if kind == nodeLetExpression {
+        lowerStatement(expression.children[0])
+        return lowerExpression(expression.children[1])
+    }
+    if kind == nodeIndex { return lowerIndexRead(expression) }
+    if kind == nodeMember {
+        if typeKinds[expression.children[0].typeIndex] != kindStruct {
+            optimizerBail("member of a non-struct")
+            return 0
+        }
+        let base = lowerExpression(expression.children[0])
+        if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatLoad, classFloat, base, 8 * expression.slot) }
+        let value = emitIr1(irLoad, classInteger, base, 8 * expression.slot)
+        if isReferenceType(expression.typeIndex) { irBorrowed[value] = true }   // a callee may reassign the field
+        return value
+    }
+    if kind == nodeCall { return lowerCall(expression) }
+    optimizerBail("expression kind {kind}")
+    return 0
+}
+
+fn lowerBinary(expression: Node) -> int {
+    let operator = expression.operator
+    if operator == tokenAnd or operator == tokenOr {
+        let result = temporaryVariable(classInteger, false)
+        let rightBlock = newBlock()
+        let shortBlock = newBlock()
+        let joinBlock = newBlock()
+        if operator == tokenAnd { lowerCondition(expression.children[0], rightBlock, shortBlock) }
+        else { lowerCondition(expression.children[0], shortBlock, rightBlock) }
+        sealBlock(rightBlock)
+        sealBlock(shortBlock)
+        currentIrBlock = rightBlock
+        writeVariableValue(result, lowerExpression(expression.children[1]))
+        jumpTo(joinBlock)
+        currentIrBlock = shortBlock
+        if operator == tokenAnd { writeVariableValue(result, integerConstant(0)) }
+        else { writeVariableValue(result, integerConstant(1)) }
+        jumpTo(joinBlock)
+        sealBlock(joinBlock)
+        currentIrBlock = joinBlock
+        return readVariableValue(result)
+    }
+    let category = expression.auxiliary
+    if category == binaryCategoryString {
+        optimizerBail("string operator")
+        return 0
+    }
+    let left = lowerExpression(expression.children[0])
+    let right = lowerExpression(expression.children[1])
+    if optimizerBailed { return 0 }
+    let condition = conditionForToken(operator)
+    if category == binaryCategoryFloat {
+        if condition >= 0 { return emitIr2(irFloatCompare, classInteger, left, right, condition) }
+        let floatOpcode = floatOpcodeForToken(operator)
+        if floatOpcode < 0 {
+            optimizerBail("float operator {operator}")
+            return 0
+        }
+        return emitIr2(floatOpcode, classFloat, left, right, 0)
+    }
+    if condition >= 0 { return emitIr2(irCompare, classInteger, left, right, condition) }
+    let opcode = integerOpcodeForToken(operator)
+    if opcode < 0 {
+        optimizerBail("operator {operator}")
+        return 0
+    }
+    if opcode == irDivide { let checked = emitIr1(irZeroCheck, classInteger, right, panicStringIndex(expression, "division by zero")) }
+    if opcode == irModulo { let checked = emitIr1(irZeroCheck, classInteger, right, panicStringIndex(expression, "modulo by zero")) }
+    return emitIr2(opcode, classInteger, left, right, 0)
+}
+
+// element type of a list the tier can address with 8-byte strides, or -1
+fn plainListElement(listType: int) -> int {
+    if typeKinds[listType] != kindList {
+        optimizerBail("index into a non-list")
+        return 0 - 1
+    }
+    let elementType = typeElementIds[listType]
+    if typeKinds[elementType] == kindByte or typeKinds[elementType] == kindFloat32 {
+        optimizerBail("packed list")
+        return 0 - 1
+    }
+    return elementType
+}
+
+// bounds-checked element address: returns the data pointer; the caller indexes it
+fn lowerElementAddress(list: int, index: int, site: Node) -> int {
+    let checked = emitIr2(irBoundsCheck, classInteger, list, index, panicStringIndex(site, "index out of bounds"))
+    let data = emitIr1(irLoad, classInteger, list, 16)
+    irBorrowed[data] = true                   // a push reallocates it
+    return data
+}
+
+fn lowerIndexRead(expression: Node) -> int {
+    let elementType = plainListElement(expression.children[0].typeIndex)
+    if optimizerBailed { return 0 }
+    let list = lowerExpression(expression.children[0])
+    let index = lowerExpression(expression.children[1])
+    if optimizerBailed { return 0 }
+    let data = lowerElementAddress(list, index, expression)
+    if typeKinds[elementType] == kindFloat { return emitIr2(irFloatLoadIndexed, classFloat, data, index, 0) }
+    let value = emitIr2(irLoadIndexed, classInteger, data, index, 0)
+    if isReferenceType(elementType) { irBorrowed[value] = true }
+    return value
+}
+
+fn lowerPanicAt(expression: Node, message: Node) {
+    let text = literalText(message)
+    if optimizerBailed { return }
+    let messageValue = emitIr0(irDataAddress, classInteger, addDataString(text))
+    var noOperands: [int] = []
+    terminate(irPanicAt, [messageValue], addDataString(panicSite(expression)), noOperands)
+}
+
+fn lowerFixedPanic(stringIndex: int) {
+    ensureOpenBlock()
+    var noOperands: [int] = []
+    var noSuccessors: [int] = []
+    terminate(irUnreachable, noOperands, stringIndex, noSuccessors)
+}
+
+fn lowerCall(expression: Node) -> int {
+    let callKind = expression.auxiliary
+    if callKind == callKindSquareRoot { return emitIr1(irFloatSquareRoot, classFloat, lowerExpression(expression.children[1]), 0) }
+    if callKind == callKindAbsolute {
+        let operand = lowerExpression(expression.children[1])
+        if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatAbsolute, classFloat, operand, 0) }
+        return emitIr1(irIntegerAbsolute, classInteger, operand, 0)
+    }
+    if callKind == callKindMin or callKind == callKindMax {
+        let left = lowerExpression(expression.children[1])
+        let right = lowerExpression(expression.children[2])
+        if expression.operator == 1 {
+            if callKind == callKindMin { return emitIr2(irFloatMinimum, classFloat, left, right, 0) }
+            return emitIr2(irFloatMaximum, classFloat, left, right, 0)
+        }
+        if callKind == callKindMin { return emitIr2(irIntegerMinimum, classInteger, left, right, 0) }
+        return emitIr2(irIntegerMaximum, classInteger, left, right, 0)
+    }
+    if callKind == callKindLength {
+        let receiver = expression.children[0].children[0]
+        let receiverKind = typeKinds[receiver.typeIndex]
+        if receiverKind != kindList and receiverKind != kindString {
+            optimizerBail("len of kind {receiverKind}")
+            return 0
+        }
+        return emitIr1(irLoad, classInteger, lowerExpression(receiver), 0)
+    }
+    if callKind == callKindBits {                // bits() and floatFromBits(): same bits, retyped
+        let operand = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        let resultClass = classOfType(expression.typeIndex)
+        if irClasses[operand] == resultClass { return operand }
+        if resultClass == classFloat { return emitIr1(irFloatFromBits, classFloat, operand, 0) }
+        return emitIr1(irBitsFromFloat, classInteger, operand, 0)
+    }
+    if callKind == callKindPanic {
+        lowerPanicAt(expression, expression.children[1])
+        return 0
+    }
+    if callKind == callKindAssert {
+        if expression.children[1].nodeKind == nodeBoolean and expression.children[1].integerValue == 1 { return 0 }
+        let okBlock = newBlock()
+        let failBlock = newBlock()
+        lowerCondition(expression.children[1], okBlock, failBlock)
+        sealBlock(okBlock)
+        sealBlock(failBlock)
+        currentIrBlock = failBlock
+        if expression.children.len() > 2 { lowerPanicAt(expression, expression.children[2]) }
+        else { lowerFixedPanic(panicStringIndex(expression, "assertion failed")) }
+        currentIrBlock = okBlock
+        return 0
+    }
+    if callKind != callKindUser {
+        optimizerBail("call kind {callKind}")
+        return 0
+    }
+    let functionDefinition = functionDefinitions[expression.referenceIndex]
+    var callArguments: [Node] = []
+    if expression.operator == 1 { callArguments.push(expression.children[0].children[0]) }        // UFCS receiver
+    for i in 1..expression.children.len() { callArguments.push(expression.children[i]) }
+    if functionDefinition.name == "runtimeFail" and callArguments.len() == 1 {
+        lowerFixedPanic(panicStringIndex(expression, literalText(callArguments[0])))
+        return 0
+    }
+    if functionDefinition.hasEnvironment or textStartsWith(functionDefinition.name, "runtime") {
+        optimizerBail("call to {functionDefinition.name}")
+        return 0
+    }
+    if isReferenceType(functionDefinition.returnType) {
+        optimizerBail("call returning a reference")
+        return 0
+    }
+    var operands: [int] = []
+    var referenceMask = 0
+    for i in 0..callArguments.len() {
+        var value = lowerExpression(callArguments[i])
+        if optimizerBailed { return 0 }
+        if isReferenceType(callArguments[i].typeIndex) { referenceMask = referenceMask | (1 << i) }
+        if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+        operands.push(value)
+    }
+    if callArguments.len() > 60 {
+        optimizerBail("too many arguments")
+        return 0
+    }
+    regionHasUserCall = true
+    let result = emitIr(irCall, classInteger, operands, expression.referenceIndex)
+    irReferenceArguments[result] = referenceMask
+    if typeKinds[functionDefinition.returnType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
+    return result
+}
+
+// branch to trueBlock or falseBlock; compares fuse into the branch
+fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
+    if optimizerBailed { return }
+    let kind = condition.nodeKind
+    if kind == nodeBoolean {
+        if condition.integerValue == 1 { jumpTo(trueBlock) } else { jumpTo(falseBlock) }
+        return
+    }
+    if kind == nodeNot {
+        lowerCondition(condition.children[0], falseBlock, trueBlock)
+        return
+    }
+    if kind == nodeBinary and (condition.operator == tokenAnd or condition.operator == tokenOr) {
+        let middleBlock = newBlock()
+        if condition.operator == tokenAnd { lowerCondition(condition.children[0], middleBlock, falseBlock) }
+        else { lowerCondition(condition.children[0], trueBlock, middleBlock) }
+        sealBlock(middleBlock)
+        currentIrBlock = middleBlock
+        lowerCondition(condition.children[1], trueBlock, falseBlock)
+        return
+    }
+    if kind == nodeBinary and conditionForToken(condition.operator) >= 0 and condition.auxiliary != binaryCategoryString {
+        let left = lowerExpression(condition.children[0])
+        let right = lowerExpression(condition.children[1])
+        if optimizerBailed { return }
+        ensureOpenBlock()
+        var opcode = irBranchCompare
+        if condition.auxiliary == binaryCategoryFloat { opcode = irBranchFloatCompare }
+        terminate(opcode, [left, right], conditionForToken(condition.operator), [trueBlock, falseBlock])
+        return
+    }
+    let value = lowerExpression(condition)
+    if optimizerBailed { return }
+    ensureOpenBlock()
+    terminate(irBranch, [value], 0, [trueBlock, falseBlock])
+}
+
+fn lowerStatement(statement: Node) {
+    if optimizerBailed { return }
+    let kind = statement.nodeKind
+    if kind == nodeDeclaration {
+        let value = lowerExpression(statement.children[0])
+        if optimizerBailed { return }
+        let variable = variableForSlot(statement.auxiliary, statement.slot, statement.typeIndex)
+        if optimizerBailed { return }
+        declareVariable(variable, value)
+        return
+    }
+    if kind == nodeAssign {
+        let target = statement.children[0]
+        if target.nodeKind == nodeIdentifier {
+            let value = lowerExpression(statement.children[1])
+            if optimizerBailed { return }
+            assignVariable(target, value)
+            return
+        }
+        if isReferenceType(target.typeIndex) {
+            optimizerBail("reference store into memory")
+            return
+        }
+        if target.nodeKind == nodeMember {
+            if typeKinds[target.children[0].typeIndex] != kindStruct {
+                optimizerBail("member store to a non-struct")
+                return
+            }
+            let base = lowerExpression(target.children[0])
+            let value = lowerExpression(statement.children[1])
+            if optimizerBailed { return }
+            if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, base, value, 8 * target.slot) }
+            else { let stored = emitIr2(irStore, classInteger, base, value, 8 * target.slot) }
+            return
+        }
+        if target.nodeKind == nodeIndex {
+            let elementType = plainListElement(target.children[0].typeIndex)
+            if optimizerBailed { return }
+            let list = lowerExpression(target.children[0])
+            let index = lowerExpression(target.children[1])
+            let value = lowerExpression(statement.children[1])
+            if optimizerBailed { return }
+            let data = lowerElementAddress(list, index, target)
+            if irClasses[value] == classFloat { let stored = emitIr(irFloatStoreIndexed, classFloat, [data, index, value], 0) }
+            else { let stored = emitIr(irStoreIndexed, classInteger, [data, index, value], 0) }
+            return
+        }
+        optimizerBail("assignment target kind {target.nodeKind}")
+        return
+    }
+    if kind == nodeIf {
+        let thenBlock = newBlock()
+        let joinBlock = newBlock()
+        var elseBlock = joinBlock
+        let hasElse = statement.children[2].nodeKind != nodeNone
+        if hasElse { elseBlock = newBlock() }
+        lowerCondition(statement.children[0], thenBlock, elseBlock)
+        sealBlock(thenBlock)
+        currentIrBlock = thenBlock
+        lowerBlock(statement.children[1])
+        jumpTo(joinBlock)
+        if hasElse {
+            sealBlock(elseBlock)
+            currentIrBlock = elseBlock
+            lowerBlock(statement.children[2])
+            jumpTo(joinBlock)
+        }
+        sealBlock(joinBlock)
+        currentIrBlock = joinBlock
+        return
+    }
+    if kind == nodeWhile {
+        currentLoopDepth += 1
+        let headerBlock = newBlock()
+        let bodyBlock = newBlock()
+        currentLoopDepth -= 1
+        let exitBlock = newBlock()
+        jumpTo(headerBlock)
+        currentIrBlock = headerBlock
+        lowerCondition(statement.children[0], bodyBlock, exitBlock)
+        sealBlock(bodyBlock)
+        regionBreakTargets.push(exitBlock)
+        regionContinueTargets.push(headerBlock)
+        currentLoopDepth += 1
+        currentIrBlock = bodyBlock
+        lowerBlock(statement.children[1])
+        jumpTo(headerBlock)
+        currentLoopDepth -= 1
+        let poppedBreak = regionBreakTargets.pop()
+        let poppedContinue = regionContinueTargets.pop()
+        sealBlock(headerBlock)
+        sealBlock(exitBlock)
+        currentIrBlock = exitBlock
+        return
+    }
+    if kind == nodeRangeLoop {
+        let start = lowerExpression(statement.children[0])
+        let limit = lowerExpression(statement.children[1])
+        if optimizerBailed { return }
+        let loopVariable = variableNumber(identifierKindLocal, statement.slot, classInteger, false)
+        declareVariable(loopVariable, start)
+        currentLoopDepth += 1
+        let headerBlock = newBlock()
+        let bodyBlock = newBlock()
+        let stepBlock = newBlock()
+        currentLoopDepth -= 1
+        let exitBlock = newBlock()
+        jumpTo(headerBlock)
+        currentIrBlock = headerBlock
+        let current = readVariable(loopVariable, headerBlock)
+        terminate(irBranchCompare, [current, limit], conditionLess, [bodyBlock, exitBlock])
+        sealBlock(bodyBlock)
+        regionBreakTargets.push(exitBlock)
+        regionContinueTargets.push(stepBlock)
+        currentLoopDepth += 1
+        currentIrBlock = bodyBlock
+        lowerBlock(statement.children[2])
+        jumpTo(stepBlock)
+        sealBlock(stepBlock)
+        currentIrBlock = stepBlock
+        let incremented = emitIr2(irAdd, classInteger, readVariable(loopVariable, stepBlock), integerConstant(1), 0)
+        writeVariableValue(loopVariable, incremented)
+        jumpTo(headerBlock)
+        currentLoopDepth -= 1
+        let poppedBreak = regionBreakTargets.pop()
+        let poppedContinue = regionContinueTargets.pop()
+        sealBlock(headerBlock)
+        sealBlock(exitBlock)
+        currentIrBlock = exitBlock
+        return
+    }
+    if kind == nodeIterableLoop {
+        let elementType = plainListElement(statement.children[0].typeIndex)
+        if optimizerBailed { return }
+        let list = lowerExpression(statement.children[0])
+        if optimizerBailed { return }
+        let indexVariable = temporaryVariable(classInteger, false)
+        writeVariableValue(indexVariable, integerConstant(0))
+        let elementVariable = variableForSlot(identifierKindLocal, statement.slot, elementType)
+        if optimizerBailed { return }
+        currentLoopDepth += 1
+        let headerBlock = newBlock()
+        let bodyBlock = newBlock()
+        let stepBlock = newBlock()
+        currentLoopDepth -= 1
+        let exitBlock = newBlock()
+        jumpTo(headerBlock)
+        currentIrBlock = headerBlock
+        let length = emitIr1(irLoad, classInteger, list, 0)
+        terminate(irBranchCompare, [readVariable(indexVariable, headerBlock), length], conditionLess, [bodyBlock, exitBlock])
+        sealBlock(bodyBlock)
+        currentLoopDepth += 1
+        currentIrBlock = bodyBlock
+        let data = emitIr1(irLoad, classInteger, list, 16)
+        irBorrowed[data] = true
+        let index = readVariable(indexVariable, bodyBlock)
+        var element = 0
+        if typeKinds[elementType] == kindFloat { element = emitIr2(irFloatLoadIndexed, classFloat, data, index, 0) }
+        else {
+            element = emitIr2(irLoadIndexed, classInteger, data, index, 0)
+            if isReferenceType(elementType) { irBorrowed[element] = true }
+        }
+        declareVariable(elementVariable, element)
+        regionBreakTargets.push(exitBlock)
+        regionContinueTargets.push(stepBlock)
+        lowerBlock(statement.children[1])
+        jumpTo(stepBlock)
+        sealBlock(stepBlock)
+        currentIrBlock = stepBlock
+        let incremented = emitIr2(irAdd, classInteger, readVariable(indexVariable, stepBlock), integerConstant(1), 0)
+        writeVariableValue(indexVariable, incremented)
+        jumpTo(headerBlock)
+        currentLoopDepth -= 1
+        let poppedBreak = regionBreakTargets.pop()
+        let poppedContinue = regionContinueTargets.pop()
+        sealBlock(headerBlock)
+        sealBlock(exitBlock)
+        currentIrBlock = exitBlock
+        return
+    }
+    if kind == nodeReturn {
+        if not regionIsFunction {
+            optimizerBail("return inside an outlined loop")
+            return
+        }
+        if statement.children[0].nodeKind != nodeNone {
+            let value = lowerExpression(statement.children[0])
+            if optimizerBailed { return }
+            writeVariableValue(regionReturnVariable, value)
+        }
+        jumpTo(regionReturnBlock)
+        return
+    }
+    if kind == nodeBreak or kind == nodeContinue {
+        let levels = statement.integerValue
+        if levels >= regionBreakTargets.len() {
+            optimizerBail("break/continue out of the region")
+            return
+        }
+        if kind == nodeBreak { jumpTo(regionBreakTargets[regionBreakTargets.len() - 1 - levels]) }
+        else { jumpTo(regionContinueTargets[regionContinueTargets.len() - 1 - levels]) }
+        return
+    }
+    if kind == nodeInline {
+        let endBlock = newBlock()
+        regionInlineEnds.push(endBlock)
+        regionInlineSlots.push(statement.slot)
+        regionInlineTypes.push(statement.typeIndex)
+        for innerStatement in statement.children {
+            if optimizerBailed { return }
+            lowerStatement(innerStatement)
+        }
+        jumpTo(endBlock)
+        let poppedEnd = regionInlineEnds.pop()
+        let poppedSlot = regionInlineSlots.pop()
+        let poppedType = regionInlineTypes.pop()
+        sealBlock(endBlock)
+        currentIrBlock = endBlock
+        return
+    }
+    if kind == nodeInlineReturn {
+        if regionInlineEnds.len() == 0 {
+            optimizerBail("inline return outside an inline")
+            return
+        }
+        let last = regionInlineEnds.len() - 1
+        if statement.children[0].nodeKind != nodeNone {
+            let value = lowerExpression(statement.children[0])
+            if optimizerBailed { return }
+            let variable = variableForSlot(identifierKindLocal, regionInlineSlots[last], statement.children[0].typeIndex)
+            if optimizerBailed { return }
+            declareVariable(variable, value)
+        }
+        jumpTo(regionInlineEnds[last])
+        return
+    }
+    if kind == nodeExpressionStatement {
+        let discarded = lowerExpression(statement.children[0])
+        return
+    }
+    if kind == nodeOutlinedLoop {                // a whole function that contains an outlined loop: lower the loop itself
+        lowerStatement(statement.children[0])
+        return
+    }
+    optimizerBail("statement kind {kind}")
+}
+
+// does any call in this subtree reach user code (which may touch globals)?
+fn subtreeHasUserCall(node: Node) -> bool {
+    if node.nodeKind == nodeCall and node.auxiliary == callKindUser {
+        if functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
+    }
+    for child in node.children {
+        if subtreeHasUserCall(child) { return true }
+    }
+    return false
+}
+
+// write the variables a region changed back to their homes, at an exit
+fn writeBackVariables() {
+    for variable in 0..variableClasses.len() {
+        if not variableWritten[variable] or variableIsReference[variable] { continue }
+        let kind = variableHomeKind[variable]
+        if kind == identifierKindTemporary { continue }
+        if kind == identifierKindGlobal {
+            if regionGlobalsInMemory { continue }     // already stored where it was written
+            let value = readVariable(variable, currentIrBlock)
+            if variableClasses[variable] == classFloat { let stored = emitIr1(irFloatStoreGlobal, classFloat, value, variableHomeIndex[variable]) }
+            else { let stored = emitIr1(irStoreGlobal, classInteger, value, variableHomeIndex[variable]) }
+        } else if not regionIsFunction {
+            let value = readVariable(variable, currentIrBlock)
+            let offset = parentSlotOffset(kind, variableHomeIndex[variable])
+            if variableClasses[variable] == classFloat { let stored = emitIr2(irFloatStoreFrame, classFloat, regionFrameValue, value, offset) }
+            else { let stored = emitIr2(irStoreFrame, classInteger, regionFrameValue, value, offset) }
+        }
+    }
+}
+
+// lower one loop statement of a parent function into an outlined region
+fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCount: int, parentRegisterCall: bool) -> bool {
+    resetIr()
+    regionIsFunction = false
+    regionFunctionIndex = 0 - 1
+    regionParentSlotCount = parentSlotCount
+    regionParentParameterCount = parentParameterCount
+    regionParentRegisterCall = parentRegisterCall
+    regionGlobalsInMemory = subtreeHasUserCall(loopStatement)
+    let entryBlock = newBlock()
+    blockSealed[entryBlock] = true
+    currentIrBlock = entryBlock
+    regionFrameValue = emitIr0(irParameter, classInteger, 0)
+    lowerStatement(loopStatement)
+    if optimizerBailed { return false }
+    ensureOpenBlock()
+    writeBackVariables()
+    var noOperands: [int] = []
+    var noSuccessors: [int] = []
+    terminate(irReturn, noOperands, 0, noSuccessors)
+    return not optimizerBailed
+}
+
+// lower a whole function body into a region
+fn lowerFunctionRegion(functionIndex: int) -> bool {
+    resetIr()
+    let functionDefinition = functionDefinitions[functionIndex]
+    regionIsFunction = true
+    regionFunctionIndex = functionIndex
+    regionReturnType = functionDefinition.returnType
+    if isReferenceType(regionReturnType) {
+        optimizerBail("returns a reference")
+        return false
+    }
+    regionGlobalsInMemory = subtreeHasUserCall(functionDefinition.body)
+    let entryBlock = newBlock()
+    blockSealed[entryBlock] = true
+    currentIrBlock = entryBlock
+    // every parameter is defined at entry, all at once (the prologue moves them as one)
+    for i in 0..functionDefinition.parameterNames.len() { parameterValues.push(emitIr0(irParameter, classInteger, i)) }
+    for i in 0..functionDefinition.parameterNames.len() {
+        if typeKinds[functionDefinition.parameterTypes[i]] == kindFloat { parameterValues[i] = emitIr1(irFloatFromBits, classFloat, parameterValues[i], 0) }
+    }
+    regionReturnBlock = newBlock()
+    let hasValue = typeKinds[regionReturnType] != kindVoid
+    if hasValue { regionReturnVariable = temporaryVariable(classOfType(regionReturnType), false) }
+    lowerBlock(functionDefinition.body)
+    if optimizerBailed { return false }
+    jumpTo(regionReturnBlock)
+    sealBlock(regionReturnBlock)
+    currentIrBlock = regionReturnBlock
+    writeBackVariables()
+    var noSuccessors: [int] = []
+    if hasValue {
+        var value = readVariable(regionReturnVariable, currentIrBlock)
+        if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+        terminate(irReturn, [value], 0, noSuccessors)
+    } else {
+        var noOperands: [int] = []
+        terminate(irReturn, noOperands, 0, noSuccessors)
+    }
+    return not optimizerBailed
+}
+
+// ================= cleanup passes =================
+var blockReachable: [bool] = []
+var valueForward: [int] = []
+var valueDead: [bool] = []
+
+fn isTerminatorOpcode(opcode: int) -> bool { return opcode >= irJump }
+
+// instructions that may be deleted when nothing reads their result
+fn isPureOpcode(opcode: int) -> bool {
+    if opcode == irStore or opcode == irStoreIndexed or opcode == irStoreGlobal or opcode == irStoreFrame { return false }
+    if opcode == irFloatStore or opcode == irFloatStoreIndexed or opcode == irFloatStoreGlobal or opcode == irFloatStoreFrame { return false }
+    if opcode == irBoundsCheck or opcode == irZeroCheck or opcode == irCall { return false }
+    return not isTerminatorOpcode(opcode)
+}
+
+fn producesValue(opcode: int) -> bool {
+    if not isPureOpcode(opcode) { return opcode == irCall }
+    return true
+}
+
+fn resolveValue(value: int) -> int {
+    var current = value
+    while valueForward[current] != current { current = valueForward[current] }
+    return current
+}
+
+fn removeUnreachableBlocks() {
+    let blockCount = blockInstructions.len()
+    var reachable: [bool] = []
+    for i in 0..blockCount { reachable.push(false) }
+    var stack: [int] = [0]
+    reachable[0] = true
+    while stack.len() > 0 {
+        let block = stack.pop()
+        for successor in blockSuccessors[block] {
+            if not reachable[successor] {
+                reachable[successor] = true
+                stack.push(successor)
+            }
+        }
+    }
+    for block in 0..blockCount {
+        if not reachable[block] {
+            var noInstructions: [int] = []
+            blockInstructions[block] = noInstructions
+            var noSuccessors: [int] = []
+            blockSuccessors[block] = noSuccessors
+            var noPredecessors: [int] = []
+            blockPredecessors[block] = noPredecessors
+            continue
+        }
+        let predecessors = blockPredecessors[block]
+        var keptIndices: [int] = []
+        var kept: [int] = []
+        for i in 0..predecessors.len() {
+            if reachable[predecessors[i]] {
+                keptIndices.push(i)
+                kept.push(predecessors[i])
+            }
+        }
+        if kept.len() != predecessors.len() {
+            for instruction in blockInstructions[block] {
+                if irOpcodes[instruction] == irPhi {
+                    var operands: [int] = []
+                    for index in keptIndices { operands.push(irOperands[instruction][index]) }
+                    irOperands[instruction] = operands
+                }
+            }
+            blockPredecessors[block] = kept
+        }
+    }
+    blockReachable = reachable
+}
+
+fn resetForwarding() {
+    var identity: [int] = []
+    for value in 0..irOpcodes.len() { identity.push(value) }
+    valueForward = identity
+    var noneDead: [bool] = []
+    for value in 0..irOpcodes.len() { noneDead.push(false) }
+    valueDead = noneDead
+}
+
+// point every operand at the value it was forwarded to, and drop dead instructions
+fn rewriteOperands() {
+    for block in 0..blockInstructions.len() {
+        var kept: [int] = []
+        var changed = false
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] or valueForward[instruction] != instruction {
+                changed = true
+                continue
+            }
+            let operands = irOperands[instruction]
+            for i in 0..operands.len() { operands[i] = resolveValue(operands[i]) }
+            kept.push(instruction)
+        }
+        if changed { blockInstructions[block] = kept }
+    }
+}
+
+// a phi whose operands are all one value (or itself) is that value
+fn removeTrivialPhis() {
+    var changed = true
+    while changed {
+        changed = false
+        for block in 0..blockInstructions.len() {
+            for instruction in blockInstructions[block] {
+                if irOpcodes[instruction] != irPhi or valueForward[instruction] != instruction { continue }
+                var same = 0 - 1
+                var trivial = true
+                for operand in irOperands[instruction] {
+                    let resolved = resolveValue(operand)
+                    if resolved == instruction or resolved == same { continue }
+                    if same >= 0 {
+                        trivial = false
+                        break
+                    }
+                    same = resolved
+                }
+                if trivial and same >= 0 {
+                    valueForward[instruction] = same
+                    changed = true
+                }
+            }
+        }
+    }
+    rewriteOperands()
+}
+
+fn countUses() {
+    for value in 0..irUseCounts.len() { irUseCounts[value] = 0 }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            for operand in irOperands[instruction] { irUseCounts[operand] += 1 }
+        }
+    }
+}
+
+fn eliminateDeadCode() {
+    countUses()
+    var worklist: [int] = []
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if irUseCounts[instruction] == 0 and isPureOpcode(irOpcodes[instruction]) { worklist.push(instruction) }
+        }
+    }
+    while worklist.len() > 0 {
+        let value = worklist.pop()
+        if valueDead[value] { continue }
+        valueDead[value] = true
+        for operand in irOperands[value] {
+            irUseCounts[operand] -= 1
+            if irUseCounts[operand] == 0 and isPureOpcode(irOpcodes[operand]) and not valueDead[operand] { worklist.push(operand) }
+        }
+    }
+    rewriteOperands()
+}
+
+// Borrowed-reference rules (see the contract at the top): a phi is unpinned if
+// any input is, and no unpinned reference may be handed to a callee.
+fn checkBorrows() {
+    var changed = true
+    while changed {
+        changed = false
+        for block in 0..blockInstructions.len() {
+            for instruction in blockInstructions[block] {
+                if irOpcodes[instruction] != irPhi or irBorrowed[instruction] { continue }
+                for operand in irOperands[instruction] {
+                    if irBorrowed[operand] {
+                        irBorrowed[instruction] = true
+                        changed = true
+                    }
+                }
+            }
+        }
+    }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irCall { continue }
+            let operands = irOperands[instruction]
+            for i in 0..operands.len() {
+                if ((irReferenceArguments[instruction] >> i) & 1) == 1 and irBorrowed[operands[i]] { optimizerBail("unpinned reference passed to a call") }
+            }
+        }
+    }
+}
+
+// an edge from a block with several successors to one with several
+// predecessors gets a block of its own, so phi moves have a place to go
+fn splitCriticalEdges() {
+    let originalCount = blockInstructions.len()
+    for block in 0..originalCount {
+        if not blockReachable[block] or blockSuccessors[block].len() < 2 { continue }
+        for successorIndex in 0..blockSuccessors[block].len() {
+            let successor = blockSuccessors[block][successorIndex]
+            if blockPredecessors[successor].len() < 2 { continue }
+            let middle = newBlock()
+            blockReachable.push(true)
+            blockSealed[middle] = true
+            blockLoopDepth[middle] = blockLoopDepth[successor]
+            var noOperands: [int] = []
+            let jump = addInstruction(middle, irJump, classInteger, noOperands, 0)
+            blockTerminated[middle] = true
+            blockSuccessors[middle].push(successor)
+            blockPredecessors[middle].push(block)
+            blockSuccessors[block][successorIndex] = middle
+            let predecessors = blockPredecessors[successor]
+            var replaced = false
+            for i in 0..predecessors.len() {
+                if not replaced and predecessors[i] == block {
+                    predecessors[i] = middle
+                    replaced = true
+                }
+            }
+        }
+    }
+}
+
+// ================= block order, liveness, intervals =================
+var blockOrder: [int] = []
+var blockOrderIndex: [int] = []            // block -> position in blockOrder, -1 = unreachable
+var blockStartPositions: [int] = []
+var blockEndPositions: [int] = []
+var instructionPositions: [int] = []
+var intervalStarts: [int] = []
+var intervalEnds: [int] = []
+var callPositions: [int] = []
+var liveIn: [[int]] = []
+var liveOut: [[int]] = []
+var liveWordCount = 0
+
+// reverse postorder; a branch's first successor is laid out right after it
+fn computeBlockOrder() {
+    let blockCount = blockInstructions.len()
+    var visited: [bool] = []
+    for i in 0..blockCount { visited.push(false) }
+    var postorder: [int] = []
+    var stackBlocks: [int] = [0]
+    var stackNext: [int] = [0]
+    visited[0] = true
+    while stackBlocks.len() > 0 {
+        let top = stackBlocks.len() - 1
+        let block = stackBlocks[top]
+        let successors = blockSuccessors[block]
+        let next = stackNext[top]
+        if next < successors.len() {
+            stackNext[top] = next + 1
+            let successor = successors[successors.len() - 1 - next]     // last successor first: RPO puts the first right after
+            if not visited[successor] {
+                visited[successor] = true
+                stackBlocks.push(successor)
+                stackNext.push(0)
+            }
+        } else {
+            postorder.push(block)
+            let poppedBlock = stackBlocks.pop()
+            let poppedNext = stackNext.pop()
+        }
+    }
+    var order: [int] = []
+    var index = postorder.len() - 1
+    while index >= 0 {
+        order.push(postorder[index])
+        index -= 1
+    }
+    blockOrder = order
+    var orderIndex: [int] = []
+    for i in 0..blockCount { orderIndex.push(0 - 1) }
+    for i in 0..order.len() { orderIndex[order[i]] = i }
+    blockOrderIndex = orderIndex
+}
+
+fn bitSet(set: [int], value: int) { set[value / 64] = set[value / 64] | (1 << (value % 64)) }
+fn bitTest(set: [int], value: int) -> bool { return ((set[value / 64] >> (value % 64)) & 1) == 1 }
+fn emptyBitSet() -> [int] {
+    var set: [int] = []
+    for i in 0..liveWordCount { set.push(0) }
+    return set
+}
+
+fn predecessorIndex(block: int, predecessor: int) -> int {
+    let predecessors = blockPredecessors[block]
+    for i in 0..predecessors.len() {
+        if predecessors[i] == predecessor { return i }
+    }
+    return 0 - 1
+}
+
+fn computeLiveness() {
+    liveWordCount = (irOpcodes.len() + 63) / 64
+    let blockCount = blockInstructions.len()
+    var useSets: [[int]] = []
+    var defineSets: [[int]] = []
+    var noIn: [[int]] = []
+    liveIn = noIn
+    var noOut: [[int]] = []
+    liveOut = noOut
+    for block in 0..blockCount {
+        var uses = emptyBitSet()
+        var defines = emptyBitSet()
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irPhi {
+                for operand in irOperands[instruction] {
+                    if not bitTest(defines, operand) { bitSet(uses, operand) }
+                }
+            }
+            bitSet(defines, instruction)
+        }
+        useSets.push(uses)
+        defineSets.push(defines)
+        liveIn.push(emptyBitSet())
+        liveOut.push(emptyBitSet())
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var orderPosition = blockOrder.len() - 1
+        while orderPosition >= 0 {
+            let block = blockOrder[orderPosition]
+            orderPosition -= 1
+            var out = emptyBitSet()
+            for successor in blockSuccessors[block] {
+                let successorIn = liveIn[successor]
+                for word in 0..liveWordCount { out[word] = out[word] | successorIn[word] }
+                let edgeIndex = predecessorIndex(successor, block)
+                for instruction in blockInstructions[successor] {
+                    if irOpcodes[instruction] == irPhi { bitSet(out, irOperands[instruction][edgeIndex]) }
+                }
+            }
+            let uses = useSets[block]
+            let defines = defineSets[block]
+            let oldIn = liveIn[block]
+            var newIn = emptyBitSet()
+            for word in 0..liveWordCount {
+                newIn[word] = uses[word] | (out[word] & (~defines[word]))
+                if newIn[word] != oldIn[word] { changed = true }
+            }
+            liveIn[block] = newIn
+            liveOut[block] = out
+        }
+    }
+}
+
+fn extendInterval(value: int, position: int) {
+    if position < intervalStarts[value] { intervalStarts[value] = position }
+    if position > intervalEnds[value] { intervalEnds[value] = position }
+}
+
+// One hull [start, end] per value: every position where it is live lies inside.
+// ponytail: no lifetime holes or interval splitting; a value spills for its
+// whole life. Split intervals are the upgrade if register pressure bites.
+fn buildIntervals() {
+    let valueCount = irOpcodes.len()
+    var noPositions: [int] = []
+    instructionPositions = noPositions
+    var starts: [int] = []
+    var ends: [int] = []
+    for value in 0..valueCount {
+        instructionPositions.push(0 - 1)
+        starts.push(1 << 60)
+        ends.push(0 - 1)
+    }
+    intervalStarts = starts
+    intervalEnds = ends
+    var blockStarts: [int] = []
+    var blockEnds: [int] = []
+    for block in 0..blockInstructions.len() {
+        blockStarts.push(0)
+        blockEnds.push(0)
+    }
+    var noCalls: [int] = []
+    callPositions = noCalls
+    var position = 0
+    for block in blockOrder {
+        blockStarts[block] = position
+        position += 2
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] == irPhi or irOpcodes[instruction] == irParameter { instructionPositions[instruction] = blockStarts[block] }
+            else {
+                instructionPositions[instruction] = position
+                if irOpcodes[instruction] == irCall { callPositions.push(position) }
+                position += 2
+            }
+        }
+        blockEnds[block] = position
+        position += 2
+    }
+    blockStartPositions = blockStarts
+    blockEndPositions = blockEnds
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            extendInterval(instruction, instructionPositions[instruction])
+            if irOpcodes[instruction] == irPhi {
+                let predecessors = blockPredecessors[block]
+                let operands = irOperands[instruction]
+                for i in 0..predecessors.len() {
+                    extendInterval(operands[i], blockEnds[predecessors[i]])
+                    extendInterval(instruction, blockEnds[predecessors[i]])     // the move that defines it sits there
+                }
+            } else {
+                for operand in irOperands[instruction] { extendInterval(operand, instructionPositions[instruction]) }
+            }
+        }
+        let inSet = liveIn[block]
+        let outSet = liveOut[block]
+        for word in 0..liveWordCount {
+            if inSet[word] != 0 or outSet[word] != 0 {
+                for bit in 0..64 {
+                    let value = word * 64 + bit
+                    if value < valueCount {
+                        if ((inSet[word] >> bit) & 1) == 1 { extendInterval(value, blockStarts[block]) }
+                        if ((outSet[word] >> bit) & 1) == 1 { extendInterval(value, blockEnds[block]) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn crossesCall(value: int) -> bool {
+    for position in callPositions {
+        if intervalStarts[value] < position and position < intervalEnds[value] { return true }
+    }
+    return false
+}
+
+// ================= register allocation (linear scan) =================
+// rax rcx rdx r11 and xmm0 xmm1 are scratch for the emitter and never allocated.
+let integerRegisterNames = ["r8", "r9", "r10", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"]
+let integerRegisterCalleeSaved = [false, false, false, true, true, true, true, true, true, true]
+let floatRegisterNames = ["xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"]
+let floatRegisterCalleeSaved = [false, false, false, false, true, true, true, true, true, true, true, true, true, true]
+
+var valueRegisters: [int] = []             // index into the class's register list, -1 = none
+var valueSpillSlots: [int] = []
+var spillSlotCount = 0
+var integerRegisterUsed: [bool] = []
+var floatRegisterUsed: [bool] = []
+
+fn allocateRegisters() {
+    let valueCount = irOpcodes.len()
+    var registers: [int] = []
+    var spills: [int] = []
+    for value in 0..valueCount {
+        registers.push(0 - 1)
+        spills.push(0 - 1)
+    }
+    valueRegisters = registers
+    valueSpillSlots = spills
+    spillSlotCount = 0
+    var integerUsed: [bool] = []
+    for i in 0..integerRegisterNames.len() { integerUsed.push(false) }
+    integerRegisterUsed = integerUsed
+    var floatUsed: [bool] = []
+    for i in 0..floatRegisterNames.len() { floatUsed.push(false) }
+    floatRegisterUsed = floatUsed
+    countUses()
+    var sortKeys: [int] = []
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            if producesValue(irOpcodes[instruction]) and irUseCounts[instruction] > 0 {
+                sortKeys.push(intervalStarts[instruction] * 1048576 + instruction)
+            }
+        }
+    }
+    sortKeys.sort()
+    var active: [int] = []
+    for key in sortKeys {
+        let value = key % 1048576
+        let start = intervalStarts[value]
+        var stillActive: [int] = []
+        for other in active {
+            if intervalEnds[other] > start { stillActive.push(other) }
+        }
+        active = stillActive
+        let valueClass = irClasses[value]
+        var registerCount = integerRegisterNames.len()
+        if valueClass == classFloat { registerCount = floatRegisterNames.len() }
+        let needsCalleeSaved = crossesCall(value)
+        if needsCalleeSaved and irBorrowed[value] { optimizerBail("unpinned reference live across a call") }
+        var taken: [bool] = []
+        for i in 0..registerCount { taken.push(false) }
+        for other in active {
+            if irClasses[other] == valueClass and valueRegisters[other] >= 0 { taken[valueRegisters[other]] = true }
+        }
+        var chosen = 0 - 1
+        for i in 0..registerCount {
+            if chosen < 0 and not taken[i] and (not needsCalleeSaved or registerIsCalleeSaved(valueClass, i)) { chosen = i }
+        }
+        if chosen < 0 {
+            // evict the active interval that lives longest, if it outlives this one
+            var victim = 0 - 1
+            for other in active {
+                if irClasses[other] == valueClass and valueRegisters[other] >= 0 and (not needsCalleeSaved or registerIsCalleeSaved(valueClass, valueRegisters[other])) {
+                    if victim < 0 or intervalEnds[other] > intervalEnds[victim] { victim = other }
+                }
+            }
+            if victim >= 0 and intervalEnds[victim] > intervalEnds[value] {
+                chosen = valueRegisters[victim]
+                valueRegisters[victim] = 0 - 1
+                valueSpillSlots[victim] = spillSlotCount
+                spillSlotCount += 1
+            } else {
+                valueSpillSlots[value] = spillSlotCount
+                spillSlotCount += 1
+            }
+        }
+        if chosen >= 0 {
+            valueRegisters[value] = chosen
+            if valueClass == classFloat { floatRegisterUsed[chosen] = true } else { integerRegisterUsed[chosen] = true }
+        }
+        active.push(value)
+    }
+}
+
+fn registerIsCalleeSaved(valueClass: int, index: int) -> bool {
+    if valueClass == classFloat { return floatRegisterCalleeSaved[index] }
+    return integerRegisterCalleeSaved[index]
+}
+
+// ================= x86 emission =================
+var optimizerLines: [str] = []
+var optimizerColdLines: [str] = []
+var blockLabels: [int] = []
+var outgoingAreaSize = 0
+var savedIntegerRegisters: [int] = []
+var savedFloatRegisters: [int] = []
+var currentOrderPosition = 0
+
+fn emitOptimized(text: str) { optimizerLines.push("  " + text + "\n") }
+fn emitCold(text: str) { optimizerColdLines.push("  " + text + "\n") }
+
+fn spillOffset(slot: int) -> int { return outgoingAreaSize + 8 * slot }
+
+// where a value lives: a register name, a stack slot, or "" (never read)
+fn locationOf(value: int) -> str {
+    if valueRegisters[value] >= 0 {
+        if irClasses[value] == classFloat { return floatRegisterNames[valueRegisters[value]] }
+        return integerRegisterNames[valueRegisters[value]]
+    }
+    if valueSpillSlots[value] >= 0 { return "qword ptr [rsp + {spillOffset(valueSpillSlots[value])}]" }
+    return ""
+}
+
+fn isRegisterLocation(location: str) -> bool { return location != "" and location.byte(0) != 113 }   // not "qword ptr"
+
+// the value in a GPR: its own register, or loaded into scratch
+fn integerIn(value: int, scratch: str) -> str {
+    let location = locationOf(value)
+    if isRegisterLocation(location) { return location }
+    emitOptimized("mov {scratch}, {location}")
+    return scratch
+}
+
+fn floatIn(value: int, scratch: str) -> str {
+    let location = locationOf(value)
+    if isRegisterLocation(location) { return location }
+    emitOptimized("movsd {scratch}, {location}")
+    return scratch
+}
+
+// register the result is computed into: its own, or scratch if it lives in memory
+fn resultRegister(value: int, scratch: str) -> str {
+    let location = locationOf(value)
+    if isRegisterLocation(location) { return location }
+    return scratch
+}
+
+fn finishResult(value: int, register: str) {
+    let location = locationOf(value)
+    if location == "" or location == register { return }
+    if irClasses[value] == classFloat { emitOptimized("movsd {location}, {register}") }
+    else { emitOptimized("mov {location}, {register}") }
+}
+
+fn moveFloat(destination: str, source: str) {
+    if destination == source { return }
+    if isRegisterLocation(destination) and isRegisterLocation(source) { emitOptimized("movapd {destination}, {source}") }
+    else { emitOptimized("movsd {destination}, {source}") }
+}
+
+fn memoryAt(base: str, offset: int) -> str {
+    if offset == 0 { return "[{base}]" }
+    if offset < 0 { return "[{base} - {0 - offset}]" }
+    return "[{base} + {offset}]"
+}
+
+fn moveImmediate(register: str, immediate: int) {
+    if immediate >= 0 - 2147483648 and immediate <= 2147483647 { emitOptimized("mov {register}, {immediate}") }
+    else { emitOptimized("movabs {register}, {immediate}") }
+}
+
+fn floatConstantLabel(valueBits: int) -> str {
+    for i in 0..floatConstants.len() {
+        if floatConstants[i] == valueBits { return "[rip + __fc{i}]" }
+    }
+    floatConstants.push(valueBits)
+    return "[rip + __fc{floatConstants.len() - 1}]"
+}
+
+fn conditionSuffix(condition: int) -> str {
+    if condition == conditionEqual { return "e" }
+    if condition == conditionNotEqual { return "ne" }
+    if condition == conditionLess { return "l" }
+    if condition == conditionLessOrEqual { return "le" }
+    if condition == conditionGreater { return "g" }
+    return "ge"
+}
+
+fn invertCondition(condition: int) -> int {
+    if condition == conditionEqual { return conditionNotEqual }
+    if condition == conditionNotEqual { return conditionEqual }
+    if condition == conditionLess { return conditionGreaterOrEqual }
+    if condition == conditionLessOrEqual { return conditionGreater }
+    if condition == conditionGreater { return conditionLessOrEqual }
+    return conditionLess
+}
+
+fn nextBlockInOrder() -> int {
+    if currentOrderPosition + 1 < blockOrder.len() { return blockOrder[currentOrderPosition + 1] }
+    return 0 - 1
+}
+
+fn blockLabelText(block: int) -> str { return ".L{blockLabels[block]}" }
+
+fn jumpUnlessNext(block: int) {
+    if block != nextBlockInOrder() { emitOptimized("jmp {blockLabelText(block)}") }
+}
+
+// jump to trueBlock when `trueSuffix` holds, else falseBlock, falling through where possible
+fn conditionalJump(trueSuffix: str, falseSuffix: str, trueBlock: int, falseBlock: int) {
+    if trueBlock == nextBlockInOrder() { emitOptimized("j{falseSuffix} {blockLabelText(falseBlock)}") }
+    else {
+        emitOptimized("j{trueSuffix} {blockLabelText(trueBlock)}")
+        jumpUnlessNext(falseBlock)
+    }
+}
+
+// ---- parallel moves (phis at block ends, call arguments, parameters) ----
+var moveSources: [str] = []
+var moveDestinations: [str] = []
+
+fn clearMoves() {
+    var noSources: [str] = []
+    moveSources = noSources
+    var noDestinations: [str] = []
+    moveDestinations = noDestinations
+}
+
+fn addMove(source: str, destination: str) {
+    if source == destination or destination == "" { return }
+    moveSources.push(source)
+    moveDestinations.push(destination)
+}
+
+fn isFloatRegister(location: str) -> bool { return location.len() > 3 and location.byte(0) == 120 }   // "xmm"
+
+// one copy of 64 bits between any two of: GPR, xmm register, stack slot
+fn emitOneMove(source: str, destination: str) {
+    let sourceIsFloat = isFloatRegister(source)
+    let destinationIsFloat = isFloatRegister(destination)
+    if not isRegisterLocation(source) and not isRegisterLocation(destination) {
+        emitOptimized("mov r11, {source}")
+        emitOptimized("mov {destination}, r11")
+    } else if sourceIsFloat and destinationIsFloat {
+        emitOptimized("movapd {destination}, {source}")
+    } else if sourceIsFloat or destinationIsFloat {
+        if isRegisterLocation(source) and isRegisterLocation(destination) { emitOptimized("movq {destination}, {source}") }
+        else { emitOptimized("movsd {destination}, {source}") }
+    } else {
+        emitOptimized("mov {destination}, {source}")
+    }
+}
+
+fn emitParallelMoves() {
+    var pending: [bool] = []
+    for i in 0..moveSources.len() { pending.push(true) }
+    var remaining = moveSources.len()
+    while remaining > 0 {
+        var progressed = false
+        for i in 0..moveSources.len() {
+            if not pending[i] { continue }
+            var blocked = false
+            for j in 0..moveSources.len() {
+                if pending[j] and j != i and moveSources[j] == moveDestinations[i] { blocked = true }
+            }
+            if not blocked {
+                emitOneMove(moveSources[i], moveDestinations[i])
+                pending[i] = false
+                remaining -= 1
+                progressed = true
+            }
+        }
+        if not progressed {
+            // a cycle: park one destination's current value in scratch
+            var first = 0
+            while not pending[first] { first += 1 }
+            let parked = moveDestinations[first]
+            var scratch = "rax"
+            if isFloatRegister(parked) { scratch = "xmm0" }
+            emitOneMove(parked, scratch)
+            for j in 0..moveSources.len() {
+                if pending[j] and moveSources[j] == parked { moveSources[j] = scratch }
+            }
+        }
+    }
+    clearMoves()
+}
+
+// the phi moves on the edge from `block` into its single successor
+fn emitPhiMoves(block: int) {
+    if blockSuccessors[block].len() != 1 { return }
+    let successor = blockSuccessors[block][0]
+    let edgeIndex = predecessorIndex(successor, block)
+    clearMoves()
+    for instruction in blockInstructions[successor] {
+        if irOpcodes[instruction] != irPhi { continue }
+        addMove(locationOf(irOperands[instruction][edgeIndex]), locationOf(instruction))
+    }
+    emitParallelMoves()
+}
+
+fn emitColdPanic(stringIndex: int) -> int {
+    let label = allocateLabel()
+    optimizerColdLines.push(".L{label}:\n")
+    emitCold("lea rcx, [rip + __s{stringIndex}]")
+    emitCold("and rsp, -16")
+    emitCold("sub rsp, 32")
+    emitCold("call runtimePanicWithString")
+    return label
+}
+
+fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
+    let first = locationOf(irOperands[value][0])
+    let second = locationOf(irOperands[value][1])
+    let target = resultRegister(value, "rax")
+    if target == second and target != first {
+        if commutative { emitOptimized("{mnemonic} {target}, {first}") }
+        else {
+            emitOptimized("mov rax, {first}")
+            emitOptimized("{mnemonic} rax, {second}")
+            emitOptimized("mov {target}, rax")
+        }
+    } else {
+        if target != first { emitOptimized("mov {target}, {first}") }
+        emitOptimized("{mnemonic} {target}, {second}")
+    }
+    finishResult(value, target)
+}
+
+fn emitFloatBinary(value: int, mnemonic: str, commutative: bool) {
+    let first = locationOf(irOperands[value][0])
+    let second = locationOf(irOperands[value][1])
+    let target = resultRegister(value, "xmm0")
+    if target == second and target != first {
+        if commutative { emitOptimized("{mnemonic} {target}, {first}") }
+        else {
+            moveFloat("xmm0", first)
+            emitOptimized("{mnemonic} xmm0, {second}")
+            moveFloat(target, "xmm0")
+        }
+    } else {
+        moveFloat(target, first)
+        emitOptimized("{mnemonic} {target}, {second}")
+    }
+    finishResult(value, target)
+}
+
+fn emitSetFromFlags(value: int, suffix: str) {
+    emitOptimized("set{suffix} al")
+    emitOptimized("movzx eax, al")
+    finishResult(value, "rax")
+}
+
+fn emitFloatCompareValue(value: int) {
+    let condition = irImmediates[value]
+    let first = irOperands[value][0]
+    let second = irOperands[value][1]
+    if condition == conditionEqual or condition == conditionNotEqual {
+        let left = floatIn(first, "xmm0")
+        let right = floatIn(second, "xmm1")
+        emitOptimized("ucomisd {left}, {right}")
+        if condition == conditionEqual {
+            emitOptimized("setnp al")
+            emitOptimized("sete cl")
+            emitOptimized("and al, cl")
+        } else {
+            emitOptimized("setp al")
+            emitOptimized("setne cl")
+            emitOptimized("or al, cl")
+        }
+        emitOptimized("movzx eax, al")
+        finishResult(value, "rax")
+        return
+    }
+    // a < b is b > a: comisd's "above" is false on NaN, as the baseline's
+    if condition == conditionGreater or condition == conditionGreaterOrEqual {
+        let left = floatIn(first, "xmm0")
+        emitOptimized("comisd {left}, {locationOf(second)}")
+    } else {
+        let right = floatIn(second, "xmm0")
+        emitOptimized("comisd {right}, {locationOf(first)}")
+    }
+    if condition == conditionGreater or condition == conditionLess { emitSetFromFlags(value, "a") }
+    else { emitSetFromFlags(value, "ae") }
+}
+
+fn emitCallInstruction(value: int) {
+    let functionIndex = irImmediates[value]
+    let operands = irOperands[value]
+    if functionIsRegisterCall(functionIndex) {
+        let argumentRegisters = ["rcx", "rdx", "r8", "r9"]
+        clearMoves()
+        for i in 0..operands.len() { addMove(locationOf(operands[i]), argumentRegisters[i]) }
+        emitParallelMoves()
+    } else {
+        for i in 0..operands.len() {
+            let argument = integerIn(operands[i], "rax")
+            emitOptimized("mov qword ptr [rsp + {8 * (operands.len() - 1 - i)}], {argument}")
+        }
+    }
+    emitOptimized("call {functionCodeLabel(functionDefinitions[functionIndex].label)}")
+    finishResult(value, "rax")
+}
+
+fn emitInstructionFor(value: int) {
+    let opcode = irOpcodes[value]
+    let operands = irOperands[value]
+    let immediate = irImmediates[value]
+    if opcode == irPhi or opcode == irParameter { return }
+    if opcode == irConstant {
+        let target = resultRegister(value, "rax")
+        moveImmediate(target, immediate)
+        finishResult(value, target)
+        return
+    }
+    if opcode == irFloatConstant {
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("movsd {target}, {floatConstantLabel(immediate)}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irDataAddress {
+        let target = resultRegister(value, "rax")
+        emitOptimized("lea {target}, [rip + __s{immediate}]")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irCopy {
+        if irClasses[value] == classFloat {
+            let target = resultRegister(value, "xmm0")
+            moveFloat(target, locationOf(operands[0]))
+            finishResult(value, target)
+        } else {
+            let target = resultRegister(value, "rax")
+            if target != locationOf(operands[0]) { emitOptimized("mov {target}, {locationOf(operands[0])}") }
+            finishResult(value, target)
+        }
+        return
+    }
+    if opcode == irAdd {
+        emitIntegerBinary(value, "add", true)
+        return
+    }
+    if opcode == irSubtract {
+        emitIntegerBinary(value, "sub", false)
+        return
+    }
+    if opcode == irMultiply {
+        emitIntegerBinary(value, "imul", true)
+        return
+    }
+    if opcode == irBitAnd {
+        emitIntegerBinary(value, "and", true)
+        return
+    }
+    if opcode == irBitOr {
+        emitIntegerBinary(value, "or", true)
+        return
+    }
+    if opcode == irBitXor {
+        emitIntegerBinary(value, "xor", true)
+        return
+    }
+    if opcode == irShiftLeft or opcode == irShiftRight {
+        emitOptimized("mov rcx, {locationOf(operands[1])}")
+        let target = resultRegister(value, "rax")
+        if target != locationOf(operands[0]) { emitOptimized("mov {target}, {locationOf(operands[0])}") }
+        if opcode == irShiftLeft { emitOptimized("shl {target}, cl") } else { emitOptimized("sar {target}, cl") }
+        finishResult(value, target)
+        return
+    }
+    if opcode == irDivide or opcode == irModulo {
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("cqo")
+        emitOptimized("idiv {locationOf(operands[1])}")
+        if opcode == irDivide { finishResult(value, "rax") }
+        else { finishResult(value, "rdx") }
+        return
+    }
+    if opcode == irNegate {
+        let target = resultRegister(value, "rax")
+        if target != locationOf(operands[0]) { emitOptimized("mov {target}, {locationOf(operands[0])}") }
+        emitOptimized("neg {target}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irCompare {
+        let left = integerIn(operands[0], "rax")
+        emitOptimized("cmp {left}, {locationOf(operands[1])}")
+        emitSetFromFlags(value, conditionSuffix(immediate))
+        return
+    }
+    if opcode == irIntegerMinimum or opcode == irIntegerMaximum {
+        let skipLabel = allocateLabel()
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("cmp rax, {locationOf(operands[1])}")
+        if opcode == irIntegerMinimum { emitOptimized("jle .L{skipLabel}") } else { emitOptimized("jge .L{skipLabel}") }
+        emitOptimized("mov rax, {locationOf(operands[1])}")
+        optimizerLines.push(".L{skipLabel}:\n")
+        finishResult(value, "rax")
+        return
+    }
+    if opcode == irIntegerAbsolute {
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("mov rcx, rax")
+        emitOptimized("sar rcx, 63")
+        emitOptimized("xor rax, rcx")
+        emitOptimized("sub rax, rcx")
+        finishResult(value, "rax")
+        return
+    }
+    if opcode == irFloatAdd {
+        emitFloatBinary(value, "addsd", true)
+        return
+    }
+    if opcode == irFloatSubtract {
+        emitFloatBinary(value, "subsd", false)
+        return
+    }
+    if opcode == irFloatMultiply {
+        emitFloatBinary(value, "mulsd", true)
+        return
+    }
+    if opcode == irFloatDivide {
+        emitFloatBinary(value, "divsd", false)
+        return
+    }
+    if opcode == irFloatMinimum {
+        emitFloatBinary(value, "minsd", false)
+        return
+    }
+    if opcode == irFloatMaximum {
+        emitFloatBinary(value, "maxsd", false)
+        return
+    }
+    if opcode == irFloatNegate or opcode == irFloatAbsolute {
+        let source = floatIn(operands[0], "xmm0")
+        emitOptimized("movq rax, {source}")
+        if opcode == irFloatNegate {
+            emitOptimized("movabs rcx, {1 << 63}")
+            emitOptimized("xor rax, rcx")
+        } else {
+            emitOptimized("movabs rcx, 9223372036854775807")
+            emitOptimized("and rax, rcx")
+        }
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("movq {target}, rax")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irFloatSquareRoot {
+        let source = floatIn(operands[0], "xmm0")
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("sqrtsd {target}, {source}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irFloatCompare {
+        emitFloatCompareValue(value)
+        return
+    }
+    if opcode == irIntegerToFloat {
+        let source = integerIn(operands[0], "rax")
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("cvtsi2sd {target}, {source}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irFloatToInteger {
+        let source = floatIn(operands[0], "xmm0")
+        let target = resultRegister(value, "rax")
+        emitOptimized("cvttsd2si {target}, {source}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irFloatFromBits {
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("movq {target}, {locationOf(operands[0])}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irBitsFromFloat {
+        let source = locationOf(operands[0])
+        let target = resultRegister(value, "rax")
+        if isRegisterLocation(source) { emitOptimized("movq {target}, {source}") }
+        else { emitOptimized("mov {target}, {source}") }
+        finishResult(value, target)
+        return
+    }
+    if opcode == irLoad or opcode == irFloatLoad or opcode == irLoadFrame or opcode == irFloatLoadFrame {
+        let base = integerIn(operands[0], "rcx")
+        if opcode == irFloatLoad or opcode == irFloatLoadFrame {
+            let target = resultRegister(value, "xmm0")
+            emitOptimized("movsd {target}, {memoryAt(base, immediate)}")
+            finishResult(value, target)
+        } else {
+            let target = resultRegister(value, "rax")
+            emitOptimized("mov {target}, {memoryAt(base, immediate)}")
+            finishResult(value, target)
+        }
+        return
+    }
+    if opcode == irLoadIndexed or opcode == irFloatLoadIndexed {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        var address = "[{base} + {index}*8]"
+        if immediate != 0 { address = "[{base} + {index}*8 + {immediate}]" }
+        if opcode == irFloatLoadIndexed {
+            let target = resultRegister(value, "xmm0")
+            emitOptimized("movsd {target}, {address}")
+            finishResult(value, target)
+        } else {
+            let target = resultRegister(value, "rax")
+            emitOptimized("mov {target}, {address}")
+            finishResult(value, target)
+        }
+        return
+    }
+    if opcode == irStore or opcode == irStoreFrame {
+        let base = integerIn(operands[0], "rcx")
+        let stored = integerIn(operands[1], "rax")
+        emitOptimized("mov {memoryAt(base, immediate)}, {stored}")
+        return
+    }
+    if opcode == irFloatStore or opcode == irFloatStoreFrame {
+        let base = integerIn(operands[0], "rcx")
+        let stored = floatIn(operands[1], "xmm0")
+        emitOptimized("movsd {memoryAt(base, immediate)}, {stored}")
+        return
+    }
+    if opcode == irStoreIndexed or opcode == irFloatStoreIndexed {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        var address = "[{base} + {index}*8]"
+        if immediate != 0 { address = "[{base} + {index}*8 + {immediate}]" }
+        if opcode == irFloatStoreIndexed {
+            let stored = floatIn(operands[2], "xmm0")
+            emitOptimized("movsd {address}, {stored}")
+        } else {
+            let stored = integerIn(operands[2], "rax")
+            emitOptimized("mov {address}, {stored}")
+        }
+        return
+    }
+    if opcode == irLoadGlobal or opcode == irFloatLoadGlobal {
+        let address = "[rip + __zephyr_globals + {8 * immediate}]"
+        if opcode == irFloatLoadGlobal {
+            let target = resultRegister(value, "xmm0")
+            emitOptimized("movsd {target}, {address}")
+            finishResult(value, target)
+        } else {
+            let target = resultRegister(value, "rax")
+            emitOptimized("mov {target}, {address}")
+            finishResult(value, target)
+        }
+        return
+    }
+    if opcode == irStoreGlobal {
+        let stored = integerIn(operands[0], "rax")
+        emitOptimized("mov [rip + __zephyr_globals + {8 * immediate}], {stored}")
+        return
+    }
+    if opcode == irFloatStoreGlobal {
+        let stored = floatIn(operands[0], "xmm0")
+        emitOptimized("movsd [rip + __zephyr_globals + {8 * immediate}], {stored}")
+        return
+    }
+    if opcode == irBoundsCheck {
+        let list = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        emitOptimized("cmp {index}, [{list}]")
+        emitOptimized("jae .L{emitColdPanic(immediate)}")
+        return
+    }
+    if opcode == irZeroCheck {
+        let divisor = integerIn(operands[0], "rax")
+        emitOptimized("test {divisor}, {divisor}")
+        emitOptimized("je .L{emitColdPanic(immediate)}")
+        return
+    }
+    if opcode == irCall {
+        emitCallInstruction(value)
+        return
+    }
+    optimizerBail("cannot emit opcode {opcode}")
+}
+
+fn emitTerminator(block: int, value: int) {
+    let opcode = irOpcodes[value]
+    let operands = irOperands[value]
+    let successors = blockSuccessors[block]
+    if opcode == irJump {
+        emitPhiMoves(block)
+        jumpUnlessNext(successors[0])
+        return
+    }
+    if opcode == irBranch {
+        let condition = integerIn(operands[0], "rax")
+        emitOptimized("test {condition}, {condition}")
+        conditionalJump("ne", "e", successors[0], successors[1])
+        return
+    }
+    if opcode == irBranchCompare {
+        let condition = irImmediates[value]
+        let left = integerIn(operands[0], "rax")
+        emitOptimized("cmp {left}, {locationOf(operands[1])}")
+        conditionalJump(conditionSuffix(condition), conditionSuffix(invertCondition(condition)), successors[0], successors[1])
+        return
+    }
+    if opcode == irBranchFloatCompare {
+        let condition = irImmediates[value]
+        let trueBlock = successors[0]
+        let falseBlock = successors[1]
+        if condition == conditionEqual or condition == conditionNotEqual {
+            let left = floatIn(operands[0], "xmm0")
+            let right = floatIn(operands[1], "xmm1")
+            emitOptimized("ucomisd {left}, {right}")
+            if condition == conditionEqual {
+                emitOptimized("jp {blockLabelText(falseBlock)}")
+                conditionalJump("e", "ne", trueBlock, falseBlock)
+            } else {
+                emitOptimized("jp {blockLabelText(trueBlock)}")
+                conditionalJump("ne", "e", trueBlock, falseBlock)
+            }
+            return
+        }
+        if condition == conditionGreater or condition == conditionGreaterOrEqual {
+            let left = floatIn(operands[0], "xmm0")
+            emitOptimized("comisd {left}, {locationOf(operands[1])}")
+        } else {
+            let right = floatIn(operands[1], "xmm0")
+            emitOptimized("comisd {right}, {locationOf(operands[0])}")
+        }
+        if condition == conditionGreater or condition == conditionLess { conditionalJump("a", "be", trueBlock, falseBlock) }
+        else { conditionalJump("ae", "b", trueBlock, falseBlock) }
+        return
+    }
+    if opcode == irReturn {
+        if operands.len() > 0 {
+            let result = locationOf(operands[0])
+            if result != "rax" { emitOptimized("mov rax, {result}") }
+        }
+        emitEpilogue()
+        return
+    }
+    if opcode == irUnreachable {
+        emitOptimized("lea rcx, [rip + __s{irImmediates[value]}]")
+        emitOptimized("and rsp, -16")
+        emitOptimized("sub rsp, 32")
+        emitOptimized("call runtimePanicWithString")
+        return
+    }
+    if opcode == irPanicAt {
+        emitOptimized("mov rdx, {locationOf(operands[0])}")
+        emitOptimized("lea rcx, [rip + __s{irImmediates[value]}]")
+        emitOptimized("and rsp, -16")
+        emitOptimized("sub rsp, 32")
+        emitOptimized("call runtimePanicAt")
+        return
+    }
+    optimizerBail("cannot emit terminator {opcode}")
+}
+
+fn saveAreaOffset(index: int) -> int { return outgoingAreaSize + 8 * spillSlotCount + 8 * index }
+
+fn emitEpilogue() {
+    var index = 0
+    for register in savedIntegerRegisters {
+        emitOptimized("mov {integerRegisterNames[register]}, [rsp + {saveAreaOffset(index)}]")
+        index += 1
+    }
+    for register in savedFloatRegisters {
+        emitOptimized("movsd {floatRegisterNames[register]}, [rsp + {saveAreaOffset(index)}]")
+        index += 1
+    }
+    emitOptimized("mov rsp, rbp")
+    emitOptimized("pop rbp")
+    emitOptimized("ret")
+}
+
+// frame: [rsp] outgoing stack arguments | spill slots | callee-saved registers
+fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
+    var noLines: [str] = []
+    optimizerLines = noLines
+    var noColdLines: [str] = []
+    optimizerColdLines = noColdLines
+    var maximumStackArguments = 0
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] == irCall and not functionIsRegisterCall(irImmediates[instruction]) {
+                if irOperands[instruction].len() > maximumStackArguments { maximumStackArguments = irOperands[instruction].len() }
+            }
+        }
+    }
+    outgoingAreaSize = 8 * maximumStackArguments
+    var noSavedIntegers: [int] = []
+    savedIntegerRegisters = noSavedIntegers
+    var noSavedFloats: [int] = []
+    savedFloatRegisters = noSavedFloats
+    for i in 0..integerRegisterNames.len() {
+        if integerRegisterUsed[i] and integerRegisterCalleeSaved[i] { savedIntegerRegisters.push(i) }
+    }
+    for i in 0..floatRegisterNames.len() {
+        if floatRegisterUsed[i] and floatRegisterCalleeSaved[i] { savedFloatRegisters.push(i) }
+    }
+    var frameSize = outgoingAreaSize + 8 * spillSlotCount + 8 * (savedIntegerRegisters.len() + savedFloatRegisters.len())
+    frameSize = (frameSize + 15) / 16 * 16
+    var noLabels: [int] = []
+    blockLabels = noLabels
+    for block in 0..blockInstructions.len() { blockLabels.push(allocateLabel()) }
+    optimizerLines.push(label + ":\n")
+    emitOptimized("push rbp")
+    emitOptimized("mov rbp, rsp")
+    emitOptimized("and rsp, -16")
+    if frameSize > 0 { emitOptimized("sub rsp, {frameSize}") }
+    var index = 0
+    for register in savedIntegerRegisters {
+        emitOptimized("mov [rsp + {saveAreaOffset(index)}], {integerRegisterNames[register]}")
+        index += 1
+    }
+    for register in savedFloatRegisters {
+        emitOptimized("movsd [rsp + {saveAreaOffset(index)}], {floatRegisterNames[register]}")
+        index += 1
+    }
+    // parameters into their allocated homes, as one parallel move
+    clearMoves()
+    for instruction in blockInstructions[0] {
+        if irOpcodes[instruction] != irParameter { continue }
+        let parameterIndex = irImmediates[instruction]
+        var source = "rcx"
+        if regionIsFunction {
+            let argumentRegisters = ["rcx", "rdx", "r8", "r9"]
+            if registerCall { source = argumentRegisters[parameterIndex] }
+            else { source = "qword ptr [rbp + {16 + 8 * (parameterCount - 1 - parameterIndex)}]" }
+        }
+        addMove(source, locationOf(instruction))
+    }
+    emitParallelMoves()
+    for orderPosition in 0..blockOrder.len() {
+        currentOrderPosition = orderPosition
+        let block = blockOrder[orderPosition]
+        optimizerLines.push("{blockLabelText(block)}:\n")
+        for instruction in blockInstructions[block] {
+            if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
+            else { emitInstructionFor(instruction) }
+        }
+    }
+    for line in optimizerColdLines { optimizerLines.push(line) }
+    optimizerLines.push("\n")
+}
+
+// run every pass after lowering; false (with optimizerBailReason) if any gives up
+fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
+    for block in 0..blockInstructions.len() {
+        if not blockSealed[block] { optimizerBail("internal: unsealed block") }
+    }
+    if optimizerBailed { return false }
+    resetForwarding()
+    removeUnreachableBlocks()
+    removeTrivialPhis()
+    eliminateDeadCode()
+    checkBorrows()
+    if optimizerBailed { return false }
+    splitCriticalEdges()
+    resetForwarding()
+    computeBlockOrder()
+    computeLiveness()
+    buildIntervals()
+    allocateRegisters()
+    if optimizerBailed { return false }
+    emitRegionCode(label, parameterCount, registerCall)
+    return not optimizerBailed
+}
+
+// ================= driving the tier from the baseline generator =================
+var optimizedRegionCount = 0
+
+fn optimizerNote(text: str) {
+    if optimizerReport { print("opt: " + text) }
+}
+
+// whole function: replaces generateFunctionBody when every statement lowers
+fn tryOptimizeFunction(functionIndex: int) -> bool {
+    let functionDefinition = functionDefinitions[functionIndex]
+    if textStartsWith(functionDefinition.name, "runtime") or functionDefinition.hasEnvironment { return false }
+    let label = functionCodeLabel(functionDefinition.label)
+    if not lowerFunctionRegion(functionIndex) or not compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex)) {
+        optimizerNote("function {functionDefinition.name}: baseline ({optimizerBailReason})")
+        return false
+    }
+    optimizerNote("function {functionDefinition.name}: optimized, {spillSlotCount} spills")
+    for line in optimizerLines { assemblyLines.push(line) }
+    return true
+}
+
+fn isLoopStatement(statement: Node) -> bool {
+    return statement.nodeKind == nodeWhile or statement.nodeKind == nodeRangeLoop or statement.nodeKind == nodeIterableLoop
+}
+
+// A range loop the baseline may turn into an AVX2 kernel (tryFill, tryReduce,
+// tryScaledVectorAddition all want a one-assignment body): leave it to them.
+fn baselineVectorCandidate(statement: Node) -> bool {
+    if statement.nodeKind != nodeRangeLoop { return false }
+    let body = statement.children[2]
+    return body.children.len() == 1 and body.children[0].nodeKind == nodeAssign
+}
+
+fn containsBaselineVectorCandidate(node: Node) -> bool {
+    if baselineVectorCandidate(node) { return true }
+    for child in node.children {
+        if containsBaselineVectorCandidate(child) { return true }
+    }
+    return false
+}
+
+fn excludeSlots(node: Node) {
+    let kind = node.nodeKind
+    if kind == nodeIdentifier {
+        if node.auxiliary == identifierKindLocal and node.slot < excludedLocalSlots.len() { excludedLocalSlots[node.slot] = true }
+        if node.auxiliary == identifierKindParameter and node.slot < excludedParameterSlots.len() { excludedParameterSlots[node.slot] = true }
+    }
+    if kind == nodeDeclaration and node.auxiliary == identifierKindLocal and node.slot < excludedLocalSlots.len() { excludedLocalSlots[node.slot] = true }
+    if kind == nodeRangeLoop or kind == nodeIterableLoop or kind == nodeInline {
+        if node.slot < excludedLocalSlots.len() { excludedLocalSlots[node.slot] = true }
+    }
+    for child in node.children { excludeSlots(child) }
+}
+
+// outline the outermost loops that lower; descend into the ones that do not
+fn outlineLoops(statements: [Node], slotCount: int, parameterCount: int, registerCall: bool, functionName: str) {
+    for statement in statements {
+        if isLoopStatement(statement) and not containsBaselineVectorCandidate(statement) {
+            let regionLabel = "zopt_region{optimizedRegionCount}"
+            if lowerLoopRegion(statement, slotCount, parameterCount, registerCall) and compileRegion(regionLabel, 0, false) {
+                optimizerNote("loop at {functionName}:{statement.line}: optimized, {spillSlotCount} spills")
+                for line in optimizerLines { pendingRegionLines.push(line) }
+                var original = makeNode(statement.nodeKind, statement.line)
+                original.operator = statement.operator
+                original.name = statement.name
+                original.integerValue = statement.integerValue
+                original.floatValue = statement.floatValue
+                original.children = statement.children
+                original.typeIndex = statement.typeIndex
+                original.slot = statement.slot
+                original.auxiliary = statement.auxiliary
+                original.referenceIndex = statement.referenceIndex
+                original.isMutable = statement.isMutable
+                original.file = statement.file
+                statement.nodeKind = nodeOutlinedLoop
+                statement.children = [original]
+                statement.integerValue = optimizedRegionCount
+                optimizedRegionCount += 1
+                excludeSlots(original)
+                continue
+            }
+            optimizerNote("loop at {functionName}:{statement.line}: baseline ({optimizerBailReason})")
+        }
+        if statement.nodeKind == nodeIf {
+            outlineLoops(statement.children[1].children, slotCount, parameterCount, registerCall, functionName)
+            if statement.children[2].nodeKind != nodeNone { outlineLoops(statement.children[2].children, slotCount, parameterCount, registerCall, functionName) }
+        } else if statement.nodeKind == nodeWhile {
+            outlineLoops(statement.children[1].children, slotCount, parameterCount, registerCall, functionName)
+        } else if statement.nodeKind == nodeRangeLoop {
+            outlineLoops(statement.children[2].children, slotCount, parameterCount, registerCall, functionName)
+        } else if statement.nodeKind == nodeIterableLoop {
+            outlineLoops(statement.children[1].children, slotCount, parameterCount, registerCall, functionName)
+        } else if statement.nodeKind == nodeInline {
+            outlineLoops(statement.children, slotCount, parameterCount, registerCall, functionName)
+        }
+    }
+}
+
+// called at the top of generateFunctionBody
+fn prepareOptimizedLoops(label: str, statements: [Node], slotCount: int, parameterCount: int, registerCall: bool) {
+    clearBooleans(excludedLocalSlots)
+    clearBooleans(excludedParameterSlots)
+    if not optimizerEnabled or debugEnabled or textStartsWith(label, "runtime") { return }
+    for i in 0..slotCount { excludedLocalSlots.push(false) }
+    for i in 0..parameterCount { excludedParameterSlots.push(false) }
+    outlineLoops(statements, slotCount, parameterCount, registerCall, label)
+}

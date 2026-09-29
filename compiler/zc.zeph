@@ -151,6 +151,7 @@ let nodeGroup = 61     // several statements from one (let (a, b) = t); spliced 
 let nodeIs = 62        // x is Member (parse only): kids = [value, nodeIdentifier or nodeMember]
 let nodePrivate = 63   // private <declaration> (parse only; scopeModule renames it): kids = [decl]
 let nodeTest = 64      // test "name" { ... } (parse only): name = the test's name, kids = [block]
+let nodeOutlinedLoop = 65    // -O2: a loop compiled by the optimizing tier (optimizer.zeph); kids = [the original loop], ival = region number
 
 // ---------------- type kinds & table ----------------
 let kindInteger = 0
@@ -375,6 +376,12 @@ var currentParameterCount = 0
 var currentSlotCount = 0
 var currentUsesRegisterCall = false   // current fn is rt_*: params arrive in rcx/rdx/r8/r9
 var functionRegisterCall: [bool] = []   // per-function: register convention (see computeRegisterCall)
+// -O2: the optimizing tier (optimizer.zeph)
+var optimizerEnabled = false
+var optimizerReport = false                // --opt-report: say what was optimized and why not
+var pendingRegionLines: [str] = []         // outlined loop bodies, emitted after their parent
+var excludedLocalSlots: [bool] = []        // parent slots an outlined loop owns: never promoted
+var excludedParameterSlots: [bool] = []
 var nextUsesRegisterCall = false
 var floatSpillDepth = 0            // float spill-stack depth: intermediates live in xmm2+
 
@@ -6073,6 +6080,19 @@ fn computePromotions(statements: [Node], slotCount: int, parameterCount: int) {
         parameterHasPointer.push(false)
     }
     for statement in statements { countReferences(statement, 1) }
+    // slots an outlined loop reads and writes in place stay in memory
+    for i in 0..excludedLocalSlots.len() {
+        if excludedLocalSlots[i] and i < slotCount {
+            localUseCounts[i] = 0
+            localFloatUseCounts[i] = 0
+        }
+    }
+    for i in 0..excludedParameterSlots.len() {
+        if excludedParameterSlots[i] and i < parameterCount {
+            parameterUseCounts[i] = 0
+            parameterFloatUseCounts[i] = 0
+        }
+    }
     // reference slots stay in memory whatever the reads say
     for i in 0..slotCount {
         if i < referenceHoldingSlots.len() and referenceHoldingSlots[i] { localHasPointer[i] = true }
@@ -9974,6 +9994,11 @@ fn generateStatement(statement: Node, returnLabel: int) {
         emitInstruction("jmp {labelText(continueLabels[continueLabels.len() - 1 - statement.integerValue])}")
         return
     }
+    if statement.nodeKind == nodeOutlinedLoop {
+        emitInstruction("mov rcx, rbp")
+        emitInstruction("call zopt_region{statement.integerValue}")
+        return
+    }
     if statement.nodeKind == nodeExpressionStatement {
         let ownsTemporary = generateTemporary(statement.children[0], true)  // an owned result nobody keeps
         if ownsTemporary { dropRax() }
@@ -10049,6 +10074,7 @@ fn tryIndexReadModifyWrite(targetNode: Node, value: Node) -> bool {
 
 fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, statements: [Node]) {
     currentUsesRegisterCall = nextUsesRegisterCall
+    prepareOptimizedLoops(label, statements, slotCount, parameterCount, nextUsesRegisterCall)
     currentSlotCount = slotCount
     currentParameterCount = parameterCount
     // Which slots hold references is decided BEFORE promotion, because
@@ -10203,6 +10229,8 @@ fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, stateme
     emitInstruction("pop rbp")
     emitInstruction("ret")
     flushCold()                // never-taken bounds-failure blocks, out of line
+    for line in pendingRegionLines { assemblyLines.push(line) }
+    clearStrings(pendingRegionLines)
     emitAssemblyLine("")
 }
 
@@ -10297,6 +10325,10 @@ fn generateProgram(program: Node) {
             generatingUserFunction = functionDefinition.body.file == mainSourceFile
             nextUsesRegisterCall = functionIsRegisterCall(topLevelNode.referenceIndex)
             currentParameterTypes = functionDefinition.parameterTypes
+            if optimizerEnabled and not debugEnabled and tryOptimizeFunction(topLevelNode.referenceIndex) {
+                streamAssembledLines()
+                continue
+            }
             generateFunctionBody(functionCodeLabel(functionDefinition.label), functionDefinition.slotCount, functionDefinition.parameterNames.len(), functionDefinition.body.children)
             streamAssembledLines()
         }
@@ -10306,6 +10338,10 @@ fn generateProgram(program: Node) {
         generatingUserFunction = functionDefinition.body.file == mainSourceFile
         nextUsesRegisterCall = functionIsRegisterCall(instantiatedFunctions[i])
         currentParameterTypes = functionDefinition.parameterTypes
+        if optimizerEnabled and not debugEnabled and tryOptimizeFunction(instantiatedFunctions[i]) {
+            streamAssembledLines()
+            continue
+        }
         generateFunctionBody(functionCodeLabel(functionDefinition.label), functionDefinition.slotCount, functionDefinition.parameterNames.len(), functionDefinition.body.children)
         streamAssembledLines()
     }
@@ -18758,6 +18794,8 @@ fn assembleAndLink(path: str) {
     if debugEnabled and not linuxTargetEnabled { writeDebugSymbols(path + ".zdbg") }
 }
 
+import "optimizer.zeph"
+
 // ---------------- driver ----------------
 let commandLineArguments = args()
 var includeRuntime = false
@@ -18786,6 +18824,8 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "--wasm" { wasmTargetEnabled = true }
     else if argument == "--version" { showVersion = true }
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
+    else if argument == "-O2" { optimizerEnabled = true }
+    else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true
         includeRuntime = true
