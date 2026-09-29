@@ -21,10 +21,10 @@ enum Result[T, E] {
 
 impl Result[T, E] {
     // Whether this holds a value.
-    fn is_ok(self) -> bool { return self is Ok }
+    fn isOk(self) -> bool { return self is Ok }
 
     // Whether this holds an error.
-    fn is_err(self) -> bool { return self is Err }
+    fn isError(self) -> bool { return self is Err }
 
     // The value; panics with the error on Err.
     fn unwrap(self) -> T {
@@ -35,7 +35,7 @@ impl Result[T, E] {
     }
 
     // The value, or fallback on Err.
-    fn unwrap_or(self, fallback: T) -> T {
+    fn unwrapOr(self, fallback: T) -> T {
         match self {
             Ok(value) { return value }
             Err(_) { return fallback }
@@ -51,7 +51,7 @@ impl Result[T, E] {
     }
 
     // The error as an optional; none on Ok.
-    fn err(self) -> E? {
+    fn error(self) -> E? {
         match self {
             Ok(_) { return none }
             Err(error) { return error }
@@ -67,7 +67,7 @@ impl Result[T, E] {
     }
 
     // Transform the error, keeping a value as it is.
-    fn map_err[F](self, transform: fn(E) -> F) -> Result[T, F] {
+    fn mapError[F](self, transform: fn(E) -> F) -> Result[T, F] {
         match self {
             Ok(value) { return Result.Ok(value) }
             Err(error) { return Result.Err(transform(error)) }
@@ -75,7 +75,7 @@ impl Result[T, E] {
     }
 
     // Chain a step that can itself fail; the first error wins.
-    fn and_then[U](self, next: fn(T) -> Result[U, E]) -> Result[U, E] {
+    fn andThen[U](self, next: fn(T) -> Result[U, E]) -> Result[U, E] {
         match self {
             Ok(value) { return next(value) }
             Err(error) { return Result.Err(error) }

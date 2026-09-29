@@ -18,22 +18,22 @@
 // arithmetic may be reordered and effectful nodes may not.
 import "ml/autograd.zeph"
 
-let EFF_NONE = 0
-let EFF_PARAM = 1      // reads a mutable parameter, so ordering against a
+let effectNone = 0
+let effectParameter = 1      // reads a mutable parameter, so ordering against a
                        // parameter update matters
-let EFF_RNG = 2
-let EFF_IO = 4
-let EFF_TRANSFER = 8
+let effectRng = 2
+let effectInputOutput = 4
+let effectTransfer = 8
 
-let DEV_CPU = 0
-let DEV_GPU = 1
+let deviceCpu = 0
+let deviceGpu = 1
 
 struct IrValue {
     id: int,
-    dt: DType,
+    dtype: DType,
     shape: [int],
     stride: [int],
-    off: int,
+    offset: int,
     device: int,
     contiguous: bool,
 }
@@ -43,8 +43,8 @@ struct IrNode {
     out: int,          // index into values
     a: int,            // operand value index, or -1
     b: int,
-    ia: [int],         // integer attributes, as recorded on the tape
-    fa: [float],       // float attributes
+    integerAttributes: [int],         // integer attributes, as recorded on the tape
+    floatAttributes: [float],       // float attributes
     effects: int,
     span: int,         // the tape node this came from, so a diagnostic can
                        // point back at something real
@@ -55,38 +55,38 @@ struct IrGraph {
     nodes: [IrNode],
     inputs: [int],     // value indices with no defining node
     result: int,
-    var_of: [int],     // value index -> tape variable, for replay
+    tapeVariableOf: [int],     // value index -> tape variable, for replay
 }
 
-fn ir_op_name(op: int) -> str {
+fn irOperationName(opcode: int) -> str {
     let names = ["leaf", "add", "sub", "mul", "div", "neg", "matmul", "tanh",
                  "sum_dim", "sum_all", "mean_all", "abs2", "conj", "real",
                  "imag", "expi", "complex", "concat", "index_select", "roll",
                  "transpose", "reshape", "slice", "cast", "expand", "cos",
                  "sin", "ln", "exp", "givens", "bias_tanh"]
-    if op < 0 or op >= names.len() { return "op{op}" }
-    return names[op]
+    if opcode < 0 or opcode >= names.len() { return "op{opcode}" }
+    return names[opcode]
 }
 
-fn ir_dtype_name(d: DType) -> str {
-    if d == DType.F64 { return "f64" }
-    if d == DType.F32 { return "f32" }
-    if d == DType.C64 { return "c64" }
-    if d == DType.C32 { return "c32" }
-    if d == DType.I64 { return "i64" }
+fn irDtypeName(dtype: DType) -> str {
+    if dtype == DType.F64 { return "f64" }
+    if dtype == DType.F32 { return "f32" }
+    if dtype == DType.C64 { return "c64" }
+    if dtype == DType.C32 { return "c32" }
+    if dtype == DType.I64 { return "i64" }
     return "?"
 }
 
-fn ir_shape_str(sh: [int]) -> str {
-    var s = "["
-    for i in 0..sh.len() {
-        if i > 0 { s = s + "," }
-        s = s + "{sh[i]}"
+fn irShapeString(shape: [int]) -> str {
+    var text = "["
+    for i in 0..shape.len() {
+        if i > 0 { text = text + "," }
+        text = text + "{shape[i]}"
     }
-    return s + "]"
+    return text + "]"
 }
 
-fn ir_is_contiguous(t: Tensor) -> bool { return t_is_contiguous(t) }
+fn irIsContiguous(tensor: Tensor) -> bool { return tensorIsContiguous(tensor) }
 
 // ---------------------------------------------------------------------------
 // Capture
@@ -96,42 +96,42 @@ fn ir_is_contiguous(t: Tensor) -> bool { return t_is_contiguous(t) }
 // than their consumer and dominance holds by construction -- which the
 // verifier then checks rather than assumes, because "by construction" is a
 // claim about code that can change.
-fn ir_capture(result: int) -> IrGraph {
+fn irCapture(result: int) -> IrGraph {
     var values: [IrValue] = []
     var nodes: [IrNode] = []
     var inputs: [int] = []
-    var var_of: [int] = []
+    var tapeVariableOf: [int] = []
 
-    for v in 0..A_VARS.len() {
-        let t = A_VARS[v].v
-        values.push(IrValue{ id: v, dt: t.dt, shape: t.shape, stride: t.stride,
-                             off: t.off, device: DEV_CPU, contiguous: ir_is_contiguous(t) })
-        var_of.push(v)
-        if A_VARS[v].node < 0 { inputs.push(v) }
+    for variableIndex in 0..tapeVariables.len() {
+        let tensor = tapeVariables[variableIndex].v
+        values.push(IrValue{ id: variableIndex, dtype: tensor.dtype, shape: tensor.shape, stride: tensor.stride,
+                             offset: tensor.offset, device: deviceCpu, contiguous: irIsContiguous(tensor) })
+        tapeVariableOf.push(variableIndex)
+        if tapeVariables[variableIndex].node < 0 { inputs.push(variableIndex) }
     }
 
     // tape node index -> the variable it defines
-    var node_out: [int] = []
-    for i in 0..A_NODES.len() { node_out.push(0 - 1) }
-    for v in 0..A_VARS.len() {
-        let n = A_VARS[v].node
-        if n >= 0 { node_out[n] = v }
+    var nodeOutput: [int] = []
+    for i in 0..tapeNodes.len() { nodeOutput.push(0 - 1) }
+    for variableIndex in 0..tapeVariables.len() {
+        let tapeNodeIndex = tapeVariables[variableIndex].node
+        if tapeNodeIndex >= 0 { nodeOutput[tapeNodeIndex] = variableIndex }
     }
 
-    for i in 0..A_NODES.len() {
-        let nd = A_NODES[i]
+    for i in 0..tapeNodes.len() {
+        let tapeNode = tapeNodes[i]
         // A parameter read is the only effect the tape can carry today: there
         // is no RNG op, no host I/O op and no explicit transfer op in the
         // recorded set. Marking them here rather than pretending they cannot
         // exist keeps the ordering rules meaningful when they do.
-        var eff = EFF_NONE
-        if nd.a >= 0 {
-            if A_VARS[nd.a].node < 0 and A_VARS[nd.a].req { eff = eff + EFF_PARAM }
+        var effects = effectNone
+        if tapeNode.a >= 0 {
+            if tapeVariables[tapeNode.a].node < 0 and tapeVariables[tapeNode.a].requiresGradient { effects = effects + effectParameter }
         }
-        nodes.push(IrNode{ op: nd.op, out: node_out[i], a: nd.a, b: nd.b,
-                           ia: nd.ia, fa: nd.fa, effects: eff, span: i })
+        nodes.push(IrNode{ op: tapeNode.op, out: nodeOutput[i], a: tapeNode.a, b: tapeNode.b,
+                           integerAttributes: tapeNode.integerAttributes, floatAttributes: tapeNode.floatAttributes, effects: effects, span: i })
     }
-    return IrGraph{ values: values, nodes: nodes, inputs: inputs, result: result, var_of: var_of }
+    return IrGraph{ values: values, nodes: nodes, inputs: inputs, result: result, tapeVariableOf: tapeVariableOf }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,209 +145,209 @@ fn ir_capture(result: int) -> IrGraph {
 // specification asks for source-located errors and a message that only says
 // "shape mismatch" cannot be acted on.
 
-fn ir_broadcast_ok(a: [int], b: [int]) -> bool {
-    let n = a.len()
-    var m = b.len()
-    if m > n { m = n }
-    for k in 0..m {
-        let x = a[a.len() - 1 - k]
-        let y = b[b.len() - 1 - k]
-        if x != y and x != 1 and y != 1 { return false }
+fn irBroadcastCompatible(firstShape: [int], secondShape: [int]) -> bool {
+    let firstRank = firstShape.len()
+    var sharedRank = secondShape.len()
+    if sharedRank > firstRank { sharedRank = firstRank }
+    for k in 0..sharedRank {
+        let firstExtent = firstShape[firstShape.len() - 1 - k]
+        let secondExtent = secondShape[secondShape.len() - 1 - k]
+        if firstExtent != secondExtent and firstExtent != 1 and secondExtent != 1 { return false }
     }
     return true
 }
 
-fn ir_same_shape(a: [int], b: [int]) -> bool {
-    if a.len() != b.len() { return false }
-    for i in 0..a.len() {
-        if a[i] != b[i] { return false }
+fn irSameShape(firstShape: [int], secondShape: [int]) -> bool {
+    if firstShape.len() != secondShape.len() { return false }
+    for i in 0..firstShape.len() {
+        if firstShape[i] != secondShape[i] { return false }
     }
     return true
 }
 
-fn ir_numel(sh: [int]) -> int {
-    var n = 1
-    for i in 0..sh.len() { n = n * sh[i] }
-    return n
+fn irElementCount(shape: [int]) -> int {
+    var elementCount = 1
+    for i in 0..shape.len() { elementCount = elementCount * shape[i] }
+    return elementCount
 }
 
-fn ir_verify(g: IrGraph) -> [str] {
-    var errs: [str] = []
+fn irVerify(graph: IrGraph) -> [str] {
+    var errors: [str] = []
 
-    if g.result < 0 or g.result >= g.values.len() {
-        errs.push("graph result {g.result} is not a value in this graph")
-        return errs
+    if graph.result < 0 or graph.result >= graph.values.len() {
+        errors.push("graph result {graph.result} is not a value in this graph")
+        return errors
     }
 
     var defined: [bool] = []
-    for i in 0..g.values.len() { defined.push(false) }
-    for i in 0..g.inputs.len() { defined[g.inputs[i]] = true }
+    for i in 0..graph.values.len() { defined.push(false) }
+    for i in 0..graph.inputs.len() { defined[graph.inputs[i]] = true }
 
-    for i in 0..g.nodes.len() {
-        let nd = g.nodes[i]
-        let where = "node {i} ({ir_op_name(nd.op)}, tape node {nd.span})"
+    for i in 0..graph.nodes.len() {
+        let node = graph.nodes[i]
+        let where = "node {i} ({irOperationName(node.op)}, tape node {node.span})"
 
-        if nd.out < 0 or nd.out >= g.values.len() {
-            errs.push("{where}: defines value {nd.out}, which is out of range")
+        if node.out < 0 or node.out >= graph.values.len() {
+            errors.push("{where}: defines value {node.out}, which is out of range")
             continue
         }
 
         // ---- dominance: operands must be defined before use ----
-        var bad_operand = false
-        if nd.a >= 0 {
-            if nd.a >= g.values.len() {
-                errs.push("{where}: operand a = {nd.a} is out of range")
-                bad_operand = true
+        var badOperand = false
+        if node.a >= 0 {
+            if node.a >= graph.values.len() {
+                errors.push("{where}: operand a = {node.a} is out of range")
+                badOperand = true
             } else {
-                if not defined[nd.a] {
-                    errs.push("{where}: operand a = %{nd.a} is used before it is defined")
-                    bad_operand = true
+                if not defined[node.a] {
+                    errors.push("{where}: operand a = %{node.a} is used before it is defined")
+                    badOperand = true
                 }
-                if nd.a >= nd.out {
-                    errs.push("{where}: operand a = %{nd.a} does not dominate its use in %{nd.out}")
-                    bad_operand = true
+                if node.a >= node.out {
+                    errors.push("{where}: operand a = %{node.a} does not dominate its use in %{node.out}")
+                    badOperand = true
                 }
             }
         }
-        if nd.b >= 0 {
-            if nd.b >= g.values.len() {
-                errs.push("{where}: operand b = {nd.b} is out of range")
-                bad_operand = true
+        if node.b >= 0 {
+            if node.b >= graph.values.len() {
+                errors.push("{where}: operand b = {node.b} is out of range")
+                badOperand = true
             } else {
-                if not defined[nd.b] {
-                    errs.push("{where}: operand b = %{nd.b} is used before it is defined")
-                    bad_operand = true
+                if not defined[node.b] {
+                    errors.push("{where}: operand b = %{node.b} is used before it is defined")
+                    badOperand = true
                 }
-                if nd.b >= nd.out {
-                    errs.push("{where}: operand b = %{nd.b} does not dominate its use in %{nd.out}")
-                    bad_operand = true
+                if node.b >= node.out {
+                    errors.push("{where}: operand b = %{node.b} does not dominate its use in %{node.out}")
+                    badOperand = true
                 }
             }
         }
-        if defined[nd.out] {
-            errs.push("{where}: value %{nd.out} is assigned more than once, which is not SSA")
+        if defined[node.out] {
+            errors.push("{where}: value %{node.out} is assigned more than once, which is not SSA")
         }
-        defined[nd.out] = true
-        if bad_operand { continue }
+        defined[node.out] = true
+        if badOperand { continue }
 
-        let out = g.values[nd.out]
+        let outputValue = graph.values[node.out]
 
         // ---- dtype and shape inference ----
-        if nd.a >= 0 {
-            let a = g.values[nd.a]
+        if node.a >= 0 {
+            let firstOperand = graph.values[node.a]
 
             // elementwise binary: broadcast-compatible, same dtype
-            if nd.op == OP_ADD or nd.op == OP_SUB or nd.op == OP_MUL or nd.op == OP_DIV {
-                if nd.b < 0 {
-                    errs.push("{where}: a binary op has no second operand")
+            if node.op == operationAdd or node.op == operationSubtract or node.op == operationMultiply or node.op == operationDivide {
+                if node.b < 0 {
+                    errors.push("{where}: a binary op has no second operand")
                 } else {
-                    let b = g.values[nd.b]
-                    if a.dt != b.dt {
-                        errs.push("{where}: operands differ in dtype, {ir_dtype_name(a.dt)} against {ir_dtype_name(b.dt)}; the library requires an explicit cast")
+                    let secondOperand = graph.values[node.b]
+                    if firstOperand.dtype != secondOperand.dtype {
+                        errors.push("{where}: operands differ in dtype, {irDtypeName(firstOperand.dtype)} against {irDtypeName(secondOperand.dtype)}; the library requires an explicit cast")
                     }
-                    if not ir_broadcast_ok(a.shape, b.shape) {
-                        errs.push("{where}: operand shapes {ir_shape_str(a.shape)} and {ir_shape_str(b.shape)} do not broadcast")
+                    if not irBroadcastCompatible(firstOperand.shape, secondOperand.shape) {
+                        errors.push("{where}: operand shapes {irShapeString(firstOperand.shape)} and {irShapeString(secondOperand.shape)} do not broadcast")
                     }
-                    if out.dt != a.dt {
-                        errs.push("{where}: result dtype {ir_dtype_name(out.dt)} should be {ir_dtype_name(a.dt)}")
+                    if outputValue.dtype != firstOperand.dtype {
+                        errors.push("{where}: result dtype {irDtypeName(outputValue.dtype)} should be {irDtypeName(firstOperand.dtype)}")
                     }
                 }
             }
 
             // dtype-changing unary ops, which are where a wrong rule is
             // easiest to write and hardest to notice
-            if nd.op == OP_ABS2 or nd.op == OP_REAL or nd.op == OP_IMAG {
-                if not dtype_is_complex(a.dt) {
-                    errs.push("{where}: takes a complex operand, got {ir_dtype_name(a.dt)}")
+            if node.op == operationAbs2 or node.op == operationReal or node.op == operationImaginary {
+                if not dtypeIsComplex(firstOperand.dtype) {
+                    errors.push("{where}: takes a complex operand, got {irDtypeName(firstOperand.dtype)}")
                 }
-                if dtype_is_complex(out.dt) {
-                    errs.push("{where}: produces a real tensor, but the result is {ir_dtype_name(out.dt)}")
+                if dtypeIsComplex(outputValue.dtype) {
+                    errors.push("{where}: produces a real tensor, but the result is {irDtypeName(outputValue.dtype)}")
                 }
-                if not ir_same_shape(out.shape, a.shape) {
-                    errs.push("{where}: result shape {ir_shape_str(out.shape)} should equal the operand's {ir_shape_str(a.shape)}")
-                }
-            }
-            if nd.op == OP_EXPI {
-                if dtype_is_complex(a.dt) {
-                    errs.push("{where}: takes a real angle, got {ir_dtype_name(a.dt)}")
-                }
-                if not dtype_is_complex(out.dt) {
-                    errs.push("{where}: produces a complex tensor, but the result is {ir_dtype_name(out.dt)}")
+                if not irSameShape(outputValue.shape, firstOperand.shape) {
+                    errors.push("{where}: result shape {irShapeString(outputValue.shape)} should equal the operand's {irShapeString(firstOperand.shape)}")
                 }
             }
-            if nd.op == OP_CONJ {
-                if not dtype_is_complex(a.dt) {
-                    errs.push("{where}: takes a complex operand, got {ir_dtype_name(a.dt)}")
+            if node.op == operationExpImaginary {
+                if dtypeIsComplex(firstOperand.dtype) {
+                    errors.push("{where}: takes a real angle, got {irDtypeName(firstOperand.dtype)}")
                 }
-                if out.dt != a.dt {
-                    errs.push("{where}: conj preserves dtype, {ir_dtype_name(out.dt)} against {ir_dtype_name(a.dt)}")
+                if not dtypeIsComplex(outputValue.dtype) {
+                    errors.push("{where}: produces a complex tensor, but the result is {irDtypeName(outputValue.dtype)}")
+                }
+            }
+            if node.op == operationConjugate {
+                if not dtypeIsComplex(firstOperand.dtype) {
+                    errors.push("{where}: takes a complex operand, got {irDtypeName(firstOperand.dtype)}")
+                }
+                if outputValue.dtype != firstOperand.dtype {
+                    errors.push("{where}: conj preserves dtype, {irDtypeName(outputValue.dtype)} against {irDtypeName(firstOperand.dtype)}")
                 }
             }
 
             // shape-preserving unary
-            if nd.op == OP_TANH or nd.op == OP_COS or nd.op == OP_SIN or nd.op == OP_LN or nd.op == OP_EXP or nd.op == OP_NEG {
-                if not ir_same_shape(out.shape, a.shape) {
-                    errs.push("{where}: result shape {ir_shape_str(out.shape)} should equal the operand's {ir_shape_str(a.shape)}")
+            if node.op == operationTanh or node.op == operationCos or node.op == operationSin or node.op == operationLn or node.op == operationExp or node.op == operationNegate {
+                if not irSameShape(outputValue.shape, firstOperand.shape) {
+                    errors.push("{where}: result shape {irShapeString(outputValue.shape)} should equal the operand's {irShapeString(firstOperand.shape)}")
                 }
-                if out.dt != a.dt {
-                    errs.push("{where}: result dtype {ir_dtype_name(out.dt)} should be {ir_dtype_name(a.dt)}")
-                }
-            }
-
-            if nd.op == OP_GIVENS {
-                if nd.b < 0 {
-                    errs.push("{where}: the fused Givens stage has no angle operand")
-                } else {
-                    let ang = g.values[nd.b]
-                    if not dtype_is_complex(a.dt) {
-                        errs.push("{where}: state operand is {ir_dtype_name(a.dt)}, must be complex")
-                    }
-                    if dtype_is_complex(ang.dt) {
-                        errs.push("{where}: angle operand is {ir_dtype_name(ang.dt)}, must be real")
-                    }
-                    if not ir_same_shape(out.shape, a.shape) {
-                        errs.push("{where}: result shape {ir_shape_str(out.shape)} should equal the state's {ir_shape_str(a.shape)}")
-                    }
-                    if not ir_same_shape(ang.shape, a.shape) {
-                        errs.push("{where}: angle shape {ir_shape_str(ang.shape)} should equal the state's {ir_shape_str(a.shape)}, theta then phi")
-                    }
-                    if nd.ia.len() < 1 or nd.ia[0] < 0 or nd.ia[0] > 1 {
-                        errs.push("{where}: stage must be 0 or 1")
-                    }
+                if outputValue.dtype != firstOperand.dtype {
+                    errors.push("{where}: result dtype {irDtypeName(outputValue.dtype)} should be {irDtypeName(firstOperand.dtype)}")
                 }
             }
 
-            if nd.op == OP_MATMUL {
-                if nd.b < 0 {
-                    errs.push("{where}: matmul has no second operand")
+            if node.op == operationGivens {
+                if node.b < 0 {
+                    errors.push("{where}: the fused Givens stage has no angle operand")
                 } else {
-                    let b = g.values[nd.b]
-                    if a.shape.len() != 2 or b.shape.len() != 2 {
-                        errs.push("{where}: matmul needs rank-2 operands, got {ir_shape_str(a.shape)} and {ir_shape_str(b.shape)}")
+                    let angle = graph.values[node.b]
+                    if not dtypeIsComplex(firstOperand.dtype) {
+                        errors.push("{where}: state operand is {irDtypeName(firstOperand.dtype)}, must be complex")
+                    }
+                    if dtypeIsComplex(angle.dtype) {
+                        errors.push("{where}: angle operand is {irDtypeName(angle.dtype)}, must be real")
+                    }
+                    if not irSameShape(outputValue.shape, firstOperand.shape) {
+                        errors.push("{where}: result shape {irShapeString(outputValue.shape)} should equal the state's {irShapeString(firstOperand.shape)}")
+                    }
+                    if not irSameShape(angle.shape, firstOperand.shape) {
+                        errors.push("{where}: angle shape {irShapeString(angle.shape)} should equal the state's {irShapeString(firstOperand.shape)}, theta then phi")
+                    }
+                    if node.integerAttributes.len() < 1 or node.integerAttributes[0] < 0 or node.integerAttributes[0] > 1 {
+                        errors.push("{where}: stage must be 0 or 1")
+                    }
+                }
+            }
+
+            if node.op == operationMatmul {
+                if node.b < 0 {
+                    errors.push("{where}: matmul has no second operand")
+                } else {
+                    let secondOperand = graph.values[node.b]
+                    if firstOperand.shape.len() != 2 or secondOperand.shape.len() != 2 {
+                        errors.push("{where}: matmul needs rank-2 operands, got {irShapeString(firstOperand.shape)} and {irShapeString(secondOperand.shape)}")
                     } else {
-                        if a.shape[1] != b.shape[0] {
-                            errs.push("{where}: inner dimensions disagree, {a.shape[1]} against {b.shape[0]}")
+                        if firstOperand.shape[1] != secondOperand.shape[0] {
+                            errors.push("{where}: inner dimensions disagree, {firstOperand.shape[1]} against {secondOperand.shape[0]}")
                         }
-                        if out.shape.len() != 2 or out.shape[0] != a.shape[0] or out.shape[1] != b.shape[1] {
-                            errs.push("{where}: result shape {ir_shape_str(out.shape)} should be [{a.shape[0]},{b.shape[1]}]")
+                        if outputValue.shape.len() != 2 or outputValue.shape[0] != firstOperand.shape[0] or outputValue.shape[1] != secondOperand.shape[1] {
+                            errors.push("{where}: result shape {irShapeString(outputValue.shape)} should be [{firstOperand.shape[0]},{secondOperand.shape[1]}]")
                         }
                     }
-                    if a.dt != b.dt {
-                        errs.push("{where}: matmul operands differ in dtype")
+                    if firstOperand.dtype != secondOperand.dtype {
+                        errors.push("{where}: matmul operands differ in dtype")
                     }
                 }
             }
 
-            if nd.op == OP_SUM_DIM {
-                if nd.ia.len() < 1 {
-                    errs.push("{where}: sum_dim has no axis attribute")
+            if node.op == operationSumDimension {
+                if node.integerAttributes.len() < 1 {
+                    errors.push("{where}: sum_dim has no axis attribute")
                 } else {
-                    let d = nd.ia[0]
-                    if d < 0 or d >= a.shape.len() {
-                        errs.push("{where}: axis {d} is out of range for {ir_shape_str(a.shape)}")
+                    let axis = node.integerAttributes[0]
+                    if axis < 0 or axis >= firstOperand.shape.len() {
+                        errors.push("{where}: axis {axis} is out of range for {irShapeString(firstOperand.shape)}")
                     } else {
-                        if out.shape.len() != a.shape.len() or out.shape[d] != 1 {
-                            errs.push("{where}: sum_dim keeps the reduced axis at extent 1; result is {ir_shape_str(out.shape)}")
+                        if outputValue.shape.len() != firstOperand.shape.len() or outputValue.shape[axis] != 1 {
+                            errors.push("{where}: sum_dim keeps the reduced axis at extent 1; result is {irShapeString(outputValue.shape)}")
                         }
                     }
                 }
@@ -357,53 +357,53 @@ fn ir_verify(g: IrGraph) -> [str] {
             // specification's "valid pairings": a gate pairing is an index
             // list, and an out-of-range entry is the failure it is guarding
             // against.
-            if nd.op == OP_INDEX_SELECT {
-                if nd.ia.len() < 1 {
-                    errs.push("{where}: index_select has no axis attribute")
+            if node.op == operationIndexSelect {
+                if node.integerAttributes.len() < 1 {
+                    errors.push("{where}: index_select has no axis attribute")
                 } else {
-                    let d = nd.ia[0]
-                    if d < 0 or d >= a.shape.len() {
-                        errs.push("{where}: axis {d} is out of range for {ir_shape_str(a.shape)}")
+                    let axis = node.integerAttributes[0]
+                    if axis < 0 or axis >= firstOperand.shape.len() {
+                        errors.push("{where}: axis {axis} is out of range for {irShapeString(firstOperand.shape)}")
                     } else {
                         // ia is [dim, source extent, then the selection],
                         // so the indices start at 2. Starting at 1 would read
                         // the recorded extent as though it were a selection.
-                        var oob = 0
-                        for k in 2..nd.ia.len() {
-                            if nd.ia[k] < 0 or nd.ia[k] >= a.shape[d] { oob = oob + 1 }
+                        var outOfBoundsCount = 0
+                        for k in 2..node.integerAttributes.len() {
+                            if node.integerAttributes[k] < 0 or node.integerAttributes[k] >= firstOperand.shape[axis] { outOfBoundsCount = outOfBoundsCount + 1 }
                         }
-                        if nd.ia.len() >= 2 {
-                            if nd.ia[1] != a.shape[d] {
-                                errs.push("{where}: recorded source extent {nd.ia[1]} disagrees with the operand's {a.shape[d]} on axis {d}")
+                        if node.integerAttributes.len() >= 2 {
+                            if node.integerAttributes[1] != firstOperand.shape[axis] {
+                                errors.push("{where}: recorded source extent {node.integerAttributes[1]} disagrees with the operand's {firstOperand.shape[axis]} on axis {axis}")
                             }
                         }
-                        if oob > 0 {
-                            errs.push("{where}: {oob} selected indices are outside 0..{a.shape[d]} on axis {d}")
+                        if outOfBoundsCount > 0 {
+                            errors.push("{where}: {outOfBoundsCount} selected indices are outside 0..{firstOperand.shape[axis]} on axis {axis}")
                         }
                     }
                 }
             }
 
-            if nd.op == OP_RESHAPE {
-                if ir_numel(out.shape) != ir_numel(a.shape) {
-                    errs.push("{where}: reshape changes the element count, {ir_numel(a.shape)} to {ir_numel(out.shape)}")
+            if node.op == operationReshape {
+                if irElementCount(outputValue.shape) != irElementCount(firstOperand.shape) {
+                    errors.push("{where}: reshape changes the element count, {irElementCount(firstOperand.shape)} to {irElementCount(outputValue.shape)}")
                 }
             }
 
-            if nd.op == OP_EXPAND {
-                if not ir_broadcast_ok(out.shape, a.shape) {
-                    errs.push("{where}: cannot expand {ir_shape_str(a.shape)} to {ir_shape_str(out.shape)}")
+            if node.op == operationExpand {
+                if not irBroadcastCompatible(outputValue.shape, firstOperand.shape) {
+                    errors.push("{where}: cannot expand {irShapeString(firstOperand.shape)} to {irShapeString(outputValue.shape)}")
                 }
             }
 
-            if nd.op == OP_CONCAT {
-                if nd.b < 0 {
-                    errs.push("{where}: concat has no second operand")
+            if node.op == operationConcat {
+                if node.b < 0 {
+                    errors.push("{where}: concat has no second operand")
                 } else {
-                    let b = g.values[nd.b]
-                    if a.dt != b.dt { errs.push("{where}: concat operands differ in dtype") }
-                    if a.shape.len() != b.shape.len() {
-                        errs.push("{where}: concat operands differ in rank")
+                    let secondOperand = graph.values[node.b]
+                    if firstOperand.dtype != secondOperand.dtype { errors.push("{where}: concat operands differ in dtype") }
+                    if firstOperand.shape.len() != secondOperand.shape.len() {
+                        errors.push("{where}: concat operands differ in rank")
                     }
                 }
             }
@@ -415,26 +415,26 @@ fn ir_verify(g: IrGraph) -> [str] {
         // so this is a diagnostic about where it may run, not an error about
         // whether it is valid -- but it has to be visible before a backend
         // silently truncates something.
-        if out.shape.len() > 4 and nd.op != OP_LEAF {
-            errs.push("{where}: rank {out.shape.len()} exceeds the device kernels' limit of 4; this region must stay eager")
+        if outputValue.shape.len() > 4 and node.op != operationLeaf {
+            errors.push("{where}: rank {outputValue.shape.len()} exceeds the device kernels' limit of 4; this region must stay eager")
         }
-        if ir_numel(out.shape) > 2147483647 {
-            errs.push("{where}: {ir_numel(out.shape)} elements exceeds the 32-bit launch bound")
+        if irElementCount(outputValue.shape) > 2147483647 {
+            errors.push("{where}: {irElementCount(outputValue.shape)} elements exceeds the 32-bit launch bound")
         }
 
         // ---- transfer boundaries ----
-        if nd.a >= 0 {
-            if g.values[nd.a].device != out.device {
-                errs.push("{where}: operand a is on device {g.values[nd.a].device} but the result is on {out.device}, with no transfer between them")
+        if node.a >= 0 {
+            if graph.values[node.a].device != outputValue.device {
+                errors.push("{where}: operand a is on device {graph.values[node.a].device} but the result is on {outputValue.device}, with no transfer between them")
             }
         }
-        if nd.b >= 0 {
-            if g.values[nd.b].device != out.device {
-                errs.push("{where}: operand b is on device {g.values[nd.b].device} but the result is on {out.device}, with no transfer between them")
+        if node.b >= 0 {
+            if graph.values[node.b].device != outputValue.device {
+                errors.push("{where}: operand b is on device {graph.values[node.b].device} but the result is on {outputValue.device}, with no transfer between them")
             }
         }
     }
-    return errs
+    return errors
 }
 
 // ---------------------------------------------------------------------------
@@ -443,53 +443,53 @@ fn ir_verify(g: IrGraph) -> [str] {
 // Deterministic means: no addresses, no iteration over anything unordered, no
 // timings. Two captures of the same model must produce byte-identical text or
 // the golden test is worthless and the graph hash below is meaningless.
-fn ir_dump(g: IrGraph) -> str {
-    var s = "graph \{\n"
-    for i in 0..g.inputs.len() {
-        let v = g.values[g.inputs[i]]
-        s = s + "  %{v.id} = input : {ir_dtype_name(v.dt)}{ir_shape_str(v.shape)}\n"
+fn irDump(graph: IrGraph) -> str {
+    var text = "graph \{\n"
+    for i in 0..graph.inputs.len() {
+        let value = graph.values[graph.inputs[i]]
+        text = text + "  %{value.id} = input : {irDtypeName(value.dtype)}{irShapeString(value.shape)}\n"
     }
-    for i in 0..g.nodes.len() {
-        let nd = g.nodes[i]
-        let v = g.values[nd.out]
-        var line = "  %{nd.out} = {ir_op_name(nd.op)}"
-        if nd.a >= 0 { line = line + " %{nd.a}" }
-        if nd.b >= 0 { line = line + ", %{nd.b}" }
-        if nd.ia.len() > 0 {
+    for i in 0..graph.nodes.len() {
+        let node = graph.nodes[i]
+        let value = graph.values[node.out]
+        var line = "  %{node.out} = {irOperationName(node.op)}"
+        if node.a >= 0 { line = line + " %{node.a}" }
+        if node.b >= 0 { line = line + ", %{node.b}" }
+        if node.integerAttributes.len() > 0 {
             line = line + " \{"
-            for k in 0..nd.ia.len() {
+            for k in 0..node.integerAttributes.len() {
                 if k > 0 { line = line + "," }
-                line = line + "{nd.ia[k]}"
+                line = line + "{node.integerAttributes[k]}"
             }
             line = line + "\}"
         }
-        line = line + " : {ir_dtype_name(v.dt)}{ir_shape_str(v.shape)}"
-        if not v.contiguous { line = line + " strided" }
-        if nd.effects != EFF_NONE { line = line + " effects={nd.effects}" }
-        s = s + line + "\n"
+        line = line + " : {irDtypeName(value.dtype)}{irShapeString(value.shape)}"
+        if not value.contiguous { line = line + " strided" }
+        if node.effects != effectNone { line = line + " effects={node.effects}" }
+        text = text + line + "\n"
     }
-    s = s + "  return %{g.result}\n\}\n"
-    return s
+    text = text + "  return %{graph.result}\n\}\n"
+    return text
 }
 
 // A stable hash of the structure, dtypes and shapes -- deliberately NOT of
 // the data, because two steps of the same model differ in values and must hit
 // the same cache entry.
-fn ir_hash(g: IrGraph) -> int {
-    var h = 1469598103
-    for i in 0..g.nodes.len() {
-        let nd = g.nodes[i]
-        let v = g.values[nd.out]
-        h = (h * 31 + nd.op) % 2147483647
-        h = (h * 31 + nd.a + 2) % 2147483647
-        h = (h * 31 + nd.b + 2) % 2147483647
-        h = (h * 31 + nd.effects) % 2147483647
-        h = (h * 31 + (v.dt as int)) % 2147483647
-        for k in 0..v.shape.len() { h = (h * 31 + v.shape[k]) % 2147483647 }
-        for k in 0..nd.ia.len() { h = (h * 31 + nd.ia[k]) % 2147483647 }
+fn irHash(graph: IrGraph) -> int {
+    var hash = 1469598103
+    for i in 0..graph.nodes.len() {
+        let node = graph.nodes[i]
+        let value = graph.values[node.out]
+        hash = (hash * 31 + node.op) % 2147483647
+        hash = (hash * 31 + node.a + 2) % 2147483647
+        hash = (hash * 31 + node.b + 2) % 2147483647
+        hash = (hash * 31 + node.effects) % 2147483647
+        hash = (hash * 31 + (value.dtype as int)) % 2147483647
+        for k in 0..value.shape.len() { hash = (hash * 31 + value.shape[k]) % 2147483647 }
+        for k in 0..node.integerAttributes.len() { hash = (hash * 31 + node.integerAttributes[k]) % 2147483647 }
     }
-    h = (h * 31 + g.result) % 2147483647
-    return h
+    hash = (hash * 31 + graph.result) % 2147483647
+    return hash
 }
 
 // ---------------------------------------------------------------------------
@@ -505,71 +505,71 @@ fn ir_hash(g: IrGraph) -> int {
 // silently skipped an op would agree with eager on every graph that did not
 // use that op -- which is precisely the set of graphs where the skip does not
 // matter, so the test would pass exactly when it was useless.
-fn ir_replay(g: IrGraph, inputs: [Tensor]) -> Tensor {
-    if inputs.len() != g.inputs.len() {
-        panic("ir_replay: graph takes {g.inputs.len()} inputs, got {inputs.len()}")
+fn irReplay(graph: IrGraph, inputs: [Tensor]) -> Tensor {
+    if inputs.len() != graph.inputs.len() {
+        panic("irReplay: graph takes {graph.inputs.len()} inputs, got {inputs.len()}")
     }
-    var vals: [Tensor] = []
-    let placeholder = t_zeros(DType.F64, [1])
-    for i in 0..g.values.len() { vals.push(placeholder) }
-    for i in 0..g.inputs.len() { vals[g.inputs[i]] = inputs[i] }
+    var values: [Tensor] = []
+    let placeholder = tensorZeros(DType.F64, [1])
+    for i in 0..graph.values.len() { values.push(placeholder) }
+    for i in 0..graph.inputs.len() { values[graph.inputs[i]] = inputs[i] }
 
-    for i in 0..g.nodes.len() {
-        let nd = g.nodes[i]
-        let ov = g.values[nd.out]
+    for i in 0..graph.nodes.len() {
+        let node = graph.nodes[i]
+        let outputValue = graph.values[node.out]
         var x = placeholder
         var y = placeholder
-        if nd.a >= 0 { x = vals[nd.a] }
-        if nd.b >= 0 { y = vals[nd.b] }
-        var r = placeholder
+        if node.a >= 0 { x = values[node.a] }
+        if node.b >= 0 { y = values[node.b] }
+        var result = placeholder
         var done = true
 
-        if nd.op == OP_ADD { r = t_add(x, y) }
-        if nd.op == OP_SUB { r = t_sub(x, y) }
-        if nd.op == OP_MUL { r = t_mul(x, y) }
-        if nd.op == OP_DIV { r = t_div(x, y) }
-        if nd.op == OP_NEG { r = t_neg(x) }
-        if nd.op == OP_MATMUL { r = t_matmul(x, y) }
-        if nd.op == OP_TANH { r = t_tanh(x) }
-        if nd.op == OP_COS { r = t_cos(x) }
-        if nd.op == OP_SIN { r = t_sin(x) }
-        if nd.op == OP_LN { r = t_ln(x) }
-        if nd.op == OP_EXP { r = t_exp(x) }
-        if nd.op == OP_ABS2 { r = t_abs2(x) }
-        if nd.op == OP_CONJ { r = t_conj(x) }
-        if nd.op == OP_REAL { r = t_real(x) }
-        if nd.op == OP_IMAG { r = t_imag(x) }
-        if nd.op == OP_EXPI { r = t_expi(x, ov.dt) }
-        if nd.op == OP_COMPLEX { r = t_complex(x, y, ov.dt) }
-        if nd.op == OP_SUM_DIM { r = t_sum_dim(x, nd.ia[0]) }
+        if node.op == operationAdd { result = tensorAdd(x, y) }
+        if node.op == operationSubtract { result = tensorSubtract(x, y) }
+        if node.op == operationMultiply { result = tensorMultiply(x, y) }
+        if node.op == operationDivide { result = tensorDivide(x, y) }
+        if node.op == operationNegate { result = tensorNegate(x) }
+        if node.op == operationMatmul { result = tensorMatmul(x, y) }
+        if node.op == operationTanh { result = tensorTanh(x) }
+        if node.op == operationCos { result = tensorCos(x) }
+        if node.op == operationSin { result = tensorSin(x) }
+        if node.op == operationLn { result = tensorLn(x) }
+        if node.op == operationExp { result = tensorExp(x) }
+        if node.op == operationAbs2 { result = tensorAbs2(x) }
+        if node.op == operationConjugate { result = tensorConjugate(x) }
+        if node.op == operationReal { result = tensorReal(x) }
+        if node.op == operationImaginary { result = tensorImaginary(x) }
+        if node.op == operationExpImaginary { result = tensorExpImaginary(x, outputValue.dtype) }
+        if node.op == operationComplex { result = tensorComplex(x, y, outputValue.dtype) }
+        if node.op == operationSumDimension { result = tensorSumDimension(x, node.integerAttributes[0]) }
         // sum_all and mean_all reduce to a one-element tensor rather than a
         // scalar, exactly as the tape does, so the graph stays all-tensor.
-        if nd.op == OP_SUM_ALL { r = t_sum_to_one(x) }
-        if nd.op == OP_MEAN_ALL { r = t_div(t_sum_to_one(x), t_full(x.dt, [1], t_numel(x) as float)) }
-        if nd.op == OP_CONCAT { r = t_concat(x, y, nd.ia[0]) }
-        if nd.op == OP_ROLL { r = t_roll(x, nd.ia[0], nd.ia[1]) }
-        if nd.op == OP_TRANSPOSE { r = t_copy(t_transpose(x, nd.ia[0], nd.ia[1])) }
-        if nd.op == OP_RESHAPE { r = t_reshape(t_copy(x), ov.shape) }
-        if nd.op == OP_EXPAND { r = t_copy(t_expand(x, ov.shape)) }
-        if nd.op == OP_SLICE { r = t_copy(t_slice(x, nd.ia[0], nd.ia[1], nd.ia[2])) }
-        if nd.op == OP_CAST { r = t_cast(x, ov.dt) }
-        if nd.op == OP_INDEX_SELECT {
-            var sel: [int] = []
-            for k in 2..nd.ia.len() { sel.push(nd.ia[k]) }
-            r = t_index_select(x, nd.ia[0], sel)
+        if node.op == operationSumAll { result = tensorSumToOne(x) }
+        if node.op == operationMeanAll { result = tensorDivide(tensorSumToOne(x), tensorFull(x.dtype, [1], tensorElementCount(x) as float)) }
+        if node.op == operationConcat { result = tensorConcat(x, y, node.integerAttributes[0]) }
+        if node.op == operationRoll { result = tensorRoll(x, node.integerAttributes[0], node.integerAttributes[1]) }
+        if node.op == operationTranspose { result = tensorCopy(tensorTranspose(x, node.integerAttributes[0], node.integerAttributes[1])) }
+        if node.op == operationReshape { result = tensorReshape(tensorCopy(x), outputValue.shape) }
+        if node.op == operationExpand { result = tensorCopy(tensorExpand(x, outputValue.shape)) }
+        if node.op == operationSlice { result = tensorCopy(tensorSlice(x, node.integerAttributes[0], node.integerAttributes[1], node.integerAttributes[2])) }
+        if node.op == operationCast { result = tensorCast(x, outputValue.dtype) }
+        if node.op == operationIndexSelect {
+            var indices: [int] = []
+            for k in 2..node.integerAttributes.len() { indices.push(node.integerAttributes[k]) }
+            result = tensorIndexSelect(x, node.integerAttributes[0], indices)
         }
-        if nd.op == OP_GIVENS { r = t_givens(x, y, nd.ia[0]) }
-        if nd.op == OP_BIAS_TANH { r = t_bias_tanh(x, y) }
-        if nd.op == OP_LEAF { done = false }
-        if nd.op > OP_BIAS_TANH { done = false }
-        if nd.op < 0 { done = false }
+        if node.op == operationGivens { result = tensorGivens(x, y, node.integerAttributes[0]) }
+        if node.op == operationBiasTanh { result = tensorBiasTanh(x, y) }
+        if node.op == operationLeaf { done = false }
+        if node.op > operationBiasTanh { done = false }
+        if node.op < 0 { done = false }
 
         if not done {
-            panic("ir_replay: no rule for {ir_op_name(nd.op)} (opcode {nd.op}) at tape node {nd.span}. Add one rather than letting replay diverge silently.")
+            panic("irReplay: no rule for {irOperationName(node.op)} (opcode {node.op}) at tape node {node.span}. Add one rather than letting replay diverge silently.")
         }
-        vals[nd.out] = r
+        values[node.out] = result
     }
-    return vals[g.result]
+    return values[graph.result]
 }
 
 // ---------------------------------------------------------------------------
@@ -580,33 +580,33 @@ fn ir_replay(g: IrGraph, inputs: [Tensor]) -> Tensor {
 // run a mismatched specialization" -- so a guard records what was assumed and
 // a miss falls back to eager rather than to recompile-and-hope.
 struct IrGuard {
-    dts: [DType],
+    dtypes: [DType],
     shapes: [[int]],
 }
 
-fn ir_guard_make(g: IrGraph) -> IrGuard {
-    var dts: [DType] = []
+fn irGuardMake(graph: IrGraph) -> IrGuard {
+    var dtypes: [DType] = []
     var shapes: [[int]] = []
-    for i in 0..g.inputs.len() {
-        let v = g.values[g.inputs[i]]
-        dts.push(v.dt)
-        shapes.push(v.shape)
+    for i in 0..graph.inputs.len() {
+        let value = graph.values[graph.inputs[i]]
+        dtypes.push(value.dtype)
+        shapes.push(value.shape)
     }
-    return IrGuard{ dts: dts, shapes: shapes }
+    return IrGuard{ dtypes: dtypes, shapes: shapes }
 }
 
 // Returns "" on a hit, or the reason for the miss. A boolean would be cheaper
 // and would make the diagnostic the specification asks for impossible.
-fn ir_guard_check(gu: IrGuard, inputs: [Tensor]) -> str {
-    if inputs.len() != gu.dts.len() {
-        return "guard miss: specialised for {gu.dts.len()} inputs, called with {inputs.len()}"
+fn irGuardCheck(guard: IrGuard, inputs: [Tensor]) -> str {
+    if inputs.len() != guard.dtypes.len() {
+        return "guard miss: specialised for {guard.dtypes.len()} inputs, called with {inputs.len()}"
     }
     for i in 0..inputs.len() {
-        if inputs[i].dt != gu.dts[i] {
-            return "guard miss: input {i} has dtype {ir_dtype_name(inputs[i].dt)}, specialised for {ir_dtype_name(gu.dts[i])}"
+        if inputs[i].dtype != guard.dtypes[i] {
+            return "guard miss: input {i} has dtype {irDtypeName(inputs[i].dtype)}, specialised for {irDtypeName(guard.dtypes[i])}"
         }
-        if not ir_same_shape(inputs[i].shape, gu.shapes[i]) {
-            return "guard miss: input {i} has shape {ir_shape_str(inputs[i].shape)}, specialised for {ir_shape_str(gu.shapes[i])}"
+        if not irSameShape(inputs[i].shape, guard.shapes[i]) {
+            return "guard miss: input {i} has shape {irShapeString(inputs[i].shape)}, specialised for {irShapeString(guard.shapes[i])}"
         }
     }
     return ""
@@ -621,8 +621,8 @@ fn ir_guard_check(gu: IrGuard, inputs: [Tensor]) -> str {
 // of correctness, so the key is built from explicit named fields rather than
 // from whatever happened to be in scope, and the test changes each in turn.
 struct IrCacheKey {
-    graph_hash: int,
-    guard_hash: int,
+    graphHash: int,
+    guardHash: int,
     abi: str,
     backend: str,
     device: str,
@@ -631,18 +631,18 @@ struct IrCacheKey {
     layout: str,
 }
 
-fn ir_guard_hash(gu: IrGuard) -> int {
-    var h = 2166136261
-    for i in 0..gu.dts.len() {
-        h = (h * 31 + (gu.dts[i] as int)) % 2147483647
-        for k in 0..gu.shapes[i].len() { h = (h * 31 + gu.shapes[i][k]) % 2147483647 }
-        h = (h * 31 + 7) % 2147483647      // separator, so [2,3] and [2],[3] differ
+fn irGuardHash(guard: IrGuard) -> int {
+    var hash = 2166136261
+    for i in 0..guard.dtypes.len() {
+        hash = (hash * 31 + (guard.dtypes[i] as int)) % 2147483647
+        for k in 0..guard.shapes[i].len() { hash = (hash * 31 + guard.shapes[i][k]) % 2147483647 }
+        hash = (hash * 31 + 7) % 2147483647      // separator, so [2,3] and [2],[3] differ
     }
-    return h
+    return hash
 }
 
-fn ir_key_str(k: IrCacheKey) -> str {
-    return "g{k.graph_hash}/u{k.guard_hash}/abi={k.abi}/be={k.backend}/dev={k.device}/drv={k.driver}/num={k.numeric}/lay={k.layout}"
+fn irKeyString(key: IrCacheKey) -> str {
+    return "g{key.graphHash}/u{key.guardHash}/abi={key.abi}/be={key.backend}/dev={key.device}/drv={key.driver}/num={key.numeric}/lay={key.layout}"
 }
 
 struct IrCache {
@@ -654,59 +654,59 @@ struct IrCache {
     evictions: int,
 }
 
-fn ir_cache_new() -> IrCache {
-    var k: [str] = []
-    var g: [IrGraph] = []
-    var u: [IrGuard] = []
-    return IrCache{ keys: k, graphs: g, guards: u, hits: 0, misses: 0, evictions: 0 }
+fn newIrCache() -> IrCache {
+    var emptyKeys: [str] = []
+    var emptyGraphs: [IrGraph] = []
+    var emptyGuards: [IrGuard] = []
+    return IrCache{ keys: emptyKeys, graphs: emptyGraphs, guards: emptyGuards, hits: 0, misses: 0, evictions: 0 }
 }
 
-fn ir_cache_find(c: IrCache, key: IrCacheKey) -> int {
-    let s = ir_key_str(key)
-    for i in 0..c.keys.len() {
-        if c.keys[i] == s { return i }
+fn irCacheFind(cache: IrCache, key: IrCacheKey) -> int {
+    let keyText = irKeyString(key)
+    for i in 0..cache.keys.len() {
+        if cache.keys[i] == keyText { return i }
     }
     return 0 - 1
 }
 
-fn ir_cache_get(c: IrCache, key: IrCacheKey) -> int {
-    let i = ir_cache_find(c, key)
-    if i >= 0 { c.hits = c.hits + 1 } else { c.misses = c.misses + 1 }
-    return i
+fn irCacheGet(cache: IrCache, key: IrCacheKey) -> int {
+    let entryIndex = irCacheFind(cache, key)
+    if entryIndex >= 0 { cache.hits = cache.hits + 1 } else { cache.misses = cache.misses + 1 }
+    return entryIndex
 }
 
-fn ir_cache_put(c: IrCache, key: IrCacheKey, g: IrGraph, gu: IrGuard) {
-    let i = ir_cache_find(c, key)
-    if i >= 0 {
-        c.graphs[i] = g
-        c.guards[i] = gu
+fn irCachePut(cache: IrCache, key: IrCacheKey, graph: IrGraph, guard: IrGuard) {
+    let entryIndex = irCacheFind(cache, key)
+    if entryIndex >= 0 {
+        cache.graphs[entryIndex] = graph
+        cache.guards[entryIndex] = guard
         return
     }
-    c.keys.push(ir_key_str(key))
-    c.graphs.push(g)
-    c.guards.push(gu)
+    cache.keys.push(irKeyString(key))
+    cache.graphs.push(graph)
+    cache.guards.push(guard)
 }
 
 // Drop every entry whose key mentions something that has changed underneath
 // us -- a driver or toolchain version, say -- where keeping the entry would
 // mean running a binary built for a different thing.
-fn ir_cache_invalidate(c: IrCache, substring: str) -> int {
+fn irCacheInvalidate(cache: IrCache, substring: str) -> int {
     var keys: [str] = []
     var graphs: [IrGraph] = []
     var guards: [IrGuard] = []
     var dropped = 0
-    for i in 0..c.keys.len() {
-        if c.keys[i].contains(substring) {
+    for i in 0..cache.keys.len() {
+        if cache.keys[i].contains(substring) {
             dropped = dropped + 1
         } else {
-            keys.push(c.keys[i])
-            graphs.push(c.graphs[i])
-            guards.push(c.guards[i])
+            keys.push(cache.keys[i])
+            graphs.push(cache.graphs[i])
+            guards.push(cache.guards[i])
         }
     }
-    c.keys = keys
-    c.graphs = graphs
-    c.guards = guards
-    c.evictions = c.evictions + dropped
+    cache.keys = keys
+    cache.graphs = graphs
+    cache.guards = guards
+    cache.evictions = cache.evictions + dropped
     return dropped
 }

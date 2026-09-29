@@ -16,41 +16,41 @@
 // independent real coordinates; nothing here assumes holomorphicity.
 import "ml/ops.zeph"
 
-let OP_LEAF = 0
-let OP_ADD = 1
-let OP_SUB = 2
-let OP_MUL = 3
-let OP_DIV = 4
-let OP_NEG = 5
-let OP_MATMUL = 6
-let OP_TANH = 7
-let OP_SUM_DIM = 8
-let OP_SUM_ALL = 9
-let OP_MEAN_ALL = 10
-let OP_ABS2 = 11
-let OP_CONJ = 12
-let OP_REAL = 13
-let OP_IMAG = 14
-let OP_EXPI = 15
-let OP_COMPLEX = 16
-let OP_CONCAT = 17
-let OP_INDEX_SELECT = 18
-let OP_ROLL = 19
-let OP_TRANSPOSE = 20
-let OP_RESHAPE = 21
-let OP_SLICE = 22
-let OP_CAST = 23
-let OP_EXPAND = 24
-let OP_COS = 25
-let OP_SIN = 26
-let OP_LN = 27
-let OP_EXP = 28
+let operationLeaf = 0
+let operationAdd = 1
+let operationSubtract = 2
+let operationMultiply = 3
+let operationDivide = 4
+let operationNegate = 5
+let operationMatmul = 6
+let operationTanh = 7
+let operationSumDimension = 8
+let operationSumAll = 9
+let operationMeanAll = 10
+let operationAbs2 = 11
+let operationConjugate = 12
+let operationReal = 13
+let operationImaginary = 14
+let operationExpImaginary = 15
+let operationComplex = 16
+let operationConcat = 17
+let operationIndexSelect = 18
+let operationRoll = 19
+let operationTranspose = 20
+let operationReshape = 21
+let operationSlice = 22
+let operationCast = 23
+let operationExpand = 24
+let operationCos = 25
+let operationSin = 26
+let operationLn = 27
+let operationExp = 28
 
 // The fused Givens stage (A25). A fusion is a new opcode, not a rewrite of
 // the old ones: the composed form stays reachable so the two can be compared,
 // which is the whole content of the acceptance check.
-let OP_GIVENS = 29
-let OP_BIAS_TANH = 30
+let operationGivens = 29
+let operationBiasTanh = 30
 
 // A node's inputs are variable handles, never tensors: a handle cannot go
 // stale and cannot alias, and the graph stays a plain integer DAG.
@@ -59,577 +59,577 @@ struct ANode {
     a: int,
     b: int,
     saved: [Saved],
-    ia: [int],
-    fa: [float],
+    integerAttributes: [int],
+    floatAttributes: [float],
 }
 
 struct AVar {
     v: Tensor,
     g: Tensor,
-    has_g: bool,
+    hasGradient: bool,
     node: int,
-    req: bool,
+    requiresGradient: bool,
 }
 
-var A_VARS: [AVar] = []
-var A_NODES: [ANode] = []
-var A_RECORD = true
-var A_CONSUMED = false
+var tapeVariables: [AVar] = []
+var tapeNodes: [ANode] = []
+var tapeRecording = true
+var tapeConsumed = false
 
 // ---- tape lifetime ---------------------------------------------------------
 // A07: the tape must not grow without bound across training steps, so it is
-// explicitly reset rather than trimmed heuristically. av_nodes() is exported
+// explicitly reset rather than trimmed heuristically. autogradNodeCount() is exported
 // so a test can assert the count returns to its baseline.
 
-fn av_reset() {
-    let no_vars: [AVar] = []
-    let no_nodes: [ANode] = []
-    A_VARS = no_vars
-    A_NODES = no_nodes
-    A_RECORD = true
-    A_CONSUMED = false
+fn autogradReset() {
+    let noVariables: [AVar] = []
+    let noNodes: [ANode] = []
+    tapeVariables = noVariables
+    tapeNodes = noNodes
+    tapeRecording = true
+    tapeConsumed = false
 }
 
-fn av_nodes() -> int { return A_NODES.len() }
-fn av_vars() -> int { return A_VARS.len() }
-fn av_consumed() -> bool { return A_CONSUMED }
+fn autogradNodeCount() -> int { return tapeNodes.len() }
+fn autogradVariableCount() -> int { return tapeVariables.len() }
+fn autogradIsConsumed() -> bool { return tapeConsumed }
 
-fn av_no_grad(on: bool) { A_RECORD = not on }
-fn av_recording() -> bool { return A_RECORD }
+fn autogradNoGradient(enabled: bool) { tapeRecording = not enabled }
+fn autogradIsRecording() -> bool { return tapeRecording }
 
 // ---- variables -------------------------------------------------------------
 
-fn av_leaf(t: Tensor, req: bool) -> int {
-    A_VARS.push(AVar{v: t, g: t, has_g: false, node: 0 - 1, req: req})
-    return A_VARS.len() - 1
+fn autogradLeaf(tensor: Tensor, requiresGradient: bool) -> int {
+    tapeVariables.push(AVar{v: tensor, g: tensor, hasGradient: false, node: 0 - 1, requiresGradient: requiresGradient})
+    return tapeVariables.len() - 1
 }
 
-fn av_const(t: Tensor) -> int { return av_leaf(t, false) }
+fn autogradConstant(tensor: Tensor) -> int { return autogradLeaf(tensor, false) }
 
-fn av_value(id: int) -> Tensor {
-    if id < 0 or id >= A_VARS.len() { panic("autograd: bad variable handle") }
-    return A_VARS[id].v
+fn autogradValue(handle: int) -> Tensor {
+    if handle < 0 or handle >= tapeVariables.len() { panic("autograd: bad variable handle") }
+    return tapeVariables[handle].v
 }
 
-fn av_requires(id: int) -> bool { return A_VARS[id].req }
+fn autogradRequiresGradient(handle: int) -> bool { return tapeVariables[handle].requiresGradient }
 
-fn av_has_grad(id: int) -> bool { return A_VARS[id].has_g }
+fn autogradHasGradient(handle: int) -> bool { return tapeVariables[handle].hasGradient }
 
-fn av_grad(id: int) -> Tensor {
-    if id < 0 or id >= A_VARS.len() { panic("autograd: bad variable handle") }
-    if not A_VARS[id].has_g { panic("autograd: no gradient for this variable") }
-    return A_VARS[id].g
+fn autogradGradient(handle: int) -> Tensor {
+    if handle < 0 or handle >= tapeVariables.len() { panic("autograd: bad variable handle") }
+    if not tapeVariables[handle].hasGradient { panic("autograd: no gradient for this variable") }
+    return tapeVariables[handle].g
 }
 
 // detach yields a fresh leaf that shares the value but carries no history, so
 // a gradient can never flow back through it.
-fn av_detach(id: int) -> int { return av_leaf(av_value(id), false) }
+fn autogradDetach(handle: int) -> int { return autogradLeaf(autogradValue(handle), false) }
 
 // ---- recording -------------------------------------------------------------
 
-fn any_req(a: int, b: int) -> bool {
-    var r = false
-    if a >= 0 and A_VARS[a].req { r = true }
-    if b >= 0 and A_VARS[b].req { r = true }
-    return r
+fn anyRequiresGradient(firstOperand: int, secondOperand: int) -> bool {
+    var anyRequires = false
+    if firstOperand >= 0 and tapeVariables[firstOperand].requiresGradient { anyRequires = true }
+    if secondOperand >= 0 and tapeVariables[secondOperand].requiresGradient { anyRequires = true }
+    return anyRequires
 }
 
-fn record(out: Tensor, op: int, a: int, b: int, saved: [Saved], ia: [int], fa: [float]) -> int {
-    let live = A_RECORD and any_req(a, b)
-    if not live { return av_leaf(out, false) }
-    A_NODES.push(ANode{op: op, a: a, b: b, saved: saved, ia: ia, fa: fa})
-    A_VARS.push(AVar{v: out, g: out, has_g: false, node: A_NODES.len() - 1, req: true})
-    return A_VARS.len() - 1
+fn record(output: Tensor, operation: int, firstOperand: int, secondOperand: int, saved: [Saved], integerAttributes: [int], floatAttributes: [float]) -> int {
+    let live = tapeRecording and anyRequiresGradient(firstOperand, secondOperand)
+    if not live { return autogradLeaf(output, false) }
+    tapeNodes.push(ANode{op: operation, a: firstOperand, b: secondOperand, saved: saved, integerAttributes: integerAttributes, floatAttributes: floatAttributes})
+    tapeVariables.push(AVar{v: output, g: output, hasGradient: false, node: tapeNodes.len() - 1, requiresGradient: true})
+    return tapeVariables.len() - 1
 }
 
 // ---- gradient plumbing -----------------------------------------------------
 
-fn zeros_like(t: Tensor) -> Tensor { return t_zeros(t.dt, t.shape) }
+fn zerosLike(tensor: Tensor) -> Tensor { return tensorZeros(tensor.dtype, tensor.shape) }
 
-fn accumulate(id: int, g: Tensor) {
-    if id < 0 { return }
-    if not A_VARS[id].req { return }
-    if A_VARS[id].has_g {
-        A_VARS[id].g = t_add(A_VARS[id].g, g)
+fn accumulate(handle: int, gradient: Tensor) {
+    if handle < 0 { return }
+    if not tapeVariables[handle].requiresGradient { return }
+    if tapeVariables[handle].hasGradient {
+        tapeVariables[handle].g = tensorAdd(tapeVariables[handle].g, gradient)
     } else {
-        A_VARS[id].g = g
-        A_VARS[id].has_g = true
+        tapeVariables[handle].g = gradient
+        tapeVariables[handle].hasGradient = true
     }
 }
 
 // A broadcast forward must be summed back down in reverse, or a shared
 // parameter silently receives one contribution instead of all of them.
-fn reduce_to(g: Tensor, shape: [int]) -> Tensor {
-    if shapes_equal(g.shape, shape) { return g }
-    var out = g
+fn reduceToShape(gradient: Tensor, shape: [int]) -> Tensor {
+    if shapesEqual(gradient.shape, shape) { return gradient }
+    var reduced = gradient
     // leading axes the input does not have at all
-    while out.shape.len() > shape.len() {
-        let summed = t_sum_dim(out, 0)
+    while reduced.shape.len() > shape.len() {
+        let summed = tensorSumDimension(reduced, 0)
         var rest: [int] = []
         for i in 1..summed.shape.len() { rest.push(summed.shape[i]) }
-        out = t_reshape(t_copy(summed), rest)
+        reduced = tensorReshape(tensorCopy(summed), rest)
     }
     for i in 0..shape.len() {
-        if out.shape[i] != shape[i] {
+        if reduced.shape[i] != shape[i] {
             if shape[i] != 1 { panic("autograd: cannot reduce gradient to the input shape") }
-            out = t_sum_dim(out, i)
+            reduced = tensorSumDimension(reduced, i)
         }
     }
-    if not shapes_equal(out.shape, shape) { panic("autograd: reduced gradient has the wrong shape") }
-    return out
+    if not shapesEqual(reduced.shape, shape) { panic("autograd: reduced gradient has the wrong shape") }
+    return reduced
 }
 
 // ---- differentiable operations --------------------------------------------
 
-fn av_add(x: int, y: int) -> int {
-    let out = t_add(av_value(x), av_value(y))
-    return record(out, OP_ADD, x, y, [], [], [])
+fn autogradAdd(x: int, y: int) -> int {
+    let output = tensorAdd(autogradValue(x), autogradValue(y))
+    return record(output, operationAdd, x, y, [], [], [])
 }
 
-fn av_sub(x: int, y: int) -> int {
-    let out = t_sub(av_value(x), av_value(y))
-    return record(out, OP_SUB, x, y, [], [], [])
+fn autogradSubtract(x: int, y: int) -> int {
+    let output = tensorSubtract(autogradValue(x), autogradValue(y))
+    return record(output, operationSubtract, x, y, [], [], [])
 }
 
-fn av_mul(x: int, y: int) -> int {
-    let out = t_mul(av_value(x), av_value(y))
-    return record(out, OP_MUL, x, y, [t_save(av_value(x)), t_save(av_value(y))], [], [])
+fn autogradMultiply(x: int, y: int) -> int {
+    let output = tensorMultiply(autogradValue(x), autogradValue(y))
+    return record(output, operationMultiply, x, y, [tensorSave(autogradValue(x)), tensorSave(autogradValue(y))], [], [])
 }
 
-fn av_div(x: int, y: int) -> int {
-    let out = t_div(av_value(x), av_value(y))
-    return record(out, OP_DIV, x, y, [t_save(av_value(y)), t_save(out)], [], [])
+fn autogradDivide(x: int, y: int) -> int {
+    let output = tensorDivide(autogradValue(x), autogradValue(y))
+    return record(output, operationDivide, x, y, [tensorSave(autogradValue(y)), tensorSave(output)], [], [])
 }
 
-fn av_neg(x: int) -> int {
-    return record(t_neg(av_value(x)), OP_NEG, x, 0 - 1, [], [], [])
+fn autogradNegate(x: int) -> int {
+    return record(tensorNegate(autogradValue(x)), operationNegate, x, 0 - 1, [], [], [])
 }
 
-fn av_matmul(x: int, y: int) -> int {
-    let out = t_matmul(av_value(x), av_value(y))
-    return record(out, OP_MATMUL, x, y, [t_save(av_value(x)), t_save(av_value(y))], [], [])
+fn autogradMatmul(x: int, y: int) -> int {
+    let output = tensorMatmul(autogradValue(x), autogradValue(y))
+    return record(output, operationMatmul, x, y, [tensorSave(autogradValue(x)), tensorSave(autogradValue(y))], [], [])
 }
 
-fn av_tanh(x: int) -> int {
-    let out = t_tanh(av_value(x))
-    return record(out, OP_TANH, x, 0 - 1, [t_save(out)], [], [])
+fn autogradTanh(x: int) -> int {
+    let output = tensorTanh(autogradValue(x))
+    return record(output, operationTanh, x, 0 - 1, [tensorSave(output)], [], [])
 }
 
 // cos and sin keep their own input rather than their output, because each
 // one's derivative is the other function, not an expression in its own value.
-fn av_cos(x: int) -> int {
-    let out = t_cos(av_value(x))
-    return record(out, OP_COS, x, 0 - 1, [t_save(av_value(x))], [], [])
+fn autogradCos(x: int) -> int {
+    let output = tensorCos(autogradValue(x))
+    return record(output, operationCos, x, 0 - 1, [tensorSave(autogradValue(x))], [], [])
 }
 
-fn av_sin(x: int) -> int {
-    let out = t_sin(av_value(x))
-    return record(out, OP_SIN, x, 0 - 1, [t_save(av_value(x))], [], [])
+fn autogradSin(x: int) -> int {
+    let output = tensorSin(autogradValue(x))
+    return record(output, operationSin, x, 0 - 1, [tensorSave(autogradValue(x))], [], [])
 }
 
-fn av_ln(x: int) -> int {
-    let out = t_ln(av_value(x))
-    return record(out, OP_LN, x, 0 - 1, [t_save(av_value(x))], [], [])
+fn autogradLn(x: int) -> int {
+    let output = tensorLn(autogradValue(x))
+    return record(output, operationLn, x, 0 - 1, [tensorSave(autogradValue(x))], [], [])
 }
 
-fn av_exp(x: int) -> int {
-    let out = t_exp(av_value(x))
-    return record(out, OP_EXP, x, 0 - 1, [t_save(out)], [], [])
+fn autogradExp(x: int) -> int {
+    let output = tensorExp(autogradValue(x))
+    return record(output, operationExp, x, 0 - 1, [tensorSave(output)], [], [])
 }
 
-fn av_sum_dim(x: int, dim: int) -> int {
-    let out = t_sum_dim(av_value(x), dim)
-    return record(out, OP_SUM_DIM, x, 0 - 1, [], [dim], [])
+fn autogradSumDimension(x: int, dimension: int) -> int {
+    let output = tensorSumDimension(autogradValue(x), dimension)
+    return record(output, operationSumDimension, x, 0 - 1, [], [dimension], [])
 }
 
 // Sums every element into a rank-1 single-element tensor, so a loss stays a
 // tensor and needs no separate scalar path through the tape.
-fn t_sum_to_one(t: Tensor) -> Tensor {
-    let out = t_zeros(t.dt, [1])
-    if dtype_is_complex(t.dt) {
-        t_set_c(out, [0], t_sum_all_re(t), t_sum_all_im(t))
+fn tensorSumToOne(tensor: Tensor) -> Tensor {
+    let result = tensorZeros(tensor.dtype, [1])
+    if dtypeIsComplex(tensor.dtype) {
+        tensorSetComplex(result, [0], tensorSumAllReal(tensor), tensorSumAllImaginary(tensor))
     } else {
-        t_set(out, [0], t_sum_all(t))
+        tensorSet(result, [0], tensorSumAll(tensor))
     }
-    return out
+    return result
 }
 
-fn av_sum_all(x: int) -> int {
-    let out = t_sum_to_one(av_value(x))
-    var sh: [int] = []
-    for i in 0..av_value(x).shape.len() { sh.push(av_value(x).shape[i]) }
-    return record(out, OP_SUM_ALL, x, 0 - 1, [], sh, [])
+fn autogradSumAll(x: int) -> int {
+    let output = tensorSumToOne(autogradValue(x))
+    var inputShape: [int] = []
+    for i in 0..autogradValue(x).shape.len() { inputShape.push(autogradValue(x).shape[i]) }
+    return record(output, operationSumAll, x, 0 - 1, [], inputShape, [])
 }
 
-fn av_mean_all(x: int) -> int {
-    let n = t_numel(av_value(x))
-    if n == 0 { panic("autograd: mean of an empty tensor") }
-    let out = t_div(t_sum_to_one(av_value(x)), t_full(av_value(x).dt, [1], n as float))
-    var sh: [int] = []
-    for i in 0..av_value(x).shape.len() { sh.push(av_value(x).shape[i]) }
-    return record(out, OP_MEAN_ALL, x, 0 - 1, [], sh, [])
+fn autogradMeanAll(x: int) -> int {
+    let elementCount = tensorElementCount(autogradValue(x))
+    if elementCount == 0 { panic("autograd: mean of an empty tensor") }
+    let output = tensorDivide(tensorSumToOne(autogradValue(x)), tensorFull(autogradValue(x).dtype, [1], elementCount as float))
+    var inputShape: [int] = []
+    for i in 0..autogradValue(x).shape.len() { inputShape.push(autogradValue(x).shape[i]) }
+    return record(output, operationMeanAll, x, 0 - 1, [], inputShape, [])
 }
 
-fn av_abs2(x: int) -> int {
-    let out = t_abs2(av_value(x))
-    return record(out, OP_ABS2, x, 0 - 1, [t_save(av_value(x))], [], [])
+fn autogradAbs2(x: int) -> int {
+    let output = tensorAbs2(autogradValue(x))
+    return record(output, operationAbs2, x, 0 - 1, [tensorSave(autogradValue(x))], [], [])
 }
 
-fn av_conj(x: int) -> int {
-    return record(t_conj(av_value(x)), OP_CONJ, x, 0 - 1, [], [], [])
+fn autogradConjugate(x: int) -> int {
+    return record(tensorConjugate(autogradValue(x)), operationConjugate, x, 0 - 1, [], [], [])
 }
 
-fn av_real(x: int) -> int {
-    return record(t_real(av_value(x)), OP_REAL, x, 0 - 1, [], [dtype_size(av_value(x).dt)], [])
+fn autogradReal(x: int) -> int {
+    return record(tensorReal(autogradValue(x)), operationReal, x, 0 - 1, [], [dtypeSize(autogradValue(x).dtype)], [])
 }
 
-fn av_imag(x: int) -> int {
-    return record(t_imag(av_value(x)), OP_IMAG, x, 0 - 1, [], [dtype_size(av_value(x).dt)], [])
+fn autogradImaginary(x: int) -> int {
+    return record(tensorImaginary(autogradValue(x)), operationImaginary, x, 0 - 1, [], [dtypeSize(autogradValue(x).dtype)], [])
 }
 
-fn av_expi(x: int, d: DType) -> int {
-    let out = t_expi(av_value(x), d)
-    return record(out, OP_EXPI, x, 0 - 1, [t_save(out)], [], [])
+fn autogradExpImaginary(x: int, complexDtype: DType) -> int {
+    let output = tensorExpImaginary(autogradValue(x), complexDtype)
+    return record(output, operationExpImaginary, x, 0 - 1, [tensorSave(output)], [], [])
 }
 
-fn av_complex(re: int, im: int, d: DType) -> int {
-    let out = t_complex(av_value(re), av_value(im), d)
-    return record(out, OP_COMPLEX, re, im, [], [], [])
+fn autogradComplex(realPart: int, imaginaryPart: int, complexDtype: DType) -> int {
+    let output = tensorComplex(autogradValue(realPart), autogradValue(imaginaryPart), complexDtype)
+    return record(output, operationComplex, realPart, imaginaryPart, [], [], [])
 }
 
-fn av_concat(x: int, y: int, dim: int) -> int {
-    let out = t_concat(av_value(x), av_value(y), dim)
-    return record(out, OP_CONCAT, x, y, [], [dim, av_value(x).shape[dim], av_value(y).shape[dim]], [])
+fn autogradConcat(x: int, y: int, dimension: int) -> int {
+    let output = tensorConcat(autogradValue(x), autogradValue(y), dimension)
+    return record(output, operationConcat, x, y, [], [dimension, autogradValue(x).shape[dimension], autogradValue(y).shape[dimension]], [])
 }
 
-fn av_index_select(x: int, dim: int, sel: [int]) -> int {
-    let out = t_index_select(av_value(x), dim, sel)
-    var ia: [int] = [dim, av_value(x).shape[dim]]
-    for i in 0..sel.len() { ia.push(sel[i]) }
-    return record(out, OP_INDEX_SELECT, x, 0 - 1, [], ia, [])
+fn autogradIndexSelect(x: int, dimension: int, indices: [int]) -> int {
+    let output = tensorIndexSelect(autogradValue(x), dimension, indices)
+    var integerAttributes: [int] = [dimension, autogradValue(x).shape[dimension]]
+    for i in 0..indices.len() { integerAttributes.push(indices[i]) }
+    return record(output, operationIndexSelect, x, 0 - 1, [], integerAttributes, [])
 }
 
 // The controller nonlinearity as a single node: tanh(x + b).
-fn av_bias_tanh(x: int, b: int) -> int {
-    let out = t_bias_tanh(av_value(x), av_value(b))
-    return record(out, OP_BIAS_TANH, x, b, [t_save(out)], [], [])
+fn autogradBiasTanh(x: int, bias: int) -> int {
+    let output = tensorBiasTanh(autogradValue(x), autogradValue(bias))
+    return record(output, operationBiasTanh, x, bias, [tensorSave(output)], [], [])
 }
 
 // One Givens stage as a single node. theta and phi travel as one tensor, tp,
 // theta in columns 0..D/2 and phi in D/2..D -- the two halves the caller used
 // to slice apart.
-fn av_givens(z: int, tp: int, stage: int) -> int {
-    let out = t_givens(av_value(z), av_value(tp), stage)
-    return record(out, OP_GIVENS, z, tp, [t_save(av_value(z)), t_save(av_value(tp))], [stage], [])
+fn autogradGivens(z: int, thetaPhi: int, stage: int) -> int {
+    let output = tensorGivens(autogradValue(z), autogradValue(thetaPhi), stage)
+    return record(output, operationGivens, z, thetaPhi, [tensorSave(autogradValue(z)), tensorSave(autogradValue(thetaPhi))], [stage], [])
 }
 
-fn av_roll(x: int, dim: int, shift: int) -> int {
-    let out = t_roll(av_value(x), dim, shift)
-    return record(out, OP_ROLL, x, 0 - 1, [], [dim, shift], [])
+fn autogradRoll(x: int, dimension: int, shift: int) -> int {
+    let output = tensorRoll(autogradValue(x), dimension, shift)
+    return record(output, operationRoll, x, 0 - 1, [], [dimension, shift], [])
 }
 
-fn av_transpose(x: int, a: int, b: int) -> int {
-    let out = t_copy(t_transpose(av_value(x), a, b))
-    return record(out, OP_TRANSPOSE, x, 0 - 1, [], [a, b], [])
+fn autogradTranspose(x: int, firstAxis: int, secondAxis: int) -> int {
+    let output = tensorCopy(tensorTranspose(autogradValue(x), firstAxis, secondAxis))
+    return record(output, operationTranspose, x, 0 - 1, [], [firstAxis, secondAxis], [])
 }
 
-fn av_reshape(x: int, shape: [int]) -> int {
-    let out = t_reshape(t_copy(av_value(x)), shape)
-    var ia: [int] = []
-    for i in 0..av_value(x).shape.len() { ia.push(av_value(x).shape[i]) }
-    return record(out, OP_RESHAPE, x, 0 - 1, [], ia, [])
+fn autogradReshape(x: int, shape: [int]) -> int {
+    let output = tensorReshape(tensorCopy(autogradValue(x)), shape)
+    var inputShape: [int] = []
+    for i in 0..autogradValue(x).shape.len() { inputShape.push(autogradValue(x).shape[i]) }
+    return record(output, operationReshape, x, 0 - 1, [], inputShape, [])
 }
 
-fn av_slice(x: int, dim: int, start: int, stop: int) -> int {
-    let out = t_copy(t_slice(av_value(x), dim, start, stop))
-    return record(out, OP_SLICE, x, 0 - 1, [], [dim, start, stop, av_value(x).shape[dim]], [])
+fn autogradSlice(x: int, dimension: int, start: int, stop: int) -> int {
+    let output = tensorCopy(tensorSlice(autogradValue(x), dimension, start, stop))
+    return record(output, operationSlice, x, 0 - 1, [], [dimension, start, stop, autogradValue(x).shape[dimension]], [])
 }
 
-fn av_cast(x: int, d: DType) -> int {
-    let src = av_value(x).dt
-    let out = t_cast(av_value(x), d)
-    var from_complex = 0
-    if dtype_is_complex(src) { from_complex = 1 }
-    return record(out, OP_CAST, x, 0 - 1, [], [from_complex], [])
+fn autogradCast(x: int, targetDtype: DType) -> int {
+    let sourceDtype = autogradValue(x).dtype
+    let output = tensorCast(autogradValue(x), targetDtype)
+    var fromComplex = 0
+    if dtypeIsComplex(sourceDtype) { fromComplex = 1 }
+    return record(output, operationCast, x, 0 - 1, [], [fromComplex], [])
 }
 
-fn av_expand(x: int, shape: [int]) -> int {
-    let out = t_copy(t_expand(av_value(x), shape))
-    var ia: [int] = []
-    for i in 0..av_value(x).shape.len() { ia.push(av_value(x).shape[i]) }
-    return record(out, OP_EXPAND, x, 0 - 1, [], ia, [])
+fn autogradExpand(x: int, shape: [int]) -> int {
+    let output = tensorCopy(tensorExpand(autogradValue(x), shape))
+    var inputShape: [int] = []
+    for i in 0..autogradValue(x).shape.len() { inputShape.push(autogradValue(x).shape[i]) }
+    return record(output, operationExpand, x, 0 - 1, [], inputShape, [])
 }
 
 // ---- the reverse pass ------------------------------------------------------
 
-fn real_like(t: Tensor) -> DType {
-    if dtype_is_complex(t.dt) { return dtype_component(t.dt) }
-    return t.dt
+fn realDtypeOf(tensor: Tensor) -> DType {
+    if dtypeIsComplex(tensor.dtype) { return dtypeComponent(tensor.dtype) }
+    return tensor.dtype
 }
 
 // Scatter-add rather than scatter-copy: index_select may repeat an index, and
-// each occurrence contributes. t_index_copy deliberately refuses duplicates,
+// each occurrence contributes. tensorIndexCopy deliberately refuses duplicates,
 // so it cannot be reused here.
-var SCATTER_HOOK: [fn(Tensor, int, int, [int]) -> Tensor] = []
+var scatterHook: [fn(Tensor, int, int, [int]) -> Tensor] = []
 
-fn scatter_add(g: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
-    if SCATTER_HOOK.len() > 0 {
-        let f = SCATTER_HOOK[0]
-        return f(g, dim, n, sel)
+fn scatterAdd(gradient: Tensor, dimension: int, outputExtent: int, indices: [int]) -> Tensor {
+    if scatterHook.len() > 0 {
+        let hook = scatterHook[0]
+        return hook(gradient, dimension, outputExtent, indices)
     }
-    return scatter_add_cpu(g, dim, n, sel)
+    return scatterAddCpu(gradient, dimension, outputExtent, indices)
 }
 
-fn scatter_add_cpu(g: Tensor, dim: int, n: int, sel: [int]) -> Tensor {
-    var osh: [int] = []
-    for i in 0..g.shape.len() { osh.push(g.shape[i]) }
-    osh[dim] = n
-    let out = t_zeros(g.dt, osh)
-    if t_numel(g) == 0 { return out }
-    var idx = idx_zeros(g.shape.len())
+fn scatterAddCpu(gradient: Tensor, dimension: int, outputExtent: int, indices: [int]) -> Tensor {
+    var outputShape: [int] = []
+    for i in 0..gradient.shape.len() { outputShape.push(gradient.shape[i]) }
+    outputShape[dimension] = outputExtent
+    let output = tensorZeros(gradient.dtype, outputShape)
+    if tensorElementCount(gradient) == 0 { return output }
+    var index = indexZeros(gradient.shape.len())
     var more = true
     while more {
-        var did: [int] = []
-        for i in 0..idx.len() { did.push(idx[i]) }
-        did[dim] = sel[idx[dim]]
-        if dtype_is_complex(g.dt) {
-            t_set_c(out, did, t_get_re(out, did) + t_get_re(g, idx), t_get_im(out, did) + t_get_im(g, idx))
+        var destinationIndex: [int] = []
+        for i in 0..index.len() { destinationIndex.push(index[i]) }
+        destinationIndex[dimension] = indices[index[dimension]]
+        if dtypeIsComplex(gradient.dtype) {
+            tensorSetComplex(output, destinationIndex, tensorGetReal(output, destinationIndex) + tensorGetReal(gradient, index), tensorGetImaginary(output, destinationIndex) + tensorGetImaginary(gradient, index))
         } else {
-            t_set(out, did, t_get(out, did) + t_get(g, idx))
+            tensorSet(output, destinationIndex, tensorGet(output, destinationIndex) + tensorGet(gradient, index))
         }
-        more = idx_next(idx, g.shape)
+        more = indexNext(index, gradient.shape)
     }
-    return out
+    return output
 }
 
-fn pad_slice_grad(g: Tensor, dim: int, start: int, n: int) -> Tensor {
-    var osh: [int] = []
-    for i in 0..g.shape.len() { osh.push(g.shape[i]) }
-    osh[dim] = n
-    let out = t_zeros(g.dt, osh)
-    if t_numel(g) == 0 { return out }
-    var idx = idx_zeros(g.shape.len())
+fn padSliceGradient(gradient: Tensor, dimension: int, start: int, outputExtent: int) -> Tensor {
+    var outputShape: [int] = []
+    for i in 0..gradient.shape.len() { outputShape.push(gradient.shape[i]) }
+    outputShape[dimension] = outputExtent
+    let output = tensorZeros(gradient.dtype, outputShape)
+    if tensorElementCount(gradient) == 0 { return output }
+    var index = indexZeros(gradient.shape.len())
     var more = true
     while more {
-        var did: [int] = []
-        for i in 0..idx.len() { did.push(idx[i]) }
-        did[dim] = start + idx[dim]
-        if dtype_is_complex(g.dt) {
-            t_set_c(out, did, t_get_re(g, idx), t_get_im(g, idx))
+        var destinationIndex: [int] = []
+        for i in 0..index.len() { destinationIndex.push(index[i]) }
+        destinationIndex[dimension] = start + index[dimension]
+        if dtypeIsComplex(gradient.dtype) {
+            tensorSetComplex(output, destinationIndex, tensorGetReal(gradient, index), tensorGetImaginary(gradient, index))
         } else {
-            t_set(out, did, t_get(g, idx))
+            tensorSet(output, destinationIndex, tensorGet(gradient, index))
         }
-        more = idx_next(idx, g.shape)
+        more = indexNext(index, gradient.shape)
     }
-    return out
+    return output
 }
 
-fn backward_node(nd: ANode, g: Tensor) {
-    let a = nd.a
-    let b = nd.b
+fn backwardNode(node: ANode, gradient: Tensor) {
+    let firstOperand = node.a
+    let secondOperand = node.b
 
-    if nd.op == OP_ADD {
-        if a >= 0 { accumulate(a, reduce_to(g, av_value(a).shape)) }
-        if b >= 0 { accumulate(b, reduce_to(g, av_value(b).shape)) }
+    if node.op == operationAdd {
+        if firstOperand >= 0 { accumulate(firstOperand, reduceToShape(gradient, autogradValue(firstOperand).shape)) }
+        if secondOperand >= 0 { accumulate(secondOperand, reduceToShape(gradient, autogradValue(secondOperand).shape)) }
         return
     }
-    if nd.op == OP_SUB {
-        if a >= 0 { accumulate(a, reduce_to(g, av_value(a).shape)) }
-        if b >= 0 { accumulate(b, reduce_to(t_neg(g), av_value(b).shape)) }
+    if node.op == operationSubtract {
+        if firstOperand >= 0 { accumulate(firstOperand, reduceToShape(gradient, autogradValue(firstOperand).shape)) }
+        if secondOperand >= 0 { accumulate(secondOperand, reduceToShape(tensorNegate(gradient), autogradValue(secondOperand).shape)) }
         return
     }
-    if nd.op == OP_MUL {
-        let x = saved_get(nd.saved[0])
-        let y = saved_get(nd.saved[1])
-        if a >= 0 {
-            var ga = t_mul(g, y)
-            if dtype_is_complex(y.dt) { ga = t_mul(g, t_conj(y)) }
-            accumulate(a, reduce_to(ga, x.shape))
+    if node.op == operationMultiply {
+        let x = savedGet(node.saved[0])
+        let y = savedGet(node.saved[1])
+        if firstOperand >= 0 {
+            var firstGradient = tensorMultiply(gradient, y)
+            if dtypeIsComplex(y.dtype) { firstGradient = tensorMultiply(gradient, tensorConjugate(y)) }
+            accumulate(firstOperand, reduceToShape(firstGradient, x.shape))
         }
-        if b >= 0 {
-            var gb = t_mul(g, x)
-            if dtype_is_complex(x.dt) { gb = t_mul(g, t_conj(x)) }
-            accumulate(b, reduce_to(gb, y.shape))
-        }
-        return
-    }
-    if nd.op == OP_DIV {
-        let y = saved_get(nd.saved[0])
-        let out = saved_get(nd.saved[1])
-        var yc = y
-        if dtype_is_complex(y.dt) { yc = t_conj(y) }
-        if a >= 0 { accumulate(a, reduce_to(t_div(g, yc), av_value(a).shape)) }
-        if b >= 0 {
-            var oc = out
-            if dtype_is_complex(out.dt) { oc = t_conj(out) }
-            accumulate(b, reduce_to(t_neg(t_div(t_mul(g, oc), yc)), y.shape))
+        if secondOperand >= 0 {
+            var secondGradient = tensorMultiply(gradient, x)
+            if dtypeIsComplex(x.dtype) { secondGradient = tensorMultiply(gradient, tensorConjugate(x)) }
+            accumulate(secondOperand, reduceToShape(secondGradient, y.shape))
         }
         return
     }
-    if nd.op == OP_NEG { accumulate(a, t_neg(g))
+    if node.op == operationDivide {
+        let y = savedGet(node.saved[0])
+        let output = savedGet(node.saved[1])
+        var yConjugate = y
+        if dtypeIsComplex(y.dtype) { yConjugate = tensorConjugate(y) }
+        if firstOperand >= 0 { accumulate(firstOperand, reduceToShape(tensorDivide(gradient, yConjugate), autogradValue(firstOperand).shape)) }
+        if secondOperand >= 0 {
+            var outputConjugate = output
+            if dtypeIsComplex(output.dtype) { outputConjugate = tensorConjugate(output) }
+            accumulate(secondOperand, reduceToShape(tensorNegate(tensorDivide(tensorMultiply(gradient, outputConjugate), yConjugate)), y.shape))
+        }
+        return
+    }
+    if node.op == operationNegate { accumulate(firstOperand, tensorNegate(gradient))
         return }
-    if nd.op == OP_MATMUL {
-        let x = saved_get(nd.saved[0])
-        let y = saved_get(nd.saved[1])
-        if a >= 0 {
-            var yt = t_copy(t_transpose(y, 0, 1))
-            if dtype_is_complex(y.dt) { yt = t_conj_transpose(y) }
-            accumulate(a, t_matmul(g, yt))
+    if node.op == operationMatmul {
+        let x = savedGet(node.saved[0])
+        let y = savedGet(node.saved[1])
+        if firstOperand >= 0 {
+            var yTransposed = tensorCopy(tensorTranspose(y, 0, 1))
+            if dtypeIsComplex(y.dtype) { yTransposed = tensorConjugateTranspose(y) }
+            accumulate(firstOperand, tensorMatmul(gradient, yTransposed))
         }
-        if b >= 0 {
-            var xt = t_copy(t_transpose(x, 0, 1))
-            if dtype_is_complex(x.dt) { xt = t_conj_transpose(x) }
-            accumulate(b, t_matmul(xt, g))
+        if secondOperand >= 0 {
+            var xTransposed = tensorCopy(tensorTranspose(x, 0, 1))
+            if dtypeIsComplex(x.dtype) { xTransposed = tensorConjugateTranspose(x) }
+            accumulate(secondOperand, tensorMatmul(xTransposed, gradient))
         }
         return
     }
-    if nd.op == OP_BIAS_TANH {
-        let gs = t_bias_tanh_backward(saved_get(nd.saved[0]), g)
-        accumulate(a, gs[0])
-        accumulate(b, gs[1])
+    if node.op == operationBiasTanh {
+        let gradients = tensorBiasTanhBackward(savedGet(node.saved[0]), gradient)
+        accumulate(firstOperand, gradients[0])
+        accumulate(secondOperand, gradients[1])
         return
     }
-    if nd.op == OP_GIVENS {
-        let zv = saved_get(nd.saved[0])
-        let tv = saved_get(nd.saved[1])
-        let gs = t_givens_backward(zv, tv, g, nd.ia[0])
-        accumulate(a, gs[0])
-        accumulate(b, gs[1])
+    if node.op == operationGivens {
+        let stateValue = savedGet(node.saved[0])
+        let angleValue = savedGet(node.saved[1])
+        let gradients = tensorGivensBackward(stateValue, angleValue, gradient, node.integerAttributes[0])
+        accumulate(firstOperand, gradients[0])
+        accumulate(secondOperand, gradients[1])
         return
     }
-    if nd.op == OP_TANH {
-        let out = saved_get(nd.saved[0])
-        accumulate(a, t_mul(g, t_sub(t_ones(out.dt, out.shape), t_mul(out, out))))
+    if node.op == operationTanh {
+        let output = savedGet(node.saved[0])
+        accumulate(firstOperand, tensorMultiply(gradient, tensorSubtract(tensorOnes(output.dtype, output.shape), tensorMultiply(output, output))))
         return
     }
-    if nd.op == OP_COS {
-        accumulate(a, t_neg(t_mul(g, t_sin(saved_get(nd.saved[0])))))
+    if node.op == operationCos {
+        accumulate(firstOperand, tensorNegate(tensorMultiply(gradient, tensorSin(savedGet(node.saved[0])))))
         return
     }
-    if nd.op == OP_SIN {
-        accumulate(a, t_mul(g, t_cos(saved_get(nd.saved[0]))))
+    if node.op == operationSin {
+        accumulate(firstOperand, tensorMultiply(gradient, tensorCos(savedGet(node.saved[0]))))
         return
     }
-    if nd.op == OP_LN {
-        accumulate(a, t_div(g, saved_get(nd.saved[0])))
+    if node.op == operationLn {
+        accumulate(firstOperand, tensorDivide(gradient, savedGet(node.saved[0])))
         return
     }
-    if nd.op == OP_EXP {
-        accumulate(a, t_mul(g, saved_get(nd.saved[0])))
+    if node.op == operationExp {
+        accumulate(firstOperand, tensorMultiply(gradient, savedGet(node.saved[0])))
         return
     }
-    if nd.op == OP_SUM_DIM {
-        accumulate(a, t_copy(t_expand(g, av_value(a).shape)))
+    if node.op == operationSumDimension {
+        accumulate(firstOperand, tensorCopy(tensorExpand(gradient, autogradValue(firstOperand).shape)))
         return
     }
-    if nd.op == OP_SUM_ALL {
-        let full = t_zeros(g.dt, nd.ia)
-        var idx = idx_zeros(nd.ia.len())
-        var more = t_numel(full) > 0
+    if node.op == operationSumAll {
+        let full = tensorZeros(gradient.dtype, node.integerAttributes)
+        var index = indexZeros(node.integerAttributes.len())
+        var more = tensorElementCount(full) > 0
         while more {
-            if dtype_is_complex(g.dt) {
-                t_set_c(full, idx, t_get_re(g, [0]), t_get_im(g, [0]))
+            if dtypeIsComplex(gradient.dtype) {
+                tensorSetComplex(full, index, tensorGetReal(gradient, [0]), tensorGetImaginary(gradient, [0]))
             } else {
-                t_set(full, idx, t_get(g, [0]))
+                tensorSet(full, index, tensorGet(gradient, [0]))
             }
-            more = idx_next(idx, nd.ia)
+            more = indexNext(index, node.integerAttributes)
         }
-        accumulate(a, full)
+        accumulate(firstOperand, full)
         return
     }
-    if nd.op == OP_MEAN_ALL {
-        let full = t_zeros(g.dt, nd.ia)
-        let n = t_numel(full)
-        var idx = idx_zeros(nd.ia.len())
-        var more = n > 0
+    if node.op == operationMeanAll {
+        let full = tensorZeros(gradient.dtype, node.integerAttributes)
+        let size = tensorElementCount(full)
+        var index = indexZeros(node.integerAttributes.len())
+        var more = size > 0
         while more {
-            if dtype_is_complex(g.dt) {
-                t_set_c(full, idx, t_get_re(g, [0]) / (n as float), t_get_im(g, [0]) / (n as float))
+            if dtypeIsComplex(gradient.dtype) {
+                tensorSetComplex(full, index, tensorGetReal(gradient, [0]) / (size as float), tensorGetImaginary(gradient, [0]) / (size as float))
             } else {
-                t_set(full, idx, t_get(g, [0]) / (n as float))
+                tensorSet(full, index, tensorGet(gradient, [0]) / (size as float))
             }
-            more = idx_next(idx, nd.ia)
+            more = indexNext(index, node.integerAttributes)
         }
-        accumulate(a, full)
+        accumulate(firstOperand, full)
         return
     }
-    if nd.op == OP_ABS2 {
+    if node.op == operationAbs2 {
         // the convention's defining case: a unit upstream gradient gives 2z
-        let z = saved_get(nd.saved[0])
-        let two = t_cast(t_mul(g, t_full(g.dt, [], 2.0)), z.dt)
-        accumulate(a, t_mul(z, two))
+        let z = savedGet(node.saved[0])
+        let doubledGradient = tensorCast(tensorMultiply(gradient, tensorFull(gradient.dtype, [], 2.0)), z.dtype)
+        accumulate(firstOperand, tensorMultiply(z, doubledGradient))
         return
     }
-    if nd.op == OP_CONJ { accumulate(a, t_conj(g))
+    if node.op == operationConjugate { accumulate(firstOperand, tensorConjugate(gradient))
         return }
-    if nd.op == OP_REAL {
-        accumulate(a, t_complex(g, t_zeros(g.dt, g.shape), av_value(a).dt))
+    if node.op == operationReal {
+        accumulate(firstOperand, tensorComplex(gradient, tensorZeros(gradient.dtype, gradient.shape), autogradValue(firstOperand).dtype))
         return
     }
-    if nd.op == OP_IMAG {
-        accumulate(a, t_complex(t_zeros(g.dt, g.shape), g, av_value(a).dt))
+    if node.op == operationImaginary {
+        accumulate(firstOperand, tensorComplex(tensorZeros(gradient.dtype, gradient.shape), gradient, autogradValue(firstOperand).dtype))
         return
     }
-    if nd.op == OP_EXPI {
+    if node.op == operationExpImaginary {
         // z = exp(i*t); dz/dt = i*z, so dL/dt = Re(conj(g) * i * z)
-        let z = saved_get(nd.saved[0])
-        accumulate(a, t_sub(t_mul(t_imag(g), t_real(z)), t_mul(t_real(g), t_imag(z))))
+        let z = savedGet(node.saved[0])
+        accumulate(firstOperand, tensorSubtract(tensorMultiply(tensorImaginary(gradient), tensorReal(z)), tensorMultiply(tensorReal(gradient), tensorImaginary(z))))
         return
     }
-    if nd.op == OP_COMPLEX {
-        if a >= 0 { accumulate(a, t_real(g)) }
-        if b >= 0 { accumulate(b, t_imag(g)) }
+    if node.op == operationComplex {
+        if firstOperand >= 0 { accumulate(firstOperand, tensorReal(gradient)) }
+        if secondOperand >= 0 { accumulate(secondOperand, tensorImaginary(gradient)) }
         return
     }
-    if nd.op == OP_CONCAT {
-        let dim = nd.ia[0]
-        let na = nd.ia[1]
-        let nb = nd.ia[2]
-        if a >= 0 { accumulate(a, t_copy(t_slice(g, dim, 0, na))) }
-        if b >= 0 { accumulate(b, t_copy(t_slice(g, dim, na, na + nb))) }
+    if node.op == operationConcat {
+        let dimension = node.integerAttributes[0]
+        let firstExtent = node.integerAttributes[1]
+        let secondExtent = node.integerAttributes[2]
+        if firstOperand >= 0 { accumulate(firstOperand, tensorCopy(tensorSlice(gradient, dimension, 0, firstExtent))) }
+        if secondOperand >= 0 { accumulate(secondOperand, tensorCopy(tensorSlice(gradient, dimension, firstExtent, firstExtent + secondExtent))) }
         return
     }
-    if nd.op == OP_INDEX_SELECT {
-        let dim = nd.ia[0]
-        let n = nd.ia[1]
-        var sel: [int] = []
-        for i in 2..nd.ia.len() { sel.push(nd.ia[i]) }
-        accumulate(a, scatter_add(g, dim, n, sel))
+    if node.op == operationIndexSelect {
+        let dimension = node.integerAttributes[0]
+        let size = node.integerAttributes[1]
+        var indices: [int] = []
+        for i in 2..node.integerAttributes.len() { indices.push(node.integerAttributes[i]) }
+        accumulate(firstOperand, scatterAdd(gradient, dimension, size, indices))
         return
     }
-    if nd.op == OP_ROLL {
-        accumulate(a, t_roll(g, nd.ia[0], 0 - nd.ia[1]))
+    if node.op == operationRoll {
+        accumulate(firstOperand, tensorRoll(gradient, node.integerAttributes[0], 0 - node.integerAttributes[1]))
         return
     }
-    if nd.op == OP_TRANSPOSE {
-        accumulate(a, t_copy(t_transpose(g, nd.ia[0], nd.ia[1])))
+    if node.op == operationTranspose {
+        accumulate(firstOperand, tensorCopy(tensorTranspose(gradient, node.integerAttributes[0], node.integerAttributes[1])))
         return
     }
-    if nd.op == OP_RESHAPE {
-        accumulate(a, t_reshape(t_copy(g), nd.ia))
+    if node.op == operationReshape {
+        accumulate(firstOperand, tensorReshape(tensorCopy(gradient), node.integerAttributes))
         return
     }
-    if nd.op == OP_SLICE {
-        accumulate(a, pad_slice_grad(g, nd.ia[0], nd.ia[1], nd.ia[3]))
+    if node.op == operationSlice {
+        accumulate(firstOperand, padSliceGradient(gradient, node.integerAttributes[0], node.integerAttributes[1], node.integerAttributes[3]))
         return
     }
-    if nd.op == OP_CAST {
-        if nd.ia[0] == 1 { panic("autograd: no gradient path out of a complex-to-real cast") }
+    if node.op == operationCast {
+        if node.integerAttributes[0] == 1 { panic("autograd: no gradient path out of a complex-to-real cast") }
         // The forward was real-to-something. If that something was complex the
         // upstream gradient is complex and its real part is what flows back;
         // if the cast was degenerate -- the same dtype on both sides, which is
-        // legal and which t_cast happily performs -- the gradient is already
+        // legal and which tensorCast happily performs -- the gradient is already
         // real and taking its real part panics. An earlier version did that
         // unconditionally, and a same-dtype cast crashed the backward pass.
-        if dtype_is_complex(g.dt) {
-            accumulate(a, t_real(g))
+        if dtypeIsComplex(gradient.dtype) {
+            accumulate(firstOperand, tensorReal(gradient))
         } else {
-            accumulate(a, g)
+            accumulate(firstOperand, gradient)
         }
         return
     }
-    if nd.op == OP_EXPAND {
-        accumulate(a, reduce_to(g, nd.ia))
+    if node.op == operationExpand {
+        accumulate(firstOperand, reduceToShape(gradient, node.integerAttributes))
         return
     }
     panic("autograd: no VJP for this opcode")
@@ -638,20 +638,20 @@ fn backward_node(nd: ANode, g: Tensor) {
 // Nodes are appended in forward order and every input handle is strictly
 // smaller than its output's, so one descending sweep visits each node after
 // all of its consumers. No topological sort is needed.
-fn av_backward(loss: int) {
-    if A_CONSUMED { panic("autograd: tape already consumed; reset before differentiating again") }
-    if loss < 0 or loss >= A_VARS.len() { panic("autograd: bad loss handle") }
-    if t_numel(av_value(loss)) != 1 { panic("autograd: loss must be a single element") }
-    if not A_VARS[loss].req { panic("autograd: loss does not depend on anything requiring a gradient") }
-    A_CONSUMED = true
-    let seed = t_ones(av_value(loss).dt, av_value(loss).shape)
+fn autogradBackward(loss: int) {
+    if tapeConsumed { panic("autograd: tape already consumed; reset before differentiating again") }
+    if loss < 0 or loss >= tapeVariables.len() { panic("autograd: bad loss handle") }
+    if tensorElementCount(autogradValue(loss)) != 1 { panic("autograd: loss must be a single element") }
+    if not tapeVariables[loss].requiresGradient { panic("autograd: loss does not depend on anything requiring a gradient") }
+    tapeConsumed = true
+    let seed = tensorOnes(autogradValue(loss).dtype, autogradValue(loss).shape)
     accumulate(loss, seed)
-    var vid = A_VARS.len() - 1
-    while vid >= 0 {
-        let v = A_VARS[vid]
-        if v.node >= 0 and v.has_g and v.req {
-            backward_node(A_NODES[v.node], v.g)
+    var variableIndex = tapeVariables.len() - 1
+    while variableIndex >= 0 {
+        let variable = tapeVariables[variableIndex]
+        if variable.node >= 0 and variable.hasGradient and variable.requiresGradient {
+            backwardNode(tapeNodes[variable.node], variable.g)
         }
-        vid -= 1
+        variableIndex -= 1
     }
 }

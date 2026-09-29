@@ -159,7 +159,7 @@ fn type_fn_void() -> int {
 }
 
 fn const_float(v: float) -> int {
-    let fb = f32_bits(v)
+    let fb = float32Bits(v)
     for i in 0..g_const_bits.len() {
         if g_const_bits[i] == fb { return g_const_id[i] }
     }

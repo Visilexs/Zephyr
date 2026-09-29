@@ -3,31 +3,31 @@
 // Deterministic, mutable, and not suitable for cryptography or shared threads.
 struct Rng { state: int }
 
-fn rng_new(seed: int) -> Rng {
+fn newRng(seed: int) -> Rng {
     var initialState = seed
     if initialState == 0 { initialState = 2685821657736338717 }
     return Rng{state: initialState}
 }
 
 // Masks make right shifts logical despite Zephyr's signed integer type.
-fn next_int(rng: Rng) -> int {
-    var nextState = rng.state
+fn nextInt(generator: Rng) -> int {
+    var nextState = generator.state
     nextState = nextState ^ ((nextState >> 12) & 4503599627370495)
     nextState = nextState ^ (nextState << 25)
     nextState = nextState ^ ((nextState >> 27) & 137438953471)
-    rng.state = nextState
+    generator.state = nextState
     return nextState * 2685821657736338717
 }
 
 // Rejection sampling avoids modulo bias, including intervals wider than 2^63.
-fn int_between(rng: Rng, low: int, high: int) -> int {
-    assert(low < high, "int_between: low must be less than high")
+fn intBetween(generator: Rng, low: int, high: int) -> int {
+    assert(low < high, "intBetween: low must be less than high")
     let span = high - low
     if span < 0 {
         // Unsigned span exceeds 2^63: accept nonzero outputs <= span,
         // then subtract one to map uniformly onto all offsets 0..span-1.
         while true {
-            let candidate = next_int(rng)
+            let candidate = nextInt(generator)
             if candidate > 0 or candidate <= span { return low + (candidate - 1) }
         }
     }
@@ -36,26 +36,26 @@ fn int_between(rng: Rng, low: int, high: int) -> int {
     let maximum = 9223372036854775807
     let limit = maximum - maximum % span
     while true {
-        let candidate = next_int(rng) & maximum
+        let candidate = nextInt(generator) & maximum
         if candidate > 0 and candidate <= limit { return low + (candidate - 1) % span }
     }
     return low
 }
 
-fn next_float(rng: Rng) -> float {
-    return (((next_int(rng) >> 11) & 9007199254740991) as float) / 9007199254740992.0
+fn nextFloat(generator: Rng) -> float {
+    return (((nextInt(generator) >> 11) & 9007199254740991) as float) / 9007199254740992.0
 }
 
-fn chance(rng: Rng, probability: float) -> bool {
+fn chance(generator: Rng, probability: float) -> bool {
     assert(probability >= 0.0 and probability <= 1.0, "chance: probability must be in [0, 1]")
-    return next_float(rng) < probability
+    return nextFloat(generator) < probability
 }
 
 // In-place Fisher-Yates, with an unbiased index at each step.
-fn shuffle[T](rng: Rng, items: [T]) {
+fn shuffle[T](generator: Rng, items: [T]) {
     var remaining = items.len()
     while remaining > 1 {
-        let chosenIndex = int_between(rng, 0, remaining)
+        let chosenIndex = intBetween(generator, 0, remaining)
         remaining -= 1
         let saved = items[remaining]
         items[remaining] = items[chosenIndex]

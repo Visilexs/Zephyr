@@ -33,216 +33,216 @@
 //     padding.
 import "ml/autograd.zeph"
 
-let TF_PER_LAYER = 12
-let TF_NEG = 0.0 - 1000000000000000000000000000000.0
+let transformerParametersPerLayer = 12
+let transformerMaskedScore = 0.0 - 1000000000000000000000000000000.0
 
 struct TfConfig {
-    input_vocab: int,
-    output_vocab: int,
+    inputVocab: int,
+    outputVocab: int,
     d: int,           // model width
-    ff: int,          // MLP inner width
+    feedForwardDimension: int,          // MLP inner width
     layers: int,
-    max_len: int,
-    pad: int,
-    eps: float,
+    maxLength: int,
+    padToken: int,
+    epsilon: float,
 }
 
 struct TfParams {
     config: TfConfig,
-    // embedding, pos, then TF_PER_LAYER per layer, then lnf_g, lnf_b, Wout, bout
-    ts: [Tensor],
+    // embedding, pos, then transformerParametersPerLayer per layer, then lnf_g, lnf_b, Wout, bout
+    tensors: [Tensor],
 }
 
 struct TfAD {
-    cfg: TfConfig,
-    hs: [int],
+    config: TfConfig,
+    handles: [int],
 }
 
 // The parameter order is fixed and is the only thing that relates a
 // TfParams to a TfAD, so it is written once, here, and never duplicated.
-fn tf_new(cfg: TfConfig) -> TfParams {
-    var ts: [Tensor] = []
-    ts.push(t_zeros(DType.F64, [cfg.input_vocab, cfg.d]))   // token embedding
-    ts.push(t_zeros(DType.F64, [cfg.max_len, cfg.d]))       // positional
-    for l in 0..cfg.layers {
-        ts.push(t_ones(DType.F64, [cfg.d]))                 // ln1 gain
-        ts.push(t_zeros(DType.F64, [cfg.d]))                // ln1 bias
-        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wq
-        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wk
-        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wv
-        ts.push(t_zeros(DType.F64, [cfg.d, cfg.d]))         // Wo
-        ts.push(t_ones(DType.F64, [cfg.d]))                 // ln2 gain
-        ts.push(t_zeros(DType.F64, [cfg.d]))                // ln2 bias
-        ts.push(t_zeros(DType.F64, [cfg.ff, cfg.d]))        // W1
-        ts.push(t_zeros(DType.F64, [cfg.ff]))               // b1
-        ts.push(t_zeros(DType.F64, [cfg.d, cfg.ff]))        // W2
-        ts.push(t_zeros(DType.F64, [cfg.d]))                // b2
+fn newTransformer(config: TfConfig) -> TfParams {
+    var tensors: [Tensor] = []
+    tensors.push(tensorZeros(DType.F64, [config.inputVocab, config.d]))   // token embedding
+    tensors.push(tensorZeros(DType.F64, [config.maxLength, config.d]))       // positional
+    for layer in 0..config.layers {
+        tensors.push(tensorOnes(DType.F64, [config.d]))                 // ln1 gain
+        tensors.push(tensorZeros(DType.F64, [config.d]))                // ln1 bias
+        tensors.push(tensorZeros(DType.F64, [config.d, config.d]))         // Wq
+        tensors.push(tensorZeros(DType.F64, [config.d, config.d]))         // Wk
+        tensors.push(tensorZeros(DType.F64, [config.d, config.d]))         // Wv
+        tensors.push(tensorZeros(DType.F64, [config.d, config.d]))         // Wo
+        tensors.push(tensorOnes(DType.F64, [config.d]))                 // ln2 gain
+        tensors.push(tensorZeros(DType.F64, [config.d]))                // ln2 bias
+        tensors.push(tensorZeros(DType.F64, [config.feedForwardDimension, config.d]))        // W1
+        tensors.push(tensorZeros(DType.F64, [config.feedForwardDimension]))               // b1
+        tensors.push(tensorZeros(DType.F64, [config.d, config.feedForwardDimension]))        // W2
+        tensors.push(tensorZeros(DType.F64, [config.d]))                // b2
     }
-    ts.push(t_ones(DType.F64, [cfg.d]))                     // final ln gain
-    ts.push(t_zeros(DType.F64, [cfg.d]))                    // final ln bias
-    ts.push(t_zeros(DType.F64, [cfg.output_vocab, cfg.d]))  // readout
-    ts.push(t_zeros(DType.F64, [cfg.output_vocab]))
-    return TfParams{config: cfg, ts: ts}
+    tensors.push(tensorOnes(DType.F64, [config.d]))                     // final ln gain
+    tensors.push(tensorZeros(DType.F64, [config.d]))                    // final ln bias
+    tensors.push(tensorZeros(DType.F64, [config.outputVocab, config.d]))  // readout
+    tensors.push(tensorZeros(DType.F64, [config.outputVocab]))
+    return TfParams{config: config, tensors: tensors}
 }
 
-fn tf_param_list(p: TfParams) -> [Tensor] { return p.ts }
+fn transformerParameterList(parameters: TfParams) -> [Tensor] { return parameters.tensors }
 
-fn tf_params(p: TfParams, req: bool) -> TfAD {
-    var hs: [int] = []
-    for i in 0..p.ts.len() { hs.push(av_leaf(p.ts[i], req)) }
-    return TfAD{cfg: p.config, hs: hs}
+fn transformerParameters(parameters: TfParams, requiresGradient: bool) -> TfAD {
+    var handles: [int] = []
+    for i in 0..parameters.tensors.len() { handles.push(autogradLeaf(parameters.tensors[i], requiresGradient)) }
+    return TfAD{config: parameters.config, handles: handles}
 }
 
-fn tf_layer_base(cfg: TfConfig, l: int) -> int { return 2 + l * TF_PER_LAYER }
-fn tf_tail_base(cfg: TfConfig) -> int { return 2 + cfg.layers * TF_PER_LAYER }
+fn transformerLayerBase(config: TfConfig, layer: int) -> int { return 2 + layer * transformerParametersPerLayer }
+fn transformerTailBase(config: TfConfig) -> int { return 2 + config.layers * transformerParametersPerLayer }
 
-fn tf_scalar(v: float) -> int { return av_leaf(t_full(DType.F64, [], v), false) }
+fn transformerScalar(value: float) -> int { return autogradLeaf(tensorFull(DType.F64, [], value), false) }
 
 // Softmax along rows with a detached maximum. See the header note: the
 // maximum is a constant leaf, so it shifts the exponent without creating a
 // gradient path.
-fn tf_softmax(s: int) -> int {
-    let v = av_value(s)
-    let n = v.shape[0]
-    let m = v.shape[1]
-    let mx = t_zeros(DType.F64, [n, 1])
-    for r in 0..n {
-        var best = t_get(v, [r, 0])
-        for c in 1..m {
-            let x = t_get(v, [r, c])
-            if x > best { best = x }
+fn transformerSoftmax(scores: int) -> int {
+    let scoreValues = autogradValue(scores)
+    let rowCount = scoreValues.shape[0]
+    let columnCount = scoreValues.shape[1]
+    let rowMaximum = tensorZeros(DType.F64, [rowCount, 1])
+    for row in 0..rowCount {
+        var best = tensorGet(scoreValues, [row, 0])
+        for column in 1..columnCount {
+            let candidate = tensorGet(scoreValues, [row, column])
+            if candidate > best { best = candidate }
         }
-        t_set(mx, [r, 0], best)
+        tensorSet(rowMaximum, [row, 0], best)
     }
-    let e = av_exp(av_sub(s, av_leaf(mx, false)))
-    return av_div(e, av_sum_dim(e, 1))
+    let exponentials = autogradExp(autogradSubtract(scores, autogradLeaf(rowMaximum, false)))
+    return autogradDivide(exponentials, autogradSumDimension(exponentials, 1))
 }
 
 // Layer norm over the feature dimension. The reciprocal square root is
 // reached through exp(-0.5 ln(v)) for the same reason phase_ad does it: ln
 // and exp already carry VJPs and a sqrt primitive would buy nothing.
-fn tf_layernorm(x: int, gain: int, bias: int, d: int, eps: float) -> int {
-    let dn = tf_scalar(d as float)
-    let mean = av_div(av_sum_dim(x, 1), dn)
-    let c = av_sub(x, mean)
-    let vr = av_div(av_sum_dim(av_mul(c, c), 1), dn)
-    let inv = av_exp(av_mul(av_ln(av_add(vr, tf_scalar(eps))), tf_scalar(0.0 - 0.5)))
-    return av_add(av_mul(av_mul(c, inv), gain), bias)
+fn transformerLayerNorm(input: int, gain: int, bias: int, width: int, epsilon: float) -> int {
+    let widthScalar = transformerScalar(width as float)
+    let mean = autogradDivide(autogradSumDimension(input, 1), widthScalar)
+    let centered = autogradSubtract(input, mean)
+    let variance = autogradDivide(autogradSumDimension(autogradMultiply(centered, centered), 1), widthScalar)
+    let inverseDeviation = autogradExp(autogradMultiply(autogradLn(autogradAdd(variance, transformerScalar(epsilon))), transformerScalar(0.0 - 0.5)))
+    return autogradAdd(autogradMultiply(autogradMultiply(centered, inverseDeviation), gain), bias)
 }
 
 // The additive attention mask for one row: -inf above the diagonal, and
 // -inf on any key at a PAD position. Built as a constant because it depends
 // only on the input, never on the parameters.
-fn tf_mask_row(tokens: Tensor, row: int, length: int, pad: int) -> Tensor {
-    let m = t_zeros(DType.F64, [length, length])
-    for q in 0..length {
-        for k in 0..length {
-            var blocked = k > q
-            if t_get_int(tokens, [row, k]) == pad { blocked = true }
+fn transformerMaskRow(tokens: Tensor, row: int, length: int, padToken: int) -> Tensor {
+    let mask = tensorZeros(DType.F64, [length, length])
+    for queryPosition in 0..length {
+        for keyPosition in 0..length {
+            var blocked = keyPosition > queryPosition
+            if tensorGetInt(tokens, [row, keyPosition]) == padToken { blocked = true }
             // A row's first position must keep at least one visible key, or
             // the softmax is 0/0. The diagonal is always visible.
-            if k == q { blocked = false }
-            if blocked { t_set(m, [q, k], TF_NEG) }
+            if keyPosition == queryPosition { blocked = false }
+            if blocked { tensorSet(mask, [queryPosition, keyPosition], transformerMaskedScore) }
         }
     }
-    return m
+    return mask
 }
 
 // The last non-PAD position of each row, which is where the readout is
 // taken. A model read at the padded end is reading padding.
-fn tf_last_real(tokens: Tensor, row: int, length: int, pad: int) -> int {
+fn transformerLastReal(tokens: Tensor, row: int, length: int, padToken: int) -> int {
     var last = 0
     for k in 0..length {
-        if t_get_int(tokens, [row, k]) != pad { last = k }
+        if tensorGetInt(tokens, [row, k]) != padToken { last = k }
     }
     return last
 }
 
 // The full hidden state, [B*T, d], before any position is selected.
-// Separated from tf_forward so causality can be tested directly: two inputs
+// Separated from transformerForward so causality can be tested directly: two inputs
 // that agree up to position p must give the same hidden state AT p, and
 // there is no way to check that if only the selected row is reachable.
-fn tf_encode(m: TfAD, tokens: Tensor) -> int {
+fn transformerEncode(model: TfAD, tokens: Tensor) -> int {
     let batch = tokens.shape[0]
     let length = tokens.shape[1]
-    let cfg = m.cfg
-    let d = cfg.d
-    if length > cfg.max_len { panic("transformer: sequence of {length} exceeds max_len {cfg.max_len}") }
+    let config = model.config
+    let width = config.d
+    if length > config.maxLength { panic("transformer: sequence of {length} exceeds maxLength {config.maxLength}") }
 
     // Token and position embeddings, flattened to [B*T, d] so every linear
     // layer below is one matmul rather than B of them.
-    var tok_ids: [int] = []
-    var pos_ids: [int] = []
-    for r in 0..batch {
-        for s in 0..length {
-            let tid = t_get_int(tokens, [r, s])
-            if tid < 0 or tid >= cfg.input_vocab { panic("transformer: token id {tid} outside the vocabulary of {cfg.input_vocab}") }
-            tok_ids.push(tid)
-            pos_ids.push(s)
+    var tokenIds: [int] = []
+    var positionIds: [int] = []
+    for row in 0..batch {
+        for position in 0..length {
+            let tokenId = tensorGetInt(tokens, [row, position])
+            if tokenId < 0 or tokenId >= config.inputVocab { panic("transformer: token id {tokenId} outside the vocabulary of {config.inputVocab}") }
+            tokenIds.push(tokenId)
+            positionIds.push(position)
         }
     }
-    var x = av_add(av_index_select(m.hs[0], 0, tok_ids), av_index_select(m.hs[1], 0, pos_ids))
+    var residual = autogradAdd(autogradIndexSelect(model.handles[0], 0, tokenIds), autogradIndexSelect(model.handles[1], 0, positionIds))
 
     // The per-row attention masks, constant for the whole forward pass.
     var masks: [int] = []
-    for r in 0..batch { masks.push(av_leaf(tf_mask_row(tokens, r, length, cfg.pad), false)) }
-    let scale = tf_scalar(1.0 / fexp(0.5 * fln(d as float)))
+    for row in 0..batch { masks.push(autogradLeaf(transformerMaskRow(tokens, row, length, config.padToken), false)) }
+    let scale = transformerScalar(1.0 / fexp(0.5 * fln(width as float)))
 
-    for l in 0..cfg.layers {
-        let b = tf_layer_base(cfg, l)
-        let h = tf_layernorm(x, m.hs[b], m.hs[b + 1], d, cfg.eps)
-        let q = av_matmul(h, av_transpose(m.hs[b + 2], 0, 1))
-        let k = av_matmul(h, av_transpose(m.hs[b + 3], 0, 1))
-        let v = av_matmul(h, av_transpose(m.hs[b + 4], 0, 1))
+    for layer in 0..config.layers {
+        let layerBase = transformerLayerBase(config, layer)
+        let attentionInput = transformerLayerNorm(residual, model.handles[layerBase], model.handles[layerBase + 1], width, config.epsilon)
+        let queryProjection = autogradMatmul(attentionInput, autogradTranspose(model.handles[layerBase + 2], 0, 1))
+        let keyProjection = autogradMatmul(attentionInput, autogradTranspose(model.handles[layerBase + 3], 0, 1))
+        let valueProjection = autogradMatmul(attentionInput, autogradTranspose(model.handles[layerBase + 4], 0, 1))
 
-        var ctx = 0 - 1
-        for r in 0..batch {
-            let lo = r * length
-            let hi = lo + length
-            let qr = av_slice(q, 0, lo, hi)
-            let kr = av_slice(k, 0, lo, hi)
-            let vr = av_slice(v, 0, lo, hi)
-            let sc = av_add(av_mul(av_matmul(qr, av_transpose(kr, 0, 1)), scale), masks[r])
-            let at = tf_softmax(sc)
-            let cr = av_matmul(at, vr)
-            if r == 0 { ctx = cr } else { ctx = av_concat(ctx, cr, 0) }
+        var context = 0 - 1
+        for row in 0..batch {
+            let rowStart = row * length
+            let rowEnd = rowStart + length
+            let rowQueries = autogradSlice(queryProjection, 0, rowStart, rowEnd)
+            let rowKeys = autogradSlice(keyProjection, 0, rowStart, rowEnd)
+            let rowValues = autogradSlice(valueProjection, 0, rowStart, rowEnd)
+            let scores = autogradAdd(autogradMultiply(autogradMatmul(rowQueries, autogradTranspose(rowKeys, 0, 1)), scale), masks[row])
+            let attention = transformerSoftmax(scores)
+            let rowContext = autogradMatmul(attention, rowValues)
+            if row == 0 { context = rowContext } else { context = autogradConcat(context, rowContext, 0) }
         }
-        x = av_add(x, av_matmul(ctx, av_transpose(m.hs[b + 5], 0, 1)))
+        residual = autogradAdd(residual, autogradMatmul(context, autogradTranspose(model.handles[layerBase + 5], 0, 1)))
 
-        let h2 = tf_layernorm(x, m.hs[b + 6], m.hs[b + 7], d, cfg.eps)
-        let inner = av_tanh(av_add(av_matmul(h2, av_transpose(m.hs[b + 8], 0, 1)), m.hs[b + 9]))
-        x = av_add(x, av_add(av_matmul(inner, av_transpose(m.hs[b + 10], 0, 1)), m.hs[b + 11]))
+        let mlpInput = transformerLayerNorm(residual, model.handles[layerBase + 6], model.handles[layerBase + 7], width, config.epsilon)
+        let inner = autogradTanh(autogradAdd(autogradMatmul(mlpInput, autogradTranspose(model.handles[layerBase + 8], 0, 1)), model.handles[layerBase + 9]))
+        residual = autogradAdd(residual, autogradAdd(autogradMatmul(inner, autogradTranspose(model.handles[layerBase + 10], 0, 1)), model.handles[layerBase + 11]))
     }
 
-    let tb = tf_tail_base(cfg)
-    return tf_layernorm(x, m.hs[tb], m.hs[tb + 1], d, cfg.eps)
+    let tailBase = transformerTailBase(config)
+    return transformerLayerNorm(residual, model.handles[tailBase], model.handles[tailBase + 1], width, config.epsilon)
 }
 
-fn tf_forward(m: TfAD, tokens: Tensor) -> int {
+fn transformerForward(model: TfAD, tokens: Tensor) -> int {
     let batch = tokens.shape[0]
     let length = tokens.shape[1]
-    let hf = tf_encode(m, tokens)
+    let hiddenStates = transformerEncode(model, tokens)
     var pick: [int] = []
-    for r in 0..batch { pick.push(r * length + tf_last_real(tokens, r, length, m.cfg.pad)) }
-    return av_index_select(hf, 0, pick)
+    for row in 0..batch { pick.push(row * length + transformerLastReal(tokens, row, length, model.config.padToken)) }
+    return autogradIndexSelect(hiddenStates, 0, pick)
 }
 
-fn tf_readout(m: TfAD, h: int) -> int {
-    let tb = tf_tail_base(m.cfg)
-    return tf_softmax(av_add(av_matmul(h, av_transpose(m.hs[tb + 2], 0, 1)), m.hs[tb + 3]))
+fn transformerReadout(model: TfAD, hidden: int) -> int {
+    let tailBase = transformerTailBase(model.config)
+    return transformerSoftmax(autogradAdd(autogradMatmul(hidden, autogradTranspose(model.handles[tailBase + 2], 0, 1)), model.handles[tailBase + 3]))
 }
 
 // Mean negative log likelihood, selected by a one-hot mask and a sum so the
-// selection stays on the tape -- the same construction pad_loss uses, for
+// selection stays on the tape -- the same construction phaseAutogradLoss uses, for
 // the same reason, and so the two families' losses are the same quantity.
-fn tf_loss(m: TfAD, tokens: Tensor, targets: [int]) -> int {
+fn transformerLoss(model: TfAD, tokens: Tensor, targets: [int]) -> int {
     let batch = tokens.shape[0]
-    let probs = tf_readout(m, tf_forward(m, tokens))
-    let hot = t_zeros(DType.F64, [batch, m.cfg.output_vocab])
+    let probabilities = transformerReadout(model, transformerForward(model, tokens))
+    let oneHot = tensorZeros(DType.F64, [batch, model.config.outputVocab])
     for row in 0..batch {
-        if targets[row] < 0 or targets[row] >= m.cfg.output_vocab { panic("transformer: target out of range") }
-        t_set(hot, [row, targets[row]], 1.0)
+        if targets[row] < 0 or targets[row] >= model.config.outputVocab { panic("transformer: target out of range") }
+        tensorSet(oneHot, [row, targets[row]], 1.0)
     }
-    let picked = av_sum_dim(av_mul(probs, av_leaf(hot, false)), 1)
-    return av_mean_all(av_neg(av_ln(picked)))
+    let picked = autogradSumDimension(autogradMultiply(probabilities, autogradLeaf(oneHot, false)), 1)
+    return autogradMeanAll(autogradNegate(autogradLn(picked)))
 }

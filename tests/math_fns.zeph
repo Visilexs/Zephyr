@@ -34,7 +34,7 @@ fn ck_ftc(f: fn(float) -> float, d: fn(float) -> float, a: float, b: float, name
 
 // ---- gamma a second way, from the Euler integral ---------------------------
 // gamma(x) = integral from 0 to infinity of t^(x-1) e^(-t) dt, evaluated with
-// integrate_p. Nothing here shares code with the Lanczos gamma beyond exp and
+// integrateWithParameter. Nothing here shares code with the Lanczos gamma beyond exp and
 // ln, so agreement between the two is real evidence rather than a shared bug.
 
 // log of the integrand's peak, at t = x-1. The integral is divided through by
@@ -60,25 +60,25 @@ fn gintegrand(t: float, x: float) -> float {
 // below 1 the integrand is singular at the origin, so walk x up with
 // gamma(x) = gamma(x+1)/x and integrate something well behaved instead
 fn gamma_quad(x: float) -> float {
-    if x <= 0.0 { return NAN }
+    if x <= 0.0 { return nan }
     if x < 1.0 { return gamma_quad(x + 1.0) / x }
     let hi = 60.0 + 3.0 * x
-    let s = integrate_p(gintegrand, x, 0.0, hi, 0.0000000000001)
+    let s = integrateWithParameter(gintegrand, x, 0.0, hi, 0.0000000000001)
     return s * fexp(gpeak_log(x))
 }
 
 var n = 0
 
 // ---- anchors: exact closed forms
-n += ck(near(fatan(1.0), PI / 4.0, 0.0000000000001), "atan(1)=pi/4")
-n += ck(near(fasin(0.5), PI / 6.0, 0.0000000000001), "asin(1/2)=pi/6")
-n += ck(near(facos(0.5), PI / 3.0, 0.0000000000001), "acos(1/2)=pi/3")
-n += ck(near(facot(1.0), PI / 4.0, 0.0000000000001), "acot(1)=pi/4")
-n += ck(near(fasec(2.0), PI / 3.0, 0.0000000000001), "asec(2)=pi/3")
-n += ck(near(facsc(2.0), PI / 6.0, 0.0000000000001), "acsc(2)=pi/6")
+n += ck(near(fatan(1.0), pi / 4.0, 0.0000000000001), "atan(1)=pi/4")
+n += ck(near(fasin(0.5), pi / 6.0, 0.0000000000001), "asin(1/2)=pi/6")
+n += ck(near(facos(0.5), pi / 3.0, 0.0000000000001), "acos(1/2)=pi/3")
+n += ck(near(facot(1.0), pi / 4.0, 0.0000000000001), "acot(1)=pi/4")
+n += ck(near(fasec(2.0), pi / 3.0, 0.0000000000001), "asec(2)=pi/3")
+n += ck(near(facsc(2.0), pi / 6.0, 0.0000000000001), "acsc(2)=pi/6")
 n += ck(near(gamma(5.0), 24.0, 0.0000000001), "gamma(5)=24")
-n += ck(near(gamma(0.5), sqrt(PI), 0.0000000001), "gamma(1/2)=sqrt(pi)")
-n += ck(near(gamma(1.5), sqrt(PI) / 2.0, 0.0000000001), "gamma(3/2)=sqrt(pi)/2")
+n += ck(near(gamma(0.5), sqrt(pi), 0.0000000001), "gamma(1/2)=sqrt(pi)")
+n += ck(near(gamma(1.5), sqrt(pi) / 2.0, 0.0000000001), "gamma(3/2)=sqrt(pi)/2")
 n += ck(near(lgamma(1.0), 0.0, 0.0000000001), "lgamma(1)=0")
 n += ck(near(digamma(1.0), 0.0 - 0.5772156649015329, 0.0000000001), "digamma(1)=-euler")
 n += ck(near(gd(0.0), 0.0, 0.0000000000001), "gd(0)=0")
@@ -86,10 +86,10 @@ n += ck(near(sinh(0.0), 0.0, 0.0000000000001), "sinh(0)=0")
 n += ck(near(cosh(0.0), 1.0, 0.0000000000001), "cosh(0)=1")
 
 // acot is the continuous (0,pi) branch, so it must not jump at the origin
-n += ck(near(facot(0.0000001), HALF_PI, 0.00001), "acot continuous from above")
-n += ck(near(facot(0.0 - 0.0000001), HALF_PI, 0.00001), "acot continuous from below")
-n += ck(facot(0.0 - 1.0) > HALF_PI, "acot(-1) in upper half")
-n += ck(near(facot(0.0 - 1.0), 3.0 * PI / 4.0, 0.0000000000001), "acot(-1)=3pi/4")
+n += ck(near(facot(0.0000001), halfPi, 0.00001), "acot continuous from above")
+n += ck(near(facot(0.0 - 0.0000001), halfPi, 0.00001), "acot continuous from below")
+n += ck(facot(0.0 - 1.0) > halfPi, "acot(-1) in upper half")
+n += ck(near(facot(0.0 - 1.0), 3.0 * pi / 4.0, 0.0000000000001), "acot(-1)=3pi/4")
 
 // ---- identities
 let xs = [0.13, 0.4, 0.77, 1.3, 2.2, 3.9]
@@ -116,7 +116,7 @@ for i in 0..us.len() {
     n += ck(near(fsin(fasin(u)), u, 0.0000000001), "sin(asin(u))=u")
     n += ck(near(fcos(facos(u)), u, 0.0000000001), "cos(acos(u))=u")
     n += ck(near(ftan(fatan(u)), u, 0.0000000001), "tan(atan(u))=u")
-    n += ck(near(gd_inv(gd(u)), u, 0.0000000001), "gd_inv(gd(u))=u")
+    n += ck(near(gdInverse(gd(u)), u, 0.0000000001), "gd_inv(gd(u))=u")
     n += ck(near(tanh(u), gd(u) * 0.0 + tanh(u), 0.0000000001), "tanh stable")
 }
 
@@ -137,65 +137,65 @@ for i in 0..rs.len() {
 }
 
 // ---- derivatives against central differences
-n += ck_d(fsin, d_fsin, 0.7, "d sin")
-n += ck_d(fcos, d_fcos, 0.7, "d cos")
-n += ck_d(ftan, d_ftan, 0.7, "d tan")
-n += ck_d(fcsc, d_fcsc, 0.7, "d csc")
-n += ck_d(fsec, d_fsec, 0.7, "d sec")
-n += ck_d(fcot, d_fcot, 0.7, "d cot")
-n += ck_d(fasin, d_fasin, 0.4, "d asin")
-n += ck_d(facos, d_facos, 0.4, "d acos")
-n += ck_d(fatan, d_fatan, 0.4, "d atan")
-n += ck_d(facot, d_facot, 0.4, "d acot")
-n += ck_d(facot, d_facot, 0.0 - 2.0, "d acot negative")
-n += ck_d(fasec, d_fasec, 3.0, "d asec")
-n += ck_d(fasec, d_fasec, 0.0 - 3.0, "d asec negative")
-n += ck_d(facsc, d_facsc, 3.0, "d acsc")
-n += ck_d(facsc, d_facsc, 0.0 - 3.0, "d acsc negative")
-n += ck_d(fln, d_fln, 2.3, "d ln")
-n += ck_d(fexp, d_fexp, 1.1, "d exp")
-n += ck_d(sinh, d_sinh, 1.1, "d sinh")
-n += ck_d(cosh, d_cosh, 1.1, "d cosh")
-n += ck_d(tanh, d_tanh, 1.1, "d tanh")
-n += ck_d(tanh, d_tanh, 0.001, "d tanh near zero")
-n += ck_d(gd, d_gd, 1.1, "d gd")
-n += ck_d(gd_inv, d_gd_inv, 0.6, "d gd_inv")
-n += ck_d(lgamma, d_lgamma, 2.7, "d lgamma")
-n += ck_d(gamma, d_gamma, 2.7, "d gamma")
-n += ck_d(gamma, d_gamma, 0.6, "d gamma below one")
+n += ck_d(fsin, derivativeFsin, 0.7, "d sin")
+n += ck_d(fcos, derivativeFcos, 0.7, "d cos")
+n += ck_d(ftan, derivativeFtan, 0.7, "d tan")
+n += ck_d(fcsc, derivativeFcsc, 0.7, "d csc")
+n += ck_d(fsec, derivativeFsec, 0.7, "d sec")
+n += ck_d(fcot, derivativeFcot, 0.7, "d cot")
+n += ck_d(fasin, derivativeFasin, 0.4, "d asin")
+n += ck_d(facos, derivativeFacos, 0.4, "d acos")
+n += ck_d(fatan, derivativeFatan, 0.4, "d atan")
+n += ck_d(facot, derivativeFacot, 0.4, "d acot")
+n += ck_d(facot, derivativeFacot, 0.0 - 2.0, "d acot negative")
+n += ck_d(fasec, derivativeFasec, 3.0, "d asec")
+n += ck_d(fasec, derivativeFasec, 0.0 - 3.0, "d asec negative")
+n += ck_d(facsc, derivativeFacsc, 3.0, "d acsc")
+n += ck_d(facsc, derivativeFacsc, 0.0 - 3.0, "d acsc negative")
+n += ck_d(fln, derivativeFln, 2.3, "d ln")
+n += ck_d(fexp, derivativeFexp, 1.1, "d exp")
+n += ck_d(sinh, derivativeSinh, 1.1, "d sinh")
+n += ck_d(cosh, derivativeCosh, 1.1, "d cosh")
+n += ck_d(tanh, derivativeTanh, 1.1, "d tanh")
+n += ck_d(tanh, derivativeTanh, 0.001, "d tanh near zero")
+n += ck_d(gd, derivativeGd, 1.1, "d gd")
+n += ck_d(gdInverse, derivativeGdInverse, 0.6, "d gd_inv")
+n += ck_d(lgamma, derivativeLgamma, 2.7, "d lgamma")
+n += ck_d(gamma, derivativeGamma, 2.7, "d gamma")
+n += ck_d(gamma, derivativeGamma, 0.6, "d gamma below one")
 
 // the sign of d_asec/d_acsc for x < -1 is the classic error; pin it
-n += ck(d_fasec(0.0 - 3.0) > 0.0, "d asec positive for x<-1")
-n += ck(d_facsc(0.0 - 3.0) < 0.0, "d acsc negative for x<-1")
+n += ck(derivativeFasec(0.0 - 3.0) > 0.0, "d asec positive for x<-1")
+n += ck(derivativeFacsc(0.0 - 3.0) < 0.0, "d acsc negative for x<-1")
 
 // ---- quadrature via the fundamental theorem
-n += ck_ftc(fsin, d_fsin, 0.2, 1.4, "ftc sin")
-n += ck_ftc(fatan, d_fatan, 0.0 - 0.8, 1.9, "ftc atan")
-n += ck_ftc(fasin, d_fasin, 0.0 - 0.5, 0.5, "ftc asin")
-n += ck_ftc(sinh, d_sinh, 0.0, 2.0, "ftc sinh")
-n += ck_ftc(tanh, d_tanh, 0.0 - 1.0, 1.5, "ftc tanh")
-n += ck_ftc(fexp, d_fexp, 0.0, 3.0, "ftc exp")
-n += ck_ftc(fln, d_fln, 0.5, 4.0, "ftc ln")
-n += ck_ftc(gd, d_gd, 0.0 - 2.0, 2.0, "ftc gd")
-n += ck_ftc(lgamma, d_lgamma, 1.2, 4.0, "ftc lgamma")
+n += ck_ftc(fsin, derivativeFsin, 0.2, 1.4, "ftc sin")
+n += ck_ftc(fatan, derivativeFatan, 0.0 - 0.8, 1.9, "ftc atan")
+n += ck_ftc(fasin, derivativeFasin, 0.0 - 0.5, 0.5, "ftc asin")
+n += ck_ftc(sinh, derivativeSinh, 0.0, 2.0, "ftc sinh")
+n += ck_ftc(tanh, derivativeTanh, 0.0 - 1.0, 1.5, "ftc tanh")
+n += ck_ftc(fexp, derivativeFexp, 0.0, 3.0, "ftc exp")
+n += ck_ftc(fln, derivativeFln, 0.5, 4.0, "ftc ln")
+n += ck_ftc(gd, derivativeGd, 0.0 - 2.0, 2.0, "ftc gd")
+n += ck_ftc(lgamma, derivativeLgamma, 1.2, 4.0, "ftc lgamma")
 
 // integral of sec is the inverse gudermannian, the one identity that links
 // the quadrature, the trig family and the special functions together
-n += ck(near(integrate(fsec, 0.0, 1.0, 0.000000000001), gd_inv(1.0), 0.0000000001), "int sec = gd_inv")
+n += ck(near(integrate(fsec, 0.0, 1.0, 0.000000000001), gdInverse(1.0), 0.0000000001), "int sec = gd_inv")
 
 // ---- domain handling: NAN out, no silent garbage
-n += ck(is_nan(fasin(1.5)), "asin out of domain")
-n += ck(is_nan(facos(0.0 - 1.5)), "acos out of domain")
-n += ck(is_nan(fasec(0.5)), "asec out of domain")
-n += ck(is_nan(facsc(0.0 - 0.5)), "acsc out of domain")
-n += ck(is_nan(gd_inv(HALF_PI)), "gd_inv out of domain")
-n += ck(is_nan(fln(0.0 - 1.0)), "ln of a negative is NAN")
-n += ck(fln(0.0) == 0.0 - INF, "ln of zero is -INF")
-n += ck(is_nan(gamma(0.0)), "gamma pole at 0")
-n += ck(is_nan(gamma(0.0 - 3.0)), "gamma pole at -3")
-n += ck(is_nan(digamma(0.0 - 2.0)), "digamma pole at -2")
-n += ck(lgamma(0.0) == INF, "lgamma pole is +inf")
-n += ck(not is_nan(gamma(0.0 - 2.5)), "gamma finite between poles")
+n += ck(isNan(fasin(1.5)), "asin out of domain")
+n += ck(isNan(facos(0.0 - 1.5)), "acos out of domain")
+n += ck(isNan(fasec(0.5)), "asec out of domain")
+n += ck(isNan(facsc(0.0 - 0.5)), "acsc out of domain")
+n += ck(isNan(gdInverse(halfPi)), "gd_inv out of domain")
+n += ck(isNan(fln(0.0 - 1.0)), "ln of a negative is NAN")
+n += ck(fln(0.0) == 0.0 - infinity, "ln of zero is -INF")
+n += ck(isNan(gamma(0.0)), "gamma pole at 0")
+n += ck(isNan(gamma(0.0 - 3.0)), "gamma pole at -3")
+n += ck(isNan(digamma(0.0 - 2.0)), "digamma pole at -2")
+n += ck(lgamma(0.0) == infinity, "lgamma pole is +inf")
+n += ck(not isNan(gamma(0.0 - 2.5)), "gamma finite between poles")
 // gamma alternates sign between poles: +ve on (-2,-1), -ve on (-3,-2)
 n += ck(gamma(0.0 - 1.5) > 0.0, "gamma(-1.5) positive")
 n += ck(gamma(0.0 - 2.5) < 0.0, "gamma(-2.5) negative")
@@ -209,10 +209,10 @@ n += ck(near(fexp(100.0), fexp(50.0) * fexp(50.0), 0.0000000000001), "exp(100) c
 n += ck(near(fexp(0.0 - 100.0) * fexp(100.0), 1.0, 0.0000000001), "exp(-100) not flushed")
 n += ck(near(fexp(0.0 - 300.0) * fexp(300.0), 1.0, 0.0000000001), "exp(-300) not flushed")
 n += ck(fexp(0.0 - 745.5) == 0.0, "exp underflows to zero")
-n += ck(fexp(710.0) == INF, "exp overflows to inf")
+n += ck(fexp(710.0) == infinity, "exp overflows to inf")
 n += ck(near(cosh(100.0), fexp(100.0) / 2.0, 0.0000000001), "cosh(100) not clamped")
 n += ck(near(fln(gamma(100.0)), lgamma(100.0), 0.0000000001), "gamma(100) not clamped")
-n += ck(gamma(172.0) == INF, "gamma overflows past 171.62")
+n += ck(gamma(172.0) == infinity, "gamma overflows past 171.62")
 
 // tanh must not lose digits near zero: tanh(x) - x is about -x^3/3
 let t = 0.00000001
@@ -227,7 +227,7 @@ for i in 0..gq.len() {
     let x = gq[i]
     n += ck(near(gamma_quad(x), gamma(x), 0.00000000001), "gamma = euler integral")
 }
-n += ck(near(gamma_quad(0.5) * gamma_quad(0.5), PI, 0.0000000001), "quad gamma(1/2)^2 = pi")
+n += ck(near(gamma_quad(0.5) * gamma_quad(0.5), pi, 0.0000000001), "quad gamma(1/2)^2 = pi")
 n += ck(near(gamma_quad(6.0), 120.0, 0.0000000001), "quad gamma(6) = 120")
 
 print("math: {n} checks passed")

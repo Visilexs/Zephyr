@@ -1,9 +1,9 @@
 // A21: the same full training step, CPU against the Vulkan backend.
 //
 // Not a kernel microbenchmark. A step here is what tests/ml/overfit_test.zeph
-// does every iteration -- pad_loss over the whole batch, av_backward over the
+// does every iteration -- phaseAutogradLoss over the whole batch, autogradBackward over the
 // whole tape, gradient clipping, and an AdamW update -- with the only
-// difference being whether t_matmul dispatches to the device.
+// difference being whether tensorMatmul dispatches to the device.
 //
 // Two requirements of A21 shape the output. Correctness is checked before any
 // timing is reported: the two paths must produce the same loss and the same
@@ -66,12 +66,12 @@ fn rndi(n: int) -> int {
     return SEED % n
 }
 fn fill_random(t: Tensor) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
         let re = rnd()
-        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
-        more = idx_next(idx, t.shape)
+        if dtypeIsComplex(t.dtype) { tensorSetComplex(t, idx, re, rnd()) } else { tensorSet(t, idx, re) }
+        more = indexNext(idx, t.shape)
     }
 }
 
@@ -89,49 +89,49 @@ let CFG_T = [4, 4]
 let REPS = [12, 6]
 
 fn build(d: int, e: int, h: int, k: int, iv: int, ov: int) -> PhaseParams {
-    let config = PhaseConfig{input_vocab: iv, output_vocab: ov, D: d, E: e, H: h, K: k, pad: 0, eps: 0.00000001}
-    let embedding = t_zeros(DType.F64, [iv, e])
-    let think = t_zeros(DType.F64, [e])
-    let W1 = t_zeros(DType.F64, [h, e + 3 * d])
-    let b1 = t_zeros(DType.F64, [h])
-    let W2 = t_zeros(DType.F64, [3 * d, h])
-    let b2 = t_zeros(DType.F64, [3 * d])
-    let z_init = t_zeros(DType.C64, [d])
-    let Mo = t_zeros(DType.C64, [ov, d])
+    let config = PhaseConfig{inputVocab: iv, outputVocab: ov, stateDimension: d, embeddingDimension: e, hiddenDimension: h, thinkSteps: k, padToken: 0, epsilon: 0.00000001}
+    let embedding = tensorZeros(DType.F64, [iv, e])
+    let think = tensorZeros(DType.F64, [e])
+    let W1 = tensorZeros(DType.F64, [h, e + 3 * d])
+    let b1 = tensorZeros(DType.F64, [h])
+    let W2 = tensorZeros(DType.F64, [3 * d, h])
+    let b2 = tensorZeros(DType.F64, [3 * d])
+    let z_init = tensorZeros(DType.C64, [d])
+    let Mo = tensorZeros(DType.C64, [ov, d])
     let ps = [embedding, think, W1, b1, W2, b2, z_init, Mo]
     for i in 0..ps.len() { fill_random(ps[i]) }
-    return PhaseParams{config: config, embedding: embedding, think: think, W1: W1, b1: b1, W2: W2, b2: b2, z_init: z_init, M: Mo}
+    return PhaseParams{config: config, embedding: embedding, think: think, hiddenWeight: W1, hiddenBias: b1, angleWeight: W2, angleBias: b2, initialState: z_init, readoutMatrix: Mo}
 }
 
 fn params_of(p: PhaseParams) -> [Tensor] {
-    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+    return [p.embedding, p.think, p.hiddenWeight, p.hiddenBias, p.angleWeight, p.angleBias, p.initialState, p.readoutMatrix]
 }
 
 // One full step, exactly as overfit_test runs it. Returns the loss value; the
 // gradients are left in `out` so the two paths can be compared element by
 // element without re-running anything.
 fn full_step(p: PhaseParams, tokens: Tensor, targets: [int], opt: Optim, out: [Tensor]) -> float {
-    av_reset()
-    let m = pad_params(p, true)
-    let loss = pad_loss(m, tokens, targets)
-    av_backward(loss)
-    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    autogradReset()
+    let m = phaseAutogradParameters(p, true)
+    let loss = phaseAutogradLoss(m, tokens, targets)
+    autogradBackward(loss)
+    let handles = [m.embedding, m.think, m.hiddenWeight, m.hiddenBias, m.angleWeight, m.angleBias, m.initialState, m.readoutMatrix]
     var grads: [Tensor] = []
-    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
-    clip_grad_norm(grads, 5.0)
-    optim_step(opt, params_of(p), grads)
+    for i in 0..handles.len() { grads.push(tensorCopy(autogradGradient(handles[i]))) }
+    clipGradientNorm(grads, 5.0)
+    optimizerStep(opt, params_of(p), grads)
     for i in 0..grads.len() { out.push(grads[i]) }
-    return t_get(av_value(loss), [0])
+    return tensorGet(autogradValue(loss), [0])
 }
 
 fn forward_only(p: PhaseParams, tokens: Tensor, targets: [int]) -> float {
-    av_reset()
-    let m = pad_params(p, false)
-    return t_get(av_value(pad_loss(m, tokens, targets)), [0])
+    autogradReset()
+    let m = phaseAutogradParameters(p, false)
+    return tensorGet(autogradValue(phaseAutogradLoss(m, tokens, targets)), [0])
 }
 
-let gm = gpu_init()
-print("device: {gpu_device_name(gm)}")
+let gm = gpuInitialize()
+print("device: {gpuDeviceName(gm)}")
 print("cuda arm: BLOCKED -- NVRTC, cuBLAS and the CUDA toolkit are absent on this machine")
 print("")
 
@@ -147,10 +147,10 @@ for c in 0..NAME.len() {
     let reps = REPS[c]
     print("=== {NAME[c]} ===")
 
-    let tokens = t_zeros(DType.I64, [nb, tt])
+    let tokens = tensorZeros(DType.I64, [nb, tt])
     var targets: [int] = []
     for row in 0..nb {
-        for st in 0..tt { t_set_int(tokens, [row, st], 1 + rndi(iv - 1)) }
+        for st in 0..tt { tensorSetInt(tokens, [row, st], 1 + rndi(iv - 1)) }
         targets.push(rndi(ov))
     }
 
@@ -160,18 +160,18 @@ for c in 0..NAME.len() {
     SEED = save
     let p_gpu = build(d, e, h, k, iv, ov)
 
-    gpu_disable()
-    MATMUL_CALLS = 0
+    gpuDisable()
+    matmulCallCount = 0
     var g_cpu: [Tensor] = []
-    let loss_cpu = full_step(p_cpu, tokens, targets, adamw_new(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_cpu)
-    let mm_per_step = MATMUL_CALLS
+    let loss_cpu = full_step(p_cpu, tokens, targets, newAdamW(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_cpu)
+    let mm_per_step = matmulCallCount
 
-    gpu_enable(gm)
-    gpu_reset_memory()
+    gpuEnable(gm)
+    gpuResetMemory()
     var g_gpu: [Tensor] = []
-    let loss_gpu = full_step(p_gpu, tokens, targets, adamw_new(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_gpu)
-    let peak = GPU_PEAK_BYTES
-    gpu_disable()
+    let loss_gpu = full_step(p_gpu, tokens, targets, newAdamW(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0), g_gpu)
+    let peak = gpuPeakBytes
+    gpuDisable()
 
     let dl = fabs(loss_gpu - loss_cpu) / (1.0 + fabs(loss_cpu))
     assert(dl < 0.000000001, "loss disagrees between CPU and GPU: {loss_cpu} against {loss_gpu}")
@@ -179,21 +179,21 @@ for c in 0..NAME.len() {
     var worst = 0.0
     var compared = 0
     for i in 0..g_cpu.len() {
-        var idx = idx_zeros(g_cpu[i].shape.len())
-        var more = t_numel(g_cpu[i]) > 0
+        var idx = indexZeros(g_cpu[i].shape.len())
+        var more = tensorElementCount(g_cpu[i]) > 0
         while more {
-            if dtype_is_complex(g_cpu[i].dt) {
-                let a1 = fabs(t_get_re(g_gpu[i], idx) - t_get_re(g_cpu[i], idx)) / (1.0 + fabs(t_get_re(g_cpu[i], idx)))
-                let a2 = fabs(t_get_im(g_gpu[i], idx) - t_get_im(g_cpu[i], idx)) / (1.0 + fabs(t_get_im(g_cpu[i], idx)))
+            if dtypeIsComplex(g_cpu[i].dtype) {
+                let a1 = fabs(tensorGetReal(g_gpu[i], idx) - tensorGetReal(g_cpu[i], idx)) / (1.0 + fabs(tensorGetReal(g_cpu[i], idx)))
+                let a2 = fabs(tensorGetImaginary(g_gpu[i], idx) - tensorGetImaginary(g_cpu[i], idx)) / (1.0 + fabs(tensorGetImaginary(g_cpu[i], idx)))
                 if a1 > worst { worst = a1 }
                 if a2 > worst { worst = a2 }
                 compared = compared + 2
             } else {
-                let a1 = fabs(t_get(g_gpu[i], idx) - t_get(g_cpu[i], idx)) / (1.0 + fabs(t_get(g_cpu[i], idx)))
+                let a1 = fabs(tensorGet(g_gpu[i], idx) - tensorGet(g_cpu[i], idx)) / (1.0 + fabs(tensorGet(g_cpu[i], idx)))
                 if a1 > worst { worst = a1 }
                 compared = compared + 1
             }
-            more = idx_next(idx, g_cpu[i].shape)
+            more = indexNext(idx, g_cpu[i].shape)
         }
     }
     assert(worst < 0.000000001, "gradients disagree between CPU and GPU, worst {worst}")
@@ -205,10 +205,10 @@ for c in 0..NAME.len() {
     var cs: [float] = []
     var gf: [float] = []
     var gs: [float] = []
-    let o1 = adamw_new(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
-    let o2 = adamw_new(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
+    let o1 = newAdamW(params_of(p_cpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
+    let o2 = newAdamW(params_of(p_gpu), 0.02, 0.9, 0.999, 0.00000001, 0.0)
 
-    gpu_disable()
+    gpuDisable()
     forward_only(p_cpu, tokens, targets)
     for r in 0..reps {
         let a0 = now_ms()
@@ -220,7 +220,7 @@ for c in 0..NAME.len() {
         cs.push(now_ms() - b0)
     }
 
-    gpu_enable(gm)
+    gpuEnable(gm)
     forward_only(p_gpu, tokens, targets)
     for r in 0..reps {
         let a0 = now_ms()
@@ -231,7 +231,7 @@ for c in 0..NAME.len() {
         full_step(p_gpu, tokens, targets, o2, sink)
         gs.push(now_ms() - b0)
     }
-    gpu_disable()
+    gpuDisable()
 
     print("  forward only  cpu med {med_of(cf)} p95 {p95_of(cf)} | gpu med {med_of(gf)} p95 {p95_of(gf)} | speedup {med_of(cf) / med_of(gf)}")
     print("  full step     cpu med {med_of(cs)} p95 {p95_of(cs)} | gpu med {med_of(gs)} p95 {p95_of(gs)} | speedup {med_of(cs) / med_of(gs)}")
@@ -250,5 +250,5 @@ for c in 0..NAME.len() {
     print("")
 }
 
-gpu_done(gm)
+gpuShutdown(gm)
 print("bench complete")

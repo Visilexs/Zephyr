@@ -9,15 +9,15 @@ struct Channel { address: int }
 struct WaitGroup { address: int }
 
 // Allocate zeroed native storage, stopping on allocation failure.
-fn sync_alloc(byteCount: int) -> int {
+fn allocateSyncStorage(byteCount: int) -> int {
     let memoryAddress = win("VirtualAlloc", 0, byteCount, 12288, 4)
     assert(memoryAddress != 0, "sync: allocation failed")
     return memoryAddress
 }
 
 // Create a recursive mutex.
-fn mutex_new() -> Mutex {
-    let memoryAddress = sync_alloc(40)
+fn newMutex() -> Mutex {
+    let memoryAddress = allocateSyncStorage(40)
     let initialized = win("InitializeCriticalSection", memoryAddress)
     return Mutex{address: memoryAddress}
 }
@@ -28,11 +28,11 @@ impl Mutex {
     // Release one level of ownership.
     fn unlock(self) { let released = win("LeaveCriticalSection", self.address) }
     // Acquire without waiting, returning whether ownership was obtained.
-    fn try_lock(self) -> bool { return win("TryEnterCriticalSection", self.address) != 0 }
+    fn tryLock(self) -> bool { return win("TryEnterCriticalSection", self.address) != 0 }
 }
 
 // Create an aligned atomic cell and its native operations in one executable page.
-fn atomic_new(initial: int) -> Atomic {
+fn newAtomic(initial: int) -> Atomic {
     let memoryAddress = win("VirtualAlloc", 0, 4096, 12288, 64)
     assert(memoryAddress != 0, "atomic: allocation failed")
     store64(memoryAddress, initial)
@@ -58,15 +58,15 @@ impl Atomic {
     // Replace the value atomically and return the old value.
     fn swap(self, value: int) -> int { return callPointer(self.address + 32, self.address, value) }
     // Replace expected with replacement atomically, returning success.
-    fn compare_exchange(self, expected: int, replacement: int) -> bool {
+    fn compareExchange(self, expected: int, replacement: int) -> bool {
         return callPointer(self.address + 48, self.address, expected, replacement) != 0
     }
 }
 
 // Create a bounded FIFO; capacity must be positive and fit its allocation.
-fn channel_new(capacity: int) -> Channel {
+fn newChannel(capacity: int) -> Channel {
     assert(capacity > 0 and capacity <= (9223372036854775807 - 96) / 8, "channel: invalid capacity")
-    let memoryAddress = sync_alloc(96 + capacity * 8)
+    let memoryAddress = allocateSyncStorage(96 + capacity * 8)
     let initialized = win("InitializeCriticalSection", memoryAddress)
     let readersReady = win("InitializeConditionVariable", memoryAddress + 40)
     let writersReady = win("InitializeConditionVariable", memoryAddress + 48)
@@ -94,9 +94,9 @@ impl Channel {
         let released = win("LeaveCriticalSection", memoryAddress)
     }
     // Wait for a value, returning none once closed and drained.
-    fn receive(self) -> int? { return sync_receive(self.address, true) }
+    fn receive(self) -> int? { return receiveFromChannel(self.address, true) }
     // Return an available value, or none immediately if empty or contended.
-    fn try_receive(self) -> int? { return sync_receive(self.address, false) }
+    fn tryReceive(self) -> int? { return receiveFromChannel(self.address, false) }
     // Close idempotently and wake all blocked senders and receivers.
     fn close(self) {
         let acquired = win("EnterCriticalSection", self.address)
@@ -115,7 +115,7 @@ impl Channel {
 }
 
 // Remove the oldest value under the channel lock, optionally waiting.
-fn sync_receive(memoryAddress: int, shouldWait: bool) -> int? {
+fn receiveFromChannel(memoryAddress: int, shouldWait: bool) -> int? {
     if shouldWait {
         let acquired = win("EnterCriticalSection", memoryAddress)
     } else {
@@ -138,8 +138,8 @@ fn sync_receive(memoryAddress: int, shouldWait: bool) -> int? {
 }
 
 // Create a zero-count group; add work before launching workers or waiting.
-fn wait_group_new() -> WaitGroup {
-    let memoryAddress = sync_alloc(56)
+fn newWaitGroup() -> WaitGroup {
+    let memoryAddress = allocateSyncStorage(56)
     let initialized = win("InitializeCriticalSection", memoryAddress)
     let ready = win("InitializeConditionVariable", memoryAddress + 40)
     return WaitGroup{address: memoryAddress}

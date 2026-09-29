@@ -20,11 +20,11 @@ for a in args() {
 }
 if layers.len() > 0 { print("validation enabled") }
 
-var wnd = window_open("Zephyr - Vulkan", WIDTH, HEIGHT)
-var g = Gfx.init_windowed("zephyr-window", layers, wnd)
-print("gpu: {g.gpu_name()}")
+var wnd = openWindow("Zephyr - Vulkan", WIDTH, HEIGHT)
+var g = Gfx.initWindowed("zephyr-window", layers, wnd)
+print("gpu: {g.gpuName()}")
 
-let format = g.surface_format()
+let format = g.surfaceFormat()
 
 // ---------------- render pass (ends in PRESENT_SRC so it can be shown) ----------------
 var attach = Bytes.new(VkAttachmentDescription_sizeof)
@@ -52,16 +52,16 @@ rpci.put64(VkRenderPassCreateInfo_pAttachments, attach.addr())
 rpci.put32(VkRenderPassCreateInfo_subpassCount, 1)
 rpci.put64(VkRenderPassCreateInfo_pSubpasses, subpass.addr())
 var prp = Bytes.new(8)
-vkcheck(vkCreateRenderPass(g.dev, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
+checkVulkanResult(vkCreateRenderPass(g.device, rpci.addr(), 0, prp.addr()), "vkCreateRenderPass")
 let renderpass = prp.get64(0)
 
 var swap = g.swapchain(format, renderpass, 0)
-print("swapchain: {swap.w}x{swap.h}, {swap.images.len()} images")
+print("swapchain: {swap.width}x{swap.height}, {swap.images.len()} images")
 
 // ---------------- pipeline ----------------
 let vs = g.shader("examples/shaders/spin.vert.spv")
 let fs = g.shader("examples/shaders/triangle.frag.spv")
-var entry = cbytes("main")
+var entry = cString("main")
 
 var stages = Bytes.new(VkPipelineShaderStageCreateInfo_sizeof * 2)
 stages.put32(VkPipelineShaderStageCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
@@ -104,7 +104,7 @@ rs.put32(VkPipelineRasterizationStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELIN
 rs.put32(VkPipelineRasterizationStateCreateInfo_polygonMode, VK_POLYGON_MODE_FILL)
 rs.put32(VkPipelineRasterizationStateCreateInfo_cullMode, VK_CULL_MODE_NONE)
 rs.put32(VkPipelineRasterizationStateCreateInfo_frontFace, VK_FRONT_FACE_CLOCKWISE)
-rs.putf32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
+rs.putFloat32(VkPipelineRasterizationStateCreateInfo_lineWidth, 1.0)
 
 var ms = Bytes.new(VkPipelineMultisampleStateCreateInfo_sizeof)
 ms.put32(VkPipelineMultisampleStateCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
@@ -129,7 +129,7 @@ plci.put32(VkPipelineLayoutCreateInfo_sType, VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_C
 plci.put32(VkPipelineLayoutCreateInfo_pushConstantRangeCount, 1)
 plci.put64(VkPipelineLayoutCreateInfo_pPushConstantRanges, pcr.addr())
 var ppl = Bytes.new(8)
-vkcheck(vkCreatePipelineLayout(g.dev, plci.addr(), 0, ppl.addr()), "vkCreatePipelineLayout")
+checkVulkanResult(vkCreatePipelineLayout(g.device, plci.addr(), 0, ppl.addr()), "vkCreatePipelineLayout")
 let layout = ppl.get64(0)
 
 var gpci = Bytes.new(VkGraphicsPipelineCreateInfo_sizeof)
@@ -147,21 +147,21 @@ gpci.put64(VkGraphicsPipelineCreateInfo_layout, layout)
 gpci.put64(VkGraphicsPipelineCreateInfo_renderPass, renderpass)
 gpci.put32(VkGraphicsPipelineCreateInfo_basePipelineIndex, 0 - 1)
 var ppipe = Bytes.new(8)
-vkcheck(vkCreateGraphicsPipelines(g.dev, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
+checkVulkanResult(vkCreateGraphicsPipelines(g.device, 0, 1, gpci.addr(), 0, ppipe.addr()), "vkCreateGraphicsPipelines")
 let pipeline = ppipe.get64(0)
 
 // ---------------- frame loop ----------------
 var clear = Bytes.new(VkClearValue_sizeof)
-clear.putf32(0, 0.07)
-clear.putf32(4, 0.08)
-clear.putf32(8, 0.11)
-clear.putf32(12, 1.0)
+clear.putFloat32(0, 0.07)
+clear.putFloat32(4, 0.08)
+clear.putFloat32(8, 0.11)
+clear.putFloat32(12, 1.0)
 
 var rpbi = Bytes.new(VkRenderPassBeginInfo_sizeof)
 rpbi.put32(VkRenderPassBeginInfo_sType, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
 rpbi.put64(VkRenderPassBeginInfo_renderPass, renderpass)
-rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
-rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.width)
+rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.height)
 rpbi.put32(VkRenderPassBeginInfo_clearValueCount, 1)
 rpbi.put64(VkRenderPassBeginInfo_pClearValues, clear.addr())
 
@@ -196,19 +196,19 @@ while running {
         let q = QueryPerformanceCounter(qpc.addr())
         let t = ((qpc.get64(0) - t0) as float) / (freq as float)
         if t > seconds { running = false }
-        pushc.putf32(0, t * 1.2)
-        pushc.putf32(4, (swap.w as float) / (swap.h as float))
+        pushc.putFloat32(0, t * 1.2)
+        pushc.putFloat32(4, (swap.width as float) / (swap.height as float))
 
         // dynamic state follows the current swapchain extent
-        viewport.putf32(VkViewport_width, swap.w as float)
-        viewport.putf32(VkViewport_height, swap.h as float)
-        viewport.putf32(VkViewport_maxDepth, 1.0)
-        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.w)
-        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.h)
-        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.w)
-        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.h)
+        viewport.putFloat32(VkViewport_width, swap.width as float)
+        viewport.putFloat32(VkViewport_height, swap.height as float)
+        viewport.putFloat32(VkViewport_maxDepth, 1.0)
+        scissor.put32(VkRect2D_extent + VkExtent2D_width, swap.width)
+        scissor.put32(VkRect2D_extent + VkExtent2D_height, swap.height)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_width, swap.width)
+        rpbi.put32(VkRenderPassBeginInfo_renderArea + VkRect2D_extent + VkExtent2D_height, swap.height)
 
-        let fbs = swap.fbs
+        let fbs = swap.framebuffers
         let ok = g.frame(swap, fn(cb: int, idx: int) {
             store64(rpa + VkRenderPassBeginInfo_framebuffer, fbs[idx])
             vkCmdBeginRenderPass(cb, rpa, VK_SUBPASS_CONTENTS_INLINE)
@@ -238,13 +238,13 @@ let elapsed = ((qpc.get64(0) - t0) as float) / (freq as float)
 print("{frames} frames in {elapsed}s, {resizes} swapchain rebuilds")
 
 // ---------------- teardown ----------------
-vkcheck(vkDeviceWaitIdle(g.dev), "vkDeviceWaitIdle")
-vkDestroyPipeline(g.dev, pipeline, 0)
-vkDestroyPipelineLayout(g.dev, layout, 0)
-vkDestroyShaderModule(g.dev, vs, 0)
-vkDestroyShaderModule(g.dev, fs, 0)
-g.destroy_swapchain(swap)
-vkDestroyRenderPass(g.dev, renderpass, 0)
+checkVulkanResult(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle")
+vkDestroyPipeline(g.device, pipeline, 0)
+vkDestroyPipelineLayout(g.device, layout, 0)
+vkDestroyShaderModule(g.device, vs, 0)
+vkDestroyShaderModule(g.device, fs, 0)
+g.destroySwapchain(swap)
+vkDestroyRenderPass(g.device, renderpass, 0)
 g.shutdown()
 wnd.close()
 print("OK")

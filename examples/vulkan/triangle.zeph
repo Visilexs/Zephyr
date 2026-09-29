@@ -15,7 +15,7 @@ for a in args() {
     if a == "--validate" { layers.push("VK_LAYER_KHRONOS_validation") }
 }
 var g = Gfx.init("zephyr-triangle", layers)
-print("gpu: {g.gpu_name()}")
+print("gpu: {g.gpuName()}")
 
 // ---------------- render pass ----------------
 // One colour attachment: cleared on load, stored on finish, left in
@@ -45,14 +45,14 @@ let rpci = VkRenderPassCreateInfo.new()
     .subpassCount(1)
     .pSubpasses(subpass.addr())
 
-let renderpass = create_render_pass(g.dev, rpci)
+let renderpass = createRenderPass(g.device, rpci)
 
 var target = g.target(W, H, renderpass)
 
 // ---------------- shaders ----------------
 let vs = g.shader("examples/shaders/triangle.vert.spv")
 let fs = g.shader("examples/shaders/triangle.frag.spv")
-var entry = cbytes("main")
+var entry = cString("main")
 
 let vstage = VkPipelineShaderStageCreateInfo.new()
     .stage(VK_SHADER_STAGE_VERTEX_BIT).module(vs).pName(entry.addr())
@@ -90,7 +90,7 @@ let cba = VkPipelineColorBlendAttachmentState.new()
 let cb = VkPipelineColorBlendStateCreateInfo.new()
     .attachmentCount(1).pAttachments(cba.addr())
 
-let layout = create_pipeline_layout(g.dev, VkPipelineLayoutCreateInfo.new())
+let layout = createPipelineLayout(g.device, VkPipelineLayoutCreateInfo.new())
 
 let gpci = VkGraphicsPipelineCreateInfo.new()
     .stageCount(2).pStages(stages.addr())
@@ -105,16 +105,16 @@ let gpci = VkGraphicsPipelineCreateInfo.new()
     .subpass(0)
     .basePipelineIndex(0 - 1)
 
-let pipeline = create_graphics_pipeline(g.dev, gpci)
+let pipeline = createGraphicsPipeline(g.device, gpci)
 print("pipeline ok")
 
 // ---------------- record + submit ----------------
 // VkClearValue is a union of four floats: dark grey background.
-let clear = clear_color(0.10, 0.11, 0.13, 1.0)
+let clear = clearColor(0.10, 0.11, 0.13, 1.0)
 
 let rpbi = VkRenderPassBeginInfo.new()
     .renderPass(renderpass)
-    .framebuffer(target.fb)
+    .framebuffer(target.framebuffer)
     .renderArea_extent_width(W)
     .renderArea_extent_height(H)
     .clearValueCount(1)
@@ -132,7 +132,7 @@ print("drew")
 
 // ---------------- readback + BMP ----------------
 var px = g.readback(target)
-write_bmp("out.bmp", px, W, H)
+writeBmp("out.bmp", px, W, H)
 
 let cx = ((H / 2) * W + W / 2) * 4
 print("centre rgba = {px.get8(cx)},{px.get8(cx+1)},{px.get8(cx+2)},{px.get8(cx+3)}")
@@ -141,12 +141,12 @@ assert(px.get8(cx) > 128, "centre should be red-ish (triangle)")
 assert(px.get8(0) < 60, "corner should be dark (background)")
 
 // ---------------- teardown ----------------
-vkDestroyPipeline(g.dev, pipeline, 0)
-vkDestroyPipelineLayout(g.dev, layout, 0)
-vkDestroyShaderModule(g.dev, vs, 0)
-vkDestroyShaderModule(g.dev, fs, 0)
-g.destroy_target(target)
-vkDestroyRenderPass(g.dev, renderpass, 0)
+vkDestroyPipeline(g.device, pipeline, 0)
+vkDestroyPipelineLayout(g.device, layout, 0)
+vkDestroyShaderModule(g.device, vs, 0)
+vkDestroyShaderModule(g.device, fs, 0)
+g.destroyTarget(target)
+vkDestroyRenderPass(g.device, renderpass, 0)
 g.shutdown()
 print("wrote out.bmp ({W}x{H})")
 print("OK")

@@ -25,12 +25,12 @@ fn rndi(n: int) -> int {
     return SEED % n
 }
 fn fill_random(t: Tensor) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
         let re = rnd()
-        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
-        more = idx_next(idx, t.shape)
+        if dtypeIsComplex(t.dtype) { tensorSetComplex(t, idx, re, rnd()) } else { tensorSet(t, idx, re) }
+        more = indexNext(idx, t.shape)
     }
 }
 
@@ -38,42 +38,42 @@ fn bench(D: int, H: int, NB: int, T: int, K: int, reps: int) {
     let E = 32
     let IV = 12
     let OV = 4
-    let cfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
-    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]),
-              t_zeros(DType.F64, [H, E + 3 * D]), t_zeros(DType.F64, [H]),
-              t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    let cfg = PhaseConfig{inputVocab: IV, outputVocab: OV, stateDimension: D, embeddingDimension: E, hiddenDimension: H, thinkSteps: K, padToken: 0, epsilon: 0.00000001}
+    let ps = [tensorZeros(DType.F64, [IV, E]), tensorZeros(DType.F64, [E]),
+              tensorZeros(DType.F64, [H, E + 3 * D]), tensorZeros(DType.F64, [H]),
+              tensorZeros(DType.F64, [3 * D, H]), tensorZeros(DType.F64, [3 * D])]
     for i in 0..ps.len() { fill_random(ps[i]) }
-    let zi = t_zeros(DType.C64, [D])
-    let Mo = t_zeros(DType.C64, [OV, D])
+    let zi = tensorZeros(DType.C64, [D])
+    let Mo = tensorZeros(DType.C64, [OV, D])
     fill_random(zi)
     fill_random(Mo)
-    let p = PhaseParams{config: cfg, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
-                        W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
-    let all = [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+    let p = PhaseParams{config: cfg, embedding: ps[0], think: ps[1], hiddenWeight: ps[2], hiddenBias: ps[3],
+                        angleWeight: ps[4], angleBias: ps[5], initialState: zi, readoutMatrix: Mo}
+    let all = [p.embedding, p.think, p.hiddenWeight, p.hiddenBias, p.angleWeight, p.angleBias, p.initialState, p.readoutMatrix]
     var nparam = 0
     for i in 0..all.len() {
-        var n = t_numel(all[i])
-        if dtype_is_complex(all[i].dt) { n = n * 2 }
+        var n = tensorElementCount(all[i])
+        if dtypeIsComplex(all[i].dtype) { n = n * 2 }
         nparam = nparam + n
     }
-    let tokens = t_zeros(DType.I64, [NB, T])
+    let tokens = tensorZeros(DType.I64, [NB, T])
     var targets: [int] = []
     for row in 0..NB {
-        for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+        for st in 0..T { tensorSetInt(tokens, [row, st], 1 + rndi(IV - 1)) }
         targets.push(rndi(OV))
     }
-    let opt = adamw_new(all, 0.002, 0.9, 0.999, 0.00000001, 0.01)
+    let opt = newAdamW(all, 0.002, 0.9, 0.999, 0.00000001, 0.01)
     let t0 = now_ms()
     for r in 0..reps {
-        av_reset()
-        let m = pad_params(p, true)
-        let loss = pad_loss(m, tokens, targets)
-        av_backward(loss)
-        let hs = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+        autogradReset()
+        let m = phaseAutogradParameters(p, true)
+        let loss = phaseAutogradLoss(m, tokens, targets)
+        autogradBackward(loss)
+        let hs = [m.embedding, m.think, m.hiddenWeight, m.hiddenBias, m.angleWeight, m.angleBias, m.initialState, m.readoutMatrix]
         var grads: [Tensor] = []
-        for i in 0..hs.len() { grads.push(t_copy(av_grad(hs[i]))) }
-        clip_grad_norm(grads, 5.0)
-        optim_step(opt, all, grads)
+        for i in 0..hs.len() { grads.push(tensorCopy(autogradGradient(hs[i]))) }
+        clipGradientNorm(grads, 5.0)
+        optimizerStep(opt, all, grads)
     }
     let per = (now_ms() - t0) / (reps as float)
     let ex_s = 1000.0 * (NB as float) / per

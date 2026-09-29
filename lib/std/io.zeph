@@ -2,13 +2,13 @@
 // env and run currently panic explicitly on Linux. Paths/names reject NUL bytes.
 import "std/bytes.zeph"
 
-fn io_cstring(value: str) -> Bytes {
+fn checkedCString(value: str) -> Bytes {
     for i in 0..value.len() { assert(value.byte(i) != 0, "io: embedded NUL") }
-    return cbytes(value)
+    return cString(value)
 }
 
 // Reads one byte at a time so successive calls never consume the next line.
-fn read_line() -> str? {
+fn readLine() -> str? {
     let inputHandle = win("GetStdHandle", -10)
     let buffer = Bytes.new(8)
     let countBuffer = Bytes.new(8)
@@ -17,7 +17,7 @@ fn read_line() -> str? {
         let success = win("ReadFile", inputHandle, buffer.addr(), 1, countBuffer.addr(), 0)
         // A closed anonymous pipe reports ERROR_BROKEN_PIPE rather than success.
         if success == 0 {
-            assert(win("GetLastError") == 109, "read_line: ReadFile failed")
+            assert(win("GetLastError") == 109, "readLine: ReadFile failed")
             countBuffer.put32(0, 0)
         }
         if countBuffer.get32(0) == 0 {
@@ -33,8 +33,8 @@ fn read_line() -> str? {
 }
 
 // Write all bytes, handling short writes. The caller owns and closes the handle.
-fn io_write(handle: int, data: str) {
-    let buffer = cbytes(data)
+fn writeToHandle(handle: int, data: str) {
+    let buffer = cString(data)
     let countBuffer = Bytes.new(8)
     var written = 0
     while written < data.len() {
@@ -46,60 +46,60 @@ fn io_write(handle: int, data: str) {
     }
 }
 
-fn eprint(text: str) { io_write(win("GetStdHandle", -12), text + "\n") }
+fn printError(text: str) { writeToHandle(win("GetStdHandle", -12), text + "\n") }
 fn exit(code: int) { let ignored = win("ExitProcess", code) }
 
 // FILE_APPEND_DATA + OPEN_ALWAYS makes each write append, without truncating.
-fn append_file(path: str, data: str) {
-    let filename = io_cstring(path)
+fn appendFile(path: str, data: str) {
+    let filename = checkedCString(path)
     let handle = win("CreateFileA", filename.addr(), 4, 7, 0, 4, 128, 0)
-    assert(handle != -1, "append_file: cannot open file")
-    io_write(handle, data)
+    assert(handle != -1, "appendFile: cannot open file")
+    writeToHandle(handle, data)
     let closed = win("CloseHandle", handle)
-    assert(closed != 0, "append_file: close failed")
+    assert(closed != 0, "appendFile: close failed")
 }
 
-fn file_exists(path: str) -> bool {
-    let filename = io_cstring(path)
+fn fileExists(path: str) -> bool {
+    let filename = checkedCString(path)
     let attributes = win("GetFileAttributesA", filename.addr())
     return (attributes & 4294967295) != 4294967295
 }
 
-fn delete_file(path: str) -> bool {
-    let filename = io_cstring(path)
+fn deleteFile(path: str) -> bool {
+    let filename = checkedCString(path)
     return win("DeleteFileA", filename.addr()) != 0
 }
 
 // Enumerates immediate entry names in OS order, excluding dot entries.
-fn list_dir(path: str) -> [str] {
-    let directory = io_cstring(path)
+fn listDirectory(path: str) -> [str] {
+    let directory = checkedCString(path)
     let attributes = win("GetFileAttributesA", directory.addr()) & 4294967295
-    assert(attributes != 4294967295 and (attributes & 16) != 0, "list_dir: not a directory")
-    let pattern = io_cstring(path + "/*")
+    assert(attributes != 4294967295 and (attributes & 16) != 0, "listDirectory: not a directory")
+    let pattern = checkedCString(path + "/*")
     let entry = Bytes.new(320)
     var names: [str] = []
     let handle = win("FindFirstFileA", pattern.addr(), entry.addr())
     if handle == -1 {
-        assert(win("GetLastError") == 18 or win("GetLastError") == 2, "list_dir: enumeration failed")
+        assert(win("GetLastError") == 18 or win("GetLastError") == 2, "listDirectory: enumeration failed")
         return names
     }
     var more = true
     while more {
         var length = 0
         while length < 260 and entry.get8(44 + length) != 0 { length += 1 }
-        let name = entry.get_str(44, length)
+        let name = entry.getString(44, length)
         if name != "." and name != ".." { names.push(name) }
         more = win("FindNextFileA", handle, entry.addr()) != 0
     }
     let lastError = win("GetLastError")
     let closed = win("FindClose", handle)
-    assert(lastError == 18 and closed != 0, "list_dir: enumeration failed")
+    assert(lastError == 18 and closed != 0, "listDirectory: enumeration failed")
     return names
 }
 
 // Preserve the distinction between an absent variable and a present empty value.
-fn env(name: str) -> str? {
-    let variable = io_cstring(name)
+fn environmentVariable(name: str) -> str? {
+    let variable = checkedCString(name)
     var capacity = 256
     while true {
         let buffer = Bytes.new(capacity)
@@ -110,23 +110,23 @@ fn env(name: str) -> str? {
             assert(win("GetLastError") == 0, "env: lookup failed")
             return ""
         }
-        if length < capacity { return buffer.get_str(0, length) }
+        if length < capacity { return buffer.getString(0, length) }
         capacity = length
     }
     return none
 }
 
-fn now_ms() -> int { return win("GetTickCount64") }
+fn nowMilliseconds() -> int { return win("GetTickCount64") }
 
 // Divide first, retaining the fractional tick count without overflowing ticks*1e9.
-fn now_ns() -> int {
+fn nowNanoseconds() -> int {
     let counter = Bytes.new(8)
     let frequency = Bytes.new(8)
-    assert(win("QueryPerformanceFrequency", frequency.addr()) != 0, "now_ns: no performance frequency")
-    assert(win("QueryPerformanceCounter", counter.addr()) != 0, "now_ns: no performance counter")
+    assert(win("QueryPerformanceFrequency", frequency.addr()) != 0, "nowNanoseconds: no performance frequency")
+    assert(win("QueryPerformanceCounter", counter.addr()) != 0, "nowNanoseconds: no performance counter")
     let ticks = counter.get64(0)
     let ticksPerSecond = frequency.get64(0)
-    assert(ticksPerSecond > 0, "now_ns: invalid frequency")
+    assert(ticksPerSecond > 0, "nowNanoseconds: invalid frequency")
     let remainder = ticks % ticksPerSecond
     var fraction = 0
     if ticksPerSecond <= 9223372036 { fraction = remainder * 1000000000 / ticksPerSecond }
@@ -134,14 +134,14 @@ fn now_ns() -> int {
     return (ticks / ticksPerSecond) * 1000000000 + fraction
 }
 
-fn sleep_ms(milliseconds: int) {
-    assert(milliseconds >= 0 and milliseconds < 4294967295, "sleep_ms: duration out of range")
+fn sleepMilliseconds(milliseconds: int) {
+    assert(milliseconds >= 0 and milliseconds < 4294967295, "sleepMilliseconds: duration out of range")
     let ignored = win("Sleep", milliseconds)
 }
 
 // Windows command line, no implicit shell; pass cmd.exe /c for shell commands.
 fn run(command: str) -> int {
-    let commandBuffer = io_cstring(command)
+    let commandBuffer = checkedCString(command)
     let startup = Bytes.new(104)
     startup.put32(0, 104)
     let process = Bytes.new(24)

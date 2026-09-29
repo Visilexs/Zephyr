@@ -15,15 +15,15 @@ import "vk/win.zeph"
 
 struct Gfx {
     instance: int,
-    phys: int,
-    dev: int,
+    physicalDevice: int,
+    device: int,
     queue: int,
-    qfam: int,
-    cmdpool: int,
-    memprops: Bytes,       // cached VkPhysicalDeviceMemoryProperties
+    queueFamily: int,
+    commandPool: int,
+    memoryProperties: Bytes,       // cached VkPhysicalDeviceMemoryProperties
     surface: int,          // 0 when headless
-    has_f64: bool,         // shaderFloat64 was supported and is enabled
-    has_int64_atomics: bool, // shaderBufferInt64Atomics likewise. The f64
+    hasFloat64: bool,         // shaderFloat64 was supported and is enabled
+    hasInt64Atomics: bool, // shaderBufferInt64Atomics likewise. The f64
                            // compute kernels need both; a device without them
                            // still gets a working Gfx for the graphics paths,
                            // so callers must check before dispatching them.
@@ -39,7 +39,7 @@ struct Gfx {
 // rotation is what lets the CPU record frame N+1 while the GPU still works on
 // frame N.
 struct Frame {
-    cb: int,               // command buffer, reset and re-recorded each use
+    commandBuffer: int,               // command buffer, reset and re-recorded each use
     acquired: int,         // semaphore: image ready to render into
     fence: int             // signalled when this frame's submission completes
 }
@@ -49,14 +49,14 @@ struct Swapchain {
     handle: int,
     usage: int,
     format: int,
-    w: int,
-    h: int,
+    width: int,
+    height: int,
     images: [int],
     views: [int],
-    fbs: [int],
+    framebuffers: [int],
     frames: [Frame],
-    img_fence: [int],      // fence of the frame last using each image (0 = none)
-    img_serial: [int],     // serial of the frame last using each image
+    imageFences: [int],      // fence of the frame last using each image (0 = none)
+    imageSerials: [int],     // serial of the frame last using each image
     serial: int,           // frames presented so far
     // Render-finished semaphores are per IMAGE, not per frame. A present
     // operation keeps waiting on its semaphore after the submit fence has
@@ -64,113 +64,113 @@ struct Swapchain {
     // the presentation engine is still using (VUID-vkQueueSubmit-pSignalSemaphores-00067).
     // Keying them to the image means a semaphore is only reused once that image
     // comes back from acquire, which implies its present completed.
-    img_sem: [int],
-    cur: int,              // which Frame to use next
+    imageSemaphores: [int],
+    currentFrame: int,              // which Frame to use next
     // Optional depth attachment, one PER SWAPCHAIN IMAGE. A single shared depth
-    // image would be a real hazard: with FRAMES_IN_FLIGHT > 1 the next frame
+    // image would be a real hazard: with framesInFlight > 1 the next frame
     // starts writing depth while the previous one is still using it, and nothing
-    // orders those two submissions. Keyed to the image, the img_fence wait
+    // orders those two submissions. Keyed to the image, the imageFences wait
     // already guarantees exclusive use. Empty lists when depth is off.
-    depth_format: int,
-    depth_imgs: [int],
-    depth_mems: [int],
-    depth_views: [int]
+    depthFormat: int,
+    depthImages: [int],
+    depthMemories: [int],
+    depthViews: [int]
 }
 
-let FRAMES_IN_FLIGHT = 2
+let framesInFlight = 2
 
-struct GpuBuffer { buf: int, mem: int, size: int }
+struct GpuBuffer { buffer: int, memory: int, size: int }
 
 // An owned RGBA8 storage image; layout transitions remain explicit commands.
 // `d` is 1 for a 2D image and the slice count for a 3D one; `fmt` is the
 // VK_FORMAT_* it was created with, which readback needs to size a texel.
-struct GpuImage { image: int, mem: int, view: int, w: int, h: int, d: int, fmt: int }
+struct GpuImage { image: int, memory: int, view: int, width: int, height: int, d: int, format: int }
 
 // Timestamp queries on Gfx's graphics queue. Read only after the stamped
 // submission has completed; WAIT also covers a still-pending submission.
-struct QueryPool { dev: int, handle: int, count: int, period: float, valid_bits: int }
+struct QueryPool { device: int, handle: int, count: int, period: float, timestampValidBits: int }
 
 impl QueryPool {
-    fn new(g: Gfx, count: int) -> QueryPool {
+    fn new(graphics: Gfx, count: int) -> QueryPool {
         assert(count > 0, "query pool needs at least one slot")
-        let props = vk_output(VkPhysicalDeviceProperties_sizeof)
-        vkGetPhysicalDeviceProperties(g.phys, props.addr())
-        let period = props.getf32(VkPhysicalDeviceProperties_limits_timestampPeriod)
-        vk_free_output(props)
+        let properties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(graphics.physicalDevice, properties.addr())
+        let period = properties.getFloat32(VkPhysicalDeviceProperties_limits_timestampPeriod)
+        freeVulkanOutput(properties)
 
-        var qcount = vk_output(4)
-        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, qcount.addr(), 0)
-        let families = vk_output(VkQueueFamilyProperties_sizeof * qcount.get32(0))
-        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, qcount.addr(), families.addr())
-        let valid_bits = families.get32(g.qfam * VkQueueFamilyProperties_sizeof
+        var queueFamilyCountOutput = vulkanOutput(4)
+        vkGetPhysicalDeviceQueueFamilyProperties(graphics.physicalDevice, queueFamilyCountOutput.addr(), 0)
+        let families = vulkanOutput(VkQueueFamilyProperties_sizeof * queueFamilyCountOutput.get32(0))
+        vkGetPhysicalDeviceQueueFamilyProperties(graphics.physicalDevice, queueFamilyCountOutput.addr(), families.addr())
+        let timestampValidBits = families.get32(graphics.queueFamily * VkQueueFamilyProperties_sizeof
                                         + VkQueueFamilyProperties_timestampValidBits)
-        vk_free_output(families)
-        vk_free_output(qcount)
-        assert(valid_bits > 0, "graphics queue does not support timestamps")
+        freeVulkanOutput(families)
+        freeVulkanOutput(queueFamilyCountOutput)
+        assert(timestampValidBits > 0, "graphics queue does not support timestamps")
 
-        let ci = VkQueryPoolCreateInfo.new().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(count)
-        return QueryPool{dev: g.dev, handle: create_query_pool(g.dev, ci),
-                         count: count, period: period, valid_bits: valid_bits}
+        let createInfo = VkQueryPoolCreateInfo.new().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(count)
+        return QueryPool{device: graphics.device, handle: createQueryPool(graphics.device, createInfo),
+                         count: count, period: period, timestampValidBits: timestampValidBits}
     }
 
-    fn reset(self, cmd: int) { vkCmdResetQueryPool(cmd, self.handle, 0, self.count) }
+    fn reset(self, commandBuffer: int) { vkCmdResetQueryPool(commandBuffer, self.handle, 0, self.count) }
 
-    fn stamp(self, cmd: int, stage: int, i: int) {
-        assert(i >= 0 and i < self.count, "timestamp slot out of range")
-        vkCmdWriteTimestamp(cmd, stage, self.handle, i)
+    fn stamp(self, commandBuffer: int, stage: int, slot: int) {
+        assert(slot >= 0 and slot < self.count, "timestamp slot out of range")
+        vkCmdWriteTimestamp(commandBuffer, stage, self.handle, slot)
     }
 
     // Return elapsed nanoseconds, accounting for queues with fewer than 64 valid bits.
-    fn read_ns(self, i0: int, i1: int) -> int {
-        assert(i0 >= 0 and i0 < self.count and i1 >= 0 and i1 < self.count,
+    fn readNanoseconds(self, startSlot: int, endSlot: int) -> int {
+        assert(startSlot >= 0 and startSlot < self.count and endSlot >= 0 and endSlot < self.count,
                "timestamp slot out of range")
-        let data = vk_output(16)
+        let data = vulkanOutput(16)
         let flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
-        vkcheck(vkGetQueryPoolResults(self.dev, self.handle, i0, 1, 8,
+        checkVulkanResult(vkGetQueryPoolResults(self.device, self.handle, startSlot, 1, 8,
                                      data.addr(), 8, flags),
                 "vkGetQueryPoolResults")
-        vkcheck(vkGetQueryPoolResults(self.dev, self.handle, i1, 1, 8,
+        checkVulkanResult(vkGetQueryPoolResults(self.device, self.handle, endSlot, 1, 8,
                                      data.addr() + 8, 8, flags),
                 "vkGetQueryPoolResults")
         var ticks = data.get64(8) - data.get64(0)
-        vk_free_output(data)
-        if self.valid_bits < 64 { ticks = ticks & ((1 << self.valid_bits) - 1) }
+        freeVulkanOutput(data)
+        if self.timestampValidBits < 64 { ticks = ticks & ((1 << self.timestampValidBits) - 1) }
         return ((ticks as float) * self.period) as int
     }
 
-    fn destroy(self) { vkDestroyQueryPool(self.dev, self.handle, 0) }
+    fn destroy(self) { vkDestroyQueryPool(self.device, self.handle, 0) }
 }
 
 // Transition one colour mip/layer on the same queue, with an explicit dependency.
-fn image_barrier(cb: int, image: int, old_layout: int, new_layout: int,
-                 src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+fn imageBarrier(commandBuffer: int, image: int, oldLayout: int, newLayout: int,
+                 sourceStage: int, destinationStage: int, sourceAccess: int, destinationAccess: int) {
     let barrier = VkImageMemoryBarrier.new().image(image)
-        .oldLayout(old_layout).newLayout(new_layout)
-        .srcAccessMask(src_access).dstAccessMask(dst_access)
+        .oldLayout(oldLayout).newLayout(newLayout)
+        .srcAccessMask(sourceAccess).dstAccessMask(destinationAccess)
         .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
         .subresourceRange_aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
         .subresourceRange_levelCount(1).subresourceRange_layerCount(1)
-    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, 0, 0, 0, 1, barrier.addr())
+    vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, 0, 0, 0, 1, barrier.addr())
 }
 
 // an offscreen colour target: image + view + framebuffer
-struct Target { image: int, mem: int, view: int, fb: int, w: int, h: int }
+struct Target { image: int, memory: int, view: int, framebuffer: int, width: int, height: int }
 
 impl Gfx {
-    fn init(appname: str, layers: [str]) -> Gfx {
-        return Gfx.make(appname, layers, 0, 0)
+    fn init(applicationName: str, layers: [str]) -> Gfx {
+        return Gfx.make(applicationName, layers, 0, 0)
     }
 
     // Same, but able to present into a window: enables the surface/swapchain
     // extensions and requires the chosen queue family to support presentation.
-    fn init_windowed(appname: str, layers: [str], wnd: Window) -> Gfx {
-        return Gfx.make(appname, layers, wnd.hwnd, wnd.hinst)
+    fn initWindowed(applicationName: str, layers: [str], window: Window) -> Gfx {
+        return Gfx.make(applicationName, layers, window.hwnd, window.hinstance)
     }
 
-    fn make(appname: str, layers: [str], hwnd: int, hinst: int) -> Gfx {
-        var none_i: [str] = []
-        var none_d: [str] = []
-        return Gfx.make_ext(appname, layers, hwnd, hinst, none_i, none_d)
+    fn make(applicationName: str, layers: [str], hwnd: int, hinstance: int) -> Gfx {
+        var noInstanceExtensions: [str] = []
+        var noDeviceExtensions: [str] = []
+        return Gfx.makeWithExtensions(applicationName, layers, hwnd, hinstance, noInstanceExtensions, noDeviceExtensions)
     }
 
     // As make(), plus extensions the caller needs enabled at creation time.
@@ -179,145 +179,145 @@ impl Gfx {
     // VK_KHR_push_descriptor on the device and
     // VK_KHR_get_physical_device_properties2 on the instance, and if they are
     // missing it fails later and unhelpfully rather than here.
-    fn make_ext(appname: str, layers: [str], hwnd: int, hinst: int,
-                extra_inst: [str], extra_dev: [str]) -> Gfx {
+    fn makeWithExtensions(applicationName: str, layers: [str], hwnd: int, hinstance: int,
+                extraInstanceExtensions: [str], extraDeviceExtensions: [str]) -> Gfx {
         let windowed = hwnd != 0
-        var nameb = cbytes(appname)
-        var app = Bytes.new(VkApplicationInfo_sizeof)
-        app.put32(VkApplicationInfo_sType, VK_STRUCTURE_TYPE_APPLICATION_INFO)
-        app.put64(VkApplicationInfo_pApplicationName, nameb.addr())
-        app.put64(VkApplicationInfo_pEngineName, nameb.addr())
+        var applicationNameBytes = cString(applicationName)
+        var applicationInfo = Bytes.new(VkApplicationInfo_sizeof)
+        applicationInfo.put32(VkApplicationInfo_sType, VK_STRUCTURE_TYPE_APPLICATION_INFO)
+        applicationInfo.put64(VkApplicationInfo_pApplicationName, applicationNameBytes.addr())
+        applicationInfo.put64(VkApplicationInfo_pEngineName, applicationNameBytes.addr())
         // Ask for 1.2 when the loader has it: the shader-atomic-int64 feature
         // struct chained into vkCreateDevice below is core only from 1.2.
         // Older loaders keep the 1.0 behaviour and simply lose that feature.
-        var pver = Bytes.new(8)
-        var apiver = VK_API_VERSION_1_0
-        if vkEnumerateInstanceVersion(pver.addr()) == VK_SUCCESS {
-            if pver.get32(0) >= VK_API_VERSION_1_2 { apiver = VK_API_VERSION_1_2 }
+        var apiVersionOutput = Bytes.new(8)
+        var apiVersion = VK_API_VERSION_1_0
+        if vkEnumerateInstanceVersion(apiVersionOutput.addr()) == VK_SUCCESS {
+            if apiVersionOutput.get32(0) >= VK_API_VERSION_1_2 { apiVersion = VK_API_VERSION_1_2 }
         }
-        app.put32(VkApplicationInfo_apiVersion, apiver)
+        applicationInfo.put32(VkApplicationInfo_apiVersion, apiVersion)
 
         // layer names: an array of char* that must outlive vkCreateInstance
-        var lnames = Bytes.new(8 * (layers.len() + 1))
-        var lbufs: [Bytes] = []
+        var layerNamePointers = Bytes.new(8 * (layers.len() + 1))
+        var layerNameBuffers: [Bytes] = []
         for i in 0..layers.len() {
-            var lb = cbytes(layers[i])
-            lbufs.push(lb)
-            lnames.put64(i * 8, lb.addr())
+            var layerNameBuffer = cString(layers[i])
+            layerNameBuffers.push(layerNameBuffer)
+            layerNamePointers.put64(i * 8, layerNameBuffer.addr())
         }
 
         // instance extensions: presenting needs the surface pair
-        var exts: [str] = []
+        var instanceExtensions: [str] = []
         if windowed {
-            exts.push("VK_KHR_surface")
-            exts.push("VK_KHR_win32_surface")
+            instanceExtensions.push("VK_KHR_surface")
+            instanceExtensions.push("VK_KHR_win32_surface")
         }
-        for e in extra_inst { exts.push(e) }
-        var enames = Bytes.new(8 * (exts.len() + 1))
-        var ebufs: [Bytes] = []
-        for i in 0..exts.len() {
-            var eb = cbytes(exts[i])
-            ebufs.push(eb)
-            enames.put64(i * 8, eb.addr())
+        for extension in extraInstanceExtensions { instanceExtensions.push(extension) }
+        var instanceExtensionNamePointers = Bytes.new(8 * (instanceExtensions.len() + 1))
+        var instanceExtensionNameBuffers: [Bytes] = []
+        for i in 0..instanceExtensions.len() {
+            var instanceExtensionNameBuffer = cString(instanceExtensions[i])
+            instanceExtensionNameBuffers.push(instanceExtensionNameBuffer)
+            instanceExtensionNamePointers.put64(i * 8, instanceExtensionNameBuffer.addr())
         }
 
-        var ici = Bytes.new(VkInstanceCreateInfo_sizeof)
-        ici.put32(VkInstanceCreateInfo_sType, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
-        ici.put64(VkInstanceCreateInfo_pApplicationInfo, app.addr())
-        ici.put32(VkInstanceCreateInfo_enabledLayerCount, layers.len())
-        if layers.len() > 0 { ici.put64(VkInstanceCreateInfo_ppEnabledLayerNames, lnames.addr()) }
-        ici.put32(VkInstanceCreateInfo_enabledExtensionCount, exts.len())
-        if exts.len() > 0 { ici.put64(VkInstanceCreateInfo_ppEnabledExtensionNames, enames.addr()) }
+        var instanceCreateInfo = Bytes.new(VkInstanceCreateInfo_sizeof)
+        instanceCreateInfo.put32(VkInstanceCreateInfo_sType, VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
+        instanceCreateInfo.put64(VkInstanceCreateInfo_pApplicationInfo, applicationInfo.addr())
+        instanceCreateInfo.put32(VkInstanceCreateInfo_enabledLayerCount, layers.len())
+        if layers.len() > 0 { instanceCreateInfo.put64(VkInstanceCreateInfo_ppEnabledLayerNames, layerNamePointers.addr()) }
+        instanceCreateInfo.put32(VkInstanceCreateInfo_enabledExtensionCount, instanceExtensions.len())
+        if instanceExtensions.len() > 0 { instanceCreateInfo.put64(VkInstanceCreateInfo_ppEnabledExtensionNames, instanceExtensionNamePointers.addr()) }
 
-        var pinst = vk_output(8)
-        vkcheck(vkCreateInstance(ici.addr(), 0, pinst.addr()), "vkCreateInstance")
-        let instance = pinst.get64(0)
-        vk_free_output(pinst)
+        var instanceOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateInstance(instanceCreateInfo.addr(), 0, instanceOutput.addr()), "vkCreateInstance")
+        let instance = instanceOutput.get64(0)
+        freeVulkanOutput(instanceOutput)
 
         // the surface must exist before device selection so we can require
         // presentation support on the queue family we pick
         var surface = 0
         if windowed {
-            var sci = Bytes.new(VkWin32SurfaceCreateInfoKHR_sizeof)
-            sci.put32(VkWin32SurfaceCreateInfoKHR_sType, VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR)
-            sci.put64(VkWin32SurfaceCreateInfoKHR_hinstance, hinst)
-            sci.put64(VkWin32SurfaceCreateInfoKHR_hwnd, hwnd)
-            var ps = vk_output(8)
-            vkcheck(vkCreateWin32SurfaceKHR(instance, sci.addr(), 0, ps.addr()), "vkCreateWin32SurfaceKHR")
-            surface = ps.get64(0)
-            vk_free_output(ps)
+            var surfaceCreateInfo = Bytes.new(VkWin32SurfaceCreateInfoKHR_sizeof)
+            surfaceCreateInfo.put32(VkWin32SurfaceCreateInfoKHR_sType, VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR)
+            surfaceCreateInfo.put64(VkWin32SurfaceCreateInfoKHR_hinstance, hinstance)
+            surfaceCreateInfo.put64(VkWin32SurfaceCreateInfoKHR_hwnd, hwnd)
+            var surfaceOutput = vulkanOutput(8)
+            checkVulkanResult(vkCreateWin32SurfaceKHR(instance, surfaceCreateInfo.addr(), 0, surfaceOutput.addr()), "vkCreateWin32SurfaceKHR")
+            surface = surfaceOutput.get64(0)
+            freeVulkanOutput(surfaceOutput)
         }
 
         // pick a physical device: prefer a discrete GPU
-        var pcount = vk_output(8)
-        vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), 0), "vkEnumeratePhysicalDevices")
-        let ndev = pcount.get32(0)
-        if ndev == 0 { panic("no Vulkan physical devices") }
-        var devs = vk_output(8 * ndev)
-        vkcheck(vkEnumeratePhysicalDevices(instance, pcount.addr(), devs.addr()), "vkEnumeratePhysicalDevices")
-        var phys = devs.get64(0)
-        var props = vk_output(VkPhysicalDeviceProperties_sizeof)
-        for i in 0..ndev {
-            let d = devs.get64(i * 8)
-            vkGetPhysicalDeviceProperties(d, props.addr())
-            if props.get32(VkPhysicalDeviceProperties_deviceType) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
-                phys = d
+        var physicalDeviceCountOutput = vulkanOutput(8)
+        checkVulkanResult(vkEnumeratePhysicalDevices(instance, physicalDeviceCountOutput.addr(), 0), "vkEnumeratePhysicalDevices")
+        let physicalDeviceCount = physicalDeviceCountOutput.get32(0)
+        if physicalDeviceCount == 0 { panic("no Vulkan physical devices") }
+        var physicalDevices = vulkanOutput(8 * physicalDeviceCount)
+        checkVulkanResult(vkEnumeratePhysicalDevices(instance, physicalDeviceCountOutput.addr(), physicalDevices.addr()), "vkEnumeratePhysicalDevices")
+        var physicalDevice = physicalDevices.get64(0)
+        var properties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        for i in 0..physicalDeviceCount {
+            let candidateDevice = physicalDevices.get64(i * 8)
+            vkGetPhysicalDeviceProperties(candidateDevice, properties.addr())
+            if properties.get32(VkPhysicalDeviceProperties_deviceType) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
+                physicalDevice = candidateDevice
             }
         }
 
-        vk_free_output(pcount)
-        vk_free_output(devs)
-        vk_free_output(props)
+        freeVulkanOutput(physicalDeviceCountOutput)
+        freeVulkanOutput(physicalDevices)
+        freeVulkanOutput(properties)
 
         // a queue family that can do graphics
-        var qcount = vk_output(8)
-        vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), 0)
-        let nq = qcount.get32(0)
-        var qprops = vk_output(VkQueueFamilyProperties_sizeof * nq)
-        vkGetPhysicalDeviceQueueFamilyProperties(phys, qcount.addr(), qprops.addr())
-        var qfam = 0 - 1
-        var psup = vk_output(8)
-        for i in 0..nq {
-            let f = qprops.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
-            if qfam < 0 and (f & VK_QUEUE_GRAPHICS_BIT) != 0 {
+        var queueFamilyCountOutput = vulkanOutput(8)
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, queueFamilyCountOutput.addr(), 0)
+        let queueFamilyCount = queueFamilyCountOutput.get32(0)
+        var queueFamilyProperties = vulkanOutput(VkQueueFamilyProperties_sizeof * queueFamilyCount)
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, queueFamilyCountOutput.addr(), queueFamilyProperties.addr())
+        var queueFamily = 0 - 1
+        var presentSupportOutput = vulkanOutput(8)
+        for i in 0..queueFamilyCount {
+            let queueFlags = queueFamilyProperties.get32(i * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueFlags)
+            if queueFamily < 0 and (queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 {
                 if windowed {
-                    vkcheck(vkGetPhysicalDeviceSurfaceSupportKHR(phys, i, surface, psup.addr()),
+                    checkVulkanResult(vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, i, surface, presentSupportOutput.addr()),
                             "vkGetPhysicalDeviceSurfaceSupportKHR")
-                    if psup.get32(0) != 0 { qfam = i }
+                    if presentSupportOutput.get32(0) != 0 { queueFamily = i }
                 } else {
-                    qfam = i
+                    queueFamily = i
                 }
             }
         }
-        if qfam < 0 { panic("no graphics queue family that can present") }
-        let nq_avail = qprops.get32(qfam * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueCount)
-        vk_free_output(qcount)
-        vk_free_output(qprops)
-        vk_free_output(psup)
+        if queueFamily < 0 { panic("no graphics queue family that can present") }
+        let availableQueueCount = queueFamilyProperties.get32(queueFamily * VkQueueFamilyProperties_sizeof + VkQueueFamilyProperties_queueCount)
+        freeVulkanOutput(queueFamilyCountOutput)
+        freeVulkanOutput(queueFamilyProperties)
+        freeVulkanOutput(presentSupportOutput)
 
         // Ask for two queues when the family has them. Queue 0 is what every
         // existing caller uses and its behaviour is unchanged; queue 1 is
         // spare capacity for concurrent compute lanes. Families that expose
         // only one queue still work -- nq_avail clamps the request.
-        var nq_want = 2
-        if nq_avail < 2 { nq_want = 1 }
-        var prio = Bytes.new(4 * nq_want)
-        for i in 0..nq_want { prio.putf32(i * 4, 1.0) }
-        var qci = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
-        qci.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
-        qci.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, qfam)
-        qci.put32(VkDeviceQueueCreateInfo_queueCount, nq_want)
-        qci.put64(VkDeviceQueueCreateInfo_pQueuePriorities, prio.addr())
+        var requestedQueueCount = 2
+        if availableQueueCount < 2 { requestedQueueCount = 1 }
+        var queuePriorities = Bytes.new(4 * requestedQueueCount)
+        for i in 0..requestedQueueCount { queuePriorities.putFloat32(i * 4, 1.0) }
+        var queueCreateInfo = Bytes.new(VkDeviceQueueCreateInfo_sizeof)
+        queueCreateInfo.put32(VkDeviceQueueCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+        queueCreateInfo.put32(VkDeviceQueueCreateInfo_queueFamilyIndex, queueFamily)
+        queueCreateInfo.put32(VkDeviceQueueCreateInfo_queueCount, requestedQueueCount)
+        queueCreateInfo.put64(VkDeviceQueueCreateInfo_pQueuePriorities, queuePriorities.addr())
 
-        var dexts: [str] = []
-        if windowed { dexts.push("VK_KHR_swapchain") }
-        for e in extra_dev { dexts.push(e) }
-        var dnames = Bytes.new(8 * (dexts.len() + 1))
-        var dbufs: [Bytes] = []
-        for i in 0..dexts.len() {
-            var db = cbytes(dexts[i])
-            dbufs.push(db)
-            dnames.put64(i * 8, db.addr())
+        var deviceExtensions: [str] = []
+        if windowed { deviceExtensions.push("VK_KHR_swapchain") }
+        for extension in extraDeviceExtensions { deviceExtensions.push(extension) }
+        var deviceExtensionNamePointers = Bytes.new(8 * (deviceExtensions.len() + 1))
+        var deviceExtensionNameBuffers: [Bytes] = []
+        for i in 0..deviceExtensions.len() {
+            var deviceExtensionNameBuffer = cString(deviceExtensions[i])
+            deviceExtensionNameBuffers.push(deviceExtensionNameBuffer)
+            deviceExtensionNamePointers.put64(i * 8, deviceExtensionNameBuffer.addr())
         }
 
         // Features the compute kernels need, enabled only where supported --
@@ -327,416 +327,416 @@ impl Gfx {
         // atomics struct rides in pNext: the two are independent, so this is
         // shorter than building a VkPhysicalDeviceFeatures2 chain for both
         // (which would then require pEnabledFeatures to be NULL).
-        var feat = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
-        vkGetPhysicalDeviceFeatures(phys, feat.addr())
-        let want_f64 = feat.get32(VkPhysicalDeviceFeatures_shaderFloat64) != 0
-        var enabled = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
-        if want_f64 { enabled.put32(VkPhysicalDeviceFeatures_shaderFloat64, VK_TRUE) }
+        var supportedFeatures = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
+        vkGetPhysicalDeviceFeatures(physicalDevice, supportedFeatures.addr())
+        let wantFloat64 = supportedFeatures.get32(VkPhysicalDeviceFeatures_shaderFloat64) != 0
+        var enabledFeatures = Bytes.new(VkPhysicalDeviceFeatures_sizeof)
+        if wantFloat64 { enabledFeatures.put32(VkPhysicalDeviceFeatures_shaderFloat64, VK_TRUE) }
 
         // vkGetPhysicalDeviceFeatures2 is core 1.1, but the struct it reports
         // into is only usable in VkDeviceCreateInfo.pNext from 1.2, so gate on
         // the version we actually asked the instance for and on the device's.
-        var dprops = vk_output(VkPhysicalDeviceProperties_sizeof)
-        vkGetPhysicalDeviceProperties(phys, dprops.addr())
-        let dev_api = dprops.get32(VkPhysicalDeviceProperties_apiVersion)
-        vk_free_output(dprops)
-        var atomics = Bytes.new(VkPhysicalDeviceShaderAtomicInt64Features_sizeof)
-        atomics.put32(VkPhysicalDeviceShaderAtomicInt64Features_sType,
+        var deviceProperties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(physicalDevice, deviceProperties.addr())
+        let deviceApiVersion = deviceProperties.get32(VkPhysicalDeviceProperties_apiVersion)
+        freeVulkanOutput(deviceProperties)
+        var atomicFeatures = Bytes.new(VkPhysicalDeviceShaderAtomicInt64Features_sizeof)
+        atomicFeatures.put32(VkPhysicalDeviceShaderAtomicInt64Features_sType,
                       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES)
-        var want_atomics = false
-        if apiver >= VK_API_VERSION_1_2 and dev_api >= VK_API_VERSION_1_2 {
-            var f2 = Bytes.new(VkPhysicalDeviceFeatures2_sizeof)
-            f2.put32(VkPhysicalDeviceFeatures2_sType, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
-            f2.put64(VkPhysicalDeviceFeatures2_pNext, atomics.addr())
-            vkGetPhysicalDeviceFeatures2(phys, f2.addr())
-            want_atomics = atomics.get32(VkPhysicalDeviceShaderAtomicInt64Features_shaderBufferInt64Atomics) != 0
+        var wantInt64Atomics = false
+        if apiVersion >= VK_API_VERSION_1_2 and deviceApiVersion >= VK_API_VERSION_1_2 {
+            var features2 = Bytes.new(VkPhysicalDeviceFeatures2_sizeof)
+            features2.put32(VkPhysicalDeviceFeatures2_sType, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            features2.put64(VkPhysicalDeviceFeatures2_pNext, atomicFeatures.addr())
+            vkGetPhysicalDeviceFeatures2(physicalDevice, features2.addr())
+            wantInt64Atomics = atomicFeatures.get32(VkPhysicalDeviceShaderAtomicInt64Features_shaderBufferInt64Atomics) != 0
         }
         // hand the same struct back as a request, with only what we want set
-        atomics.put64(VkPhysicalDeviceShaderAtomicInt64Features_pNext, 0)
-        atomics.put32(VkPhysicalDeviceShaderAtomicInt64Features_shaderSharedInt64Atomics, VK_FALSE)
+        atomicFeatures.put64(VkPhysicalDeviceShaderAtomicInt64Features_pNext, 0)
+        atomicFeatures.put32(VkPhysicalDeviceShaderAtomicInt64Features_shaderSharedInt64Atomics, VK_FALSE)
 
-        var dci = Bytes.new(VkDeviceCreateInfo_sizeof)
-        dci.put32(VkDeviceCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
-        dci.put32(VkDeviceCreateInfo_queueCreateInfoCount, 1)
-        dci.put64(VkDeviceCreateInfo_pQueueCreateInfos, qci.addr())
-        dci.put32(VkDeviceCreateInfo_enabledExtensionCount, dexts.len())
-        if dexts.len() > 0 { dci.put64(VkDeviceCreateInfo_ppEnabledExtensionNames, dnames.addr()) }
-        dci.put64(VkDeviceCreateInfo_pEnabledFeatures, enabled.addr())
-        if want_atomics { dci.put64(VkDeviceCreateInfo_pNext, atomics.addr()) }
-        var pdev = vk_output(8)
-        vkcheck(vkCreateDevice(phys, dci.addr(), 0, pdev.addr()), "vkCreateDevice")
-        let dev = pdev.get64(0)
-        vk_free_output(pdev)
+        var deviceCreateInfo = Bytes.new(VkDeviceCreateInfo_sizeof)
+        deviceCreateInfo.put32(VkDeviceCreateInfo_sType, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+        deviceCreateInfo.put32(VkDeviceCreateInfo_queueCreateInfoCount, 1)
+        deviceCreateInfo.put64(VkDeviceCreateInfo_pQueueCreateInfos, queueCreateInfo.addr())
+        deviceCreateInfo.put32(VkDeviceCreateInfo_enabledExtensionCount, deviceExtensions.len())
+        if deviceExtensions.len() > 0 { deviceCreateInfo.put64(VkDeviceCreateInfo_ppEnabledExtensionNames, deviceExtensionNamePointers.addr()) }
+        deviceCreateInfo.put64(VkDeviceCreateInfo_pEnabledFeatures, enabledFeatures.addr())
+        if wantInt64Atomics { deviceCreateInfo.put64(VkDeviceCreateInfo_pNext, atomicFeatures.addr()) }
+        var deviceOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateDevice(physicalDevice, deviceCreateInfo.addr(), 0, deviceOutput.addr()), "vkCreateDevice")
+        let device = deviceOutput.get64(0)
+        freeVulkanOutput(deviceOutput)
 
-        var pq = vk_output(8)
-        vkGetDeviceQueue(dev, qfam, 0, pq.addr())
-        var pq2 = Bytes.new(8)
-        if nq_want > 1 {
-            vkGetDeviceQueue(dev, qfam, 1, pq2.addr())
+        var queueOutput = vulkanOutput(8)
+        vkGetDeviceQueue(device, queueFamily, 0, queueOutput.addr())
+        var secondQueueOutput = Bytes.new(8)
+        if requestedQueueCount > 1 {
+            vkGetDeviceQueue(device, queueFamily, 1, secondQueueOutput.addr())
         } else {
-            pq2.put64(0, pq.get64(0))
+            secondQueueOutput.put64(0, queueOutput.get64(0))
         }
 
-        var cpci = Bytes.new(VkCommandPoolCreateInfo_sizeof)
-        cpci.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
-        cpci.put32(VkCommandPoolCreateInfo_flags, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
-        cpci.put32(VkCommandPoolCreateInfo_queueFamilyIndex, qfam)
-        var pool = vk_output(8)
-        vkcheck(vkCreateCommandPool(dev, cpci.addr(), 0, pool.addr()), "vkCreateCommandPool")
+        var commandPoolCreateInfo = Bytes.new(VkCommandPoolCreateInfo_sizeof)
+        commandPoolCreateInfo.put32(VkCommandPoolCreateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+        commandPoolCreateInfo.put32(VkCommandPoolCreateInfo_flags, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
+        commandPoolCreateInfo.put32(VkCommandPoolCreateInfo_queueFamilyIndex, queueFamily)
+        var commandPoolOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateCommandPool(device, commandPoolCreateInfo.addr(), 0, commandPoolOutput.addr()), "vkCreateCommandPool")
 
-        var mp = vk_output(VkPhysicalDeviceMemoryProperties_sizeof)
-        vkGetPhysicalDeviceMemoryProperties(phys, mp.addr())
+        var memoryProperties = vulkanOutput(VkPhysicalDeviceMemoryProperties_sizeof)
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties.addr())
 
-        let queue = pq.get64(0)
-        let cmdpool = pool.get64(0)
-        vk_free_output(pq)
-        vk_free_output(pool)
-        return Gfx{instance: instance, phys: phys, dev: dev, queue: queue,
-                   qfam: qfam, cmdpool: cmdpool, memprops: mp, surface: surface,
-                   has_f64: want_f64, has_int64_atomics: want_atomics,
-                   queue2: pq2.get64(0)}
+        let queue = queueOutput.get64(0)
+        let commandPool = commandPoolOutput.get64(0)
+        freeVulkanOutput(queueOutput)
+        freeVulkanOutput(commandPoolOutput)
+        return Gfx{instance: instance, physicalDevice: physicalDevice, device: device, queue: queue,
+                   queueFamily: queueFamily, commandPool: commandPool, memoryProperties: memoryProperties, surface: surface,
+                   hasFloat64: wantFloat64, hasInt64Atomics: wantInt64Atomics,
+                   queue2: secondQueueOutput.get64(0)}
     }
 
     fn shutdown(self) {
-        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
-        vkDestroyCommandPool(self.dev, self.cmdpool, 0)
-        vkDestroyDevice(self.dev, 0)
+        checkVulkanResult(vkDeviceWaitIdle(self.device), "vkDeviceWaitIdle")
+        vkDestroyCommandPool(self.device, self.commandPool, 0)
+        vkDestroyDevice(self.device, 0)
         if self.surface != 0 { vkDestroySurfaceKHR(self.instance, self.surface, 0) }
         vkDestroyInstance(self.instance, 0)
-        vk_free_output(self.memprops)
+        freeVulkanOutput(self.memoryProperties)
     }
 
-    fn gpu_name(self) -> str {
-        var props = vk_output(VkPhysicalDeviceProperties_sizeof)
-        vkGetPhysicalDeviceProperties(self.phys, props.addr())
-        var out: [str] = []
+    fn gpuName(self) -> str {
+        var properties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.physicalDevice, properties.addr())
+        var characters: [str] = []
         var i = 0
         var going = true
         while going and i < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE {
-            let c = props.get8(VkPhysicalDeviceProperties_deviceName + i)
-            if c == 0 { going = false }
-            else { out.push(chr(c)) }
+            let characterCode = properties.get8(VkPhysicalDeviceProperties_deviceName + i)
+            if characterCode == 0 { going = false }
+            else { characters.push(chr(characterCode)) }
             i += 1
         }
-        vk_free_output(props)
-        return out.join()
+        freeVulkanOutput(properties)
+        return characters.join()
     }
 
     // The one genuinely intricate helper: pick a memory type satisfying both the
     // resource's allowed-type bitmask and the properties we need. Everyone gets
     // this wrong in raw Vulkan the first time.
-    fn find_mem_type(self, bits: int, flags: int) -> int {
-        let n = self.memprops.get32(VkPhysicalDeviceMemoryProperties_memoryTypeCount)
-        for i in 0..n {
-            let off = VkPhysicalDeviceMemoryProperties_memoryTypes + i * VkMemoryType_sizeof
-            let pf = self.memprops.get32(off + VkMemoryType_propertyFlags)
-            if (bits & (1 << i)) != 0 and (pf & flags) == flags { return i }
+    fn findMemoryType(self, allowedTypeBits: int, flags: int) -> int {
+        let memoryTypeCount = self.memoryProperties.get32(VkPhysicalDeviceMemoryProperties_memoryTypeCount)
+        for i in 0..memoryTypeCount {
+            let typeOffset = VkPhysicalDeviceMemoryProperties_memoryTypes + i * VkMemoryType_sizeof
+            let propertyFlags = self.memoryProperties.get32(typeOffset + VkMemoryType_propertyFlags)
+            if (allowedTypeBits & (1 << i)) != 0 and (propertyFlags & flags) == flags { return i }
         }
-        panic("no memory type with flags {flags} in mask {bits}")
+        panic("no memory type with flags {flags} in mask {allowedTypeBits}")
         return 0
     }
 
-    fn alloc(self, size: int, typebits: int, flags: int) -> int {
-        var mai = Bytes.new(VkMemoryAllocateInfo_sizeof)
-        mai.put32(VkMemoryAllocateInfo_sType, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
-        mai.put64(VkMemoryAllocateInfo_allocationSize, size)
-        mai.put32(VkMemoryAllocateInfo_memoryTypeIndex, self.find_mem_type(typebits, flags))
-        let pm = vk_output(8)
-        vkcheck(vkAllocateMemory(self.dev, mai.addr(), 0, pm.addr()), "vkAllocateMemory")
-        let mem = pm.get64(0)
-        vk_free_output(pm)
-        return mem
+    fn allocate(self, size: int, memoryTypeBits: int, flags: int) -> int {
+        var allocateInfo = Bytes.new(VkMemoryAllocateInfo_sizeof)
+        allocateInfo.put32(VkMemoryAllocateInfo_sType, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+        allocateInfo.put64(VkMemoryAllocateInfo_allocationSize, size)
+        allocateInfo.put32(VkMemoryAllocateInfo_memoryTypeIndex, self.findMemoryType(memoryTypeBits, flags))
+        let memoryOutput = vulkanOutput(8)
+        checkVulkanResult(vkAllocateMemory(self.device, allocateInfo.addr(), 0, memoryOutput.addr()), "vkAllocateMemory")
+        let memory = memoryOutput.get64(0)
+        freeVulkanOutput(memoryOutput)
+        return memory
     }
 
-    fn buffer(self, size: int, usage: int, memflags: int) -> GpuBuffer {
-        var bci = Bytes.new(VkBufferCreateInfo_sizeof)
-        bci.put32(VkBufferCreateInfo_sType, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
-        bci.put64(VkBufferCreateInfo_size, size)
-        bci.put32(VkBufferCreateInfo_usage, usage)
-        bci.put32(VkBufferCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
-        let out = vk_output(VkMemoryRequirements_sizeof)
-        vkcheck(vkCreateBuffer(self.dev, bci.addr(), 0, out.addr()), "vkCreateBuffer")
-        let buf = out.get64(0)
-        vkGetBufferMemoryRequirements(self.dev, buf, out.addr())
-        let mem = self.alloc(out.get64(VkMemoryRequirements_size),
-                             out.get32(VkMemoryRequirements_memoryTypeBits), memflags)
-        vk_free_output(out)
-        vkcheck(vkBindBufferMemory(self.dev, buf, mem, 0), "vkBindBufferMemory")
-        return GpuBuffer{buf: buf, mem: mem, size: size}
+    fn buffer(self, size: int, usage: int, memoryFlags: int) -> GpuBuffer {
+        var bufferCreateInfo = Bytes.new(VkBufferCreateInfo_sizeof)
+        bufferCreateInfo.put32(VkBufferCreateInfo_sType, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+        bufferCreateInfo.put64(VkBufferCreateInfo_size, size)
+        bufferCreateInfo.put32(VkBufferCreateInfo_usage, usage)
+        bufferCreateInfo.put32(VkBufferCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        let output = vulkanOutput(VkMemoryRequirements_sizeof)
+        checkVulkanResult(vkCreateBuffer(self.device, bufferCreateInfo.addr(), 0, output.addr()), "vkCreateBuffer")
+        let buffer = output.get64(0)
+        vkGetBufferMemoryRequirements(self.device, buffer, output.addr())
+        let memory = self.allocate(output.get64(VkMemoryRequirements_size),
+                             output.get32(VkMemoryRequirements_memoryTypeBits), memoryFlags)
+        freeVulkanOutput(output)
+        checkVulkanResult(vkBindBufferMemory(self.device, buffer, memory, 0), "vkBindBufferMemory")
+        return GpuBuffer{buffer: buffer, memory: memory, size: size}
     }
 
     // A device-local storage buffer filled from host memory through a staging
     // copy. Host-visible memory would work and be simpler, but a brick pool is
     // read at random by every ray, and leaving it across PCIe would make every
     // sample a bus transaction.
-    fn storage_upload(self, src: Bytes, n: int) -> GpuBuffer {
-        assert(n > 0 and n <= src.len(), "storage_upload size is outside the source")
-        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    fn storageUpload(self, source: Bytes, byteCount: int) -> GpuBuffer {
+        assert(byteCount > 0 and byteCount <= source.len(), "storageUpload size is outside the source")
+        var stagingBuffer = self.buffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-        let pp = vk_output(8)
-        vkcheck(vkMapMemory(self.dev, stage.mem, 0, n, 0, pp.addr()), "vkMapMemory (storage_upload)")
-        let dstp = pp.get64(0)
-        vk_free_output(pp)
-        for i in 0..n { store8(dstp + i, src.get8(i)) }
-        vkUnmapMemory(self.dev, stage.mem)
+        let mappedOutput = vulkanOutput(8)
+        checkVulkanResult(vkMapMemory(self.device, stagingBuffer.memory, 0, byteCount, 0, mappedOutput.addr()), "vkMapMemory (storageUpload)")
+        let mappedAddress = mappedOutput.get64(0)
+        freeVulkanOutput(mappedOutput)
+        for i in 0..byteCount { store8(mappedAddress + i, source.get8(i)) }
+        vkUnmapMemory(self.device, stagingBuffer.memory)
 
-        // TRANSFER_SRC as well, so read_storage can copy it back out; a buffer
+        // TRANSFER_SRC as well, so readStorage can copy it back out; a buffer
         // nothing can read is a buffer nothing can check.
-        var dst = self.buffer(n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+        var deviceBuffer = self.buffer(byteCount, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
         // VkBufferCopy is three 64-bit fields: srcOffset, dstOffset, size.
         var region = Bytes.new(24)
         region.put64(0, 0)
         region.put64(8, 0)
-        region.put64(16, n)
-        let ra = region.addr()
-        let sb = stage.buf
-        let db = dst.buf
-        self.immediate(fn(cb: int) {
-            vkCmdCopyBuffer(cb, sb, db, 1, ra)
+        region.put64(16, byteCount)
+        let regionAddress = region.addr()
+        let sourceBuffer = stagingBuffer.buffer
+        let destinationBuffer = deviceBuffer.buffer
+        self.immediate(fn(commandBuffer: int) {
+            vkCmdCopyBuffer(commandBuffer, sourceBuffer, destinationBuffer, 1, regionAddress)
         })
-        self.destroy_buffer(stage)
-        return dst
+        self.destroyBuffer(stagingBuffer)
+        return deviceBuffer
     }
 
-    // Read a DEVICE-LOCAL buffer back, through a staging copy. read_buffer maps
+    // Read a DEVICE-LOCAL buffer back, through a staging copy. readBuffer maps
     // the memory directly and so only works on host-visible buffers.
-    fn read_storage(self, b: GpuBuffer, n: int) -> Bytes {
-        assert(n > 0 and n <= b.size, "read_storage size is outside the buffer")
-        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    fn readStorage(self, source: GpuBuffer, byteCount: int) -> Bytes {
+        assert(byteCount > 0 and byteCount <= source.size, "readStorage size is outside the buffer")
+        var stagingBuffer = self.buffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         var region = Bytes.new(24)
         region.put64(0, 0)
         region.put64(8, 0)
-        region.put64(16, n)
-        let ra = region.addr()
-        let sb = b.buf
-        let db = stage.buf
-        self.immediate(fn(cb: int) {
-            vkCmdCopyBuffer(cb, sb, db, 1, ra)
+        region.put64(16, byteCount)
+        let regionAddress = region.addr()
+        let sourceBuffer = source.buffer
+        let destinationBuffer = stagingBuffer.buffer
+        self.immediate(fn(commandBuffer: int) {
+            vkCmdCopyBuffer(commandBuffer, sourceBuffer, destinationBuffer, 1, regionAddress)
         })
-        let out = self.read_buffer(stage, n)
-        self.destroy_buffer(stage)
-        return out
+        let contents = self.readBuffer(stagingBuffer, byteCount)
+        self.destroyBuffer(stagingBuffer)
+        return contents
     }
 
-    fn destroy_buffer(self, b: GpuBuffer) {
-        vkDestroyBuffer(self.dev, b.buf, 0)
-        vkFreeMemory(self.dev, b.mem, 0)
+    fn destroyBuffer(self, gpuBuffer: GpuBuffer) {
+        vkDestroyBuffer(self.device, gpuBuffer.buffer, 0)
+        vkFreeMemory(self.device, gpuBuffer.memory, 0)
     }
 
     // read a mapped host-visible buffer back into a Bytes
-    fn read_buffer(self, b: GpuBuffer, n: int) -> Bytes {
-        assert(n >= 0 and n <= b.size, "read_buffer exceeds buffer size")
-        let pp = vk_output(8)
-        vkcheck(vkMapMemory(self.dev, b.mem, 0, b.size, 0, pp.addr()), "vkMapMemory")
-        let src = pp.get64(0)
-        vk_free_output(pp)
-        var out = Bytes.new(n)
-        for i in 0..n { out.put8(i, load8(src + i)) }
-        vkUnmapMemory(self.dev, b.mem)
-        return out
+    fn readBuffer(self, gpuBuffer: GpuBuffer, byteCount: int) -> Bytes {
+        assert(byteCount >= 0 and byteCount <= gpuBuffer.size, "readBuffer exceeds buffer size")
+        let mappedOutput = vulkanOutput(8)
+        checkVulkanResult(vkMapMemory(self.device, gpuBuffer.memory, 0, gpuBuffer.size, 0, mappedOutput.addr()), "vkMapMemory")
+        let mappedAddress = mappedOutput.get64(0)
+        freeVulkanOutput(mappedOutput)
+        var contents = Bytes.new(byteCount)
+        for i in 0..byteCount { contents.put8(i, load8(mappedAddress + i)) }
+        vkUnmapMemory(self.device, gpuBuffer.memory)
+        return contents
     }
 
     fn shader(self, path: str) -> int {
-        let spv = readFile(path)
-        if spv.len() == 0 { panic("empty or missing shader: {path}") }
-        if spv.len() % 4 != 0 { panic("SPIR-V size not a multiple of 4: {path}") }
+        let spirv = readFile(path)
+        if spirv.len() == 0 { panic("empty or missing shader: {path}") }
+        if spirv.len() % 4 != 0 { panic("SPIR-V size not a multiple of 4: {path}") }
         // pCode must be 4-byte aligned -- Bytes is 16-aligned, so copying in is enough
-        var code = Bytes.new(spv.len())
-        code.put_str(0, spv)
-        var smci = Bytes.new(VkShaderModuleCreateInfo_sizeof)
-        smci.put32(VkShaderModuleCreateInfo_sType, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
-        smci.put64(VkShaderModuleCreateInfo_codeSize, spv.len())
-        smci.put64(VkShaderModuleCreateInfo_pCode, code.addr())
-        var pm = vk_output(8)
-        vkcheck(vkCreateShaderModule(self.dev, smci.addr(), 0, pm.addr()), "vkCreateShaderModule")
-        let handle = pm.get64(0)
-        vk_free_output(pm)
+        var code = Bytes.new(spirv.len())
+        code.putString(0, spirv)
+        var shaderModuleCreateInfo = Bytes.new(VkShaderModuleCreateInfo_sizeof)
+        shaderModuleCreateInfo.put32(VkShaderModuleCreateInfo_sType, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+        shaderModuleCreateInfo.put64(VkShaderModuleCreateInfo_codeSize, spirv.len())
+        shaderModuleCreateInfo.put64(VkShaderModuleCreateInfo_pCode, code.addr())
+        var shaderModuleOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateShaderModule(self.device, shaderModuleCreateInfo.addr(), 0, shaderModuleOutput.addr()), "vkCreateShaderModule")
+        let handle = shaderModuleOutput.get64(0)
+        freeVulkanOutput(shaderModuleOutput)
         return handle
     }
 
     // an offscreen RGBA8 colour target, ready to render into and copy out of
-    fn target(self, w: int, h: int, renderpass: int) -> Target {
-        var ici = Bytes.new(VkImageCreateInfo_sizeof)
-        ici.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
-        ici.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
-        ici.put32(VkImageCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_width, w)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_height, h)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
-        ici.put32(VkImageCreateInfo_mipLevels, 1)
-        ici.put32(VkImageCreateInfo_arrayLayers, 1)
-        ici.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
-        ici.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
-        ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-        ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
-        ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
-        var pi = vk_output(8)
-        vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage")
-        let image = pi.get64(0)
-        vk_free_output(pi)
+    fn target(self, width: int, height: int, renderPass: int) -> Target {
+        var imageCreateInfo = Bytes.new(VkImageCreateInfo_sizeof)
+        imageCreateInfo.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+        imageCreateInfo.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
+        imageCreateInfo.put32(VkImageCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_width, width)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_height, height)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_mipLevels, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_arrayLayers, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
+        imageCreateInfo.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
+        imageCreateInfo.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        imageCreateInfo.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        imageCreateInfo.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+        var imageOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateImage(self.device, imageCreateInfo.addr(), 0, imageOutput.addr()), "vkCreateImage")
+        let image = imageOutput.get64(0)
+        freeVulkanOutput(imageOutput)
 
-        var req = vk_output(VkMemoryRequirements_sizeof)
-        vkGetImageMemoryRequirements(self.dev, image, req.addr())
-        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
-                             req.get32(VkMemoryRequirements_memoryTypeBits),
+        var requirements = vulkanOutput(VkMemoryRequirements_sizeof)
+        vkGetImageMemoryRequirements(self.device, image, requirements.addr())
+        let memory = self.allocate(requirements.get64(VkMemoryRequirements_size),
+                             requirements.get32(VkMemoryRequirements_memoryTypeBits),
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-        vk_free_output(req)
-        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory")
+        freeVulkanOutput(requirements)
+        checkVulkanResult(vkBindImageMemory(self.device, image, memory, 0), "vkBindImageMemory")
 
-        var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
-        vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
-        vci.put64(VkImageViewCreateInfo_image, image)
-        vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
-        vci.put32(VkImageViewCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
-        let sr = VkImageViewCreateInfo_subresourceRange
-        vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-        vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
-        vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-        var pv = vk_output(8)
-        vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
-        let view = pv.get64(0)
-        vk_free_output(pv)
+        var viewCreateInfo = Bytes.new(VkImageViewCreateInfo_sizeof)
+        viewCreateInfo.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+        viewCreateInfo.put64(VkImageViewCreateInfo_image, image)
+        viewCreateInfo.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+        viewCreateInfo.put32(VkImageViewCreateInfo_format, VK_FORMAT_R8G8B8A8_UNORM)
+        let subresourceRange = VkImageViewCreateInfo_subresourceRange
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_levelCount, 1)
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_layerCount, 1)
+        var viewOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateImageView(self.device, viewCreateInfo.addr(), 0, viewOutput.addr()), "vkCreateImageView")
+        let view = viewOutput.get64(0)
+        freeVulkanOutput(viewOutput)
 
-        var att = Bytes.new(8)
-        att.put64(0, view)
-        var fci = Bytes.new(VkFramebufferCreateInfo_sizeof)
-        fci.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
-        fci.put64(VkFramebufferCreateInfo_renderPass, renderpass)
-        fci.put32(VkFramebufferCreateInfo_attachmentCount, 1)
-        fci.put64(VkFramebufferCreateInfo_pAttachments, att.addr())
-        fci.put32(VkFramebufferCreateInfo_width, w)
-        fci.put32(VkFramebufferCreateInfo_height, h)
-        fci.put32(VkFramebufferCreateInfo_layers, 1)
-        var pf = vk_output(8)
-        vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
+        var attachments = Bytes.new(8)
+        attachments.put64(0, view)
+        var framebufferCreateInfo = Bytes.new(VkFramebufferCreateInfo_sizeof)
+        framebufferCreateInfo.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+        framebufferCreateInfo.put64(VkFramebufferCreateInfo_renderPass, renderPass)
+        framebufferCreateInfo.put32(VkFramebufferCreateInfo_attachmentCount, 1)
+        framebufferCreateInfo.put64(VkFramebufferCreateInfo_pAttachments, attachments.addr())
+        framebufferCreateInfo.put32(VkFramebufferCreateInfo_width, width)
+        framebufferCreateInfo.put32(VkFramebufferCreateInfo_height, height)
+        framebufferCreateInfo.put32(VkFramebufferCreateInfo_layers, 1)
+        var framebufferOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateFramebuffer(self.device, framebufferCreateInfo.addr(), 0, framebufferOutput.addr()), "vkCreateFramebuffer")
 
-        let fb = pf.get64(0)
-        vk_free_output(pf)
-        return Target{image: image, mem: mem, view: view, fb: fb, w: w, h: h}
+        let framebuffer = framebufferOutput.get64(0)
+        freeVulkanOutput(framebufferOutput)
+        return Target{image: image, memory: memory, view: view, framebuffer: framebuffer, width: width, height: height}
     }
 
-    fn destroy_target(self, t: Target) {
-        vkDestroyFramebuffer(self.dev, t.fb, 0)
-        vkDestroyImageView(self.dev, t.view, 0)
-        vkDestroyImage(self.dev, t.image, 0)
-        vkFreeMemory(self.dev, t.mem, 0)
+    fn destroyTarget(self, target: Target) {
+        vkDestroyFramebuffer(self.device, target.framebuffer, 0)
+        vkDestroyImageView(self.device, target.view, 0)
+        vkDestroyImage(self.device, target.image, 0)
+        vkFreeMemory(self.device, target.memory, 0)
     }
 
     // Allocate a command buffer, begin it, let `rec` record into it, then end,
     // submit and wait. The begin/submit/wait is identical every time; what gets
     // recorded never is -- so only that part is a parameter.
-    fn immediate(self, rec: fn(int)) {
-        var cbai = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
-        cbai.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
-        cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
-        cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-        cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
-        var pcb = vk_output(8)
-        vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
-        let cb = pcb.get64(0)
-        vk_free_output(pcb)
+    fn immediate(self, recordCommands: fn(int)) {
+        var allocateInfo = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
+        allocateInfo.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+        allocateInfo.put64(VkCommandBufferAllocateInfo_commandPool, self.commandPool)
+        allocateInfo.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+        allocateInfo.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
+        var commandBufferOutput = vulkanOutput(8)
+        checkVulkanResult(vkAllocateCommandBuffers(self.device, allocateInfo.addr(), commandBufferOutput.addr()), "vkAllocateCommandBuffers")
+        let commandBuffer = commandBufferOutput.get64(0)
+        freeVulkanOutput(commandBufferOutput)
 
-        var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
-        bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-        bi.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
-        vkcheck(vkBeginCommandBuffer(cb, bi.addr()), "vkBeginCommandBuffer")
-        rec(cb)
-        vkcheck(vkEndCommandBuffer(cb), "vkEndCommandBuffer")
+        var beginInfo = Bytes.new(VkCommandBufferBeginInfo_sizeof)
+        beginInfo.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+        beginInfo.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+        checkVulkanResult(vkBeginCommandBuffer(commandBuffer, beginInfo.addr()), "vkBeginCommandBuffer")
+        recordCommands(commandBuffer)
+        checkVulkanResult(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer")
 
-        var pcbs = Bytes.new(8)
-        pcbs.put64(0, cb)
-        var si = Bytes.new(VkSubmitInfo_sizeof)
-        si.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
-        si.put32(VkSubmitInfo_commandBufferCount, 1)
-        si.put64(VkSubmitInfo_pCommandBuffers, pcbs.addr())
+        var commandBuffers = Bytes.new(8)
+        commandBuffers.put64(0, commandBuffer)
+        var submitInfo = Bytes.new(VkSubmitInfo_sizeof)
+        submitInfo.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
+        submitInfo.put32(VkSubmitInfo_commandBufferCount, 1)
+        submitInfo.put64(VkSubmitInfo_pCommandBuffers, commandBuffers.addr())
 
-        var fci = Bytes.new(VkFenceCreateInfo_sizeof)
-        fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
-        var pfence = vk_output(8)
-        vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pfence.addr()), "vkCreateFence")
-        let fence = pfence.get64(0)
+        var fenceCreateInfo = Bytes.new(VkFenceCreateInfo_sizeof)
+        fenceCreateInfo.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+        var fenceOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateFence(self.device, fenceCreateInfo.addr(), 0, fenceOutput.addr()), "vkCreateFence")
+        let fence = fenceOutput.get64(0)
 
-        vkcheck(vkQueueSubmit(self.queue, 1, si.addr(), fence), "vkQueueSubmit")
+        checkVulkanResult(vkQueueSubmit(self.queue, 1, submitInfo.addr(), fence), "vkQueueSubmit")
         // 5 second timeout in nanoseconds
-        vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+        checkVulkanResult(vkWaitForFences(self.device, 1, fenceOutput.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
 
-        vk_free_output(pfence)
-        vkDestroyFence(self.dev, fence, 0)
-        vkFreeCommandBuffers(self.dev, self.cmdpool, 1, pcbs.addr())
+        freeVulkanOutput(fenceOutput)
+        vkDestroyFence(self.device, fence, 0)
+        vkFreeCommandBuffers(self.device, self.commandPool, 1, commandBuffers.addr())
     }
 
     // copy a rendered target into a host-visible buffer and read it back as RGBA8
-    fn readback(self, t: Target) -> Bytes {
-        return self.read_image(t.image, t.w, t.h)
+    fn readback(self, target: Target) -> Bytes {
+        return self.readImage(target.image, target.width, target.height)
     }
 
     // Read one RGBA8 colour mip/layer, already in TRANSFER_SRC_OPTIMAL with writes made
     // visible to transfer reads. Wait for the copy before mapping coherent memory.
-    fn read_image(self, image: int, w: int, h: int) -> Bytes {
-        let n = w * h * 4
-        var dst = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    fn readImage(self, image: int, width: int, height: int) -> Bytes {
+        let byteCount = width * height * 4
+        var destination = self.buffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         var region = Bytes.new(VkBufferImageCopy_sizeof)
-        let isr = VkBufferImageCopy_imageSubresource
-        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, w)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, h)
+        let imageSubresource = VkBufferImageCopy_imageSubresource
+        region.put32(imageSubresource + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(imageSubresource + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, width)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, height)
         region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, 1)
 
-        let img = image
-        let ra = region.addr()
-        let db = dst.buf
-        self.immediate(fn(cb: int) {
-            vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, db, 1, ra)
-            let host = VkMemoryBarrier.new()
+        let capturedImage = image
+        let regionAddress = region.addr()
+        let destinationBuffer = destination.buffer
+        self.immediate(fn(commandBuffer: int) {
+            vkCmdCopyImageToBuffer(commandBuffer, capturedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationBuffer, 1, regionAddress)
+            let hostBarrier = VkMemoryBarrier.new()
                 .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT)
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                0, 1, host.addr(), 0, 0, 0, 0)
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, hostBarrier.addr(), 0, 0, 0, 0)
         })
-        var px = self.read_buffer(dst, n)
-        self.destroy_buffer(dst)
-        return px
+        var pixels = self.readBuffer(destination, byteCount)
+        self.destroyBuffer(destination)
+        return pixels
     }
 
     // Fill a 3D image from host memory and leave it in GENERAL, ready for a
     // compute shader to read. `src` is slice 0 first, `bpp` bytes per texel.
-    fn write_volume(self, img: GpuImage, src: Bytes, bpp: int) {
-        let n = img.w * img.h * img.d * bpp
-        assert(src.len() >= n, "write_volume source is smaller than the image")
-        var stage = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    fn writeVolume(self, volume: GpuImage, source: Bytes, bytesPerTexel: int) {
+        let byteCount = volume.width * volume.height * volume.d * bytesPerTexel
+        assert(source.len() >= byteCount, "writeVolume source is smaller than the image")
+        var stagingBuffer = self.buffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-        let pp = vk_output(8)
-        vkcheck(vkMapMemory(self.dev, stage.mem, 0, n, 0, pp.addr()), "vkMapMemory (write_volume)")
-        let dstp = pp.get64(0)
-        vk_free_output(pp)
-        for i in 0..n { store8(dstp + i, src.get8(i)) }
-        vkUnmapMemory(self.dev, stage.mem)
+        let mappedOutput = vulkanOutput(8)
+        checkVulkanResult(vkMapMemory(self.device, stagingBuffer.memory, 0, byteCount, 0, mappedOutput.addr()), "vkMapMemory (writeVolume)")
+        let mappedAddress = mappedOutput.get64(0)
+        freeVulkanOutput(mappedOutput)
+        for i in 0..byteCount { store8(mappedAddress + i, source.get8(i)) }
+        vkUnmapMemory(self.device, stagingBuffer.memory)
 
         var region = Bytes.new(VkBufferImageCopy_sizeof)
-        let isr = VkBufferImageCopy_imageSubresource
-        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, img.w)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, img.h)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, img.d)
+        let imageSubresource = VkBufferImageCopy_imageSubresource
+        region.put32(imageSubresource + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(imageSubresource + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, volume.width)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, volume.height)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, volume.d)
 
-        let image = img.image
-        let ra = region.addr()
-        let sb = stage.buf
-        self.immediate(fn(cb: int) {
-            image_barrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        let image = volume.image
+        let regionAddress = region.addr()
+        let sourceBuffer = stagingBuffer.buffer
+        self.immediate(fn(commandBuffer: int) {
+            imageBarrier(commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT)
-            vkCmdCopyBufferToImage(cb, sb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, ra)
-            image_barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            vkCmdCopyBufferToImage(commandBuffer, sourceBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, regionAddress)
+            imageBarrier(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
         })
-        self.destroy_buffer(stage)
+        self.destroyBuffer(stagingBuffer)
     }
 
     // Read a whole 3D image back, slice 0 first, `bpp` bytes per texel (1 for
@@ -746,48 +746,48 @@ impl Gfx {
     // a readback can be dropped into the middle of a frame without disturbing
     // anything. Pass VK_IMAGE_LAYOUT_GENERAL for an image a compute shader is
     // using, which is the usual case.
-    fn read_volume_from(self, img: GpuImage, bpp: int, from: int) -> Bytes {
-        let image = img.image
-        self.immediate(fn(cb: int) {
-            image_barrier(cb, image, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    fn readVolumeFrom(self, volume: GpuImage, bytesPerTexel: int, from: int) -> Bytes {
+        let image = volume.image
+        self.immediate(fn(commandBuffer: int) {
+            imageBarrier(commandBuffer, image, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT)
         })
-        let px = self.read_volume(image, img.w, img.h, img.d, bpp)
-        self.immediate(fn(cb: int) {
-            image_barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, from,
+        let pixels = self.readVolume(image, volume.width, volume.height, volume.d, bytesPerTexel)
+        self.immediate(fn(commandBuffer: int) {
+            imageBarrier(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, from,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT)
         })
-        return px
+        return pixels
     }
 
     // Raw readback: the image must already be in TRANSFER_SRC_OPTIMAL.
-    fn read_volume(self, image: int, w: int, h: int, d: int, bpp: int) -> Bytes {
-        let n = w * h * d * bpp
-        var dst = self.buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    fn readVolume(self, image: int, width: int, height: int, depth: int, bytesPerTexel: int) -> Bytes {
+        let byteCount = width * height * depth * bytesPerTexel
+        var destination = self.buffer(byteCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         var region = Bytes.new(VkBufferImageCopy_sizeof)
-        let isr = VkBufferImageCopy_imageSubresource
-        region.put32(isr + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-        region.put32(isr + VkImageSubresourceLayers_layerCount, 1)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, w)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, h)
-        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, d)
+        let imageSubresource = VkBufferImageCopy_imageSubresource
+        region.put32(imageSubresource + VkImageSubresourceLayers_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        region.put32(imageSubresource + VkImageSubresourceLayers_layerCount, 1)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_width, width)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_height, height)
+        region.put32(VkBufferImageCopy_imageExtent + VkExtent3D_depth, depth)
 
-        let img = image
-        let ra = region.addr()
-        let db = dst.buf
-        self.immediate(fn(cb: int) {
-            vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, db, 1, ra)
-            let host = VkMemoryBarrier.new()
+        let capturedImage = image
+        let regionAddress = region.addr()
+        let destinationBuffer = destination.buffer
+        self.immediate(fn(commandBuffer: int) {
+            vkCmdCopyImageToBuffer(commandBuffer, capturedImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationBuffer, 1, regionAddress)
+            let hostBarrier = VkMemoryBarrier.new()
                 .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT)
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                0, 1, host.addr(), 0, 0, 0, 0)
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, hostBarrier.addr(), 0, 0, 0, 0)
         })
-        var px = self.read_buffer(dst, n)
-        self.destroy_buffer(dst)
-        return px
+        var pixels = self.readBuffer(destination, byteCount)
+        self.destroyBuffer(destination)
+        return pixels
     }
 }
 
@@ -795,274 +795,274 @@ impl Gfx {
 impl Gfx {
     // Pick the surface format: prefer plain BGRA8 UNORM so the colours we write
     // land on screen unchanged (an _SRGB swapchain would re-encode them).
-    fn surface_format(self) -> int {
-        var pc = vk_output(8)
-        vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), 0),
+    fn surfaceFormat(self) -> int {
+        var formatCountOutput = vulkanOutput(8)
+        checkVulkanResult(vkGetPhysicalDeviceSurfaceFormatsKHR(self.physicalDevice, self.surface, formatCountOutput.addr(), 0),
                 "vkGetPhysicalDeviceSurfaceFormatsKHR")
-        let n = pc.get32(0)
-        if n == 0 { panic("surface reports no formats") }
-        var fmts = vk_output(VkSurfaceFormatKHR_sizeof * n)
-        vkcheck(vkGetPhysicalDeviceSurfaceFormatsKHR(self.phys, self.surface, pc.addr(), fmts.addr()),
+        let formatCount = formatCountOutput.get32(0)
+        if formatCount == 0 { panic("surface reports no formats") }
+        var formats = vulkanOutput(VkSurfaceFormatKHR_sizeof * formatCount)
+        checkVulkanResult(vkGetPhysicalDeviceSurfaceFormatsKHR(self.physicalDevice, self.surface, formatCountOutput.addr(), formats.addr()),
                 "vkGetPhysicalDeviceSurfaceFormatsKHR")
-        var chosen = fmts.get32(VkSurfaceFormatKHR_format)
-        for i in 0..n {
-            let f = fmts.get32(i * VkSurfaceFormatKHR_sizeof + VkSurfaceFormatKHR_format)
-            if f == VK_FORMAT_B8G8R8A8_UNORM { chosen = f }
+        var chosen = formats.get32(VkSurfaceFormatKHR_format)
+        for i in 0..formatCount {
+            let candidateFormat = formats.get32(i * VkSurfaceFormatKHR_sizeof + VkSurfaceFormatKHR_format)
+            if candidateFormat == VK_FORMAT_B8G8R8A8_UNORM { chosen = candidateFormat }
         }
-        vk_free_output(pc)
-        vk_free_output(fmts)
+        freeVulkanOutput(formatCountOutput)
+        freeVulkanOutput(formats)
         return chosen
     }
 
-    fn swapchain(self, format: int, renderpass: int, old: int) -> Swapchain {
-        return self.swapchain_depth(format, renderpass, old, 0)
+    fn swapchain(self, format: int, renderPass: int, oldSwapchain: int) -> Swapchain {
+        return self.swapchainWithDepth(format, renderPass, oldSwapchain, 0)
     }
 
     // A depth-only image sized to the swapchain, for use as a depth attachment.
-    fn depth_image(self, w: int, h: int, format: int) -> [int] {
-        var ici = Bytes.new(VkImageCreateInfo_sizeof)
-        ici.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
-        ici.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
-        ici.put32(VkImageCreateInfo_format, format)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_width, w)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_height, h)
-        ici.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
-        ici.put32(VkImageCreateInfo_mipLevels, 1)
-        ici.put32(VkImageCreateInfo_arrayLayers, 1)
-        ici.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
-        ici.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
-        ici.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-        ici.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
-        ici.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
-        var pi = vk_output(8)
-        vkcheck(vkCreateImage(self.dev, ici.addr(), 0, pi.addr()), "vkCreateImage (depth)")
-        let image = pi.get64(0)
-        vk_free_output(pi)
+    fn depthImage(self, width: int, height: int, format: int) -> [int] {
+        var imageCreateInfo = Bytes.new(VkImageCreateInfo_sizeof)
+        imageCreateInfo.put32(VkImageCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+        imageCreateInfo.put32(VkImageCreateInfo_imageType, VK_IMAGE_TYPE_2D)
+        imageCreateInfo.put32(VkImageCreateInfo_format, format)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_width, width)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_height, height)
+        imageCreateInfo.put32(VkImageCreateInfo_extent + VkExtent3D_depth, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_mipLevels, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_arrayLayers, 1)
+        imageCreateInfo.put32(VkImageCreateInfo_samples, VK_SAMPLE_COUNT_1_BIT)
+        imageCreateInfo.put32(VkImageCreateInfo_tiling, VK_IMAGE_TILING_OPTIMAL)
+        imageCreateInfo.put32(VkImageCreateInfo_usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+        imageCreateInfo.put32(VkImageCreateInfo_sharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        imageCreateInfo.put32(VkImageCreateInfo_initialLayout, VK_IMAGE_LAYOUT_UNDEFINED)
+        var imageOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateImage(self.device, imageCreateInfo.addr(), 0, imageOutput.addr()), "vkCreateImage (depth)")
+        let image = imageOutput.get64(0)
+        freeVulkanOutput(imageOutput)
 
-        var req = vk_output(VkMemoryRequirements_sizeof)
-        vkGetImageMemoryRequirements(self.dev, image, req.addr())
-        let mem = self.alloc(req.get64(VkMemoryRequirements_size),
-                             req.get32(VkMemoryRequirements_memoryTypeBits),
+        var requirements = vulkanOutput(VkMemoryRequirements_sizeof)
+        vkGetImageMemoryRequirements(self.device, image, requirements.addr())
+        let memory = self.allocate(requirements.get64(VkMemoryRequirements_size),
+                             requirements.get32(VkMemoryRequirements_memoryTypeBits),
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-        vk_free_output(req)
-        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory (depth)")
+        freeVulkanOutput(requirements)
+        checkVulkanResult(vkBindImageMemory(self.device, image, memory, 0), "vkBindImageMemory (depth)")
 
-        var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
-        vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
-        vci.put64(VkImageViewCreateInfo_image, image)
-        vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
-        vci.put32(VkImageViewCreateInfo_format, format)
-        let sr = VkImageViewCreateInfo_subresourceRange
-        vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_DEPTH_BIT)
-        vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
-        vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-        var pv = vk_output(8)
-        vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView (depth)")
+        var viewCreateInfo = Bytes.new(VkImageViewCreateInfo_sizeof)
+        viewCreateInfo.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+        viewCreateInfo.put64(VkImageViewCreateInfo_image, image)
+        viewCreateInfo.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+        viewCreateInfo.put32(VkImageViewCreateInfo_format, format)
+        let subresourceRange = VkImageViewCreateInfo_subresourceRange
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_DEPTH_BIT)
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_levelCount, 1)
+        viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_layerCount, 1)
+        var viewOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateImageView(self.device, viewCreateInfo.addr(), 0, viewOutput.addr()), "vkCreateImageView (depth)")
 
-        var out: [int] = []
-        out.push(image)
-        out.push(mem)
-        out.push(pv.get64(0))
-        vk_free_output(pv)
-        return out
+        var handles: [int] = []
+        handles.push(image)
+        handles.push(memory)
+        handles.push(viewOutput.get64(0))
+        freeVulkanOutput(viewOutput)
+        return handles
     }
 
     // As swapchain(), but each framebuffer also gets a depth attachment in slot
-    // 1. `depth_format` of 0 means no depth, which is what swapchain() passes.
+    // 1. `depthFormat` of 0 means no depth, which is what swapchain() passes.
     // The render pass must agree: attachment 0 colour, attachment 1 depth.
-    fn swapchain_depth(self, format: int, renderpass: int, old: int, depth_format: int) -> Swapchain {
-        return self.swapchain_usage(format, renderpass, old, depth_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+    fn swapchainWithDepth(self, format: int, renderPass: int, oldSwapchain: int, depthFormat: int) -> Swapchain {
+        return self.swapchainWithUsage(format, renderPass, oldSwapchain, depthFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
     }
 
     // A transfer-only swapchain needs no views or framebuffers (renderpass = 0).
     // Existing render-pass callers retain their original usage and frame behavior.
-    fn swapchain_usage(self, format: int, renderpass: int, old: int, depth_format: int, usage: int) -> Swapchain {
-        var caps = vk_output(VkSurfaceCapabilitiesKHR_sizeof)
-        vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
+    fn swapchainWithUsage(self, format: int, renderPass: int, oldSwapchain: int, depthFormat: int, usage: int) -> Swapchain {
+        var capabilities = vulkanOutput(VkSurfaceCapabilitiesKHR_sizeof)
+        checkVulkanResult(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.physicalDevice, self.surface, capabilities.addr()),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
-        let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
-        let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
-        assert((caps.get32(VkSurfaceCapabilitiesKHR_supportedUsageFlags) & usage) == usage,
+        let width = capabilities.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
+        let height = capabilities.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        assert((capabilities.get32(VkSurfaceCapabilitiesKHR_supportedUsageFlags) & usage) == usage,
                "surface does not support requested swapchain image usage")
-        var want = caps.get32(VkSurfaceCapabilitiesKHR_minImageCount) + 1
-        let maxi = caps.get32(VkSurfaceCapabilitiesKHR_maxImageCount)
-        if maxi > 0 and want > maxi { want = maxi }
-        vk_free_output(caps)
+        var wantedImageCount = capabilities.get32(VkSurfaceCapabilitiesKHR_minImageCount) + 1
+        let maxImageCount = capabilities.get32(VkSurfaceCapabilitiesKHR_maxImageCount)
+        if maxImageCount > 0 and wantedImageCount > maxImageCount { wantedImageCount = maxImageCount }
+        freeVulkanOutput(capabilities)
 
-        var sci = Bytes.new(VkSwapchainCreateInfoKHR_sizeof)
-        sci.put32(VkSwapchainCreateInfoKHR_sType, VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR)
-        sci.put64(VkSwapchainCreateInfoKHR_surface, self.surface)
-        sci.put32(VkSwapchainCreateInfoKHR_minImageCount, want)
-        sci.put32(VkSwapchainCreateInfoKHR_imageFormat, format)
-        sci.put32(VkSwapchainCreateInfoKHR_imageColorSpace, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-        sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_width, w)
-        sci.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_height, h)
-        sci.put32(VkSwapchainCreateInfoKHR_imageArrayLayers, 1)
-        sci.put32(VkSwapchainCreateInfoKHR_imageUsage, usage)
-        sci.put32(VkSwapchainCreateInfoKHR_imageSharingMode, VK_SHARING_MODE_EXCLUSIVE)
-        sci.put32(VkSwapchainCreateInfoKHR_preTransform, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-        sci.put32(VkSwapchainCreateInfoKHR_compositeAlpha, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
-        sci.put32(VkSwapchainCreateInfoKHR_presentMode, VK_PRESENT_MODE_FIFO_KHR)   // vsync
-        sci.put32(VkSwapchainCreateInfoKHR_clipped, VK_TRUE)
-        sci.put64(VkSwapchainCreateInfoKHR_oldSwapchain, old)
+        var swapchainCreateInfo = Bytes.new(VkSwapchainCreateInfoKHR_sizeof)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_sType, VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR)
+        swapchainCreateInfo.put64(VkSwapchainCreateInfoKHR_surface, self.surface)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_minImageCount, wantedImageCount)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageFormat, format)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageColorSpace, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_width, width)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageExtent + VkExtent2D_height, height)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageArrayLayers, 1)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageUsage, usage)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_imageSharingMode, VK_SHARING_MODE_EXCLUSIVE)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_preTransform, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_compositeAlpha, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_presentMode, VK_PRESENT_MODE_FIFO_KHR)   // vsync
+        swapchainCreateInfo.put32(VkSwapchainCreateInfoKHR_clipped, VK_TRUE)
+        swapchainCreateInfo.put64(VkSwapchainCreateInfoKHR_oldSwapchain, oldSwapchain)
 
-        var psc = vk_output(8)
-        vkcheck(vkCreateSwapchainKHR(self.dev, sci.addr(), 0, psc.addr()), "vkCreateSwapchainKHR")
-        let handle = psc.get64(0)
-        vk_free_output(psc)
+        var swapchainOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateSwapchainKHR(self.device, swapchainCreateInfo.addr(), 0, swapchainOutput.addr()), "vkCreateSwapchainKHR")
+        let handle = swapchainOutput.get64(0)
+        freeVulkanOutput(swapchainOutput)
 
-        var pn = vk_output(8)
-        vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), 0), "vkGetSwapchainImagesKHR")
-        let n = pn.get32(0)
-        var imgbuf = vk_output(8 * n)
-        vkcheck(vkGetSwapchainImagesKHR(self.dev, handle, pn.addr(), imgbuf.addr()), "vkGetSwapchainImagesKHR")
+        var imageCountOutput = vulkanOutput(8)
+        checkVulkanResult(vkGetSwapchainImagesKHR(self.device, handle, imageCountOutput.addr(), 0), "vkGetSwapchainImagesKHR")
+        let imageCount = imageCountOutput.get32(0)
+        var imageHandles = vulkanOutput(8 * imageCount)
+        checkVulkanResult(vkGetSwapchainImagesKHR(self.device, handle, imageCountOutput.addr(), imageHandles.addr()), "vkGetSwapchainImagesKHR")
 
         var images: [int] = []
         var views: [int] = []
-        var fbs: [int] = []
-        var depth_imgs: [int] = []
-        var depth_mems: [int] = []
-        var depth_views: [int] = []
-        for i in 0..n {
-            let img = imgbuf.get64(i * 8)
-            images.push(img)
+        var framebuffers: [int] = []
+        var depthImages: [int] = []
+        var depthMemories: [int] = []
+        var depthViews: [int] = []
+        for i in 0..imageCount {
+            let image = imageHandles.get64(i * 8)
+            images.push(image)
 
-            if renderpass == 0 { continue }
+            if renderPass == 0 { continue }
 
-            var vci = Bytes.new(VkImageViewCreateInfo_sizeof)
-            vci.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
-            vci.put64(VkImageViewCreateInfo_image, img)
-            vci.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
-            vci.put32(VkImageViewCreateInfo_format, format)
-            let sr = VkImageViewCreateInfo_subresourceRange
-            vci.put32(sr + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-            vci.put32(sr + VkImageSubresourceRange_levelCount, 1)
-            vci.put32(sr + VkImageSubresourceRange_layerCount, 1)
-            var pv = vk_output(8)
-            vkcheck(vkCreateImageView(self.dev, vci.addr(), 0, pv.addr()), "vkCreateImageView")
-            let view = pv.get64(0)
-            vk_free_output(pv)
+            var viewCreateInfo = Bytes.new(VkImageViewCreateInfo_sizeof)
+            viewCreateInfo.put32(VkImageViewCreateInfo_sType, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+            viewCreateInfo.put64(VkImageViewCreateInfo_image, image)
+            viewCreateInfo.put32(VkImageViewCreateInfo_viewType, VK_IMAGE_VIEW_TYPE_2D)
+            viewCreateInfo.put32(VkImageViewCreateInfo_format, format)
+            let subresourceRange = VkImageViewCreateInfo_subresourceRange
+            viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+            viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_levelCount, 1)
+            viewCreateInfo.put32(subresourceRange + VkImageSubresourceRange_layerCount, 1)
+            var viewOutput = vulkanOutput(8)
+            checkVulkanResult(vkCreateImageView(self.device, viewCreateInfo.addr(), 0, viewOutput.addr()), "vkCreateImageView")
+            let view = viewOutput.get64(0)
+            freeVulkanOutput(viewOutput)
             views.push(view)
 
-            var nattach = 1
-            var att = Bytes.new(16)
-            att.put64(0, view)
-            if depth_format != 0 {
-                let d = self.depth_image(w, h, depth_format)
-                depth_imgs.push(d[0])
-                depth_mems.push(d[1])
-                depth_views.push(d[2])
-                att.put64(8, d[2])
-                nattach = 2
+            var attachmentCount = 1
+            var attachments = Bytes.new(16)
+            attachments.put64(0, view)
+            if depthFormat != 0 {
+                let depthResources = self.depthImage(width, height, depthFormat)
+                depthImages.push(depthResources[0])
+                depthMemories.push(depthResources[1])
+                depthViews.push(depthResources[2])
+                attachments.put64(8, depthResources[2])
+                attachmentCount = 2
             }
-            var fci = Bytes.new(VkFramebufferCreateInfo_sizeof)
-            fci.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
-            fci.put64(VkFramebufferCreateInfo_renderPass, renderpass)
-            fci.put32(VkFramebufferCreateInfo_attachmentCount, nattach)
-            fci.put64(VkFramebufferCreateInfo_pAttachments, att.addr())
-            fci.put32(VkFramebufferCreateInfo_width, w)
-            fci.put32(VkFramebufferCreateInfo_height, h)
-            fci.put32(VkFramebufferCreateInfo_layers, 1)
-            var pf = vk_output(8)
-            vkcheck(vkCreateFramebuffer(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFramebuffer")
-            fbs.push(pf.get64(0))
-            vk_free_output(pf)
+            var framebufferCreateInfo = Bytes.new(VkFramebufferCreateInfo_sizeof)
+            framebufferCreateInfo.put32(VkFramebufferCreateInfo_sType, VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+            framebufferCreateInfo.put64(VkFramebufferCreateInfo_renderPass, renderPass)
+            framebufferCreateInfo.put32(VkFramebufferCreateInfo_attachmentCount, attachmentCount)
+            framebufferCreateInfo.put64(VkFramebufferCreateInfo_pAttachments, attachments.addr())
+            framebufferCreateInfo.put32(VkFramebufferCreateInfo_width, width)
+            framebufferCreateInfo.put32(VkFramebufferCreateInfo_height, height)
+            framebufferCreateInfo.put32(VkFramebufferCreateInfo_layers, 1)
+            var framebufferOutput = vulkanOutput(8)
+            checkVulkanResult(vkCreateFramebuffer(self.device, framebufferCreateInfo.addr(), 0, framebufferOutput.addr()), "vkCreateFramebuffer")
+            framebuffers.push(framebufferOutput.get64(0))
+            freeVulkanOutput(framebufferOutput)
         }
 
-        vk_free_output(pn)
-        vk_free_output(imgbuf)
+        freeVulkanOutput(imageCountOutput)
+        freeVulkanOutput(imageHandles)
 
         // per-frame command buffers, semaphores and fences
         var frames: [Frame] = []
-        for i in 0..FRAMES_IN_FLIGHT {
-            var cbai = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
-            cbai.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
-            cbai.put64(VkCommandBufferAllocateInfo_commandPool, self.cmdpool)
-            cbai.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-            cbai.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
-            var pcb = vk_output(8)
-            vkcheck(vkAllocateCommandBuffers(self.dev, cbai.addr(), pcb.addr()), "vkAllocateCommandBuffers")
+        for i in 0..framesInFlight {
+            var allocateInfo = Bytes.new(VkCommandBufferAllocateInfo_sizeof)
+            allocateInfo.put32(VkCommandBufferAllocateInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+            allocateInfo.put64(VkCommandBufferAllocateInfo_commandPool, self.commandPool)
+            allocateInfo.put32(VkCommandBufferAllocateInfo_level, VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+            allocateInfo.put32(VkCommandBufferAllocateInfo_commandBufferCount, 1)
+            var commandBufferOutput = vulkanOutput(8)
+            checkVulkanResult(vkAllocateCommandBuffers(self.device, allocateInfo.addr(), commandBufferOutput.addr()), "vkAllocateCommandBuffers")
             // created signalled so the first wait on it returns immediately
-            frames.push(Frame{cb: pcb.get64(0), acquired: self.semaphore(),
+            frames.push(Frame{commandBuffer: commandBufferOutput.get64(0), acquired: self.semaphore(),
                               fence: self.fence(true)})
-            vk_free_output(pcb)
+            freeVulkanOutput(commandBufferOutput)
         }
-        var img_fence: [int] = []
-        var img_serial: [int] = []
-        var img_sem: [int] = []
-        for i in 0..n {
-            img_fence.push(0)
-            img_serial.push(0)
-            img_sem.push(self.semaphore())
+        var imageFences: [int] = []
+        var imageSerials: [int] = []
+        var imageSemaphores: [int] = []
+        for i in 0..imageCount {
+            imageFences.push(0)
+            imageSerials.push(0)
+            imageSemaphores.push(self.semaphore())
         }
 
-        return Swapchain{handle: handle, usage: usage, format: format, w: w, h: h,
-                         images: images, views: views, fbs: fbs,
-                         frames: frames, img_fence: img_fence, img_serial: img_serial, serial: 0,
-                         img_sem: img_sem, cur: 0,
-                         depth_format: depth_format, depth_imgs: depth_imgs,
-                         depth_mems: depth_mems, depth_views: depth_views}
+        return Swapchain{handle: handle, usage: usage, format: format, width: width, height: height,
+                         images: images, views: views, framebuffers: framebuffers,
+                         frames: frames, imageFences: imageFences, imageSerials: imageSerials, serial: 0,
+                         imageSemaphores: imageSemaphores, currentFrame: 0,
+                         depthFormat: depthFormat, depthImages: depthImages,
+                         depthMemories: depthMemories, depthViews: depthViews}
     }
 
     fn fence(self, signalled: bool) -> int {
-        var fci = Bytes.new(VkFenceCreateInfo_sizeof)
-        fci.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
-        if signalled { fci.put32(VkFenceCreateInfo_flags, VK_FENCE_CREATE_SIGNALED_BIT) }
-        var pf = vk_output(8)
-        vkcheck(vkCreateFence(self.dev, fci.addr(), 0, pf.addr()), "vkCreateFence")
-        let handle = pf.get64(0)
-        vk_free_output(pf)
+        var fenceCreateInfo = Bytes.new(VkFenceCreateInfo_sizeof)
+        fenceCreateInfo.put32(VkFenceCreateInfo_sType, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+        if signalled { fenceCreateInfo.put32(VkFenceCreateInfo_flags, VK_FENCE_CREATE_SIGNALED_BIT) }
+        var fenceOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateFence(self.device, fenceCreateInfo.addr(), 0, fenceOutput.addr()), "vkCreateFence")
+        let handle = fenceOutput.get64(0)
+        freeVulkanOutput(fenceOutput)
         return handle
     }
 
     fn semaphore(self) -> int {
-        var sci = Bytes.new(VkSemaphoreCreateInfo_sizeof)
-        sci.put32(VkSemaphoreCreateInfo_sType, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
-        var ps = vk_output(8)
-        vkcheck(vkCreateSemaphore(self.dev, sci.addr(), 0, ps.addr()), "vkCreateSemaphore")
-        let handle = ps.get64(0)
-        vk_free_output(ps)
+        var semaphoreCreateInfo = Bytes.new(VkSemaphoreCreateInfo_sizeof)
+        semaphoreCreateInfo.put32(VkSemaphoreCreateInfo_sType, VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+        var semaphoreOutput = vulkanOutput(8)
+        checkVulkanResult(vkCreateSemaphore(self.device, semaphoreCreateInfo.addr(), 0, semaphoreOutput.addr()), "vkCreateSemaphore")
+        let handle = semaphoreOutput.get64(0)
+        freeVulkanOutput(semaphoreOutput)
         return handle
     }
 
-    fn destroy_swapchain(self, s: Swapchain) {
-        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
-        for sem in s.img_sem { vkDestroySemaphore(self.dev, sem, 0) }
-        for f in s.frames {
-            vkDestroySemaphore(self.dev, f.acquired, 0)
-            vkDestroyFence(self.dev, f.fence, 0)
-            var pcb = Bytes.new(8)
-            pcb.put64(0, f.cb)
-            vkFreeCommandBuffers(self.dev, self.cmdpool, 1, pcb.addr())
+    fn destroySwapchain(self, swapchain: Swapchain) {
+        checkVulkanResult(vkDeviceWaitIdle(self.device), "vkDeviceWaitIdle")
+        for semaphore in swapchain.imageSemaphores { vkDestroySemaphore(self.device, semaphore, 0) }
+        for inFlightFrame in swapchain.frames {
+            vkDestroySemaphore(self.device, inFlightFrame.acquired, 0)
+            vkDestroyFence(self.device, inFlightFrame.fence, 0)
+            var commandBuffers = Bytes.new(8)
+            commandBuffers.put64(0, inFlightFrame.commandBuffer)
+            vkFreeCommandBuffers(self.device, self.commandPool, 1, commandBuffers.addr())
         }
-        for fb in s.fbs { vkDestroyFramebuffer(self.dev, fb, 0) }
-        for v in s.views { vkDestroyImageView(self.dev, v, 0) }
-        for v in s.depth_views { vkDestroyImageView(self.dev, v, 0) }
-        for i in s.depth_imgs { vkDestroyImage(self.dev, i, 0) }
-        for m in s.depth_mems { vkFreeMemory(self.dev, m, 0) }
-        vkDestroySwapchainKHR(self.dev, s.handle, 0)
+        for framebuffer in swapchain.framebuffers { vkDestroyFramebuffer(self.device, framebuffer, 0) }
+        for view in swapchain.views { vkDestroyImageView(self.device, view, 0) }
+        for view in swapchain.depthViews { vkDestroyImageView(self.device, view, 0) }
+        for image in swapchain.depthImages { vkDestroyImage(self.device, image, 0) }
+        for memory in swapchain.depthMemories { vkFreeMemory(self.device, memory, 0) }
+        vkDestroySwapchainKHR(self.device, swapchain.handle, 0)
     }
 
     // Rebuild for the surface's current size, reusing the old swapchain so the
     // driver can hand over its images. Returns none while the window is
     // minimised (a zero-sized extent cannot back a swapchain).
-    fn rebuild(self, s: Swapchain, renderpass: int) -> Swapchain? {
-        var caps = vk_output(VkSurfaceCapabilitiesKHR_sizeof)
-        vkcheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, caps.addr()),
+    fn rebuild(self, swapchain: Swapchain, renderPass: int) -> Swapchain? {
+        var capabilities = vulkanOutput(VkSurfaceCapabilitiesKHR_sizeof)
+        checkVulkanResult(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.physicalDevice, self.surface, capabilities.addr()),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
-        let w = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
-        let h = caps.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
-        vk_free_output(caps)
-        if w == 0 or h == 0 { return none }
-        vkcheck(vkDeviceWaitIdle(self.dev), "vkDeviceWaitIdle")
-        // depth_format carries over, so a depth swapchain stays one across resizes
-        let fresh = self.swapchain_usage(s.format, renderpass, s.handle, s.depth_format, s.usage)
-        self.destroy_swapchain(s)
+        let width = capabilities.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_width)
+        let height = capabilities.get32(VkSurfaceCapabilitiesKHR_currentExtent + VkExtent2D_height)
+        freeVulkanOutput(capabilities)
+        if width == 0 or height == 0 { return none }
+        checkVulkanResult(vkDeviceWaitIdle(self.device), "vkDeviceWaitIdle")
+        // depthFormat carries over, so a depth swapchain stays one across resizes
+        let fresh = self.swapchainWithUsage(swapchain.format, renderPass, swapchain.handle, swapchain.depthFormat, swapchain.usage)
+        self.destroySwapchain(swapchain)
         return fresh
     }
 
     // Acquire -> record -> submit -> present, one frame, pipelined
-    // FRAMES_IN_FLIGHT deep so the CPU records ahead while the GPU is still
+    // framesInFlight deep so the CPU records ahead while the GPU is still
     // drawing. Returns false when the swapchain is out of date (resized) and
     // the caller should rebuild.
     //
@@ -1072,28 +1072,28 @@ impl Gfx {
     //   * the fence of whichever frame last drew into this image -- the
     //     swapchain hands out images in its own order, so image i can come back
     //     while a different in-flight frame is still writing it.
-    fn frame(self, s: Swapchain, rec: fn(int, int)) -> bool {
-        return self.frame_at_stage(s, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, rec)
+    fn frame(self, swapchain: Swapchain, recordCommands: fn(int, int)) -> bool {
+        return self.frameAtStage(swapchain, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, recordCommands)
     }
 
     // Wait for acquisition at the first stage that accesses the swapchain image.
-    fn frame_at_stage(self, s: Swapchain, wait_stage: int, rec: fn(int, int)) -> bool {
-        let f = s.frames[s.cur]
-        var pfence = Bytes.new(8)
-        pfence.put64(0, f.fence)
-        vkcheck(vkWaitForFences(self.dev, 1, pfence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+    fn frameAtStage(self, swapchain: Swapchain, waitStage: int, recordCommands: fn(int, int)) -> bool {
+        let inFlightFrame = swapchain.frames[swapchain.currentFrame]
+        var frameFence = Bytes.new(8)
+        frameFence.put64(0, inFlightFrame.fence)
+        checkVulkanResult(vkWaitForFences(self.device, 1, frameFence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
 
-        var pidx = vk_output(8)
-        let acq = vkAcquireNextImageKHR(self.dev, s.handle, 5000000000, f.acquired, 0, pidx.addr())
-        if acq == VK_ERROR_OUT_OF_DATE_KHR {
-            vk_free_output(pidx)
+        var imageIndexOutput = vulkanOutput(8)
+        let acquireResult = vkAcquireNextImageKHR(self.device, swapchain.handle, 5000000000, inFlightFrame.acquired, 0, imageIndexOutput.addr())
+        if acquireResult == VK_ERROR_OUT_OF_DATE_KHR {
+            freeVulkanOutput(imageIndexOutput)
             return false
         }
-        if acq != VK_SUCCESS and acq != VK_SUBOPTIMAL_KHR {
-            panic("vkAcquireNextImageKHR: VkResult {acq}")
+        if acquireResult != VK_SUCCESS and acquireResult != VK_SUBOPTIMAL_KHR {
+            panic("vkAcquireNextImageKHR: VkResult {acquireResult}")
         }
-        let idx = pidx.get32(0)
-        vk_free_output(pidx)
+        let imageIndex = imageIndexOutput.get32(0)
+        freeVulkanOutput(imageIndexOutput)
 
         // another in-flight frame may still be drawing into this image. Only
         // one of the last frames.len() - 1 frames can be: the wait on this
@@ -1101,63 +1101,63 @@ impl Gfx {
         // fence has been reused by a newer frame since, and waiting on it
         // stalled every third frame for the whole previous frame (3 images,
         // 2 frames in flight).
-        if s.img_fence[idx] != 0 and s.img_fence[idx] != f.fence and s.img_serial[idx] > s.serial - s.frames.len() {
-            var pother = Bytes.new(8)
-            pother.put64(0, s.img_fence[idx])
-            vkcheck(vkWaitForFences(self.dev, 1, pother.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
+        if swapchain.imageFences[imageIndex] != 0 and swapchain.imageFences[imageIndex] != inFlightFrame.fence and swapchain.imageSerials[imageIndex] > swapchain.serial - swapchain.frames.len() {
+            var otherFence = Bytes.new(8)
+            otherFence.put64(0, swapchain.imageFences[imageIndex])
+            checkVulkanResult(vkWaitForFences(self.device, 1, otherFence.addr(), VK_TRUE, 5000000000), "vkWaitForFences")
         }
-        s.img_fence[idx] = f.fence
-        s.img_serial[idx] = s.serial
+        swapchain.imageFences[imageIndex] = inFlightFrame.fence
+        swapchain.imageSerials[imageIndex] = swapchain.serial
 
         // reset only now -- everything that could still be pending has retired
-        vkcheck(vkResetFences(self.dev, 1, pfence.addr()), "vkResetFences")
-        vkcheck(vkResetCommandBuffer(f.cb, 0), "vkResetCommandBuffer")
+        checkVulkanResult(vkResetFences(self.device, 1, frameFence.addr()), "vkResetFences")
+        checkVulkanResult(vkResetCommandBuffer(inFlightFrame.commandBuffer, 0), "vkResetCommandBuffer")
 
-        var bi = Bytes.new(VkCommandBufferBeginInfo_sizeof)
-        bi.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-        bi.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
-        vkcheck(vkBeginCommandBuffer(f.cb, bi.addr()), "vkBeginCommandBuffer")
-        rec(f.cb, idx)
-        vkcheck(vkEndCommandBuffer(f.cb), "vkEndCommandBuffer")
+        var beginInfo = Bytes.new(VkCommandBufferBeginInfo_sizeof)
+        beginInfo.put32(VkCommandBufferBeginInfo_sType, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+        beginInfo.put32(VkCommandBufferBeginInfo_flags, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+        checkVulkanResult(vkBeginCommandBuffer(inFlightFrame.commandBuffer, beginInfo.addr()), "vkBeginCommandBuffer")
+        recordCommands(inFlightFrame.commandBuffer, imageIndex)
+        checkVulkanResult(vkEndCommandBuffer(inFlightFrame.commandBuffer), "vkEndCommandBuffer")
 
-        var waitsem = Bytes.new(8)
-        waitsem.put64(0, f.acquired)
-        var sigsem = Bytes.new(8)
-        sigsem.put64(0, s.img_sem[idx])          // per-image: safe to reuse now
-        var stage = Bytes.new(8)
-        stage.put32(0, wait_stage)
-        var pcbs = Bytes.new(8)
-        pcbs.put64(0, f.cb)
+        var waitSemaphores = Bytes.new(8)
+        waitSemaphores.put64(0, inFlightFrame.acquired)
+        var signalSemaphores = Bytes.new(8)
+        signalSemaphores.put64(0, swapchain.imageSemaphores[imageIndex])          // per-image: safe to reuse now
+        var waitStageMasks = Bytes.new(8)
+        waitStageMasks.put32(0, waitStage)
+        var commandBuffers = Bytes.new(8)
+        commandBuffers.put64(0, inFlightFrame.commandBuffer)
 
-        var si = Bytes.new(VkSubmitInfo_sizeof)
-        si.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
-        si.put32(VkSubmitInfo_waitSemaphoreCount, 1)
-        si.put64(VkSubmitInfo_pWaitSemaphores, waitsem.addr())
-        si.put64(VkSubmitInfo_pWaitDstStageMask, stage.addr())
-        si.put32(VkSubmitInfo_commandBufferCount, 1)
-        si.put64(VkSubmitInfo_pCommandBuffers, pcbs.addr())
-        si.put32(VkSubmitInfo_signalSemaphoreCount, 1)
-        si.put64(VkSubmitInfo_pSignalSemaphores, sigsem.addr())
-        vkcheck(vkQueueSubmit(self.queue, 1, si.addr(), f.fence), "vkQueueSubmit")
+        var submitInfo = Bytes.new(VkSubmitInfo_sizeof)
+        submitInfo.put32(VkSubmitInfo_sType, VK_STRUCTURE_TYPE_SUBMIT_INFO)
+        submitInfo.put32(VkSubmitInfo_waitSemaphoreCount, 1)
+        submitInfo.put64(VkSubmitInfo_pWaitSemaphores, waitSemaphores.addr())
+        submitInfo.put64(VkSubmitInfo_pWaitDstStageMask, waitStageMasks.addr())
+        submitInfo.put32(VkSubmitInfo_commandBufferCount, 1)
+        submitInfo.put64(VkSubmitInfo_pCommandBuffers, commandBuffers.addr())
+        submitInfo.put32(VkSubmitInfo_signalSemaphoreCount, 1)
+        submitInfo.put64(VkSubmitInfo_pSignalSemaphores, signalSemaphores.addr())
+        checkVulkanResult(vkQueueSubmit(self.queue, 1, submitInfo.addr(), inFlightFrame.fence), "vkQueueSubmit")
 
-        var pswap = Bytes.new(8)
-        pswap.put64(0, s.handle)
-        var pidxs = Bytes.new(4)
-        pidxs.put32(0, idx)
-        var pi = Bytes.new(VkPresentInfoKHR_sizeof)
-        pi.put32(VkPresentInfoKHR_sType, VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
-        pi.put32(VkPresentInfoKHR_waitSemaphoreCount, 1)
-        pi.put64(VkPresentInfoKHR_pWaitSemaphores, sigsem.addr())
-        pi.put32(VkPresentInfoKHR_swapchainCount, 1)
-        pi.put64(VkPresentInfoKHR_pSwapchains, pswap.addr())
-        pi.put64(VkPresentInfoKHR_pImageIndices, pidxs.addr())
-        let pres = vkQueuePresentKHR(self.queue, pi.addr())
+        var swapchains = Bytes.new(8)
+        swapchains.put64(0, swapchain.handle)
+        var imageIndices = Bytes.new(4)
+        imageIndices.put32(0, imageIndex)
+        var presentInfo = Bytes.new(VkPresentInfoKHR_sizeof)
+        presentInfo.put32(VkPresentInfoKHR_sType, VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
+        presentInfo.put32(VkPresentInfoKHR_waitSemaphoreCount, 1)
+        presentInfo.put64(VkPresentInfoKHR_pWaitSemaphores, signalSemaphores.addr())
+        presentInfo.put32(VkPresentInfoKHR_swapchainCount, 1)
+        presentInfo.put64(VkPresentInfoKHR_pSwapchains, swapchains.addr())
+        presentInfo.put64(VkPresentInfoKHR_pImageIndices, imageIndices.addr())
+        let presentResult = vkQueuePresentKHR(self.queue, presentInfo.addr())
 
-        s.cur = (s.cur + 1) % s.frames.len()
-        s.serial += 1
+        swapchain.currentFrame = (swapchain.currentFrame + 1) % swapchain.frames.len()
+        swapchain.serial += 1
 
-        if pres == VK_ERROR_OUT_OF_DATE_KHR or pres == VK_SUBOPTIMAL_KHR { return false }
-        if pres != VK_SUCCESS { panic("vkQueuePresentKHR: VkResult {pres}") }
+        if presentResult == VK_ERROR_OUT_OF_DATE_KHR or presentResult == VK_SUBOPTIMAL_KHR { return false }
+        if presentResult != VK_SUCCESS { panic("vkQueuePresentKHR: VkResult {presentResult}") }
         return true
     }
 }
@@ -1170,287 +1170,287 @@ struct DescSet { layout: int, pool: int, set: int }
 
 impl Gfx {
     // Query optimal-tiling capabilities before creating storage/blit resources.
-    fn format_features(self, format: int) -> int {
-        let out = vk_output(VkFormatProperties_sizeof)
-        vkGetPhysicalDeviceFormatProperties(self.phys, format, out.addr())
-        let features = out.get32(VkFormatProperties_optimalTilingFeatures)
-        vk_free_output(out)
+    fn formatFeatures(self, format: int) -> int {
+        let properties = vulkanOutput(VkFormatProperties_sizeof)
+        vkGetPhysicalDeviceFormatProperties(self.physicalDevice, format, properties.addr())
+        let features = properties.get32(VkFormatProperties_optimalTilingFeatures)
+        freeVulkanOutput(properties)
         return features
     }
 
     // The largest extent a 3D image may have on this device, in any axis. The
     // spec floor is 256, so a volume deeper than that is not portable even
     // where it happens to work here.
-    fn max_image_dimension_3d(self) -> int {
-        let out = vk_output(VkPhysicalDeviceProperties_sizeof)
-        vkGetPhysicalDeviceProperties(self.phys, out.addr())
-        let lim = out.get32(VkPhysicalDeviceProperties_limits_maxImageDimension3D)
-        vk_free_output(out)
-        return lim
+    fn maxImageDimension3D(self) -> int {
+        let properties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.physicalDevice, properties.addr())
+        let limit = properties.get32(VkPhysicalDeviceProperties_limits_maxImageDimension3D)
+        freeVulkanOutput(properties)
+        return limit
     }
 
     // The spec floor is 128 bytes. Anything larger works here but is not
     // portable, so a caller that wants more should check first and say so.
-    fn max_push_constants(self) -> int {
-        let out = vk_output(VkPhysicalDeviceProperties_sizeof)
-        vkGetPhysicalDeviceProperties(self.phys, out.addr())
-        let lim = out.get32(VkPhysicalDeviceProperties_limits_maxPushConstantsSize)
-        vk_free_output(out)
-        return lim
+    fn maxPushConstantsSize(self) -> int {
+        let properties = vulkanOutput(VkPhysicalDeviceProperties_sizeof)
+        vkGetPhysicalDeviceProperties(self.physicalDevice, properties.addr())
+        let limit = properties.get32(VkPhysicalDeviceProperties_limits_maxPushConstantsSize)
+        freeVulkanOutput(properties)
+        return limit
     }
 
     // RGBA8, one mip/layer, device-local storage with transfer readback support.
-    fn storage_image(self, w: int, h: int) -> GpuImage {
-        return self.storage_image_3d(w, h, 1, VK_FORMAT_R8G8B8A8_UNORM)
+    fn storageImage(self, width: int, height: int) -> GpuImage {
+        return self.storageImage3D(width, height, 1, VK_FORMAT_R8G8B8A8_UNORM)
     }
 
     // A storage image of any depth and format. `d` of 1 gives a 2D image and a
     // 2D view; anything larger gives VK_IMAGE_TYPE_3D and a 3D view, which is
     // what an image3D binding in a compute shader expects. The voxel volume is
     // the motivating case: one R8_UINT 3D image the tracer reads.
-    fn storage_image_3d(self, w: int, h: int, d: int, fmt: int) -> GpuImage {
-        assert(w > 0 and h > 0 and d > 0, "storage image dimensions must be positive")
-        assert((self.format_features(fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0,
+    fn storageImage3D(self, width: int, height: int, depth: int, format: int) -> GpuImage {
+        assert(width > 0 and height > 0 and depth > 0, "storage image dimensions must be positive")
+        assert((self.formatFeatures(format) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0,
                "optimal-tiling storage images unsupported for this format")
-        var itype = VK_IMAGE_TYPE_2D
-        var vtype = VK_IMAGE_VIEW_TYPE_2D
-        if d > 1 {
-            itype = VK_IMAGE_TYPE_3D
-            vtype = VK_IMAGE_VIEW_TYPE_3D
-            let lim = self.max_image_dimension_3d()
-            assert(w <= lim and h <= lim and d <= lim,
+        var imageType = VK_IMAGE_TYPE_2D
+        var viewType = VK_IMAGE_VIEW_TYPE_2D
+        if depth > 1 {
+            imageType = VK_IMAGE_TYPE_3D
+            viewType = VK_IMAGE_VIEW_TYPE_3D
+            let limit = self.maxImageDimension3D()
+            assert(width <= limit and height <= limit and depth <= limit,
                    "3D storage image exceeds maxImageDimension3D")
         }
-        let ci = VkImageCreateInfo.new().imageType(itype)
-            .format(fmt).extent_width(w).extent_height(h).extent_depth(d)
+        let imageCreateInfo = VkImageCreateInfo.new().imageType(imageType)
+            .format(format).extent_width(width).extent_height(height).extent_depth(depth)
             .mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
             .tiling(VK_IMAGE_TILING_OPTIMAL)
             .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                    | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
             .sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
-        let out = vk_output(VkMemoryRequirements_sizeof)
-        vkcheck(vkCreateImage(self.dev, ci.addr(), 0, out.addr()), "vkCreateImage (storage)")
-        let image = out.get64(0)
-        vkGetImageMemoryRequirements(self.dev, image, out.addr())
-        let size = out.get64(VkMemoryRequirements_size)
-        let typebits = out.get32(VkMemoryRequirements_memoryTypeBits)
-        let ai = VkMemoryAllocateInfo.new().allocationSize(size)
-            .memoryTypeIndex(self.find_mem_type(typebits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-        vkcheck(vkAllocateMemory(self.dev, ai.addr(), 0, out.addr()), "vkAllocateMemory (storage)")
-        let mem = out.get64(0)
-        vkcheck(vkBindImageMemory(self.dev, image, mem, 0), "vkBindImageMemory (storage)")
-        let vi = VkImageViewCreateInfo.new().image(image).viewType(vtype).format(fmt)
-        store32(vi.subresourceRange_at() + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
-        store32(vi.subresourceRange_at() + VkImageSubresourceRange_levelCount, 1)
-        store32(vi.subresourceRange_at() + VkImageSubresourceRange_layerCount, 1)
-        vkcheck(vkCreateImageView(self.dev, vi.addr(), 0, out.addr()), "vkCreateImageView (storage)")
-        let view = out.get64(0)
-        vk_free_output(out)
-        return GpuImage{image: image, mem: mem, view: view, w: w, h: h, d: d, fmt: fmt}
+        let output = vulkanOutput(VkMemoryRequirements_sizeof)
+        checkVulkanResult(vkCreateImage(self.device, imageCreateInfo.addr(), 0, output.addr()), "vkCreateImage (storage)")
+        let image = output.get64(0)
+        vkGetImageMemoryRequirements(self.device, image, output.addr())
+        let size = output.get64(VkMemoryRequirements_size)
+        let memoryTypeBits = output.get32(VkMemoryRequirements_memoryTypeBits)
+        let allocateInfo = VkMemoryAllocateInfo.new().allocationSize(size)
+            .memoryTypeIndex(self.findMemoryType(memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        checkVulkanResult(vkAllocateMemory(self.device, allocateInfo.addr(), 0, output.addr()), "vkAllocateMemory (storage)")
+        let memory = output.get64(0)
+        checkVulkanResult(vkBindImageMemory(self.device, image, memory, 0), "vkBindImageMemory (storage)")
+        let viewCreateInfo = VkImageViewCreateInfo.new().image(image).viewType(viewType).format(format)
+        store32(viewCreateInfo.subresourceRange_at() + VkImageSubresourceRange_aspectMask, VK_IMAGE_ASPECT_COLOR_BIT)
+        store32(viewCreateInfo.subresourceRange_at() + VkImageSubresourceRange_levelCount, 1)
+        store32(viewCreateInfo.subresourceRange_at() + VkImageSubresourceRange_layerCount, 1)
+        checkVulkanResult(vkCreateImageView(self.device, viewCreateInfo.addr(), 0, output.addr()), "vkCreateImageView (storage)")
+        let view = output.get64(0)
+        freeVulkanOutput(output)
+        return GpuImage{image: image, memory: memory, view: view, width: width, height: height, d: depth, format: format}
     }
 
-    fn destroy_image(self, image: GpuImage) {
-        vkDestroyImageView(self.dev, image.view, 0)
-        vkDestroyImage(self.dev, image.image, 0)
-        vkFreeMemory(self.dev, image.mem, 0)
+    fn destroyImage(self, image: GpuImage) {
+        vkDestroyImageView(self.device, image.view, 0)
+        vkDestroyImage(self.device, image.image, 0)
+        vkFreeMemory(self.device, image.memory, 0)
     }
 
     // Bind several storage images at bindings 0..n-1, all in GENERAL. The
     // tracer wants two: the volume it reads and the target it writes.
-    fn storage_images_set(self, images: [GpuImage], stages: int) -> DescSet {
-        let n = images.len()
-        assert(n > 0, "storage_images_set needs at least one image")
-        var bindings = Bytes.new(n * VkDescriptorSetLayoutBinding_sizeof)
-        for i in 0..n {
-            let b = i * VkDescriptorSetLayoutBinding_sizeof
-            bindings.put32(b + VkDescriptorSetLayoutBinding_binding, i)
-            bindings.put32(b + VkDescriptorSetLayoutBinding_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-            bindings.put32(b + VkDescriptorSetLayoutBinding_descriptorCount, 1)
-            bindings.put32(b + VkDescriptorSetLayoutBinding_stageFlags, stages)
+    fn storageImagesSet(self, images: [GpuImage], stages: int) -> DescSet {
+        let imageCount = images.len()
+        assert(imageCount > 0, "storageImagesSet needs at least one image")
+        var bindings = Bytes.new(imageCount * VkDescriptorSetLayoutBinding_sizeof)
+        for i in 0..imageCount {
+            let bindingOffset = i * VkDescriptorSetLayoutBinding_sizeof
+            bindings.put32(bindingOffset + VkDescriptorSetLayoutBinding_binding, i)
+            bindings.put32(bindingOffset + VkDescriptorSetLayoutBinding_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            bindings.put32(bindingOffset + VkDescriptorSetLayoutBinding_descriptorCount, 1)
+            bindings.put32(bindingOffset + VkDescriptorSetLayoutBinding_stageFlags, stages)
         }
-        let lci = VkDescriptorSetLayoutCreateInfo.new().bindingCount(n).pBindings(bindings.addr())
-        let out = vk_output(8)
-        vkcheck(vkCreateDescriptorSetLayout(self.dev, lci.addr(), 0, out.addr()), "vkCreateDescriptorSetLayout (images)")
-        let layout = out.get64(0)
-        let size = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(n)
-        let pci = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(size.addr())
-        vkcheck(vkCreateDescriptorPool(self.dev, pci.addr(), 0, out.addr()), "vkCreateDescriptorPool (images)")
-        let pool = out.get64(0)
-        let layouts = u64s([layout])
-        let ai = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
+        let layoutCreateInfo = VkDescriptorSetLayoutCreateInfo.new().bindingCount(imageCount).pBindings(bindings.addr())
+        let output = vulkanOutput(8)
+        checkVulkanResult(vkCreateDescriptorSetLayout(self.device, layoutCreateInfo.addr(), 0, output.addr()), "vkCreateDescriptorSetLayout (images)")
+        let layout = output.get64(0)
+        let poolSize = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(imageCount)
+        let poolCreateInfo = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(poolSize.addr())
+        checkVulkanResult(vkCreateDescriptorPool(self.device, poolCreateInfo.addr(), 0, output.addr()), "vkCreateDescriptorPool (images)")
+        let pool = output.get64(0)
+        let layouts = uint64Array([layout])
+        let allocateInfo = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
             .descriptorSetCount(1).pSetLayouts(layouts.addr())
-        vkcheck(vkAllocateDescriptorSets(self.dev, ai.addr(), out.addr()), "vkAllocateDescriptorSets (images)")
-        let set = out.get64(0)
+        checkVulkanResult(vkAllocateDescriptorSets(self.device, allocateInfo.addr(), output.addr()), "vkAllocateDescriptorSets (images)")
+        let descriptorSet = output.get64(0)
         // The infos must all stay alive until vkUpdateDescriptorSets returns,
         // so they are one flat block rather than n separate builders.
-        var infos = Bytes.new(n * VkDescriptorImageInfo_sizeof)
-        var writes = Bytes.new(n * VkWriteDescriptorSet_sizeof)
-        for i in 0..n {
-            let io = i * VkDescriptorImageInfo_sizeof
-            infos.put64(io + VkDescriptorImageInfo_imageView, images[i].view)
-            infos.put32(io + VkDescriptorImageInfo_imageLayout, VK_IMAGE_LAYOUT_GENERAL)
-            let w = i * VkWriteDescriptorSet_sizeof
-            writes.put32(w + VkWriteDescriptorSet_sType, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
-            writes.put64(w + VkWriteDescriptorSet_dstSet, set)
-            writes.put32(w + VkWriteDescriptorSet_dstBinding, i)
-            writes.put32(w + VkWriteDescriptorSet_descriptorCount, 1)
-            writes.put32(w + VkWriteDescriptorSet_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-            writes.put64(w + VkWriteDescriptorSet_pImageInfo, infos.addr() + io)
+        var infos = Bytes.new(imageCount * VkDescriptorImageInfo_sizeof)
+        var writes = Bytes.new(imageCount * VkWriteDescriptorSet_sizeof)
+        for i in 0..imageCount {
+            let infoOffset = i * VkDescriptorImageInfo_sizeof
+            infos.put64(infoOffset + VkDescriptorImageInfo_imageView, images[i].view)
+            infos.put32(infoOffset + VkDescriptorImageInfo_imageLayout, VK_IMAGE_LAYOUT_GENERAL)
+            let writeOffset = i * VkWriteDescriptorSet_sizeof
+            writes.put32(writeOffset + VkWriteDescriptorSet_sType, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+            writes.put64(writeOffset + VkWriteDescriptorSet_dstSet, descriptorSet)
+            writes.put32(writeOffset + VkWriteDescriptorSet_dstBinding, i)
+            writes.put32(writeOffset + VkWriteDescriptorSet_descriptorCount, 1)
+            writes.put32(writeOffset + VkWriteDescriptorSet_descriptorType, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            writes.put64(writeOffset + VkWriteDescriptorSet_pImageInfo, infos.addr() + infoOffset)
         }
-        vkUpdateDescriptorSets(self.dev, n, writes.addr(), 0, 0)
-        vk_free_output(out)
-        return DescSet{layout: layout, pool: pool, set: set}
+        vkUpdateDescriptorSets(self.device, imageCount, writes.addr(), 0, 0)
+        freeVulkanOutput(output)
+        return DescSet{layout: layout, pool: pool, set: descriptorSet}
     }
 
     // Bind one storage image at binding 0. Its dispatch-time layout is GENERAL.
-    fn storage_image_set(self, image: GpuImage, stages: int) -> DescSet {
+    fn storageImageSet(self, image: GpuImage, stages: int) -> DescSet {
         let binding = VkDescriptorSetLayoutBinding.new().binding(0)
             .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).stageFlags(stages)
-        let lci = VkDescriptorSetLayoutCreateInfo.new().bindingCount(1).pBindings(binding.addr())
-        let out = vk_output(8)
-        vkcheck(vkCreateDescriptorSetLayout(self.dev, lci.addr(), 0, out.addr()), "vkCreateDescriptorSetLayout (image)")
-        let layout = out.get64(0)
-        let size = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
-        let pci = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(size.addr())
-        vkcheck(vkCreateDescriptorPool(self.dev, pci.addr(), 0, out.addr()), "vkCreateDescriptorPool (image)")
-        let pool = out.get64(0)
-        let layouts = u64s([layout])
-        let ai = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
+        let layoutCreateInfo = VkDescriptorSetLayoutCreateInfo.new().bindingCount(1).pBindings(binding.addr())
+        let output = vulkanOutput(8)
+        checkVulkanResult(vkCreateDescriptorSetLayout(self.device, layoutCreateInfo.addr(), 0, output.addr()), "vkCreateDescriptorSetLayout (image)")
+        let layout = output.get64(0)
+        let poolSize = VkDescriptorPoolSize.new().type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
+        let poolCreateInfo = VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(poolSize.addr())
+        checkVulkanResult(vkCreateDescriptorPool(self.device, poolCreateInfo.addr(), 0, output.addr()), "vkCreateDescriptorPool (image)")
+        let pool = output.get64(0)
+        let layouts = uint64Array([layout])
+        let allocateInfo = VkDescriptorSetAllocateInfo.new().descriptorPool(pool)
             .descriptorSetCount(1).pSetLayouts(layouts.addr())
-        vkcheck(vkAllocateDescriptorSets(self.dev, ai.addr(), out.addr()), "vkAllocateDescriptorSets (image)")
-        let set = out.get64(0)
+        checkVulkanResult(vkAllocateDescriptorSets(self.device, allocateInfo.addr(), output.addr()), "vkAllocateDescriptorSets (image)")
+        let descriptorSet = output.get64(0)
         let info = VkDescriptorImageInfo.new().imageView(image.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL)
-        let write = VkWriteDescriptorSet.new().dstSet(set).dstBinding(0).descriptorCount(1)
+        let write = VkWriteDescriptorSet.new().dstSet(descriptorSet).dstBinding(0).descriptorCount(1)
             .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info.addr())
-        vkUpdateDescriptorSets(self.dev, 1, write.addr(), 0, 0)
-        vk_free_output(out)
-        return DescSet{layout: layout, pool: pool, set: set}
+        vkUpdateDescriptorSets(self.device, 1, write.addr(), 0, 0)
+        freeVulkanOutput(output)
+        return DescSet{layout: layout, pool: pool, set: descriptorSet}
     }
 
     // One set binding `buffers` as storage buffers at bindings 0..n-1 -- the
     // shape almost every compute pass wants. The layout/pool/set/update dance is
     // four objects and an array of writes; getting the lifetimes wrong here is
     // the classic first-compute-pass bug, so it lives in one place.
-    fn storage_set(self, buffers: [GpuBuffer], stages: int) -> DescSet {
-        let n = buffers.len()
-        if n == 0 { panic("storage_set needs at least one buffer") }
+    fn storageBufferSet(self, buffers: [GpuBuffer], stages: int) -> DescSet {
+        let bufferCount = buffers.len()
+        if bufferCount == 0 { panic("storageBufferSet needs at least one buffer") }
 
-        var binds: [Bytes] = []
-        for i in 0..n {
-            binds.push(VkDescriptorSetLayoutBinding.new()
+        var bindings: [Bytes] = []
+        for i in 0..bufferCount {
+            bindings.push(VkDescriptorSetLayoutBinding.new()
                 .binding(i)
                 .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .descriptorCount(1)
                 .stageFlags(stages).raw())
         }
-        var bindarr = pack(binds)
-        let layout = create_descriptor_set_layout(self.dev,
-            VkDescriptorSetLayoutCreateInfo.new().bindingCount(n).pBindings(bindarr.addr()))
+        var bindingArray = pack(bindings)
+        let layout = createDescriptorSetLayout(self.device,
+            VkDescriptorSetLayoutCreateInfo.new().bindingCount(bufferCount).pBindings(bindingArray.addr()))
 
-        let psize = VkDescriptorPoolSize.new()
-            .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(n)
-        let pool = create_descriptor_pool(self.dev,
-            VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(psize.addr()))
+        let poolSize = VkDescriptorPoolSize.new()
+            .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(bufferCount)
+        let pool = createDescriptorPool(self.device,
+            VkDescriptorPoolCreateInfo.new().maxSets(1).poolSizeCount(1).pPoolSizes(poolSize.addr()))
 
-        var setlayouts = u64s([layout])
-        let set = allocate_descriptor_set(self.dev,
+        var setLayouts = uint64Array([layout])
+        let descriptorSet = allocateDescriptorSet(self.device,
             VkDescriptorSetAllocateInfo.new()
-                .descriptorPool(pool).descriptorSetCount(1).pSetLayouts(setlayouts.addr()))
+                .descriptorPool(pool).descriptorSetCount(1).pSetLayouts(setLayouts.addr()))
 
         // each write points at its own VkDescriptorBufferInfo, which must stay
         // alive until vkUpdateDescriptorSets has read it
         var infos: [Bytes] = []
         var writes: [Bytes] = []
-        for i in 0..n {
+        for i in 0..bufferCount {
             let info = VkDescriptorBufferInfo.new()
-                .buffer(buffers[i].buf).offset(0).range(buffers[i].size)
+                .buffer(buffers[i].buffer).offset(0).range(buffers[i].size)
             infos.push(info.raw())
             writes.push(VkWriteDescriptorSet.new()
-                .dstSet(set).dstBinding(i).descriptorCount(1)
+                .dstSet(descriptorSet).dstBinding(i).descriptorCount(1)
                 .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                 .pBufferInfo(info.addr()).raw())
         }
-        var warr = pack(writes)
-        vkUpdateDescriptorSets(self.dev, n, warr.addr(), 0, 0)
+        var writeArray = pack(writes)
+        vkUpdateDescriptorSets(self.device, bufferCount, writeArray.addr(), 0, 0)
 
-        return DescSet{layout: layout, pool: pool, set: set}
+        return DescSet{layout: layout, pool: pool, set: descriptorSet}
     }
 
-    fn destroy_desc_set(self, d: DescSet) {
-        vkDestroyDescriptorPool(self.dev, d.pool, 0)     // frees the set with it
-        vkDestroyDescriptorSetLayout(self.dev, d.layout, 0)
+    fn destroyDescriptorSet(self, descriptorSet: DescSet) {
+        vkDestroyDescriptorPool(self.device, descriptorSet.pool, 0)     // frees the set with it
+        vkDestroyDescriptorSetLayout(self.device, descriptorSet.layout, 0)
     }
 
     // a pipeline layout over some descriptor set layouts, with optional push constants
-    fn pipeline_layout(self, setlayouts: [int], push_size: int, push_stages: int) -> int {
-        var sl = u64s(setlayouts)
-        var ci = VkPipelineLayoutCreateInfo.new().setLayoutCount(setlayouts.len())
-        if setlayouts.len() > 0 { ci = ci.pSetLayouts(sl.addr()) }
-        var pcr = VkPushConstantRange.new().stageFlags(push_stages).offset(0).size(push_size)
-        if push_size > 0 {
-            ci = ci.pushConstantRangeCount(1).pPushConstantRanges(pcr.addr())
+    fn pipelineLayout(self, setLayouts: [int], pushConstantSize: int, pushConstantStages: int) -> int {
+        var setLayoutArray = uint64Array(setLayouts)
+        var createInfo = VkPipelineLayoutCreateInfo.new().setLayoutCount(setLayouts.len())
+        if setLayouts.len() > 0 { createInfo = createInfo.pSetLayouts(setLayoutArray.addr()) }
+        var pushConstantRange = VkPushConstantRange.new().stageFlags(pushConstantStages).offset(0).size(pushConstantSize)
+        if pushConstantSize > 0 {
+            createInfo = createInfo.pushConstantRangeCount(1).pPushConstantRanges(pushConstantRange.addr())
         }
-        return create_pipeline_layout(self.dev, ci)
+        return createPipelineLayout(self.device, createInfo)
     }
 
-    fn compute_pipeline(self, shader: int, layout: int, entry: Bytes) -> int {
-        let ci = VkComputePipelineCreateInfo.new()
+    fn computePipeline(self, shader: int, layout: int, entry: Bytes) -> int {
+        let createInfo = VkComputePipelineCreateInfo.new()
             .stage_sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
             .stage_stage(VK_SHADER_STAGE_COMPUTE_BIT)
             .stage_module(shader)
             .stage_pName(entry.addr())
             .layout(layout)
             .basePipelineIndex(0 - 1)
-        return create_compute_pipeline(self.dev, ci)
+        return createComputePipeline(self.device, createInfo)
     }
 }
 
 // ---- BMP output: a 54-byte header plus raw BGRA rows, no dependencies ----
-fn write_bmp(path: str, px: Bytes, w: int, h: int) {
-    var out: [str] = []
-    let rowbytes = w * 4
-    let datasize = rowbytes * h
-    let filesize = 54 + datasize
-    out.push("BM")
-    out.push(le32(filesize))
-    out.push(le32(0))
-    out.push(le32(54))
-    out.push(le32(40))               // DIB header size
-    out.push(le32(w))
-    out.push(le32(0 - h))            // negative height = top-down rows
-    out.push(le16(1))                // planes
-    out.push(le16(32))               // bits per pixel
-    out.push(le32(0))                // BI_RGB
-    out.push(le32(datasize))
-    out.push(le32(2835))
-    out.push(le32(2835))
-    out.push(le32(0))
-    out.push(le32(0))
+fn writeBmp(path: str, pixels: Bytes, width: int, height: int) {
+    var pieces: [str] = []
+    let rowBytes = width * 4
+    let dataSize = rowBytes * height
+    let fileSize = 54 + dataSize
+    pieces.push("BM")
+    pieces.push(littleEndian32(fileSize))
+    pieces.push(littleEndian32(0))
+    pieces.push(littleEndian32(54))
+    pieces.push(littleEndian32(40))               // DIB header size
+    pieces.push(littleEndian32(width))
+    pieces.push(littleEndian32(0 - height))            // negative height = top-down rows
+    pieces.push(littleEndian16(1))                // planes
+    pieces.push(littleEndian16(32))               // bits per pixel
+    pieces.push(littleEndian32(0))                // BI_RGB
+    pieces.push(littleEndian32(dataSize))
+    pieces.push(littleEndian32(2835))
+    pieces.push(littleEndian32(2835))
+    pieces.push(littleEndian32(0))
+    pieces.push(littleEndian32(0))
     // RGBA -> BGRA
-    for y in 0..h {
-        for x in 0..w {
-            let o = (y * w + x) * 4
-            out.push(chr(px.get8(o + 2)))
-            out.push(chr(px.get8(o + 1)))
-            out.push(chr(px.get8(o)))
-            out.push(chr(px.get8(o + 3)))
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * width + x) * 4
+            pieces.push(chr(pixels.get8(offset + 2)))
+            pieces.push(chr(pixels.get8(offset + 1)))
+            pieces.push(chr(pixels.get8(offset)))
+            pieces.push(chr(pixels.get8(offset + 3)))
         }
     }
-    writeFile(path, out.join())
+    writeFile(path, pieces.join())
 }
 
-fn le16(v: int) -> str {
-    var s: [str] = []
-    s.push(chr(v & 255))
-    s.push(chr((v >> 8) & 255))
-    return s.join()
+fn littleEndian16(value: int) -> str {
+    var pieces: [str] = []
+    pieces.push(chr(value & 255))
+    pieces.push(chr((value >> 8) & 255))
+    return pieces.join()
 }
 
-fn le32(v: int) -> str {
-    var s: [str] = []
-    s.push(chr(v & 255))
-    s.push(chr((v >> 8) & 255))
-    s.push(chr((v >> 16) & 255))
-    s.push(chr((v >> 24) & 255))
-    return s.join()
+fn littleEndian32(value: int) -> str {
+    var pieces: [str] = []
+    pieces.push(chr(value & 255))
+    pieces.push(chr((value >> 8) & 255))
+    pieces.push(chr((value >> 16) & 255))
+    pieces.push(chr((value >> 24) & 255))
+    return pieces.join()
 }

@@ -39,9 +39,9 @@ static void sopen(const char *name, size_t size, const char *stype)
     g_struct = name;
     printf("\nstruct %s { b: Bytes }\n", name);
     printf("impl %s {\n", name);
-    printf("    fn new() -> %s {\n        var b = Bytes.new(%zu)\n", name, size);
-    if (stype) printf("        b.put32(0, %s)\n", stype);   /* sType filled in for you */
-    printf("        return %s{b: b}\n    }\n", name);
+    printf("    fn new() -> %s {\n        var bytes = Bytes.new(%zu)\n", name, size);
+    if (stype) printf("        bytes.put32(0, %s)\n", stype);   /* sType filled in for you */
+    printf("        return %s{b: bytes}\n    }\n", name);
     printf("    fn addr(self) -> int { return self.b.addr() }\n");
     printf("    fn raw(self) -> Bytes { return self.b }\n");
 }
@@ -50,16 +50,16 @@ static void fld(const char *name, size_t off, size_t size, const char *cls)
 {
     if (g_mode == 0) { printf("let %s_%s = %zu\n", g_struct, name, off); return; }
     if (strcmp(cls, "f32") == 0)
-        printf("    fn %s(self, v: float) -> %s {\n        self.b.putf32(%zu, v)\n        return self\n    }\n",
+        printf("    fn %s(self, value: float) -> %s {\n        self.b.putFloat32(%zu, value)\n        return self\n    }\n",
                name, g_struct, off);
     else if (strcmp(cls, "f64") == 0)
-        printf("    fn %s(self, v: float) -> %s {\n        self.b.putf64(%zu, v)\n        return self\n    }\n",
+        printf("    fn %s(self, value: float) -> %s {\n        self.b.putFloat64(%zu, value)\n        return self\n    }\n",
                name, g_struct, off);
     else if (size == 4)
-        printf("    fn %s(self, v: int) -> %s {\n        self.b.put32(%zu, v)\n        return self\n    }\n",
+        printf("    fn %s(self, value: int) -> %s {\n        self.b.put32(%zu, value)\n        return self\n    }\n",
                name, g_struct, off);
     else if (size == 8)
-        printf("    fn %s(self, v: int) -> %s {\n        self.b.put64(%zu, v)\n        return self\n    }\n",
+        printf("    fn %s(self, value: int) -> %s {\n        self.b.put64(%zu, value)\n        return self\n    }\n",
                name, g_struct, off);
     else   /* composite or array: hand back its address to fill in place */
         printf("    fn %s_at(self) -> int { return self.b.addr() + %zu }\n", name, off);
@@ -86,10 +86,10 @@ static void fld(const char *name, size_t off, size_t size, const char *cls)
 static void creator(const char *fn, const char *type, const char *name)
 {
     if (g_mode != 1) return;
-    printf("\nfn %s(dev: int, ci: %s) -> int {\n", name, type);
-    printf("    var p = vk_output(8)\n");
-    printf("    vkcheck(%s(dev, ci.addr(), 0, p.addr()), \"%s\")\n", fn, fn);
-    printf("    let handle = p.get64(0)\n    vk_free_output(p)\n    return handle\n}\n");
+    printf("\nfn %s(device: int, createInfo: %s) -> int {\n", name, type);
+    printf("    var handleOutput = vulkanOutput(8)\n");
+    printf("    checkVulkanResult(%s(device, createInfo.addr(), 0, handleOutput.addr()), \"%s\")\n", fn, fn);
+    printf("    let handle = handleOutput.get64(0)\n    freeVulkanOutput(handleOutput)\n    return handle\n}\n");
 }
 #define CREATE(FN, T, NAME) creator(#FN, #T, NAME)
 
@@ -97,9 +97,9 @@ static void creator(const char *fn, const char *type, const char *name)
 static void oneoff(const char *sig, const char *call, const char *what)
 {
     printf("\nfn %s -> int {\n", sig);
-    printf("    var p = vk_output(8)\n");
-    printf("    vkcheck(%s, \"%s\")\n", call, what);
-    printf("    let handle = p.get64(0)\n    vk_free_output(p)\n    return handle\n}\n");
+    printf("    var handleOutput = vulkanOutput(8)\n");
+    printf("    checkVulkanResult(%s, \"%s\")\n", call, what);
+    printf("    let handle = handleOutput.get64(0)\n    freeVulkanOutput(handleOutput)\n    return handle\n}\n");
 }
 #define CO(N)       do { if (g_mode == 0) printf("let %s = %lld\n", #N, (long long)(N)); } while (0)
 
@@ -791,46 +791,46 @@ int main(int argc, char **argv) {
     sclose();
 
     /* handle-returning constructors */
-    CREATE(vkCreateBuffer,        VkBufferCreateInfo,          "create_buffer");
-    CREATE(vkCreateImage,         VkImageCreateInfo,           "create_image");
-    CREATE(vkCreateImageView,     VkImageViewCreateInfo,       "create_image_view");
-    CREATE(vkCreateShaderModule,  VkShaderModuleCreateInfo,    "create_shader_module");
-    CREATE(vkCreatePipelineLayout,VkPipelineLayoutCreateInfo,  "create_pipeline_layout");
-    CREATE(vkCreateRenderPass,    VkRenderPassCreateInfo,      "create_render_pass");
-    CREATE(vkCreateFramebuffer,   VkFramebufferCreateInfo,     "create_framebuffer");
-    CREATE(vkCreateCommandPool,   VkCommandPoolCreateInfo,     "create_command_pool");
-    CREATE(vkCreateQueryPool,     VkQueryPoolCreateInfo,       "create_query_pool");
-    CREATE(vkCreateFence,         VkFenceCreateInfo,           "create_fence");
-    CREATE(vkCreateSemaphore,     VkSemaphoreCreateInfo,       "create_semaphore");
-    CREATE(vkCreateSwapchainKHR,  VkSwapchainCreateInfoKHR,    "create_swapchain");
-    CREATE(vkAllocateMemory,      VkMemoryAllocateInfo,        "allocate_memory");
-    CREATE(vkCreateDescriptorSetLayout, VkDescriptorSetLayoutCreateInfo, "create_descriptor_set_layout");
-    CREATE(vkCreateDescriptorPool,      VkDescriptorPoolCreateInfo,      "create_descriptor_pool");
-    CREATE(vkCreateSampler,       VkSamplerCreateInfo,         "create_sampler");
+    CREATE(vkCreateBuffer,        VkBufferCreateInfo,          "createBuffer");
+    CREATE(vkCreateImage,         VkImageCreateInfo,           "createImage");
+    CREATE(vkCreateImageView,     VkImageViewCreateInfo,       "createImageView");
+    CREATE(vkCreateShaderModule,  VkShaderModuleCreateInfo,    "createShaderModule");
+    CREATE(vkCreatePipelineLayout,VkPipelineLayoutCreateInfo,  "createPipelineLayout");
+    CREATE(vkCreateRenderPass,    VkRenderPassCreateInfo,      "createRenderPass");
+    CREATE(vkCreateFramebuffer,   VkFramebufferCreateInfo,     "createFramebuffer");
+    CREATE(vkCreateCommandPool,   VkCommandPoolCreateInfo,     "createCommandPool");
+    CREATE(vkCreateQueryPool,     VkQueryPoolCreateInfo,       "createQueryPool");
+    CREATE(vkCreateFence,         VkFenceCreateInfo,           "createFence");
+    CREATE(vkCreateSemaphore,     VkSemaphoreCreateInfo,       "createSemaphore");
+    CREATE(vkCreateSwapchainKHR,  VkSwapchainCreateInfoKHR,    "createSwapchain");
+    CREATE(vkAllocateMemory,      VkMemoryAllocateInfo,        "allocateMemory");
+    CREATE(vkCreateDescriptorSetLayout, VkDescriptorSetLayoutCreateInfo, "createDescriptorSetLayout");
+    CREATE(vkCreateDescriptorPool,      VkDescriptorPoolCreateInfo,      "createDescriptorPool");
+    CREATE(vkCreateSampler,       VkSamplerCreateInfo,         "createSampler");
 
     /* the few constructors whose first argument is not a device */
     if (g_mode == 1) {
-        oneoff("create_instance(ci: VkInstanceCreateInfo)",
-               "vkCreateInstance(ci.addr(), 0, p.addr())", "vkCreateInstance");
-        oneoff("create_device(phys: int, ci: VkDeviceCreateInfo)",
-               "vkCreateDevice(phys, ci.addr(), 0, p.addr())", "vkCreateDevice");
-        oneoff("create_surface(inst: int, ci: VkWin32SurfaceCreateInfoKHR)",
-               "vkCreateWin32SurfaceKHR(inst, ci.addr(), 0, p.addr())", "vkCreateWin32SurfaceKHR");
-        oneoff("create_graphics_pipeline(dev: int, ci: VkGraphicsPipelineCreateInfo)",
-               "vkCreateGraphicsPipelines(dev, 0, 1, ci.addr(), 0, p.addr())",
+        oneoff("createInstance(createInfo: VkInstanceCreateInfo)",
+               "vkCreateInstance(createInfo.addr(), 0, handleOutput.addr())", "vkCreateInstance");
+        oneoff("createDevice(physicalDevice: int, createInfo: VkDeviceCreateInfo)",
+               "vkCreateDevice(physicalDevice, createInfo.addr(), 0, handleOutput.addr())", "vkCreateDevice");
+        oneoff("createSurface(instance: int, createInfo: VkWin32SurfaceCreateInfoKHR)",
+               "vkCreateWin32SurfaceKHR(instance, createInfo.addr(), 0, handleOutput.addr())", "vkCreateWin32SurfaceKHR");
+        oneoff("createGraphicsPipeline(device: int, createInfo: VkGraphicsPipelineCreateInfo)",
+               "vkCreateGraphicsPipelines(device, 0, 1, createInfo.addr(), 0, handleOutput.addr())",
                "vkCreateGraphicsPipelines");
-        oneoff("create_compute_pipeline(dev: int, ci: VkComputePipelineCreateInfo)",
-               "vkCreateComputePipelines(dev, 0, 1, ci.addr(), 0, p.addr())",
+        oneoff("createComputePipeline(device: int, createInfo: VkComputePipelineCreateInfo)",
+               "vkCreateComputePipelines(device, 0, 1, createInfo.addr(), 0, handleOutput.addr())",
                "vkCreateComputePipelines");
-        oneoff("allocate_descriptor_set(dev: int, ci: VkDescriptorSetAllocateInfo)",
-               "vkAllocateDescriptorSets(dev, ci.addr(), p.addr())",
+        oneoff("allocateDescriptorSet(device: int, createInfo: VkDescriptorSetAllocateInfo)",
+               "vkAllocateDescriptorSets(device, createInfo.addr(), handleOutput.addr())",
                "vkAllocateDescriptorSets");
         printf("\n// a VkClearValue is a bare union of four floats\n");
-        printf("fn clear_color(r: float, g: float, b: float, a: float) -> Bytes {\n");
-        printf("    var c = Bytes.new(16)\n");
-        printf("    c.putf32(0, r)\n    c.putf32(4, g)\n");
-        printf("    c.putf32(8, b)\n    c.putf32(12, a)\n");
-        printf("    return c\n}\n");
+        printf("fn clearColor(red: float, green: float, blue: float, alpha: float) -> Bytes {\n");
+        printf("    var color = Bytes.new(16)\n");
+        printf("    color.putFloat32(0, red)\n    color.putFloat32(4, green)\n");
+        printf("    color.putFloat32(8, blue)\n    color.putFloat32(12, alpha)\n");
+        printf("    return color\n}\n");
     }
     return 0;
 }

@@ -453,21 +453,21 @@ Check "ml-tensor" ($tenBuilt -and $tenOut -eq "tensor: 73 checks passed") "got: 
 # ---- and the inputs that must be REJECTED, one process each: a rejection is
 # ---- a panic, so it cannot be asserted from inside the positive suite ----
 $mlNeg = [ordered]@{
-    "negdim"      = 'let t = t_zeros(DType.F64, [0 - 2, 3])'
-    "overflow"    = 'let t = t_zeros(DType.F64, [3000000000, 3000000000])'
-    "bytecap"     = 'let t = t_zeros(DType.C64, [500000000000])'
-    "idx-high"    = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [2, 0])}`")"
-    "idx-neg"     = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [0 - 1, 0])}`")"
-    "idx-rank"    = "let t = t_zeros(DType.F64, [2, 3])`nprint(`"{t_get(t, [1])}`")"
-    "reshape-n"   = "let t = t_zeros(DType.F64, [2, 3])`nlet r = t_reshape(t, [4, 2])"
-    "reshape-nc"  = "let t = t_zeros(DType.F64, [2, 3])`nlet r = t_reshape(t_transpose(t, 0, 1), [6])"
-    "slice-oob"   = "let t = t_zeros(DType.F64, [2, 3])`nlet s = t_slice(t, 1, 1, 9)"
-    "axis-oob"    = "let t = t_zeros(DType.F64, [2, 3])`nlet x = t_transpose(t, 0, 5)"
-    "bcast-bad"   = 'let s = broadcast_shape([2, 3], [4, 3])'
-    "stale-save"  = "let t = t_zeros(DType.F64, [2])`nlet s = t_save(t)`nt_set(t, [0], 1.0)`nlet b = saved_get(s)"
-    "dbl-release" = "let t = t_zeros(DType.F64, [2])`nstorage_release(t.st)`nstorage_release(t.st)"
-    "cplx-get"    = "let t = t_zeros(DType.C32, [2])`nprint(`"{t_get(t, [0])}`")"
-    "int-set"     = "let t = t_zeros(DType.I64, [2])`nt_set(t, [0], 1.5)"
+    "negdim"      = 'let t = tensorZeros(DType.F64, [0 - 2, 3])'
+    "overflow"    = 'let t = tensorZeros(DType.F64, [3000000000, 3000000000])'
+    "bytecap"     = 'let t = tensorZeros(DType.C64, [500000000000])'
+    "idx-high"    = "let t = tensorZeros(DType.F64, [2, 3])`nprint(`"{tensorGet(t, [2, 0])}`")"
+    "idx-neg"     = "let t = tensorZeros(DType.F64, [2, 3])`nprint(`"{tensorGet(t, [0 - 1, 0])}`")"
+    "idx-rank"    = "let t = tensorZeros(DType.F64, [2, 3])`nprint(`"{tensorGet(t, [1])}`")"
+    "reshape-n"   = "let t = tensorZeros(DType.F64, [2, 3])`nlet r = tensorReshape(t, [4, 2])"
+    "reshape-nc"  = "let t = tensorZeros(DType.F64, [2, 3])`nlet r = tensorReshape(tensorTranspose(t, 0, 1), [6])"
+    "slice-oob"   = "let t = tensorZeros(DType.F64, [2, 3])`nlet s = tensorSlice(t, 1, 1, 9)"
+    "axis-oob"    = "let t = tensorZeros(DType.F64, [2, 3])`nlet x = tensorTranspose(t, 0, 5)"
+    "bcast-bad"   = 'let s = broadcastShape([2, 3], [4, 3])'
+    "stale-save"  = "let t = tensorZeros(DType.F64, [2])`nlet s = tensorSave(t)`ntensorSet(t, [0], 1.0)`nlet b = savedGet(s)"
+    "dbl-release" = "let t = tensorZeros(DType.F64, [2])`nstorageRelease(t.storage)`nstorageRelease(t.storage)"
+    "cplx-get"    = "let t = tensorZeros(DType.C32, [2])`nprint(`"{tensorGet(t, [0])}`")"
+    "int-set"     = "let t = tensorZeros(DType.I64, [2])`ntensorSet(t, [0], 1.5)"
 }
 foreach ($nm in $mlNeg.Keys) {
     $src = "import `"ml/tensor.zeph`"`n" + $mlNeg[$nm]
@@ -670,32 +670,32 @@ if (-not $hasNumpy) {
 }
 
 $opNeg = [ordered]@{
-    "dtype-mix"  = 'let x = t_add(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]))'
-    "bcast-bad"  = 'let x = t_add(t_zeros(DType.F64, [2, 3]), t_zeros(DType.F64, [4, 3]))'
-    "mm-inner"   = 'let x = t_matmul(t_zeros(DType.F64, [2, 3]), t_zeros(DType.F64, [4, 2]))'
-    "mm-rank"    = 'let x = t_matmul(t_zeros(DType.F64, [2, 3, 1]), t_zeros(DType.F64, [3, 2]))'
-    "ro-write"   = "let r = t_zeros(DType.F64, [1, 3])`nlet e = t_expand(r, [4, 3])`nt_set(e, [0, 0], 1.0)"
-    "cast-down"  = 'let x = t_cast(t_zeros(DType.C64, [2]), DType.F64)'
-    "abs2-real"  = 'let x = t_abs2(t_zeros(DType.F64, [2]))'
-    "conj-real"  = 'let x = t_conj(t_zeros(DType.F64, [2]))'
-    "sum-cplx"   = 'let x = t_sum_all(t_zeros(DType.C64, [2]))'
-    "mean-empty" = 'let x = t_mean_all(t_zeros(DType.F64, [0]))'
-    "expi-cplx"  = 'let x = t_expi(t_zeros(DType.C64, [2]), DType.C64)'
-    "expand-bad" = 'let x = t_expand(t_zeros(DType.F64, [3]), [4])'
-    "int-arith"  = 'let x = t_add(t_zeros(DType.I64, [2]), t_zeros(DType.I64, [2]))'
-    "sel-dim"     = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 5, [0])'
-    "sel-range"   = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 0, [2])'
-    "sel-neg"     = 'let x = t_index_select(t_zeros(DType.F64, [2, 2]), 0, [0 - 1])'
-    "copy-dup"    = 't_index_copy(t_zeros(DType.F64, [3]), 0, [1, 1], t_zeros(DType.F64, [2]))'
-    "copy-shape"  = 't_index_copy(t_zeros(DType.F64, [3, 2]), 0, [0], t_zeros(DType.F64, [1, 5]))'
-    "copy-count"  = 't_index_copy(t_zeros(DType.F64, [3]), 0, [0, 1], t_zeros(DType.F64, [3]))'
-    "copy-ro"     = "let r = t_zeros(DType.F64, [1, 3])`nlet e = t_expand(r, [4, 3])`nt_index_copy(e, 0, [0], t_zeros(DType.F64, [1, 3]))"
-    "cat-dim"     = 'let x = t_concat(t_zeros(DType.F64, [2, 2]), t_zeros(DType.F64, [2, 2]), 9)'
-    "cat-shape"   = 'let x = t_concat(t_zeros(DType.F64, [2, 2]), t_zeros(DType.F64, [3, 2]), 1)'
-    "cat-dtype"   = 'let x = t_concat(t_zeros(DType.F64, [2]), t_zeros(DType.F32, [2]), 0)'
-    "map-cplx"    = 'let x = t_tanh(t_zeros(DType.C64, [2]))'
-    "map-int"     = 'let x = t_tanh(t_zeros(DType.I64, [2]))'
-    "roll-dim"    = 'let x = t_roll(t_zeros(DType.F64, [2]), 3, 1)'
+    "dtype-mix"  = 'let x = tensorAdd(tensorZeros(DType.F64, [2]), tensorZeros(DType.F32, [2]))'
+    "bcast-bad"  = 'let x = tensorAdd(tensorZeros(DType.F64, [2, 3]), tensorZeros(DType.F64, [4, 3]))'
+    "mm-inner"   = 'let x = tensorMatmul(tensorZeros(DType.F64, [2, 3]), tensorZeros(DType.F64, [4, 2]))'
+    "mm-rank"    = 'let x = tensorMatmul(tensorZeros(DType.F64, [2, 3, 1]), tensorZeros(DType.F64, [3, 2]))'
+    "ro-write"   = "let r = tensorZeros(DType.F64, [1, 3])`nlet e = tensorExpand(r, [4, 3])`ntensorSet(e, [0, 0], 1.0)"
+    "cast-down"  = 'let x = tensorCast(tensorZeros(DType.C64, [2]), DType.F64)'
+    "abs2-real"  = 'let x = tensorAbs2(tensorZeros(DType.F64, [2]))'
+    "conj-real"  = 'let x = tensorConjugate(tensorZeros(DType.F64, [2]))'
+    "sum-cplx"   = 'let x = tensorSumAll(tensorZeros(DType.C64, [2]))'
+    "mean-empty" = 'let x = tensorMeanAll(tensorZeros(DType.F64, [0]))'
+    "expi-cplx"  = 'let x = tensorExpImaginary(tensorZeros(DType.C64, [2]), DType.C64)'
+    "expand-bad" = 'let x = tensorExpand(tensorZeros(DType.F64, [3]), [4])'
+    "int-arith"  = 'let x = tensorAdd(tensorZeros(DType.I64, [2]), tensorZeros(DType.I64, [2]))'
+    "sel-dim"     = 'let x = tensorIndexSelect(tensorZeros(DType.F64, [2, 2]), 5, [0])'
+    "sel-range"   = 'let x = tensorIndexSelect(tensorZeros(DType.F64, [2, 2]), 0, [2])'
+    "sel-neg"     = 'let x = tensorIndexSelect(tensorZeros(DType.F64, [2, 2]), 0, [0 - 1])'
+    "copy-dup"    = 'tensorIndexCopy(tensorZeros(DType.F64, [3]), 0, [1, 1], tensorZeros(DType.F64, [2]))'
+    "copy-shape"  = 'tensorIndexCopy(tensorZeros(DType.F64, [3, 2]), 0, [0], tensorZeros(DType.F64, [1, 5]))'
+    "copy-count"  = 'tensorIndexCopy(tensorZeros(DType.F64, [3]), 0, [0, 1], tensorZeros(DType.F64, [3]))'
+    "copy-ro"     = "let r = tensorZeros(DType.F64, [1, 3])`nlet e = tensorExpand(r, [4, 3])`ntensorIndexCopy(e, 0, [0], tensorZeros(DType.F64, [1, 3]))"
+    "cat-dim"     = 'let x = tensorConcat(tensorZeros(DType.F64, [2, 2]), tensorZeros(DType.F64, [2, 2]), 9)'
+    "cat-shape"   = 'let x = tensorConcat(tensorZeros(DType.F64, [2, 2]), tensorZeros(DType.F64, [3, 2]), 1)'
+    "cat-dtype"   = 'let x = tensorConcat(tensorZeros(DType.F64, [2]), tensorZeros(DType.F32, [2]), 0)'
+    "map-cplx"    = 'let x = tensorTanh(tensorZeros(DType.C64, [2]))'
+    "map-int"     = 'let x = tensorTanh(tensorZeros(DType.I64, [2]))'
+    "roll-dim"    = 'let x = tensorRoll(tensorZeros(DType.F64, [2]), 3, 1)'
 }
 foreach ($nm in $opNeg.Keys) {
     $src = "import `"ml/ops.zeph`"`n" + $opNeg[$nm]
@@ -933,7 +933,7 @@ fn want(id: int) -> int {
     return acc
 }
 var ts: [Thread] = []
-for i in 0..N { ts.push(thread_spawn(work, i)) }
+for i in 0..N { ts.push(spawnThread(work, i)) }
 for t in ts { t.join() }
 var bad = 0
 for i in 0..N {
@@ -972,7 +972,7 @@ fn work(id: int) {
     store64(bad + id * 8, wrong)
 }
 var ts: [Thread] = []
-for i in 0..N { ts.push(thread_spawn(work, i)) }
+for i in 0..N { ts.push(spawnThread(work, i)) }
 for t in ts { t.join() }
 var total = 0
 for i in 0..N { total = total + load64(bad + i * 8) }

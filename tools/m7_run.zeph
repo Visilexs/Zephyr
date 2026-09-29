@@ -55,10 +55,10 @@ fn now_ms() -> float {
 }
 
 fn write_text(path: str, body: str) {
-    let name = cbytes(path)
+    let name = cString(path)
     let h = win("CreateFileA", name.addr(), 1073741824, 0, 0, 2, 128, 0)
     if h == 0 - 1 { panic("m7_run: cannot open {path} for writing") }
-    let b = cbytes(body)
+    let b = cString(body)
     let wrote = Bytes.new(8)
     let ok = win("WriteFile", h, b.addr(), body.len(), wrote.addr(), 0)
     win("CloseHandle", h)
@@ -72,11 +72,11 @@ fn rnd() -> float {
     return ((SEED % 1000001) as float) / 500000.0 - 1.0
 }
 fn fill_scaled(t: Tensor, sc: float) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
-        if dtype_is_complex(t.dt) { t_set_c(t, idx, sc * rnd(), sc * rnd()) } else { t_set(t, idx, sc * rnd()) }
-        more = idx_next(idx, t.shape)
+        if dtypeIsComplex(t.dtype) { tensorSetComplex(t, idx, sc * rnd(), sc * rnd()) } else { tensorSet(t, idx, sc * rnd()) }
+        more = indexNext(idx, t.shape)
     }
 }
 // Fan-in scaling, the same rule for every family so initialisation is not
@@ -91,8 +91,8 @@ fn init_like(t: Tensor) {
 fn count_real(ts: [Tensor]) -> int {
     var n = 0
     for i in 0..ts.len() {
-        var c = t_numel(ts[i])
-        if dtype_is_complex(ts[i].dt) { c = c * 2 }
+        var c = tensorElementCount(ts[i])
+        if dtypeIsComplex(ts[i].dtype) { c = c * 2 }
         n = n + c
     }
     return n
@@ -120,13 +120,13 @@ if LR_IDX < 0 or LR_IDX >= LR_GRID.len() { panic("m7_run: lr index {LR_IDX} outs
 if TASK != "a" and TASK != "b" { panic("m7_run: task must be a or b, got {TASK}") }
 let LR = LR_GRID[LR_IDX]
 
-let train = dataset_load("data/m7/{TASK}_train.bin")
-let valid = dataset_load("data/m7/{TASK}_validation.bin")
-let comp = dataset_load("data/m7/{TASK}_composition.bin")
-let leng = dataset_load("data/m7/{TASK}_length.bin")
+let train = datasetLoad("data/m7/{TASK}_train.bin")
+let valid = datasetLoad("data/m7/{TASK}_validation.bin")
+let comp = datasetLoad("data/m7/{TASK}_composition.bin")
+let leng = datasetLoad("data/m7/{TASK}_length.bin")
 let IV = train.vocab
-let OV = train.n_class
-let PAD = train.pad_id
+let OV = train.classCount
+let PAD = train.paddingId
 
 SEED = RUN_SEED * 7919 + 13
 
@@ -147,16 +147,16 @@ if not is_phase and not is_gru and not is_tf { panic("m7_run: unknown family {FA
 
 // The phase model is built in every case, because the parameter-matched GRU
 // needs its real parameter count as the target.
-let pcfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: PRESET_D, E: PRESET_E, H: PRESET_H,
-                       K: K_STEPS, pad: PAD, eps: 0.00000001}
-let pps = [t_zeros(DType.F64, [IV, PRESET_E]), t_zeros(DType.F64, [PRESET_E]),
-           t_zeros(DType.F64, [PRESET_H, PRESET_E + 3 * PRESET_D]), t_zeros(DType.F64, [PRESET_H]),
-           t_zeros(DType.F64, [3 * PRESET_D, PRESET_H]), t_zeros(DType.F64, [3 * PRESET_D])]
-let pzi = t_zeros(DType.C64, [PRESET_D])
-let pM = t_zeros(DType.C64, [OV, PRESET_D])
-let PH = PhaseParams{config: pcfg, embedding: pps[0], think: pps[1], W1: pps[2], b1: pps[3],
-                     W2: pps[4], b2: pps[5], z_init: pzi, M: pM}
-let phase_list = [PH.embedding, PH.think, PH.W1, PH.b1, PH.W2, PH.b2, PH.z_init, PH.M]
+let pcfg = PhaseConfig{inputVocab: IV, outputVocab: OV, stateDimension: PRESET_D, embeddingDimension: PRESET_E, hiddenDimension: PRESET_H,
+                       thinkSteps: K_STEPS, padToken: PAD, epsilon: 0.00000001}
+let pps = [tensorZeros(DType.F64, [IV, PRESET_E]), tensorZeros(DType.F64, [PRESET_E]),
+           tensorZeros(DType.F64, [PRESET_H, PRESET_E + 3 * PRESET_D]), tensorZeros(DType.F64, [PRESET_H]),
+           tensorZeros(DType.F64, [3 * PRESET_D, PRESET_H]), tensorZeros(DType.F64, [3 * PRESET_D])]
+let pzi = tensorZeros(DType.C64, [PRESET_D])
+let pM = tensorZeros(DType.C64, [OV, PRESET_D])
+let PH = PhaseParams{config: pcfg, embedding: pps[0], think: pps[1], hiddenWeight: pps[2], hiddenBias: pps[3],
+                     angleWeight: pps[4], angleBias: pps[5], initialState: pzi, readoutMatrix: pM}
+let phase_list = [PH.embedding, PH.think, PH.hiddenWeight, PH.hiddenBias, PH.angleWeight, PH.angleBias, PH.initialState, PH.readoutMatrix]
 let PHASE_PARAMS = count_real(phase_list)
 
 fn gru_count(hn: int, ov: int, iv: int) -> int {
@@ -184,28 +184,28 @@ if FAMILY == "gru_param" {
 var GRU_HEAD = 0
 if FAMILY == "gru_quad" { GRU_HEAD = 1 }
 
-let gcfg = GruConfig{input_vocab: IV, output_vocab: OV, E: PRESET_E, Hn: GRU_HIDDEN,
-                     head: GRU_HEAD, pad: PAD, eps: 0.00000001}
+let gcfg = GruConfig{inputVocab: IV, outputVocab: OV, embeddingDimension: PRESET_E, hiddenDimension: GRU_HIDDEN,
+                     head: GRU_HEAD, padToken: PAD, epsilon: 0.00000001}
 let GR = GruParams{config: gcfg,
-                   embedding: t_zeros(DType.F64, [IV, PRESET_E]),
-                   Wz: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), bz: t_zeros(DType.F64, [GRU_HIDDEN]),
-                   Wr: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), br: t_zeros(DType.F64, [GRU_HIDDEN]),
-                   Wn: t_zeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), bn: t_zeros(DType.F64, [GRU_HIDDEN]),
-                   Wo: t_zeros(DType.F64, [OV, GRU_HIDDEN]), bo: t_zeros(DType.F64, [OV]),
-                   h0: t_zeros(DType.F64, [GRU_HIDDEN])}
-let tcfg = TfConfig{input_vocab: IV, output_vocab: OV, d: TF_D, ff: TF_FF, layers: TF_LAYERS,
-                    max_len: leng.seq_len, pad: PAD, eps: 0.00001}
-let TF = tf_new(tcfg)
+                   embedding: tensorZeros(DType.F64, [IV, PRESET_E]),
+                   updateGateWeight: tensorZeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), updateGateBias: tensorZeros(DType.F64, [GRU_HIDDEN]),
+                   resetGateWeight: tensorZeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), resetGateBias: tensorZeros(DType.F64, [GRU_HIDDEN]),
+                   candidateWeight: tensorZeros(DType.F64, [GRU_HIDDEN, PRESET_E + GRU_HIDDEN]), candidateBias: tensorZeros(DType.F64, [GRU_HIDDEN]),
+                   outputWeight: tensorZeros(DType.F64, [OV, GRU_HIDDEN]), outputBias: tensorZeros(DType.F64, [OV]),
+                   initialHidden: tensorZeros(DType.F64, [GRU_HIDDEN])}
+let tcfg = TfConfig{inputVocab: IV, outputVocab: OV, d: TF_D, feedForwardDimension: TF_FF, layers: TF_LAYERS,
+                    maxLength: leng.sequenceLength, padToken: PAD, epsilon: 0.00001}
+let TF = newTransformer(tcfg)
 
 var PARAMS: [Tensor] = []
 if is_phase { PARAMS = phase_list }
-if is_gru { PARAMS = gru_param_list(GR) }
-if is_tf { PARAMS = tf_param_list(TF) }
+if is_gru { PARAMS = gruParameterList(GR) }
+if is_tf { PARAMS = transformerParameterList(TF) }
 for i in 0..PARAMS.len() { init_like(PARAMS[i]) }
 let N_PARAMS = count_real(PARAMS)
 
-READOUT_INCOHERENT = FAMILY == "incoherent"
-PHASE_REAL_ROTATIONS = FAMILY == "realrot"
+readoutIncoherent = FAMILY == "incoherent"
+phaseRealRotations = FAMILY == "realrot"
 
 // ---- forward -----------------------------------------------------------------
 // The tape handles of this run's parameters, in the same order as PARAMS.
@@ -215,30 +215,30 @@ var HANDLES: [int] = []
 
 fn loss_handle(tokens: Tensor, targets: [int], req: bool) -> int {
     if is_phase {
-        let m = pad_params(PH, req)
-        HANDLES = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
-        return pad_loss(m, tokens, targets)
+        let m = phaseAutogradParameters(PH, req)
+        HANDLES = [m.embedding, m.think, m.hiddenWeight, m.hiddenBias, m.angleWeight, m.angleBias, m.initialState, m.readoutMatrix]
+        return phaseAutogradLoss(m, tokens, targets)
     }
     if is_gru {
-        let m = gru_params(GR, req)
-        HANDLES = [m.embedding, m.Wz, m.bz, m.Wr, m.br, m.Wn, m.bn, m.Wo, m.bo, m.h0]
-        return gru_loss(m, tokens, targets)
+        let m = gruParameters(GR, req)
+        HANDLES = [m.embedding, m.updateGateWeight, m.updateGateBias, m.resetGateWeight, m.resetGateBias, m.candidateWeight, m.candidateBias, m.outputWeight, m.outputBias, m.initialHidden]
+        return gruLoss(m, tokens, targets)
     }
-    let m = tf_params(TF, req)
-    HANDLES = m.hs
-    return tf_loss(m, tokens, targets)
+    let m = transformerParameters(TF, req)
+    HANDLES = m.handles
+    return transformerLoss(m, tokens, targets)
 }
 fn probs_of(tokens: Tensor) -> Tensor {
     if is_phase {
-        let m = pad_params(PH, false)
-        return av_value(pad_readout(m, pad_forward(m, tokens)))
+        let m = phaseAutogradParameters(PH, false)
+        return autogradValue(phaseAutogradReadout(m, phaseAutogradForward(m, tokens)))
     }
     if is_gru {
-        let m = gru_params(GR, false)
-        return av_value(gru_readout(m, gru_forward(m, tokens)))
+        let m = gruParameters(GR, false)
+        return autogradValue(gruReadout(m, gruForward(m, tokens)))
     }
-    let m = tf_params(TF, false)
-    return av_value(tf_readout(m, tf_forward(m, tokens)))
+    let m = transformerParameters(TF, false)
+    return autogradValue(transformerReadout(m, transformerForward(m, tokens)))
 }
 
 // Mean NLL and accuracy over the first `rows` rows of a split.
@@ -252,18 +252,18 @@ fn evaluate(d: Dataset, rows: int) -> [float] {
     while start < n {
         var cnt = BUDGET_BATCH
         if start + cnt > n { cnt = n - start }
-        let b = dataset_batch(d, start, cnt)
-        av_reset()
+        let b = datasetBatch(d, start, cnt)
+        autogradReset()
         let pr = probs_of(b.tokens)
         for r in 0..cnt {
             let t = b.targets[r]
-            var p = t_get(pr, [r, t])
+            var p = tensorGet(pr, [r, t])
             if p < 0.000000000000001 { p = 0.000000000000001 }
             nll = nll - fln(p)
             var best = 0
-            var bv = t_get(pr, [r, 0])
-            for c in 1..d.n_class {
-                let v = t_get(pr, [r, c])
+            var bv = tensorGet(pr, [r, 0])
+            for c in 1..d.classCount {
+                let v = tensorGet(pr, [r, c])
                 if v > bv { bv = v
                             best = c }
             }
@@ -277,26 +277,26 @@ fn evaluate(d: Dataset, rows: int) -> [float] {
 
 fn snapshot() -> [Tensor] {
     var s: [Tensor] = []
-    for i in 0..PARAMS.len() { s.push(t_copy(PARAMS[i])) }
+    for i in 0..PARAMS.len() { s.push(tensorCopy(PARAMS[i])) }
     return s
 }
 fn restore(s: [Tensor]) {
     for i in 0..PARAMS.len() {
-        var idx = idx_zeros(PARAMS[i].shape.len())
-        var more = t_numel(PARAMS[i]) > 0
+        var idx = indexZeros(PARAMS[i].shape.len())
+        var more = tensorElementCount(PARAMS[i]) > 0
         while more {
-            if dtype_is_complex(PARAMS[i].dt) {
-                t_set_c(PARAMS[i], idx, t_get_re(s[i], idx), t_get_im(s[i], idx))
+            if dtypeIsComplex(PARAMS[i].dtype) {
+                tensorSetComplex(PARAMS[i], idx, tensorGetReal(s[i], idx), tensorGetImaginary(s[i], idx))
             } else {
-                t_set(PARAMS[i], idx, t_get(s[i], idx))
+                tensorSet(PARAMS[i], idx, tensorGet(s[i], idx))
             }
-            more = idx_next(idx, PARAMS[i].shape)
+            more = indexNext(idx, PARAMS[i].shape)
         }
     }
 }
 
 // ---- train ---------------------------------------------------------------------
-let opt = adamw_new(PARAMS, LR, 0.9, 0.999, 0.00000001, WD)
+let opt = newAdamW(PARAMS, LR, 0.9, 0.999, 0.00000001, WD)
 let ntrain = train.tokens.shape[0]
 var best_nll = 0.0 - 1.0
 var best_step = 0
@@ -309,18 +309,18 @@ var cursor = 0
 
 for step in 0..BUDGET_STEPS {
     if cursor + BUDGET_BATCH > ntrain { cursor = 0 }
-    let b = dataset_batch(train, cursor, BUDGET_BATCH)
+    let b = datasetBatch(train, cursor, BUDGET_BATCH)
     cursor = cursor + BUDGET_BATCH
-    av_reset()
+    autogradReset()
     let lh = loss_handle(b.tokens, b.targets, true)
-    av_backward(lh)
+    autogradBackward(lh)
     // Read the loss now. evaluate() below resets the tape, and reading the
     // handle afterwards is a dead handle, not a number.
-    let train_loss = t_get(av_value(lh), [0])
+    let train_loss = tensorGet(autogradValue(lh), [0])
     var gs: [Tensor] = []
-    for i in 0..HANDLES.len() { gs.push(t_copy(av_grad(HANDLES[i]))) }
-    clip_grad_norm(gs, CLIP)
-    optim_step(opt, PARAMS, gs)
+    for i in 0..HANDLES.len() { gs.push(tensorCopy(autogradGradient(HANDLES[i]))) }
+    clipGradientNorm(gs, CLIP)
+    optimizerStep(opt, PARAMS, gs)
     examples = examples + BUDGET_BATCH
     if (step + 1) % EVAL_EVERY == 0 {
         let v = evaluate(valid, SELECT_ROWS)

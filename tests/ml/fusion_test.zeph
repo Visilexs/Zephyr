@@ -12,7 +12,7 @@
 // The two tolerances here are deliberately different and the difference is
 // the point.
 //
-//   * The FORWARD is bit-exact. t_givens is the composed expression tree
+//   * The FORWARD is bit-exact. tensorGivens is the composed expression tree
 //     written out term for term, including the multiplications by the zero
 //     imaginary part that the real-to-complex casts introduce, so there is no
 //     reassociation and equality is the correct gate.
@@ -56,12 +56,12 @@ fn rndi(n: int) -> int {
     return SEED % n
 }
 fn fill_random(t: Tensor) {
-    var idx = idx_zeros(t.shape.len())
-    var more = t_numel(t) > 0
+    var idx = indexZeros(t.shape.len())
+    var more = tensorElementCount(t) > 0
     while more {
         let re = rnd()
-        if dtype_is_complex(t.dt) { t_set_c(t, idx, re, rnd()) } else { t_set(t, idx, re) }
-        more = idx_next(idx, t.shape)
+        if dtypeIsComplex(t.dtype) { tensorSetComplex(t, idx, re, rnd()) } else { tensorSet(t, idx, re) }
+        more = indexNext(idx, t.shape)
     }
 }
 
@@ -84,77 +84,77 @@ fn givens_composed(z: Tensor, tp: Tensor, stage: int) -> Tensor {
         perm[left[k]] = k
         perm[right[k]] = h + k
     }
-    let a = t_index_select(z, 1, left)
-    let b = t_index_select(z, 1, right)
-    let theta = t_slice(tp, 1, 0, h)
-    let phi = t_slice(tp, 1, h, d)
-    let c = t_cast(t_cos(theta), DType.C64)
-    let s = t_cast(t_sin(theta), DType.C64)
-    let q = t_expi(phi, DType.C64)
-    let new_a = t_add(t_mul(c, a), t_mul(s, t_mul(q, b)))
-    let new_b = t_add(t_neg(t_mul(s, t_mul(t_conj(q), a))), t_mul(c, b))
-    return t_index_select(t_concat(new_a, new_b, 1), 1, perm)
+    let a = tensorIndexSelect(z, 1, left)
+    let b = tensorIndexSelect(z, 1, right)
+    let theta = tensorSlice(tp, 1, 0, h)
+    let phi = tensorSlice(tp, 1, h, d)
+    let c = tensorCast(tensorCos(theta), DType.C64)
+    let s = tensorCast(tensorSin(theta), DType.C64)
+    let q = tensorExpImaginary(phi, DType.C64)
+    let new_a = tensorAdd(tensorMultiply(c, a), tensorMultiply(s, tensorMultiply(q, b)))
+    let new_b = tensorAdd(tensorNegate(tensorMultiply(s, tensorMultiply(tensorConjugate(q), a))), tensorMultiply(c, b))
+    return tensorIndexSelect(tensorConcat(new_a, new_b, 1), 1, perm)
 }
 
 fn max_rel(x: Tensor, y: Tensor) -> float {
     var worst = 0.0
-    var idx = idx_zeros(x.shape.len())
-    var more = t_numel(x) > 0
+    var idx = indexZeros(x.shape.len())
+    var more = tensorElementCount(x) > 0
     while more {
         var dv = 0.0
         var sc = 0.0
-        if dtype_is_complex(x.dt) {
-            dv = fabs(t_get_re(x, idx) - t_get_re(y, idx)) + fabs(t_get_im(x, idx) - t_get_im(y, idx))
-            sc = fabs(t_get_re(x, idx)) + fabs(t_get_im(x, idx))
+        if dtypeIsComplex(x.dtype) {
+            dv = fabs(tensorGetReal(x, idx) - tensorGetReal(y, idx)) + fabs(tensorGetImaginary(x, idx) - tensorGetImaginary(y, idx))
+            sc = fabs(tensorGetReal(x, idx)) + fabs(tensorGetImaginary(x, idx))
         } else {
-            dv = fabs(t_get(x, idx) - t_get(y, idx))
-            sc = fabs(t_get(x, idx))
+            dv = fabs(tensorGet(x, idx) - tensorGet(y, idx))
+            sc = fabs(tensorGet(x, idx))
         }
         let r = dv / (1.0 + sc)
         if r > worst { worst = r }
-        more = idx_next(idx, x.shape)
+        more = indexNext(idx, x.shape)
     }
     return worst
 }
 
 // ---- identical invalid-input behaviour, in children ------------------------
-// Run through the model rather than through t_givens directly: the composed
-// path never calls t_givens, so comparing the kernel with itself would be the
+// Run through the model rather than through tensorGivens directly: the composed
+// path never calls tensorGivens, so comparing the kernel with itself would be the
 // only thing a direct call could do. What has to match is what the caller
 // sees, with the fusion on and off, on input that must be refused.
 if args().len() > 2 {
-    GIVENS_FUSE = args()[2] == "fused"
-    CTRL_FUSE = args()[2] == "fused"
+    givensFuse = args()[2] == "fused"
+    controllerFuse = args()[2] == "fused"
     let case = args()[1]
     let d = 8
-    let cfg = PhaseConfig{input_vocab: 5, output_vocab: 3, D: d, E: 4, H: 6, K: 1, pad: 0, eps: 0.00000001}
+    let cfg = PhaseConfig{inputVocab: 5, outputVocab: 3, stateDimension: d, embeddingDimension: 4, hiddenDimension: 6, thinkSteps: 1, padToken: 0, epsilon: 0.00000001}
     var dd = d
     if case == "odd" { dd = 7 }
-    let ps = [t_zeros(DType.F64, [5, 4]), t_zeros(DType.F64, [4]),
-              t_zeros(DType.F64, [6, 4 + 3 * dd]), t_zeros(DType.F64, [6]),
-              t_zeros(DType.F64, [3 * dd, 6]), t_zeros(DType.F64, [3 * dd])]
+    let ps = [tensorZeros(DType.F64, [5, 4]), tensorZeros(DType.F64, [4]),
+              tensorZeros(DType.F64, [6, 4 + 3 * dd]), tensorZeros(DType.F64, [6]),
+              tensorZeros(DType.F64, [3 * dd, 6]), tensorZeros(DType.F64, [3 * dd])]
     for i in 0..ps.len() { fill_random(ps[i]) }
-    let zi = t_zeros(DType.C64, [dd])
-    let Mo = t_zeros(DType.C64, [3, dd])
+    let zi = tensorZeros(DType.C64, [dd])
+    let Mo = tensorZeros(DType.C64, [3, dd])
     fill_random(zi)
     fill_random(Mo)
-    if case == "bias" { ps[3] = t_zeros(DType.F64, [7]) }
+    if case == "bias" { ps[3] = tensorZeros(DType.F64, [7]) }
     var c2 = cfg
-    if case == "odd" { c2 = PhaseConfig{input_vocab: 5, output_vocab: 3, D: dd, E: 4, H: 6, K: 1, pad: 0, eps: 0.00000001} }
-    let p = PhaseParams{config: c2, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
-                        W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
-    let tok = t_zeros(DType.I64, [2, 2])
-    if case == "vocab" { t_set_int(tok, [0, 0], 99) }
-    if case == "negative" { t_set_int(tok, [1, 1], 0 - 1) }
-    av_reset()
-    let m = pad_params(p, true)
-    pad_loss(m, tok, [0, 1])
+    if case == "odd" { c2 = PhaseConfig{inputVocab: 5, outputVocab: 3, stateDimension: dd, embeddingDimension: 4, hiddenDimension: 6, thinkSteps: 1, padToken: 0, epsilon: 0.00000001} }
+    let p = PhaseParams{config: c2, embedding: ps[0], think: ps[1], hiddenWeight: ps[2], hiddenBias: ps[3],
+                        angleWeight: ps[4], angleBias: ps[5], initialState: zi, readoutMatrix: Mo}
+    let tok = tensorZeros(DType.I64, [2, 2])
+    if case == "vocab" { tensorSetInt(tok, [0, 0], 99) }
+    if case == "negative" { tensorSetInt(tok, [1, 1], 0 - 1) }
+    autogradReset()
+    let m = phaseAutogradParameters(p, true)
+    phaseAutogradLoss(m, tok, [0, 1])
     print("UNREACHABLE: {case} was accepted")
 }
 let IS_CHILD = args().len() > 2
 
 fn child(case: str, mode: str) -> int {
-    var cmd = cbytes("\"{args()[0]}\" {case} {mode}")
+    var cmd = cString("\"{args()[0]}\" {case} {mode}")
     let startup = Bytes.new(104)
     startup.put32(0, 104)
     let process = Bytes.new(24)
@@ -180,19 +180,19 @@ let NB = 8
 let T = 3
 
 fn build() -> PhaseParams {
-    let cfg = PhaseConfig{input_vocab: IV, output_vocab: OV, D: D, E: E, H: H, K: K, pad: 0, eps: 0.00000001}
-    let ps = [t_zeros(DType.F64, [IV, E]), t_zeros(DType.F64, [E]), t_zeros(DType.F64, [H, E + 3 * D]),
-              t_zeros(DType.F64, [H]), t_zeros(DType.F64, [3 * D, H]), t_zeros(DType.F64, [3 * D])]
+    let cfg = PhaseConfig{inputVocab: IV, outputVocab: OV, stateDimension: D, embeddingDimension: E, hiddenDimension: H, thinkSteps: K, padToken: 0, epsilon: 0.00000001}
+    let ps = [tensorZeros(DType.F64, [IV, E]), tensorZeros(DType.F64, [E]), tensorZeros(DType.F64, [H, E + 3 * D]),
+              tensorZeros(DType.F64, [H]), tensorZeros(DType.F64, [3 * D, H]), tensorZeros(DType.F64, [3 * D])]
     for i in 0..ps.len() { fill_random(ps[i]) }
-    let zi = t_zeros(DType.C64, [D])
-    let Mo = t_zeros(DType.C64, [OV, D])
+    let zi = tensorZeros(DType.C64, [D])
+    let Mo = tensorZeros(DType.C64, [OV, D])
     fill_random(zi)
     fill_random(Mo)
-    return PhaseParams{config: cfg, embedding: ps[0], think: ps[1], W1: ps[2], b1: ps[3],
-                       W2: ps[4], b2: ps[5], z_init: zi, M: Mo}
+    return PhaseParams{config: cfg, embedding: ps[0], think: ps[1], hiddenWeight: ps[2], hiddenBias: ps[3],
+                       angleWeight: ps[4], angleBias: ps[5], initialState: zi, readoutMatrix: Mo}
 }
 fn params_of(p: PhaseParams) -> [Tensor] {
-    return [p.embedding, p.think, p.W1, p.b1, p.W2, p.b2, p.z_init, p.M]
+    return [p.embedding, p.think, p.hiddenWeight, p.hiddenBias, p.angleWeight, p.angleBias, p.initialState, p.readoutMatrix]
 }
 
 let save = SEED
@@ -200,43 +200,43 @@ let p_ref = build()
 SEED = save
 let p_opt = build()
 
-let tokens = t_zeros(DType.I64, [NB, T])
+let tokens = tensorZeros(DType.I64, [NB, T])
 var targets: [int] = []
 for row in 0..NB {
-    for st in 0..T { t_set_int(tokens, [row, st], 1 + rndi(IV - 1)) }
+    for st in 0..T { tensorSetInt(tokens, [row, st], 1 + rndi(IV - 1)) }
     targets.push(rndi(OV))
 }
 
 var LAST_NODES = 0
 fn step(p: PhaseParams, opt: Optim, out: [Tensor]) -> float {
-    av_reset()
-    let m = pad_params(p, true)
-    let loss = pad_loss(m, tokens, targets)
-    av_backward(loss)
-    LAST_NODES = av_nodes()
-    let handles = [m.embedding, m.think, m.W1, m.b1, m.W2, m.b2, m.z_init, m.M]
+    autogradReset()
+    let m = phaseAutogradParameters(p, true)
+    let loss = phaseAutogradLoss(m, tokens, targets)
+    autogradBackward(loss)
+    LAST_NODES = autogradNodeCount()
+    let handles = [m.embedding, m.think, m.hiddenWeight, m.hiddenBias, m.angleWeight, m.angleBias, m.initialState, m.readoutMatrix]
     var grads: [Tensor] = []
-    for i in 0..handles.len() { grads.push(t_copy(av_grad(handles[i]))) }
-    clip_grad_norm(grads, 5.0)
-    optim_step(opt, params_of(p), grads)
+    for i in 0..handles.len() { grads.push(tensorCopy(autogradGradient(handles[i]))) }
+    clipGradientNorm(grads, 5.0)
+    optimizerStep(opt, params_of(p), grads)
     for i in 0..grads.len() { out.push(grads[i]) }
-    return t_get(av_value(loss), [0])
+    return tensorGet(autogradValue(loss), [0])
 }
 
 if not IS_CHILD {
-    GIVENS_FUSE = false
-    CTRL_FUSE = false
+    givensFuse = false
+    controllerFuse = false
     var g_ref: [Tensor] = []
-    let loss_ref = step(p_ref, adamw_new(params_of(p_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_ref)
+    let loss_ref = step(p_ref, newAdamW(params_of(p_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_ref)
     let nodes_unfused = LAST_NODES
 
-    GIVENS_FUSE = true
-    CTRL_FUSE = true
+    givensFuse = true
+    controllerFuse = true
     var g_opt: [Tensor] = []
-    let loss_opt = step(p_opt, adamw_new(params_of(p_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_opt)
+    let loss_opt = step(p_opt, newAdamW(params_of(p_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), g_opt)
     let nodes_fused = LAST_NODES
 
-    chk(t_hex(t_full(DType.F64, [1], loss_ref)) == t_hex(t_full(DType.F64, [1], loss_opt)),
+    chk(tensorHex(tensorFull(DType.F64, [1], loss_ref)) == tensorHex(tensorFull(DType.F64, [1], loss_opt)),
         "fused and unfused forward loss are bit-identical: {loss_ref} against {loss_opt}")
     chk(loss_ref == loss_ref and loss_ref > 0.0, "the loss is finite and positive, so this is not a comparison of NaN")
 
@@ -248,7 +248,7 @@ if not IS_CHILD {
     }
     var gbit = 0
     for i in 0..g_ref.len() {
-        if t_hex(g_ref[i]) == t_hex(g_opt[i]) { gbit = gbit + 1 }
+        if tensorHex(g_ref[i]) == tensorHex(g_opt[i]) { gbit = gbit + 1 }
     }
     // Reported scaled by 1e18, because print is fixed-point and a difference
     // of a few times 1e-17 prints as a flat 0 -- which reads as "identical"
@@ -256,17 +256,17 @@ if not IS_CHILD {
     // the spread are both visible.
     var nzdiff = 0
     for i in 0..g_ref.len() {
-        var idx = idx_zeros(g_ref[i].shape.len())
-        var more = t_numel(g_ref[i]) > 0
+        var idx = indexZeros(g_ref[i].shape.len())
+        var more = tensorElementCount(g_ref[i]) > 0
         while more {
-            if dtype_is_complex(g_ref[i].dt) {
-                let dr = t_get_re(g_ref[i], idx) - t_get_re(g_opt[i], idx)
-                let di = t_get_im(g_ref[i], idx) - t_get_im(g_opt[i], idx)
+            if dtypeIsComplex(g_ref[i].dtype) {
+                let dr = tensorGetReal(g_ref[i], idx) - tensorGetReal(g_opt[i], idx)
+                let di = tensorGetImaginary(g_ref[i], idx) - tensorGetImaginary(g_opt[i], idx)
                 if dr != 0.0 or di != 0.0 { nzdiff = nzdiff + 1 }
             } else {
-                if t_get(g_ref[i], idx) != t_get(g_opt[i], idx) { nzdiff = nzdiff + 1 }
+                if tensorGet(g_ref[i], idx) != tensorGet(g_opt[i], idx) { nzdiff = nzdiff + 1 }
             }
-            more = idx_next(idx, g_ref[i].shape)
+            more = indexNext(idx, g_ref[i].shape)
         }
     }
     print("gradients: worst relative difference {worst * 1000000000000000000.0} times 1e-18, whole tensors bit-identical {gbit} of 8, components differing at all {nzdiff}")
@@ -284,40 +284,40 @@ if not IS_CHILD {
 
     var moved = 0
     for i in 0..g_ref.len() {
-        var idx = idx_zeros(g_ref[i].shape.len())
-        var more = t_numel(g_ref[i]) > 0
+        var idx = indexZeros(g_ref[i].shape.len())
+        var more = tensorElementCount(g_ref[i]) > 0
         while more {
-            if dtype_is_complex(g_ref[i].dt) {
-                if fabs(t_get_re(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
+            if dtypeIsComplex(g_ref[i].dtype) {
+                if fabs(tensorGetReal(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
             } else {
-                if fabs(t_get(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
+                if fabs(tensorGet(g_ref[i], idx)) > 0.0001 { moved = moved + 1 }
             }
-            more = idx_next(idx, g_ref[i].shape)
+            more = indexNext(idx, g_ref[i].shape)
         }
     }
     chk(moved > 100, "the gradients are non-trivial ({moved} components above 1e-4)")
 
     // ---- the stage itself, against the composed expression ----------------
-    let zs = t_zeros(DType.C64, [7, 12])
-    let tps = t_zeros(DType.F64, [7, 12])
+    let zs = tensorZeros(DType.C64, [7, 12])
+    let tps = tensorZeros(DType.F64, [7, 12])
     fill_random(zs)
     fill_random(tps)
     for st in 0..2 {
-        chk(t_hex(t_givens(zs, tps, st)) == t_hex(givens_composed(zs, tps, st)),
+        chk(tensorHex(tensorGivens(zs, tps, st)) == tensorHex(givens_composed(zs, tps, st)),
             "stage {st} is bit-identical to the composed expression")
     }
 
     // Views. The kernel reads strides, so a non-contiguous operand must give
     // the same answer as the same operand through the composed path.
-    let zw = t_zeros(DType.C64, [12, 7])
+    let zw = tensorZeros(DType.C64, [12, 7])
     fill_random(zw)
-    let zt = t_transpose(zw, 0, 1)                  // [7,12], swapped strides
-    let tpw = t_zeros(DType.F64, [7, 20])
+    let zt = tensorTranspose(zw, 0, 1)                  // [7,12], swapped strides
+    let tpw = tensorZeros(DType.F64, [7, 20])
     fill_random(tpw)
-    let tsl = t_slice(tpw, 1, 4, 16)                // [7,12], offset
-    chk(t_hex(t_givens(zt, tps, 0)) == t_hex(givens_composed(zt, tps, 0)),
+    let tsl = tensorSlice(tpw, 1, 4, 16)                // [7,12], offset
+    chk(tensorHex(tensorGivens(zt, tps, 0)) == tensorHex(givens_composed(zt, tps, 0)),
         "a transposed state operand gives a bit-identical result")
-    chk(t_hex(t_givens(zs, tsl, 1)) == t_hex(givens_composed(zs, tsl, 1)),
+    chk(tensorHex(tensorGivens(zs, tsl, 1)) == tensorHex(givens_composed(zs, tsl, 1)),
         "a sliced and offset angle operand gives a bit-identical result")
 
     // ---- pairing: disjoint within a stage, ordered across stages ----------
@@ -328,33 +328,33 @@ if not IS_CHILD {
     // outputs it can reach is the direct way to see the pairing.
     for st in 0..2 {
         var covered = 0
-        let zc = t_zeros(DType.C64, [1, 12])
-        let tc = t_zeros(DType.F64, [1, 12])
-        for j in 0..12 { t_set_c(zc, [0, j], 1.0, 0.0) }
-        for j in 0..6 { t_set(tc, [0, j], 0.3) }
-        for j in 6..12 { t_set(tc, [0, j], 0.7) }
-        let oc = t_givens(zc, tc, st)
+        let zc = tensorZeros(DType.C64, [1, 12])
+        let tc = tensorZeros(DType.F64, [1, 12])
+        for j in 0..12 { tensorSetComplex(zc, [0, j], 1.0, 0.0) }
+        for j in 0..6 { tensorSet(tc, [0, j], 0.3) }
+        for j in 6..12 { tensorSet(tc, [0, j], 0.7) }
+        let oc = tensorGivens(zc, tc, st)
         for j in 0..12 {
-            if fabs(t_get_re(oc, [0, j])) + fabs(t_get_im(oc, [0, j])) > 0.000001 { covered = covered + 1 }
+            if fabs(tensorGetReal(oc, [0, j])) + fabs(tensorGetImaginary(oc, [0, j])) > 0.000001 { covered = covered + 1 }
         }
         chk(covered == 12, "stage {st} writes every one of the 12 output coordinates ({covered})")
     }
 
     // A rotation is unitary, so a stage preserves the norm of every row. A
     // pairing bug that dropped or duplicated a coordinate would not.
-    let zu = t_zeros(DType.C64, [4, 12])
-    let tu = t_zeros(DType.F64, [4, 12])
+    let zu = tensorZeros(DType.C64, [4, 12])
+    let tu = tensorZeros(DType.F64, [4, 12])
     fill_random(zu)
     fill_random(tu)
     for st in 0..2 {
-        let ou = t_givens(zu, tu, st)
+        let ou = tensorGivens(zu, tu, st)
         var wn = 0.0
         for r in 0..4 {
             var n0 = 0.0
             var n1 = 0.0
             for j in 0..12 {
-                n0 = n0 + t_get_re(zu, [r, j]) * t_get_re(zu, [r, j]) + t_get_im(zu, [r, j]) * t_get_im(zu, [r, j])
-                n1 = n1 + t_get_re(ou, [r, j]) * t_get_re(ou, [r, j]) + t_get_im(ou, [r, j]) * t_get_im(ou, [r, j])
+                n0 = n0 + tensorGetReal(zu, [r, j]) * tensorGetReal(zu, [r, j]) + tensorGetImaginary(zu, [r, j]) * tensorGetImaginary(zu, [r, j])
+                n1 = n1 + tensorGetReal(ou, [r, j]) * tensorGetReal(ou, [r, j]) + tensorGetImaginary(ou, [r, j]) * tensorGetImaginary(ou, [r, j])
             }
             let rel = fabs(n1 - n0) / n0
             if rel > wn { wn = rel }
@@ -368,33 +368,33 @@ if not IS_CHILD {
     // that a fact about the code rather than an intention: sequencing them
     // the other way round gives a different answer, and feeding the odd stage
     // the original state instead of the even stage's output gives a third.
-    let z2 = t_zeros(DType.C64, [3, 12])
-    let ta0 = t_zeros(DType.F64, [3, 12])
-    let ta1 = t_zeros(DType.F64, [3, 12])
+    let z2 = tensorZeros(DType.C64, [3, 12])
+    let ta0 = tensorZeros(DType.F64, [3, 12])
+    let ta1 = tensorZeros(DType.F64, [3, 12])
     fill_random(z2)
     fill_random(ta0)
     fill_random(ta1)
-    let seq = t_givens(t_givens(z2, ta0, 0), ta1, 1)
-    let rev = t_givens(t_givens(z2, ta1, 1), ta0, 0)
-    let conc = t_add(t_givens(z2, ta1, 1), t_sub(t_givens(z2, ta0, 0), z2))
-    chk(t_hex(seq) != t_hex(rev), "the two stages do not commute, so their order is load-bearing")
-    chk(t_hex(seq) != t_hex(conc), "running the overlapping stages against the same input is a different function, so they are not fused")
-    chk(t_hex(seq) == t_hex(givens_composed(givens_composed(z2, ta0, 0), ta1, 1)),
+    let seq = tensorGivens(tensorGivens(z2, ta0, 0), ta1, 1)
+    let rev = tensorGivens(tensorGivens(z2, ta1, 1), ta0, 0)
+    let conc = tensorAdd(tensorGivens(z2, ta1, 1), tensorSubtract(tensorGivens(z2, ta0, 0), z2))
+    chk(tensorHex(seq) != tensorHex(rev), "the two stages do not commute, so their order is load-bearing")
+    chk(tensorHex(seq) != tensorHex(conc), "running the overlapping stages against the same input is a different function, so they are not fused")
+    chk(tensorHex(seq) == tensorHex(givens_composed(givens_composed(z2, ta0, 0), ta1, 1)),
         "the sequenced pair matches the composed sequenced pair")
 
     // ---- the controller nonlinearity ---------------------------------------
     // tanh(x + b) against the composed pair. Same argument as the Givens
     // stage: the fused kernel evaluates the same expression in the same
     // order, so equality is the gate.
-    let cx = t_zeros(DType.F64, [9, 13])
-    let cbv = t_zeros(DType.F64, [13])
+    let cx = tensorZeros(DType.F64, [9, 13])
+    let cbv = tensorZeros(DType.F64, [13])
     fill_random(cx)
     fill_random(cbv)
-    chk(t_hex(t_bias_tanh(cx, cbv)) == t_hex(t_tanh(t_add(cx, cbv))),
+    chk(tensorHex(tensorBiasTanh(cx, cbv)) == tensorHex(tensorTanh(tensorAdd(cx, cbv))),
         "the fused controller nonlinearity is bit-identical to tanh(x + b)")
-    let cxt = t_transpose(t_zeros(DType.F64, [13, 9]), 0, 1)
+    let cxt = tensorTranspose(tensorZeros(DType.F64, [13, 9]), 0, 1)
     fill_random(cxt)
-    chk(t_hex(t_bias_tanh(cxt, cbv)) == t_hex(t_tanh(t_add(cxt, cbv))),
+    chk(tensorHex(tensorBiasTanh(cxt, cbv)) == tensorHex(tensorTanh(tensorAdd(cxt, cbv))),
         "and on a transposed input, so the kernel reads strides rather than assuming contiguity")
 
     // Isolated: the controller fusion alone, with the Givens fusion off on
@@ -408,44 +408,44 @@ if not IS_CHILD {
     let c_ref = build()
     SEED = seed_c
     let c_opt = build()
-    GIVENS_FUSE = false
-    CTRL_FUSE = false
+    givensFuse = false
+    controllerFuse = false
     var gc_ref: [Tensor] = []
-    let lc_ref = step(c_ref, adamw_new(params_of(c_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_ref)
-    CTRL_FUSE = true
+    let lc_ref = step(c_ref, newAdamW(params_of(c_ref), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_ref)
+    controllerFuse = true
     var gc_opt: [Tensor] = []
-    let lc_opt = step(c_opt, adamw_new(params_of(c_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_opt)
-    chk(t_hex(t_full(DType.F64, [1], lc_ref)) == t_hex(t_full(DType.F64, [1], lc_opt)),
+    let lc_opt = step(c_opt, newAdamW(params_of(c_opt), 0.02, 0.9, 0.999, 0.00000001, 0.01), gc_opt)
+    chk(tensorHex(tensorFull(DType.F64, [1], lc_ref)) == tensorHex(tensorFull(DType.F64, [1], lc_opt)),
         "the controller fusion alone leaves the forward loss bit-identical: {lc_ref} against {lc_opt}")
     var cbit = 0
     for i in 0..gc_ref.len() {
-        if t_hex(gc_ref[i]) == t_hex(gc_opt[i]) { cbit = cbit + 1 }
+        if tensorHex(gc_ref[i]) == tensorHex(gc_opt[i]) { cbit = cbit + 1 }
     }
     chk(cbit == 8, "and all eight gradients bit-identical ({cbit} of 8)")
-    GIVENS_FUSE = true
-    CTRL_FUSE = true
+    givensFuse = true
+    controllerFuse = true
 
-    let bx = t_zeros(DType.F64, [64, 256])
-    let bv = t_zeros(DType.F64, [256])
+    let bx = tensorZeros(DType.F64, [64, 256])
+    let bv = tensorZeros(DType.F64, [256])
     fill_random(bx)
     fill_random(bv)
     let bc0 = now_ms()
-    t_tanh(t_add(bx, bv))
+    tensorTanh(tensorAdd(bx, bv))
     let bt_comp_cold = now_ms() - bc0
     var bt_comp_warm = 0.0
     for r in 0..3 {
         let a0 = now_ms()
-        t_tanh(t_add(bx, bv))
+        tensorTanh(tensorAdd(bx, bv))
         bt_comp_warm = bt_comp_warm + (now_ms() - a0)
     }
     bt_comp_warm = bt_comp_warm / 3.0
     let bf0 = now_ms()
-    t_bias_tanh(bx, bv)
+    tensorBiasTanh(bx, bv)
     let bt_fuse_cold = now_ms() - bf0
     var bt_fuse_warm = 0.0
     for r in 0..3 {
         let a0 = now_ms()
-        t_bias_tanh(bx, bv)
+        tensorBiasTanh(bx, bv)
         bt_fuse_warm = bt_fuse_warm + (now_ms() - a0)
     }
     bt_fuse_warm = bt_fuse_warm / 3.0
@@ -461,9 +461,9 @@ if not IS_CHILD {
     // node count is the measurement this library exposes.
     print("tape nodes: unfused {nodes_unfused}, fused {nodes_fused}")
     chk(nodes_fused < nodes_unfused, "the fused tape is smaller ({nodes_fused} against {nodes_unfused} nodes)")
-    let fz = t_givens(zs, tps, 0)
+    let fz = tensorGivens(zs, tps, 0)
     let cz = givens_composed(zs, tps, 0)
-    chk(fz.st.nbytes == cz.st.nbytes, "the fused stage allocates the same output storage, {fz.st.nbytes} bytes")
+    chk(fz.storage.byteCount == cz.storage.byteCount, "the fused stage allocates the same output storage, {fz.storage.byteCount} bytes")
 
     // ---- identical invalid-input behaviour ---------------------------------
     let cases = ["odd", "vocab", "negative", "bias"]
@@ -476,8 +476,8 @@ if not IS_CHILD {
     }
 
     // ---- cold and warm latency, separately ---------------------------------
-    let zb = t_zeros(DType.C64, [64, 128])
-    let tb = t_zeros(DType.F64, [64, 128])
+    let zb = tensorZeros(DType.C64, [64, 128])
+    let tb = tensorZeros(DType.F64, [64, 128])
     fill_random(zb)
     fill_random(tb)
 
@@ -493,12 +493,12 @@ if not IS_CHILD {
     comp_warm = comp_warm / 3.0
 
     let fc0 = now_ms()
-    t_givens(zb, tb, 0)
+    tensorGivens(zb, tb, 0)
     let fuse_cold = now_ms() - fc0
     var fuse_warm = 0.0
     for r in 0..3 {
         let a0 = now_ms()
-        t_givens(zb, tb, 0)
+        tensorGivens(zb, tb, 0)
         fuse_warm = fuse_warm + (now_ms() - a0)
     }
     fuse_warm = fuse_warm / 3.0
@@ -514,19 +514,19 @@ if not IS_CHILD {
     var e_un = 0.0
     var e_fu = 0.0
     for r in 0..2 {
-        GIVENS_FUSE = false
-        CTRL_FUSE = false
-        av_reset()
+        givensFuse = false
+        controllerFuse = false
+        autogradReset()
         let u0 = now_ms()
-        let mu = pad_params(p_ref, true)
-        av_backward(pad_loss(mu, tokens, targets))
+        let mu = phaseAutogradParameters(p_ref, true)
+        autogradBackward(phaseAutogradLoss(mu, tokens, targets))
         e_un = e_un + (now_ms() - u0)
-        GIVENS_FUSE = true
-        CTRL_FUSE = true
-        av_reset()
+        givensFuse = true
+        controllerFuse = true
+        autogradReset()
         let f0 = now_ms()
-        let mf = pad_params(p_ref, true)
-        av_backward(pad_loss(mf, tokens, targets))
+        let mf = phaseAutogradParameters(p_ref, true)
+        autogradBackward(phaseAutogradLoss(mf, tokens, targets))
         e_fu = e_fu + (now_ms() - f0)
     }
     print("forward plus backward: unfused {e_un / 2.0} ms, fused {e_fu / 2.0} ms, speedup {e_un / e_fu}x")
