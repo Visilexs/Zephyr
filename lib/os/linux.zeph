@@ -38,17 +38,32 @@ fn lx_mmap(addr: int, n: int, prot: int, flags: int) -> int {
 // MEM_RESERVE=0x2000 MEM_COMMIT=0x1000. A reserve maps PROT_NONE address space
 // (Linux overcommits, so this costs nothing); a later commit just mprotects it.
 fn k32_VirtualAlloc(base: int, n: int, flags: int, prot: int) -> int {
+    var protection = PROT_RW
+    if prot == 64 { protection = 7 } // PAGE_EXECUTE_READWRITE
     let want_commit = (flags & 4096) != 0
     let want_reserve = (flags & 8192) != 0
     if want_reserve and not want_commit {
         return lx_mmap(base, n, PROT_NONE, MAP_ANON_PRIV + MAP_NORESERVE)
     }
     if want_commit and base != 0 {
-        let r = syscall(SYS_MPROTECT, base, n, PROT_RW)
+        let r = syscall(SYS_MPROTECT, base, n, protection)
         if lx_failed(r) { return 0 }
         return base
     }
-    return lx_mmap(base, n, PROT_RW, MAP_ANON_PRIV)
+    // Keep allocation size in a preceding page for MEM_RELEASE (size == 0).
+    if n <= 0 or n > 9223372036854771711 { return 0 }
+    let mappingAddress = lx_mmap(0, n + 4096, protection, MAP_ANON_PRIV)
+    if mappingAddress == 0 { return 0 }
+    store64(mappingAddress, n + 4096)
+    return mappingAddress + 4096
+}
+
+// Release a committed allocation returned by VirtualAlloc above.
+fn k32_VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
+    if memoryAddress == 0 or freeFlags != 32768 { return 0 }
+    let mappingAddress = memoryAddress - 4096
+    if syscall(11, mappingAddress, load64(mappingAddress)) != 0 { return 0 }
+    return 1
 }
 
 // ---- console and files ----
@@ -112,6 +127,7 @@ fn k32_GetFileSize(h: int, phigh: int) -> int {
 }
 
 fn k32_CloseHandle(h: int) -> int {
+    if lx_close_thread(h) { return 1 }
     let r = syscall(SYS_CLOSE, h)
     if r < 0 { return 0 }
     return 1
@@ -299,6 +315,12 @@ fn lx_find_stack() {
 }
 
 fn k32_GetCurrentThreadStackLimits(lo: int, hi: int) -> int {
+    let threadRecord = lx_current_thread()
+    if threadRecord != 0 {
+        store64(lo, load64(threadRecord + 8) + 4096)
+        store64(hi, load64(threadRecord + 40))
+        return 0
+    }
     if __lx_stack_hi == 0 { lx_find_stack() }
     if __lx_stack_hi == 0 {
         // no maps, no roots we can trust -- better to stop than to collect blind
@@ -309,44 +331,386 @@ fn k32_GetCurrentThreadStackLimits(lo: int, hi: int) -> int {
     return 0
 }
 
-// ---- threads ----
-//
-// ponytail: single-threaded. The runtime only reaches the lock and the suspend
-// paths once __nthr > 0, and nothing can raise __nthr on Linux because
-// std/thread.zeph's CreateThread is not bound here. Wire clone(2) plus a futex
-// lock and a signal-based stop-the-world when Linux threading is wanted.
-
-fn k32_GetCurrentThreadId() -> int { return 1 }
-fn k32_InitializeCriticalSection(p: int) -> int { return 0 }
-fn k32_EnterCriticalSection(p: int) -> int { return 0 }
-fn k32_LeaveCriticalSection(p: int) -> int { return 0 }
-fn k32_SuspendThread(h: int) -> int { return 0 - 1 }
-fn k32_ResumeThread(h: int) -> int { return 0 - 1 }
-fn k32_GetThreadContext(h: int, ctx: int) -> int { return 0 }
-
-// ---- thread-local storage ----
-//
-// One process-wide slot table, which is exactly right while the process is
-// single-threaded and must become a real TLS block alongside clone(2).
+// ---- threads and futex synchronization ----
+// Immutable linked records retain their addresses for lock-free stack lookup.
+// Closed records are reused under rt_lock; their stacks are unmapped on join.
+// Layout: tid32, gate32, mapping, entry, argument, next, stack high, active,
+// generation, then 512 TLS cells at offset 64. A guard precedes each stack.
+var __lx_threads = 0
+var __lx_native = 0
 var __lx_tls = 0
 var __lx_ntls = 0
 
-fn k32_TlsAlloc() -> int {
-    if __lx_tls == 0 { __lx_tls = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
-    let i = __lx_ntls
-    __lx_ntls += 1
-    return i
+// Initialize native CAS32/xadd32/clone code without touching the managed heap.
+fn lx_native_init() {
+    if __lx_native != 0 { return }
+    let codeAddress = lx_mmap(0, 4096, 7, MAP_ANON_PRIV)
+    if codeAddress == 0 { let exited = syscall(SYS_EXIT_GROUP, 70) }
+    // CAS32: mov eax,edx; lock cmpxchg [rcx],r8d; ret (old value).
+    store8(codeAddress, 137)
+    store8(codeAddress + 1, 208)
+    store8(codeAddress + 2, 240)
+    store8(codeAddress + 3, 68)
+    store8(codeAddress + 4, 15)
+    store8(codeAddress + 5, 177)
+    store8(codeAddress + 6, 1)
+    store8(codeAddress + 7, 195)
+    // XADD32: mov eax,edx; lock xadd [rcx],eax; ret.
+    store8(codeAddress + 16, 137)
+    store8(codeAddress + 17, 208)
+    store8(codeAddress + 18, 240)
+    store8(codeAddress + 19, 15)
+    store8(codeAddress + 20, 193)
+    store8(codeAddress + 21, 1)
+    store8(codeAddress + 22, 195)
+    // clone entry: push rdi/rsi; move RCX,RDX,R8,R9 to RDI,RSI,RDX,R10;
+    // clear R8 (TLS), syscall 56, then restore and return only in the parent.
+    store8(codeAddress + 32, 87)
+    store8(codeAddress + 33, 86)
+    store8(codeAddress + 34, 72)
+    store8(codeAddress + 35, 137)
+    store8(codeAddress + 36, 207)
+    store8(codeAddress + 37, 72)
+    store8(codeAddress + 38, 137)
+    store8(codeAddress + 39, 214)
+    store8(codeAddress + 40, 76)
+    store8(codeAddress + 41, 137)
+    store8(codeAddress + 42, 194)
+    store8(codeAddress + 43, 77)
+    store8(codeAddress + 44, 137)
+    store8(codeAddress + 45, 202)
+    store8(codeAddress + 46, 69)
+    store8(codeAddress + 47, 49)
+    store8(codeAddress + 48, 192)
+    store8(codeAddress + 49, 184)
+    store8(codeAddress + 50, 56)
+    store8(codeAddress + 51, 0)
+    store8(codeAddress + 52, 0)
+    store8(codeAddress + 53, 0)
+    store8(codeAddress + 54, 15)
+    store8(codeAddress + 55, 5)
+    store8(codeAddress + 56, 72)
+    store8(codeAddress + 57, 133)
+    store8(codeAddress + 58, 192)
+    store8(codeAddress + 59, 116)
+    store8(codeAddress + 60, 3)
+    store8(codeAddress + 61, 94)
+    store8(codeAddress + 62, 95)
+    store8(codeAddress + 63, 195)
+    // child: pop rbx (record); while gate == 0, FUTEX_WAIT on record + 4.
+    // JE +3 reaches the child; JNE +20 exits the gate; JMP -26 retries it.
+    store8(codeAddress + 64, 91)
+    store8(codeAddress + 65, 131)
+    store8(codeAddress + 66, 123)
+    store8(codeAddress + 67, 4)
+    store8(codeAddress + 68, 0)
+    store8(codeAddress + 69, 117)
+    store8(codeAddress + 70, 20)
+    store8(codeAddress + 71, 72)
+    store8(codeAddress + 72, 141)
+    store8(codeAddress + 73, 123)
+    store8(codeAddress + 74, 4)
+    store8(codeAddress + 75, 49)
+    store8(codeAddress + 76, 246)
+    store8(codeAddress + 77, 49)
+    store8(codeAddress + 78, 210)
+    store8(codeAddress + 79, 69)
+    store8(codeAddress + 80, 49)
+    store8(codeAddress + 81, 210)
+    store8(codeAddress + 82, 184)
+    store8(codeAddress + 83, 202)
+    store8(codeAddress + 84, 0)
+    store8(codeAddress + 85, 0)
+    store8(codeAddress + 86, 0)
+    store8(codeAddress + 87, 15)
+    store8(codeAddress + 88, 5)
+    store8(codeAddress + 89, 235)
+    store8(codeAddress + 90, 230)
+    // Reserve Win64 shadow space; RCX = argument; call [rbx + 16].
+    // The child ends with syscall 60 (exit), never a Zephyr return.
+    store8(codeAddress + 91, 72)
+    store8(codeAddress + 92, 131)
+    store8(codeAddress + 93, 236)
+    store8(codeAddress + 94, 32)
+    store8(codeAddress + 95, 72)
+    store8(codeAddress + 96, 139)
+    store8(codeAddress + 97, 75)
+    store8(codeAddress + 98, 24)
+    store8(codeAddress + 99, 255)
+    store8(codeAddress + 100, 83)
+    store8(codeAddress + 101, 16)
+    store8(codeAddress + 102, 184)
+    store8(codeAddress + 103, 60)
+    store8(codeAddress + 104, 0)
+    store8(codeAddress + 105, 0)
+    store8(codeAddress + 106, 0)
+    store8(codeAddress + 107, 49)
+    store8(codeAddress + 108, 255)
+    store8(codeAddress + 109, 15)
+    store8(codeAddress + 110, 5)
+    store8(codeAddress + 111, 15)
+    store8(codeAddress + 112, 11)
+    __lx_native = codeAddress
 }
 
-fn k32_TlsSetValue(i: int, v: int) -> int {
-    store64(__lx_tls + 8 * i, v)
+// Return the current worker's native record, or zero for the main thread.
+// ponytail: linear range lookup; index ranges if many live records make TLS hot.
+fn lx_current_thread() -> int {
+    let stackAddress = stackptr()
+    var threadRecord = __lx_threads
+    while threadRecord != 0 {
+        // An odd or changed generation belongs to another thread's reuse/close.
+        // Our own live record cannot change until this thread exits and joins.
+        let generation = load64(threadRecord + 56)
+        let stackLow = load64(threadRecord + 8) + 4096
+        let stackHigh = load64(threadRecord + 40)
+        if (generation & 1) == 0 and generation == load64(threadRecord + 56) and stackAddress >= stackLow and stackAddress < stackHigh {
+            return threadRecord
+        }
+        threadRecord = load64(threadRecord + 32)
+    }
+    return 0
+}
+
+// Obtain the kernel TID, also used as recursive-lock ownership token.
+fn k32_GetCurrentThreadId() -> int { return syscall(186) }
+
+// Initialize a recursive lock: owner TID at 0, recursion count at 8.
+fn k32_InitializeCriticalSection(lockAddress: int) -> int {
+    lx_native_init()
+    store64(lockAddress, 0)
+    store64(lockAddress + 8, 0)
+    return 0
+}
+
+// Acquire ownership without sleeping, or increase this owner's recursion count.
+fn k32_TryEnterCriticalSection(lockAddress: int) -> int {
+    let threadId = syscall(186)
+    if (load64(lockAddress) & 4294967295) == threadId {
+        store64(lockAddress + 8, load64(lockAddress + 8) + 1)
+        return 1
+    }
+    if callptr(__lx_native, lockAddress, 0, threadId) != 0 { return 0 }
+    store64(lockAddress + 8, 1)
     return 1
 }
 
-fn k32_TlsGetValue(i: int) -> int {
-    return load64(__lx_tls + 8 * i)
+// Retry acquisition around futex waits; changed ownership yields EAGAIN.
+fn k32_EnterCriticalSection(lockAddress: int) -> int {
+    while k32_TryEnterCriticalSection(lockAddress) == 0 {
+        let ownerId = load64(lockAddress) & 4294967295
+        if ownerId != 0 { let waited = syscall(202, lockAddress, 128, ownerId, 0) }
+    }
+    return 0
 }
 
+// Release the outermost acquisition and wake a waiter.
+fn k32_LeaveCriticalSection(lockAddress: int) -> int {
+    let recursionCount = load64(lockAddress + 8) - 1
+    store64(lockAddress + 8, recursionCount)
+    if recursionCount == 0 {
+        store32(lockAddress, 0)
+        let awakened = syscall(202, lockAddress, 129, 1)
+    }
+    return 0
+}
+
+// Initialize a futex sequence counter.
+fn k32_InitializeConditionVariable(conditionAddress: int) -> int {
+    store64(conditionAddress, 0)
+    return 0
+}
+
+// Atomically sleep relative to the sequence, releasing and reacquiring the lock.
+// As on Windows the caller must hold the critical section exactly once.
+fn k32_SleepConditionVariableCS(conditionAddress: int, lockAddress: int, waitTimeout: int) -> int {
+    let sequenceNumber = load64(conditionAddress) & 4294967295
+    var timeoutAddress = 0
+    if waitTimeout != 4294967295 {
+        timeoutAddress = lx_mmap(0, 16, PROT_RW, MAP_ANON_PRIV)
+        if timeoutAddress == 0 { return 0 }
+        store64(timeoutAddress, waitTimeout / 1000)
+        store64(timeoutAddress + 8, (waitTimeout % 1000) * 1000000)
+    }
+    let released = k32_LeaveCriticalSection(lockAddress)
+    let waitStatus = syscall(202, conditionAddress, 128, sequenceNumber, timeoutAddress)
+    let acquired = k32_EnterCriticalSection(lockAddress)
+    if timeoutAddress != 0 { let freed = syscall(11, timeoutAddress, 16) }
+    if waitStatus == 0 - 110 { return 0 }
+    return 1
+}
+
+// Change the sequence before waking one sleeper, preventing missed wakeups.
+fn k32_WakeConditionVariable(conditionAddress: int) -> int {
+    let previousSequence = callptr(__lx_native + 16, conditionAddress, 1)
+    return syscall(202, conditionAddress, 129, 1)
+}
+
+// Change the sequence and wake every sleeper.
+fn k32_WakeAllConditionVariable(conditionAddress: int) -> int {
+    let previousSequence = callptr(__lx_native + 16, conditionAddress, 1)
+    return syscall(202, conditionAddress, 129, 2147483647)
+}
+
+// Create a guarded stack and clone; the native child waits before entering Zephyr.
+fn k32_CreateThread(securityAddress: int, stackSize: int, entryAddress: int, argument: int, creationFlags: int, threadIdAddress: int) -> int {
+    rt_lock()
+    var threadRecord = __lx_threads
+    while threadRecord != 0 and load64(threadRecord + 48) != 0 {
+        threadRecord = load64(threadRecord + 32)
+    }
+    if threadRecord == 0 {
+        threadRecord = lx_mmap(0, 8192, PROT_RW, MAP_ANON_PRIV)
+        if threadRecord == 0 { rt_unlock()
+            return 0
+        }
+        store64(threadRecord + 32, __lx_threads)
+        __lx_threads = threadRecord
+    }
+    var requestedSize = stackSize
+    if requestedSize == 0 { requestedSize = 8388608 }
+    if requestedSize < 16384 or requestedSize > 1073741824 { rt_unlock()
+        return 0
+    }
+    let mappingSize = ((requestedSize + 4095) / 4096) * 4096 + 4096
+    let stackMapping = lx_mmap(0, mappingSize, PROT_RW, MAP_ANON_PRIV)
+    if stackMapping == 0 { rt_unlock()
+        return 0
+    }
+    let guarded = syscall(SYS_MPROTECT, stackMapping, 4096, PROT_NONE)
+    if guarded < 0 { let freed = syscall(11, stackMapping, mappingSize)
+        rt_unlock()
+        return 0
+    }
+    store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+    store64(threadRecord, 0)
+    store64(threadRecord + 8, stackMapping)
+    store64(threadRecord + 16, entryAddress)
+    store64(threadRecord + 24, argument)
+    store64(threadRecord + 40, stackMapping + mappingSize)
+    store64(threadRecord + 48, 1)
+    for i in 0..512 { store64(threadRecord + 64 + i * 8, 0) }
+    store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+    if (creationFlags & 4) == 0 { store32(threadRecord + 4, 1) }
+    // Pop the record in the child, leaving RSP 16-byte aligned for its CALL.
+    let childStack = stackMapping + mappingSize - 8
+    store64(childStack, threadRecord)
+    // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID.
+    let cloneResult = callptr(__lx_native + 32, 3477248, childStack, threadRecord, threadRecord)
+    if cloneResult < 0 {
+        let freed = syscall(11, stackMapping, mappingSize)
+        store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+        store64(threadRecord + 8, 0)
+        store64(threadRecord + 40, 0)
+        store64(threadRecord + 48, 0)
+        store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+        rt_unlock()
+        return 0
+    }
+    if threadIdAddress != 0 { store32(threadIdAddress, cloneResult) }
+    rt_unsuspendable_add(1)
+    rt_unlock()
+    return threadRecord
+}
+
+// Release a suspended child's startup gate.
+fn k32_ResumeThread(threadHandle: int) -> int {
+    store32(threadHandle + 4, 1)
+    let awakened = syscall(202, threadHandle + 4, 1, 1)
+    return 1
+}
+
+// Signal-based stack suspension is not implemented; the runtime defers GC.
+fn k32_SuspendThread(threadHandle: int) -> int { return 0 - 1 }
+// No stopped register context is available on this platform yet.
+fn k32_GetThreadContext(threadHandle: int, contextAddress: int) -> int { return 0 }
+
+// Wait on CHILD_CLEARTID using shared futexes (the kernel's wake convention).
+fn k32_WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {
+    if waitTimeout != 4294967295 and waitTimeout != 0 { return 4294967295 }
+    var threadId = load64(threadHandle) & 4294967295
+    while threadId != 0 {
+        if waitTimeout == 0 { return 258 }
+        let waitStatus = syscall(202, threadHandle, 0, threadId, 0)
+        if waitStatus < 0 and waitStatus != 0 - 4 and waitStatus != 0 - 11 { return 4294967295 }
+        threadId = load64(threadHandle) & 4294967295
+    }
+    return 0
+}
+
+// Release a joined thread's stack; retain and reuse its TLS directory record.
+fn lx_close_thread(threadHandle: int) -> bool {
+    var threadRecord = __lx_threads
+    while threadRecord != 0 {
+        if threadRecord == threadHandle {
+            rt_lock()
+            if load64(threadRecord + 48) != 0 and (load64(threadRecord) & 4294967295) == 0 {
+                store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+                let stackMapping = load64(threadRecord + 8)
+                let freed = syscall(11, stackMapping, load64(threadRecord + 40) - stackMapping)
+                store64(threadRecord + 8, 0)
+                store64(threadRecord + 40, 0)
+                store64(threadRecord + 48, 0)
+                store64(threadRecord + 56, load64(threadRecord + 56) + 1)
+                rt_unsuspendable_add(0 - 1)
+            }
+            rt_unlock()
+            return true
+        }
+        threadRecord = load64(threadRecord + 32)
+    }
+    return false
+}
+
+// Count the actual CPUs permitted by the calling thread's affinity mask.
+fn k32_GetSystemInfo(resultAddress: int) -> int {
+    let maskAddress = lx_mmap(0, 131072, PROT_RW, MAP_ANON_PRIV)
+    var processorCount = 0
+    if maskAddress != 0 {
+        let byteCount = syscall(204, 0, 131072, maskAddress)
+        if byteCount > 0 {
+            for i in 0..byteCount {
+                var remainingBits = load8(maskAddress + i)
+                while remainingBits != 0 {
+                    processorCount += remainingBits & 1
+                    remainingBits = remainingBits >> 1
+                }
+            }
+        }
+        let freed = syscall(11, maskAddress, 131072)
+    }
+    if processorCount < 1 { processorCount = 1 }
+    store32(resultAddress + 32, processorCount)
+    return 0
+}
+
+// Allocate a process-wide TLS key; each stack range has its own cell table.
+fn k32_TlsAlloc() -> int {
+    if __lx_tls == 0 { __lx_tls = lx_mmap(0, 4096, PROT_RW, MAP_ANON_PRIV) }
+    if __lx_tls == 0 or __lx_ntls >= 512 { return 4294967295 }
+    let slotIndex = __lx_ntls
+    __lx_ntls += 1
+    return slotIndex
+}
+
+// Store a value in this thread's TLS table without a gettid syscall.
+fn k32_TlsSetValue(slotIndex: int, value: int) -> int {
+    if slotIndex < 0 or slotIndex >= __lx_ntls { return 0 }
+    var tableAddress = __lx_tls
+    let threadRecord = lx_current_thread()
+    if threadRecord != 0 { tableAddress = threadRecord + 64 }
+    store64(tableAddress + 8 * slotIndex, value)
+    return 1
+}
+
+// Read this thread's TLS table without a gettid syscall.
+fn k32_TlsGetValue(slotIndex: int) -> int {
+    if slotIndex < 0 or slotIndex >= __lx_ntls { return 0 }
+    var tableAddress = __lx_tls
+    let threadRecord = lx_current_thread()
+    if threadRecord != 0 { tableAddress = threadRecord + 64 }
+    return load64(tableAddress + 8 * slotIndex)
+}
 // ---- standard I/O extensions ----
 var __lx_last_error = 0
 fn k32_SetLastError(code: int) -> int { __lx_last_error = code
@@ -478,10 +842,6 @@ fn k32_GetEnvironmentVariableA(name: int, buffer: int, capacity: int) -> int {
     return 0
 }
 fn k32_CreateProcessA(application: int, command: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, process: int) -> int {
-    panic("run: not supported on linux")
-    return 0
-}
-fn k32_WaitForSingleObject(handle: int, timeout: int) -> int {
     panic("run: not supported on linux")
     return 0
 }

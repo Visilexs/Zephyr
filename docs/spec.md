@@ -685,6 +685,8 @@ The same source compiles to three targets, selected by a flag:
 Not every feature reaches every target. WebAssembly currently omits file I/O,
 closures, interfaces and threads; native interop (§3.6) via `extern fn … from`
 is Windows-only, and non-kernel32 `win()` prefixes are Windows-only.
+Threads and synchronization primitives are available on both Windows and Linux
+x86-64 with `--rt` (§8).
 `scripts/crosscheck-linux.ps1` and `crosscheck-wasm.ps1` compile the same
 sources for two targets and require byte-identical program output.
 
@@ -707,14 +709,14 @@ linked module.
 
 ## 8. Concurrency
 
-Threads are available on the Windows target through `lib/std/thread.zeph`
+Threads are available on Windows and Linux x86-64 through `lib/std/thread.zeph`
 (`import "std/thread.zeph"`), and require `--rt`.
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
 | `thread_spawn(f, arg)` | `fn(int)`, int → `Thread` | Run `f(arg)` on a new OS thread. |
 | `t.join()` | `Thread` → void | Block until the thread finishes. |
-| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across `cpu_count()` workers, then join. |
+| `parallel_for(n, f)` | int, `fn(int)` → void | Run `f(0)…f(n-1)` across n workers, then join. |
 | `cpu_count()` | → int | Logical processor count. |
 
 The worker argument is an `int` — a worker index or a raw buffer address — and
@@ -724,9 +726,22 @@ threads adjusting the same count would race and free an object still in use.
 Share data by passing an off-heap buffer address (§3.6) and partitioning it by
 index.
 
-There is no user-facing mutex or atomics API, and none is needed while that rule
-holds, because threads then share no counted object. The backstop collector is
-stop-the-world: it suspends every registered thread and scans each one's register
-context and stack, so the rare collection is safe under concurrency without
-locking in user code. String interpolation is thread-safe, using a per-thread
-builder. Threads are not available on `--linux` or `--wasm`.
+`import "std/sync.zeph"` provides `Mutex`, `Atomic`, bounded FIFO `Channel`, and
+`WaitGroup` wrappers over off-heap storage. Atomics and channels carry `int`
+values; use `bits`/`frombits` for floats. Pass the integer `address` field to a
+worker and construct its own local wrapper: the wrappers themselves are counted
+heap objects and must not be shared. Their native storage lasts until process
+exit. Synchronization does not make shared reference counts safe.
+
+Linux starts threads with a machine-code `clone` trampoline on mapped stacks.
+Futexes implement the startup gate, join, recursive critical sections, and
+condition variables. Each thread has its own TLS table selected by stack range;
+string interpolation uses a per-thread builder on both native targets.
+
+On Windows the backstop collector remains stop-the-world: it suspends every
+other registered thread and scans its register context and stack. Linux cannot
+suspend threads without signal handlers, so collection is deferred while any
+worker remains unjoined, including a worker requesting collection itself.
+Reference counting continues to reclaim acyclic objects; cyclic garbage may grow
+until the workers are joined and a later collection runs. Join every worker. Threads
+are not available on `--wasm`.

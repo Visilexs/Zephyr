@@ -198,22 +198,70 @@ print(buffer.get64(0))
 import "std/thread.zeph"
 ```
 
-Thread workers receive an integer argument. Thread closures stay rooted until joined; join every spawned thread. Shared mutation still needs appropriate synchronization.
+Windows and Linux x86-64 workers receive an integer argument and require `--rt`. Thread closures stay rooted until joined; join every spawned thread. Share only off-heap values through integer addresses, never counted heap objects. Use `std/sync.zeph` for shared mutation.
 
 | Signature | Description |
 | --- | --- |
-| `thread_spawn(f: fn(int), arg: int) -> Thread` | Start a worker and register it with the runtime collector. |
+| `thread_spawn(threadFunction: fn(int), argument: int) -> Thread` | Start a worker and register it with the runtime collector. |
 | `Thread.join()` | Wait for completion and release the worker's retained resources. |
-| `parallel_for(n: int, f: fn(int))` | Spawn one worker for each index in [0, n), then join all. |
+| `parallel_for(workerCount: int, workerFunction: fn(int))` | Spawn one worker for each index in [0, workerCount), then join all. |
 | `cpu_count() -> int` | Return the system processor count, falling back to one. |
 
-Implementation helpers: `body_slot(b: fn(int)) -> int` reserves a rooted closure slot; `tx_thunk() -> int` obtains the native calling-convention adapter. Applications should use the operations above.
+Implementation helpers: `body_slot(threadBody: fn(int)) -> int` reserves a rooted closure slot; `tx_thunk() -> int` obtains the native calling-convention adapter. Applications should use the operations above.
 
 ```zeph
 fn worker(index: int) { print(index) }
 let task = thread_spawn(worker, 7)
 task.join()
 ```
+
+## sync.zeph
+
+```zeph
+import "std/sync.zeph"
+```
+
+Windows and Linux x86-64 synchronization uses off-heap native memory. Atomics and channels hold `int` values; encode floats with `bits` and decode with `frombits`. The `Mutex`, `Atomic`, `Channel`, and `WaitGroup` wrappers are counted heap objects: pass or capture their integer `address` fields and construct a local wrapper in each worker. Never share the wrapper itself or send a counted heap object's address. Native allocations last until process exit; there is no explicit destruction API.
+
+| Signature | Description |
+| --- | --- |
+| `mutex_new() -> Mutex` | Create a recursive mutex. |
+| `Mutex.lock()` | Block until owned by this thread. |
+| `Mutex.unlock()` | Release one acquisition; only the owner may unlock. |
+| `Mutex.try_lock() -> bool` | Acquire immediately if available or already owned by this thread. |
+| `atomic_new(initial: int) -> Atomic` | Create an aligned 64-bit cell. |
+| `Atomic.load() -> int` | Atomic read with x86 acquire ordering. |
+| `Atomic.store(value: int)` | Atomic write with x86 release ordering. |
+| `Atomic.add(delta: int) -> int` | Lock-free addition; return the new value, wrapping on overflow. |
+| `Atomic.swap(value: int) -> int` | Lock-free exchange; return the old value. |
+| `Atomic.compare_exchange(expected: int, replacement: int) -> bool` | Replace only if equal; report success. |
+| `channel_new(capacity: int) -> Channel` | Create a bounded FIFO; panic for nonpositive or overflowing capacity. |
+| `Channel.send(value: int)` | Wait for space and enqueue; panic if closed, including while waiting. |
+| `Channel.receive() -> int?` | Wait for a value; return none once closed and drained. |
+| `Channel.try_receive() -> int?` | Return the oldest queued value, or none if empty or the channel lock is contended; never block. |
+| `Channel.close()` | Close idempotently and wake blocked senders and receivers; queued values remain readable. |
+| `Channel.len() -> int` | Return a synchronized snapshot of the queued count. |
+| `wait_group_new() -> WaitGroup` | Create a group with zero outstanding work. |
+| `WaitGroup.add(amount: int)` | Adjust outstanding work; panic on underflow or overflow. |
+| `WaitGroup.done()` | Complete one unit of work, equivalent to add(-1). |
+| `WaitGroup.wait()` | Wait until outstanding work reaches zero. |
+
+Add work before launching workers or waiting. Wait groups can be reused after completion. Windows uses critical sections and condition variables; Linux uses futexes. Atomic read-modify-write operations use native x86-64 locked instructions. `try_receive` attempts to acquire the channel mutex without waiting and returns none on contention.
+
+```zeph
+import "std/thread.zeph"
+let counter = atomic_new(0)
+let counterAddress = counter.address
+parallel_for(4, fn(workerIndex: int) {
+    let localCounter = Atomic{address: counterAddress}
+    let nextCount = localCounter.add(1)
+})
+print(counter.load()) // 4
+```
+
+Implementation helpers are callable because Zephyr has no private functions: `sync_alloc(byteCount: int) -> int` allocates zeroed native storage, and `sync_receive(memoryAddress: int, shouldWait: bool) -> int?` implements channel removal. Prefer the public wrappers.
+
+The regression suite executes concurrency tests on Windows and compiles the same programs to Linux ELF. Linux execution requires a Linux host or working WSL.
 
 ## math.zeph
 

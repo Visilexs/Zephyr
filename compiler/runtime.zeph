@@ -162,6 +162,12 @@ var __gcpad = 0        // collector's own scratch: rx_scratch() is shared
 var __nthr = 0
 var __lock = 0
 var __ctx = 0
+var __threads_unsuspendable = 0   // Linux workers not yet joined (under rt_lock)
+
+// Linux calls this under rt_lock when a native worker is created or joined.
+fn rt_unsuspendable_add(threadDelta: int) {
+    __threads_unsuspendable += threadDelta
+}
 
 fn rx_thr_init() {
     if __lock != 0 { return }
@@ -294,6 +300,10 @@ fn rx_scan_threads() {
 }
 
 fn rx_collect() {
+    // ponytail: Linux cannot suspend stacks yet, including the unregistered
+    // main thread. Defer cyclic garbage until all workers are joined; add signal
+    // safepoints if long-lived workers need bounded cyclic-heap growth.
+    if __threads_unsuspendable != 0 { return }
     // clear marks
     var i = 0
     while i < __bcommit {
