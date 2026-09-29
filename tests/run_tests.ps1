@@ -339,6 +339,12 @@ $errors = @{
     "eq-fn-values"         = "fn f() -> int { return 1 }`nlet g = f`nprint(g == g)"
     "map-key-float"        = "var m: [float: int] = [:]"
     "map-key-float-field"  = "struct P { x: float }`nvar m: [P: int] = [:]"
+    "tuple-assign"         = "var t = (1, 2)`nt.0 = 5"
+    "tuple-arity"          = "let (a, b) = (1, 2, 3)"
+    "destructure-int"      = "let (a, b) = 5"
+    "tuple-bad-index"      = "let t = (1, 2)`nprint(t.2)"
+    "tuple-type-one"       = "let t: (int) = 1"
+    "tuple-none-element"   = "let t = (1, none)"
     "default-shadowed"     = "let scale = 2`nfn f(n: int = scale) -> int { return n }`nfn g() -> int {`n let scale = 9`n return f()`n}"
 }
 foreach ($name in $errors.Keys) {
@@ -1229,6 +1235,47 @@ print(grid)
 '@
 $exp = @("true false false", "true false true true", "true false", "true false true", "true false", "far", "true", "false", "2", "21", "188", "origin elsewhere", "{Point{x: 3, y: 4}: `"far`", Point{x: 0, y: 0}: `"zero`"}") -join [Environment]::NewLine
 Check "lang-equality" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
+
+# ---- language: tuples ----
+$r = RunSrc "lang_tuples" @'
+fn divmod(a: int, b: int) -> (int, int) {
+    return (a / b, a % b)
+}
+let pair = divmod(17, 5)
+print(pair)
+print("{pair.0} {pair.1}")
+let (q, r) = divmod(23, 4)
+print(q + r)
+var (lo, hi) = (1, 10)
+lo += 1
+print("{lo} {hi}")
+let nested = ((1, "a"), 2.5)
+print(nested.0.1)
+print(nested)
+let scaled: (float, int) = (1, 2)
+print(scaled)
+var seen: [(int, int): str] = [:]
+seen[(0, 0)] = "origin"
+seen[(2, 3)] = "p"
+print(seen[(2, 3)])
+print((1, 2) == (1, 2))
+print((1, "x") != (1, "y"))
+let points = [(0, 1), (2, 3)]
+var total = 0
+for p in points { total += p.0 * p.1 }
+print(total)
+fn describe(p: (int, int)) -> str {
+    return match p {
+        (0, 0) { "origin" }
+        else { "other" }
+    }
+}
+print(describe((0, 0)) + " " + describe(pair))
+let f: fn(int) -> (int, str) = fn(n: int) -> (int, str) { return (n * 2, "d") }
+print(f(4))
+'@
+$exp = @("(3, 2)", "3 2", "8", "2 10", "a", "((1, `"a`"), 2.5)", "(1, 2)", "p", "true", "true", "6", "origin other", "(8, `"d`")") -join [Environment]::NewLine
+Check "lang-tuples" ($r.code -eq 0 -and $r.out -eq $exp) "got($($r.code)): $($r.out)"
 
 Write-Host ""
 Write-Host "$pass passed, $fail failed"

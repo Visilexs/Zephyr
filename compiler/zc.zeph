@@ -135,7 +135,7 @@ let N_IRET = 45      // an inlined body's return: result -> rax, jmp to the inli
 let N_IMPL = 46      // impl Type { methods } -- desugared into plain functions
 let N_INTERFACE = 47 // interface Name { method signatures }
 let N_IBOX = 48      // box a struct into an interface value {vtable, data}; refi=iface, op=vtable idx
-let N_EXTERN = 49
+let N_EXTERN = 49    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
 let N_IFEXPR = 50    // if c { a } else { b } as a value: kids = [cond, a, b]
 let N_LETEXPR = 51   // a hidden local, then a value: kids = [N_DECL, value]
 let N_MATCH = 52     // match statement (parse only; lowered by the checker): kids = [subject, N_ARM...]
@@ -144,7 +144,10 @@ let N_ARM = 54       // one match arm: kids = [body, patterns...]; mut = the els
 let N_FOR2 = 55      // for a, b in xs (parse only): name = a; kids = [xs, body, N_TYNAME b]
 let N_IFLET = 56     // if let name = optional (parse only): kids = [optional, then, else or N_NONE]
 let N_DEFER = 57     // defer block (parse only; lowered before checking): kids = [block]
-let N_TYALIAS = 58   // type Name = T (top level): kids = [type]    // extern fn f(...) from "dll" -- desugared into a lazily-resolving wrapper
+let N_TYALIAS = 58   // type Name = T (top level): kids = [type]
+let N_TYTUPLE = 59   // (A, B) tuple type: kids = element types
+let N_TUPLE = 60     // (a, b) tuple literal: kids = elements; checked into an N_SLIT
+let N_GROUP = 61     // several statements from one (let (a, b) = t); spliced by the parser
 
 // ---------------- type kinds & table ----------------
 let K_INT = 0
@@ -749,6 +752,20 @@ fn lex_src(src: str, start_line: int) -> [Tok] {
             }
             continue
         }
+        if is_digit(c) and out.len() > 0 and out[out.len() - 1].t == T_DOT {
+            // t.0.1 is two element accesses, not t . 0.1
+            var j = i
+            var index = 0
+            while j < n and is_digit(byte_at(src, j)) {
+                index = index * 10 + byte_at(src, j) - 48
+                j += 1
+            }
+            var indexToken = tok(T_INTLIT, tl)
+            indexToken.i = index
+            out.push(indexToken)
+            i = j
+            continue
+        }
         if is_digit(c) {
             var j = i
             var t = tok(T_INTLIT, tl)
@@ -994,6 +1011,18 @@ fn p_type_base() -> Node {
         n.kids.push(ret)                 // last kid is the return type (N_NONE = void)
         return n
     }
+    if t.t == T_LP {                     // (A, B, ...) tuple
+        let x = pnext()
+        var n = nnode(N_TYTUPLE, t.line)
+        n.kids.push(p_type())
+        while at(T_COMMA) {
+            let c = pnext()
+            n.kids.push(p_type())
+        }
+        let y = expect(T_RP, "')'")
+        if n.kids.len() < 2 { die(t.line, "a tuple type has at least two elements") }
+        return n
+    }
     if t.t == T_LS {
         let x = pnext()
         var n = nnode(N_TYLIST, t.line)
@@ -1018,7 +1047,7 @@ fn p_block() -> Node {
     var blk = nnode(N_PROG, x.line)
     while not at(T_RB) {
         if at(T_EOF) { die(peek().line, "expected '\}'") }
-        blk.kids.push(p_stmt())
+        push_stmt(blk, p_stmt())
         if not at(T_RB) { terminator() }
     }
     let y = expect(T_RB, "'\}'")
@@ -1508,10 +1537,28 @@ fn p_stmt() -> Node {
             n.kids.push(p_block())
         } else {
             var block = nnode(N_PROG, t.line)
-            block.kids.push(p_stmt())
+            push_stmt(block, p_stmt())
             n.kids.push(block)
         }
         return n
+    }
+    if (t.t == T_LET or t.t == T_VAR) and P_pos + 1 < P_toks.len() and P_toks[P_pos + 1].t == T_LP {
+        let keyword = pnext()
+        let open = pnext()
+        var names: [str] = []
+        names.push(expect(T_IDENT, "variable name").s)
+        while at(T_COMMA) {
+            let c = pnext()
+            names.push(expect(T_IDENT, "variable name").s)
+        }
+        let close = expect(T_RP, "')'")
+        var annotation = nnode(N_NONE, t.line)
+        if at(T_COLON) {
+            let colon = pnext()
+            annotation = p_type()
+        }
+        let assign = expect(T_ASSIGN, "'='")
+        return destructure(t.line, t.t == T_VAR, names, p_expr(1), annotation)
     }
     if t.t == T_LET or t.t == T_VAR or t.t == T_CONST {
         let x = pnext()
@@ -1780,9 +1827,11 @@ fn p_postfix() -> Node {
         } else if at(T_DOT) {
             let x = pnext()
             let name = pnext()               // a keyword may follow '.' (e.g. .or())
-            if name.s == "" { die(name.line, "expected a member name, got '{tokdesc(name)}'") }
+            var memberName = name.s
+            if name.t == T_INTLIT { memberName = "{name.i}" }   // tuple element: t.0
+            if memberName == "" { die(name.line, "expected a member name, got '{tokdesc(name)}'") }
             var n = nnode(N_MEMBER, name.line)
-            n.name = name.s
+            n.name = memberName
             n.kids.push(e)
             e = n
         } else {
@@ -1790,6 +1839,40 @@ fn p_postfix() -> Node {
         }
     }
     return e
+}
+
+// let (a, b) = value: a hidden whole, then one declaration per element. refi on the
+// hidden declaration asks the checker to confirm the element count.
+fn destructure(line: int, isVar: bool, names: [str], value: Node, annotation: Node) -> Node {
+    var group = nnode(N_GROUP, line)
+    g_lower_count += 1
+    let hidden = "__z{g_lower_count}_tuple"
+    var whole = nnode(N_DECL, line)
+    whole.name = hidden
+    whole.refi = names.len()
+    whole.kids.push(value)
+    whole.kids.push(annotation)
+    group.kids.push(whole)
+    for i in 0..names.len() {
+        var part = nnode(N_DECL, line)
+        part.name = names[i]
+        part.mut = isVar
+        var element = nnode(N_MEMBER, line)
+        element.name = "{i}"
+        element.kids.push(name_node(hidden, line))
+        part.kids.push(element)
+        part.kids.push(nnode(N_NONE, line))
+        group.kids.push(part)
+    }
+    return group
+}
+
+fn push_stmt(block: Node, statement: Node) {
+    if statement.k == N_GROUP {
+        for part in statement.kids { block.kids.push(part) }
+    } else {
+        block.kids.push(statement)
+    }
 }
 
 fn p_slit(name: str, line: int) -> Node {
@@ -1914,6 +1997,17 @@ fn p_primary() -> Node {
         let save = P_nostruct
         P_nostruct = 0
         let e = p_expr(1)
+        if at(T_COMMA) {                      // (a, b): a tuple
+            var tuple = nnode(N_TUPLE, t.line)
+            tuple.kids.push(e)
+            while at(T_COMMA) {
+                let c = pnext()
+                tuple.kids.push(p_expr(1))
+            }
+            P_nostruct = save
+            let z = expect(T_RP, "')'")
+            return tuple
+        }
         P_nostruct = save
         let y = expect(T_RP, "')'")
         return e
@@ -1973,7 +2067,7 @@ fn parse(toks: [Tok]) -> Node {
             alias.kids.push(p_type())
             prog.kids.push(alias)
         }
-        else { prog.kids.push(p_stmt()) }
+        else { push_stmt(prog, p_stmt()) }
         terminator()
     }
     return prog
@@ -2019,10 +2113,71 @@ fn type_eq(a: int, b: int) -> bool {
 }
 
 // keys need value equality: int/bool/enum compare by value, str structurally
-fn valid_map_key(t: int) -> bool { return value_comparable(t, true, emptyStructList()) }
-fn emptyStructList() -> [int] {
-    var structIndices: [int] = []
-    return structIndices
+fn valid_map_key(t: int) -> bool { return value_comparable(t, true, emptyIntList()) }
+fn emptyIntList() -> [int] {
+    var values: [int] = []
+    return values
+}
+
+// Tuples are structs named after their element types, with fields "0", "1", ...
+// Same element types, same struct, so (int, str) is one type wherever it is written.
+fn tuple_type(elementTypes: [int]) -> int {
+    var name = "("
+    for i in 0..elementTypes.len() {
+        if i > 0 { name = name + ", " }
+        name = name + type_str(elementTypes[i])
+    }
+    name = name + ")"
+    let existing = find_struct(name)
+    if existing >= 0 { return struct_of(existing) }
+    var fieldNames: [str] = []
+    var fieldTypes: [int] = []
+    var defaults: [Node] = []
+    for i in 0..elementTypes.len() {
+        fieldNames.push("{i}")
+        fieldTypes.push(elementTypes[i])
+        defaults.push(nnode(N_NONE, 0))
+    }
+    g_structs.push(SDef{name: name, fnames: fieldNames, ftypes: fieldTypes, line: 0, defaults: defaults})
+    g_struct_names[name] = g_structs.len() - 1
+    return struct_of(g_structs.len() - 1)
+}
+
+fn is_tuple(t: int) -> bool {
+    return ty_kind[t] == K_STRUCT and g_structs[ty_sd[t]].name.byte(0) == 40
+}
+
+// (a, b) becomes the tuple struct's literal. wants: expected element types, if known.
+fn check_tuple(e: Node, wants: [int]) -> int {
+    var elementTypes: [int] = []
+    for i in 0..e.kids.len() {
+        var elementType = 0
+        if i < wants.len() {
+            let got = ce_expect(e.kids[i], wants[i])
+            e.kids[i] = coerce(e.kids[i], wants[i], "tuple element")
+            elementType = wants[i]
+        } else {
+            elementType = ce(e.kids[i])
+        }
+        if ty_kind[elementType] == K_VOID { die(e.line, "a tuple element has no value") }
+        if ty_kind[elementType] == K_NONE { die(e.line, "cannot infer the type of 'none' in a tuple; annotate it") }
+        elementTypes.push(elementType)
+    }
+    let tupleType = tuple_type(elementTypes)
+    var inits: [Node] = []
+    for i in 0..e.kids.len() {
+        var init = nnode(N_FIELDINIT, e.line)
+        init.name = "{i}"
+        init.slot = i
+        init.kids.push(e.kids[i])
+        inits.push(init)
+    }
+    e.k = N_SLIT
+    e.name = g_structs[ty_sd[tupleType]].name
+    e.kids = inits
+    e.refi = ty_sd[tupleType]
+    e.ty = tupleType
+    return tupleType
 }
 // Whether `==` compares values of t structurally. As a map key (asKey) floats and
 // maps are out: NaN breaks equality and a map key would need an order-free hash.
@@ -2144,6 +2299,11 @@ fn resolve_type(te: Node) -> int {
         return fn_of(ps, ret)
     }
     if te.k == N_TYLIST { return list_of(resolve_type(te.kids[0])) }
+    if te.k == N_TYTUPLE {
+        var elementTypes: [int] = []
+        for kid in te.kids { elementTypes.push(resolve_type(kid)) }
+        return tuple_type(elementTypes)
+    }
     if te.k == N_TYMAP {
         let kt = resolve_type(te.kids[0])
         if not valid_map_key(kt) { die(te.line, "{type_str(kt)} cannot be a map key (use int, str, bool, an enum, or a list, struct or optional of those)") }
@@ -2297,7 +2457,7 @@ fn check_bin(e: Node) -> int {
         } else if type_eq(lt, rt) and ty_kind[lt] == K_BOOL { e.aux = BC_BOOL }
         else if type_eq(lt, rt) and ty_kind[lt] == K_STR { e.aux = BC_STR }
         else if type_eq(lt, rt) and ty_kind[lt] == K_ENUM { e.aux = BC_INT }
-        else if type_eq(lt, rt) and value_comparable(lt, false, emptyStructList()) {
+        else if type_eq(lt, rt) and value_comparable(lt, false, emptyIntList()) {
             e.aux = BC_STR                       // a runtime call that only reads both sides
             e.slot = td_index(lt) + 1            // + 1: 0 means plain str
         }
@@ -3288,6 +3448,7 @@ fn ce_inner(e: Node) -> int {
         }
         return list_of(el)
     }
+    if e.k == N_TUPLE { return check_tuple(e, emptyIntList()) }
     if e.k == N_SLIT {
         let si = find_struct(e.name)
         if si < 0 { die(e.line, "unknown struct '{e.name}'") }
@@ -3408,6 +3569,7 @@ fn ce_inner(e: Node) -> int {
                     return sd.ftypes[i]
                 }
             }
+            if is_tuple(ot) { die(e.line, "tuple {sd.name} has no element {e.name}") }
             die(e.line, "struct '{sd.name}' has no field '{e.name}'")
         }
         die(e.line, "{type_str(ot)} has no field '{e.name}'")
@@ -3428,6 +3590,9 @@ fn ce(e: Node) -> int {
 // of a list literal each coerce to the expected element type, which is what lets
 // a `[Shape]` argument hold a mix of implementing structs.
 fn ce_expect(e: Node, want: int) -> int {
+    if e.k == N_TUPLE and is_tuple(want) and g_structs[ty_sd[want]].fnames.len() == e.kids.len() {
+        return check_tuple(e, g_structs[ty_sd[want]].ftypes)
+    }
     if e.k == N_LIST and e.kids.len() == 0 and ty_kind[want] == K_LIST {
         e.ty = want
         return want
@@ -3513,6 +3678,11 @@ fn check_stmt(s: Node) {
             }
         }
         s.ty = ty
+        if s.refi > 0 {                      // the hidden whole of let (a, b) = value
+            if not is_tuple(ty) { die(s.line, "cannot destructure {type_str(ty)}; only a tuple") }
+            let elementCount = g_structs[ty_sd[ty]].fnames.len()
+            if elementCount != s.refi { die(s.line, "this tuple has {elementCount} elements but {s.refi} names") }
+        }
         if s.ival == DECL_CONST and not is_const_expr(s.kids[0]) {
             die(s.line, "'{s.name}' is a const, so its value must be known at compile time: literals, other consts, enum members and operators over them")
         }
@@ -3550,6 +3720,9 @@ fn check_stmt(s: Node) {
             s.kids[1] = coerce(s.kids[1], v.ty, "assignment")
         } else {
             let ft = ce(t)
+            if t.k == N_MEMBER and is_tuple(t.kids[0].ty) {
+                die(t.line, "tuple elements cannot be assigned; build a new tuple")
+            }
             s.kids[1] = coerce(s.kids[1], ft, "assignment")
         }
         return
@@ -12285,8 +12458,12 @@ fn __emb_rt() -> str {
     p.push("    \} else if kind == 5 \{\n")
     p.push("        let name = load64(td + 8)\n")
     p.push("        let nf = load64(td + 16)\n")
-    p.push("        rx_sb_bytes(name, rx_cstrlen(name))\n")
-    p.push("        rx_sb_byte(123)\n")
+    p.push("        let isTuple = load8(name) == 40     // tuples are structs named \"(int, str)\"\n")
+    p.push("        if isTuple \{ rx_sb_byte(40) \}\n")
+    p.push("        else \{\n")
+    p.push("            rx_sb_bytes(name, rx_cstrlen(name))\n")
+    p.push("            rx_sb_byte(123)\n")
+    p.push("        \}\n")
     p.push("        var f = 0\n")
     p.push("        while f < nf \{\n")
     p.push("            if f > 0 \{\n")
@@ -12295,13 +12472,16 @@ fn __emb_rt() -> str {
     p.push("            \}\n")
     p.push("            let fname = load64(td + 24 + f * 16)\n")
     p.push("            let ftd = load64(td + 32 + f * 16)\n")
-    p.push("            rx_sb_bytes(fname, rx_cstrlen(fname))\n")
-    p.push("            rx_sb_byte(58)\n")
-    p.push("            rx_sb_byte(32)\n")
+    p.push("            if not isTuple \{\n")
+    p.push("                rx_sb_bytes(fname, rx_cstrlen(fname))\n")
+    p.push("                rx_sb_byte(58)\n")
+    p.push("                rx_sb_byte(32)\n")
+    p.push("            \}\n")
     p.push("            rx_fmt_val(load64(v + f * 8), ftd, 1)\n")
     p.push("            f += 1\n")
     p.push("        \}\n")
-    p.push("        rx_sb_byte(125)\n")
+    p.push("        if isTuple \{ rx_sb_byte(41) \}\n")
+    p.push("        else \{ rx_sb_byte(125) \}\n")
     p.push("    \} else if kind == 8 \{                 // optional: none, or the wrapped value\n")
     p.push("        if v == 0 \{\n")
     p.push("            rx_sb_bytes(addr(\"none\") + 8, 4)\n")

@@ -94,12 +94,14 @@ type       = basetype [ "?" ] ;                              (* T? optional *)
 basetype   = "int" | "i32" | "float" | "bool" | "str" | ID
            | "[" type "]"                                    (* list *)
            | "[" type ":" type "]"                           (* map *)
-           | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ; (* function value *)
+           | "fn" "(" [ type { "," type } ] ")" [ "->" type ]  (* function value *)
+           | "(" type "," type { "," type } ")" ;             (* tuple *)
 
 block      = "{" { stmt } "}" ;
 stmt       = decl | assign | ifstmt | while | for | match | defer | return | fndecl
            | "break" [ ID ] | "continue" [ ID ] | expr ;
-decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr ;
+decl       = ( "let" | "var" | "const" ) ID [ ":" type ] "=" expr
+           | ( "let" | "var" ) "(" ID { "," ID } ")" [ ":" type ] "=" expr ;
 assign     = target ( "=" | "+=" | "-=" | "*=" | "/=" | "%="
                     | "&=" | "|=" | "^=" | "<<=" | ">>=" ) expr ;
 target     = ID | postfix "." ID | postfix "[" expr "]" ;
@@ -193,6 +195,22 @@ literal leaves the field out. An optional field with no default defaults to
 `none`. Any other field a literal leaves out is an error. Defaults are
 evaluated each time a literal uses them, under the same naming rule as
 default parameters (§3.4).
+
+### 3.0.0.1 Tuples
+
+    fn divmod(a: int, b: int) -> (int, int) { return (a / b, a % b) }
+    let (q, r) = divmod(17, 5)
+    let pair = divmod(9, 2)
+    print(pair.0)               // 4
+    print(pair)                 // (4, 1)
+
+`(T, U, ...)` is a tuple type of two or more elements and `(a, b, ...)` a
+tuple value; `(x)` is still just `x` in parentheses. Elements are read with
+`.0`, `.1`, ... and cannot be assigned: a tuple is built whole. Two tuple
+types are the same when their element types are. `let (a, b) = t` (or `var`)
+binds each element to a name; the number of names must match the tuple.
+Tuples compare with `==` element by element, print as `(1, "a")`, and can be
+map keys when their elements can (§3.0.1).
 
 ### 3.0.1 Maps
 

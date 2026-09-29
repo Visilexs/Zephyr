@@ -2020,8 +2020,12 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
     } else if kind == 5 {
         let name = load64(td + 8)
         let nf = load64(td + 16)
-        rx_sb_bytes(name, rx_cstrlen(name))
-        rx_sb_byte(123)
+        let isTuple = load8(name) == 40     // tuples are structs named "(int, str)"
+        if isTuple { rx_sb_byte(40) }
+        else {
+            rx_sb_bytes(name, rx_cstrlen(name))
+            rx_sb_byte(123)
+        }
         var f = 0
         while f < nf {
             if f > 0 {
@@ -2030,13 +2034,16 @@ fn rx_fmt_val(v: int, td: int, repr: int) {
             }
             let fname = load64(td + 24 + f * 16)
             let ftd = load64(td + 32 + f * 16)
-            rx_sb_bytes(fname, rx_cstrlen(fname))
-            rx_sb_byte(58)
-            rx_sb_byte(32)
+            if not isTuple {
+                rx_sb_bytes(fname, rx_cstrlen(fname))
+                rx_sb_byte(58)
+                rx_sb_byte(32)
+            }
             rx_fmt_val(load64(v + f * 8), ftd, 1)
             f += 1
         }
-        rx_sb_byte(125)
+        if isTuple { rx_sb_byte(41) }
+        else { rx_sb_byte(125) }
     } else if kind == 8 {                 // optional: none, or the wrapped value
         if v == 0 {
             rx_sb_bytes(addr("none") + 8, 4)
