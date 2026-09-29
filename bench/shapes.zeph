@@ -1,0 +1,140 @@
+// Dynamic-dispatch benchmark: an interface with three methods implemented by
+// four shape structs. Three lists are built from a shared LCG, then summed
+// over several rounds: a monomorphic pass (circles only), a bimorphic pass
+// (circles and rectangles) and a megamorphic pass (all four types).
+// C uses vtables of function pointers, Rust uses Box<dyn Shape>.
+// Usage: shapes [count]   (default 300000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+// A length in [1, 11) with three decimal places, exact in every language.
+fn randomLength() -> float {
+    return (nextRandom() % 10000) as float / 1000.0 + 1.0
+}
+
+interface Shape {
+    fn area(self) -> float
+    fn perimeter(self) -> float
+    fn cornerCount(self) -> int
+}
+
+struct Circle { radius: float }
+impl Circle {
+    fn area(self) -> float { return 3.141592653589793 * self.radius * self.radius }
+    fn perimeter(self) -> float { return 2.0 * 3.141592653589793 * self.radius }
+    fn cornerCount(self) -> int { return 0 }
+}
+
+struct Rectangle { width: float, height: float }
+impl Rectangle {
+    fn area(self) -> float { return self.width * self.height }
+    fn perimeter(self) -> float { return 2.0 * (self.width + self.height) }
+    fn cornerCount(self) -> int { return 4 }
+}
+
+struct Triangle { sideA: float, sideB: float, sideC: float }
+impl Triangle {
+    fn area(self) -> float {
+        let halfPerimeter = (self.sideA + self.sideB + self.sideC) * 0.5
+        return sqrt(halfPerimeter * (halfPerimeter - self.sideA) * (halfPerimeter - self.sideB) * (halfPerimeter - self.sideC))
+    }
+    fn perimeter(self) -> float { return self.sideA + self.sideB + self.sideC }
+    fn cornerCount(self) -> int { return 3 }
+}
+
+struct Polygon { xs: [float], ys: [float] }
+impl Polygon {
+    fn area(self) -> float {
+        let vertexCount = self.xs.len()
+        var twiceArea = 0.0
+        for i in 0..vertexCount {
+            let j = (i + 1) % vertexCount
+            twiceArea += self.xs[i] * self.ys[j] - self.xs[j] * self.ys[i]
+        }
+        if twiceArea < 0.0 { twiceArea = -twiceArea }
+        return twiceArea * 0.5
+    }
+    fn perimeter(self) -> float {
+        let vertexCount = self.xs.len()
+        var total = 0.0
+        for i in 0..vertexCount {
+            let j = (i + 1) % vertexCount
+            let deltaX = self.xs[j] - self.xs[i]
+            let deltaY = self.ys[j] - self.ys[i]
+            total += sqrt(deltaX * deltaX + deltaY * deltaY)
+        }
+        return total
+    }
+    fn cornerCount(self) -> int { return self.xs.len() }
+}
+
+fn makeCircle() -> Shape {
+    return Circle{radius: randomLength()}
+}
+
+fn makeRectangle() -> Shape {
+    let width = randomLength()
+    let height = randomLength()
+    return Rectangle{width: width, height: height}
+}
+
+fn makeTriangle() -> Shape {
+    let legA = randomLength()
+    let legB = randomLength()
+    return Triangle{sideA: legA, sideB: legB, sideC: sqrt(legA * legA + legB * legB)}
+}
+
+fn makePolygon() -> Shape {
+    let vertexCount = nextRandom() % 4 + 5
+    var xs: [float] = []
+    var ys: [float] = []
+    for i in 0..vertexCount {
+        xs.push(randomLength())
+        ys.push(randomLength())
+    }
+    return Polygon{xs: xs, ys: ys}
+}
+
+var count = 300000
+if args().len() > 1 { count = args()[1] as int }
+let rounds = 20
+
+var monomorphicShapes: [Shape] = []
+for i in 0..count { monomorphicShapes.push(makeCircle()) }
+
+var bimorphicShapes: [Shape] = []
+for i in 0..count {
+    if nextRandom() % 2 == 0 { bimorphicShapes.push(makeCircle()) } else { bimorphicShapes.push(makeRectangle()) }
+}
+
+var megamorphicShapes: [Shape] = []
+for i in 0..count {
+    let kind = nextRandom() % 4
+    if kind == 0 { megamorphicShapes.push(makeCircle()) }
+    else if kind == 1 { megamorphicShapes.push(makeRectangle()) }
+    else if kind == 2 { megamorphicShapes.push(makeTriangle()) }
+    else { megamorphicShapes.push(makePolygon()) }
+}
+
+var checksum = 0
+for round in 0..rounds {
+    var monomorphicTotal = 0.0
+    for shape in monomorphicShapes { monomorphicTotal += shape.area() }
+    var bimorphicTotal = 0.0
+    for shape in bimorphicShapes { bimorphicTotal += shape.perimeter() }
+    var megamorphicTotal = 0.0
+    var cornerTotal = 0
+    for shape in megamorphicShapes {
+        megamorphicTotal += shape.area() + shape.perimeter() * 0.5
+        cornerTotal += shape.cornerCount()
+    }
+    checksum = checksum * 31 + (monomorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (bimorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (megamorphicTotal * 1000.0) as int + cornerTotal + round
+}
+print(checksum)

@@ -1,0 +1,35 @@
+// String-keyed hash-map benchmark: generate a deterministic stream of words
+// built from a syllable table, count them in a [str: int] map, then fold an
+// order-independent checksum (sum of frequency * polynomial hash of the word).
+// C uses its own open-addressing string table, Rust uses HashMap<String, i64>.
+// Usage: wordfreq [words]   (default 3000000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn wordHash(word: str) -> int {
+    var hash = 7
+    for i in 0..word.len() { hash = hash * 31 + word.byte(i) }
+    return hash
+}
+
+var wordCount = 3000000
+if args().len() > 1 { wordCount = args()[1] as int }
+
+let syllables = ["ka", "lo", "mi", "ne", "ru", "sa", "to", "vi", "ze", "po", "an", "el", "or", "ust", "ing", "ble"]
+
+var frequencies: [str: int] = [:]
+for i in 0..wordCount {
+    let syllableCount = nextRandom() % 4 + 1
+    var word = syllables[nextRandom() % 16]
+    for j in 1..syllableCount { word = word + syllables[nextRandom() % 16] }
+    frequencies[word] = frequencies.get(word).or(0) + 1
+}
+
+var checksum = 0
+for word, frequency in frequencies { checksum += frequency * wordHash(word) }
+print(frequencies.len(), checksum)

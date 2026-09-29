@@ -1,0 +1,46 @@
+// Higher-order-function benchmark: map / filter / fold / sort-by-key / any
+// pipelines over an int list, each stage driven by a closure that captures
+// per-round locals. C passes function pointers with context structs, Rust
+// uses closures and iterators. The sort key is a bijection, so any correct
+// sort gives the same order.
+// Usage: closures [count]   (default 200000)
+import "std/list.zeph"
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+var itemCount = 200000
+if args().len() > 1 { itemCount = args()[1] as int }
+let rounds = 10
+let modulus = 1000003
+
+var data: [int] = []
+for i in 0..itemCount { data.push(nextRandom() % 1000000) }
+
+var checksum = 0
+for round in 0..rounds {
+    let multiplier = round * 2 + 3
+    let offset = round * 7 + 1
+    let divisor = round % 5 + 3
+    let remainder = round % 3
+    let weight = round + 1
+    let mask = round * 12345
+    let threshold = round * 1000
+
+    let mapped = map(data, fn(value: int) -> int { return (value * multiplier + offset) % modulus })
+    let kept = filter(mapped, fn(value: int) -> bool { return value % divisor != remainder })
+    let weightedTotal = fold(kept, 0, fn(total: int, value: int) -> int { return total + value * weight })
+    sortBy(kept, fn(left: int, right: int) -> int { return (left ^ mask) - (right ^ mask) })
+    var orderedTotal = 0
+    for i, value in kept { orderedTotal += value * (i % 1000) }
+    let foundThreshold = any(kept, fn(value: int) -> bool { return value == threshold })
+
+    checksum = checksum * 31 + weightedTotal
+    checksum = checksum * 31 + orderedTotal
+    checksum = checksum * 31 + kept.len() + (if foundThreshold { 1 } else { 0 })
+}
+print(checksum)

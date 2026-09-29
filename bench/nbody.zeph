@@ -1,0 +1,90 @@
+// Struct-heavy float benchmark: O(n^2) softened gravity over 1000 bodies
+// stored as structs, symplectic Euler steps, then total energy. The checksum
+// folds the final energy and positions into integers. Float operations are in
+// the same order in all three languages (gcc needs -ffp-contract=off).
+// Usage: nbody [steps]   (default 100)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+struct Body { x: float, y: float, z: float, vx: float, vy: float, vz: float, mass: float }
+
+const bodyCount = 1000
+const timeStep = 0.001
+const softening = 0.01
+
+fn makeBody() -> Body {
+    let x = (nextRandom() % 20001 - 10000) as float / 1000.0
+    let y = (nextRandom() % 20001 - 10000) as float / 1000.0
+    let z = (nextRandom() % 20001 - 10000) as float / 1000.0
+    let vx = (nextRandom() % 2001 - 1000) as float / 10000.0
+    let vy = (nextRandom() % 2001 - 1000) as float / 10000.0
+    let vz = (nextRandom() % 2001 - 1000) as float / 10000.0
+    let mass = (nextRandom() % 1000 + 1) as float / 1000.0
+    return Body{x: x, y: y, z: z, vx: vx, vy: vy, vz: vz, mass: mass}
+}
+
+fn advance(bodies: [Body]) {
+    let count = bodies.len()
+    for i in 0..count {
+        let first = bodies[i]
+        for j in i + 1..count {
+            let second = bodies[j]
+            let deltaX = first.x - second.x
+            let deltaY = first.y - second.y
+            let deltaZ = first.z - second.z
+            let distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ + softening
+            let distance = sqrt(distanceSquared)
+            let magnitude = timeStep / (distanceSquared * distance)
+            let secondPull = second.mass * magnitude
+            let firstPull = first.mass * magnitude
+            first.vx -= deltaX * secondPull
+            first.vy -= deltaY * secondPull
+            first.vz -= deltaZ * secondPull
+            second.vx += deltaX * firstPull
+            second.vy += deltaY * firstPull
+            second.vz += deltaZ * firstPull
+        }
+    }
+    for body in bodies {
+        body.x += timeStep * body.vx
+        body.y += timeStep * body.vy
+        body.z += timeStep * body.vz
+    }
+}
+
+fn energy(bodies: [Body]) -> float {
+    let count = bodies.len()
+    var total = 0.0
+    for i in 0..count {
+        let first = bodies[i]
+        total += 0.5 * first.mass * (first.vx * first.vx + first.vy * first.vy + first.vz * first.vz)
+        for j in i + 1..count {
+            let second = bodies[j]
+            let deltaX = first.x - second.x
+            let deltaY = first.y - second.y
+            let deltaZ = first.z - second.z
+            total -= first.mass * second.mass / sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ + softening)
+        }
+    }
+    return total
+}
+
+var steps = 100
+if args().len() > 1 { steps = args()[1] as int }
+
+var bodies: [Body] = []
+for i in 0..bodyCount { bodies.push(makeBody()) }
+for step in 0..steps { advance(bodies) }
+
+var checksum = (energy(bodies) * 1000000000.0) as int
+for body in bodies {
+    checksum = checksum * 31 + (body.x * 1000000.0) as int
+    checksum = checksum * 31 + (body.y * 1000000.0) as int
+    checksum = checksum * 31 + (body.z * 1000000.0) as int
+}
+print(checksum)

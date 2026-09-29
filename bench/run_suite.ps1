@@ -48,6 +48,11 @@ $suite = @(
     @{ name = "cube";    area = "rasterization";   arg = "1500";    gcc = "-ffp-contract=off -lm" }
     @{ name = "pi";      area = "bignum";          arg = "20000";   gcc = "" }
     @{ name = "liquid";  area = "fluid / neighbours"; arg = "400";  gcc = "-ffp-contract=off -lm" }
+    @{ name = "shapes";  area = "dynamic dispatch"; arg = "300000"; gcc = "-ffp-contract=off -lm" }
+    @{ name = "closures"; area = "closures / HOFs"; arg = "200000"; gcc = "" }
+    @{ name = "wordfreq"; area = "string hash map"; arg = "3000000"; gcc = "" }
+    @{ name = "nbody";   area = "struct floats";   arg = "100";     gcc = "-ffp-contract=off -lm" }
+    @{ name = "lexer";   area = "tokenizer";       arg = "1000000"; gcc = "" }
 )
 
 function Median($xs) { $s = $xs | Sort-Object; return $s[[int]($s.Count / 2)] }
