@@ -4,11 +4,15 @@
 # harness verifies is byte-identical before it trusts any timing.
 #
 # Per benchmark it reports compile time, best/median wall-clock over N runs, and
-# peak working-set memory. Usage:  powershell -File bench\run_suite.ps1 [runs]
+# peak working-set memory. Zephyr runs twice: the baseline code generator, and
+# -O2 (the optimizing tier, compiler/optimizer.zeph).
+# Usage:  powershell -File bench\run_suite.ps1 [runs] [name,name,...]
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot
 Set-Location $root
 $runs = if ($args.Count -ge 1) { [int]$args[0] } else { 5 }
+$only = if ($args.Count -ge 2) { $args[1] -split "," } else { @() }
+$zephyrCompiler = if ($env:ZEPHYR_COMPILER) { $env:ZEPHYR_COMPILER } else { ".\zc.exe" }   # the compiler under test
 
 Add-Type -TypeDefinition @"
 using System;
@@ -60,13 +64,17 @@ function Median($xs) { $s = $xs | Sort-Object; return $s[[int]($s.Count / 2)] }
 $summary = @()
 foreach ($b in $suite) {
     $n = $b.name
-    $ez = "$tmp\su_${n}_z.exe"; $ec = "$tmp\su_${n}_c.exe"; $er = "$tmp\su_${n}_r.exe"
+    if ($only.Count -gt 0 -and $only -notcontains $n) { continue }
+    $ez = "$tmp\su_${n}_z.exe"; $ezo = "$tmp\su_${n}_zo.exe"; $ec = "$tmp\su_${n}_c.exe"; $er = "$tmp\su_${n}_r.exe"
     $exe = @{}
 
     # ---- compile ----
-    $cz = (Measure-Command { & .\zc.exe --rt "bench\$n.zeph" $ez | Out-Null }).TotalMilliseconds
+    $cz = (Measure-Command { & $zephyrCompiler --rt "bench\$n.zeph" $ez | Out-Null }).TotalMilliseconds
     if (-not (Test-Path $ez)) { Write-Host "SKIP $n : zeph compile failed"; continue }
     $exe["Zephyr"] = $ez
+    $czo = (Measure-Command { & $zephyrCompiler --rt -O2 "bench\$n.zeph" $ezo | Out-Null }).TotalMilliseconds
+    if (-not (Test-Path $ezo)) { Write-Host "SKIP $n : zeph -O2 compile failed"; continue }
+    $exe["Zephyr-O2"] = $ezo
 
     $gccArgs = @("-O2") + ($b.gcc -split ' ' | Where-Object { $_ }) + @("bench\$n.c", "-o", $ec)
     $cc = (Measure-Command { & gcc @gccArgs }).TotalMilliseconds
@@ -78,8 +86,8 @@ foreach ($b in $suite) {
         $exe["Rust"] = $er
     }
 
-    $langs = @("C"); if ($haveRust) { $langs += "Rust" }; $langs += "Zephyr"
-    $comp = @{ "Zephyr" = $cz; "C" = $cc; "Rust" = $cr }
+    $langs = @("C"); if ($haveRust) { $langs += "Rust" }; $langs += "Zephyr"; $langs += "Zephyr-O2"
+    $comp = @{ "Zephyr" = $cz; "Zephyr-O2" = $czo; "C" = $cc; "Rust" = $cr }
 
     # ---- correctness: checksums must be identical ----
     $sums = @{}
@@ -108,22 +116,25 @@ foreach ($b in $suite) {
     $rows | Format-Table Lang, Compile_ms, Best_ms, Median_ms, PeakMem_KB -AutoSize | Out-String | Write-Host
 
     $z = $rows | Where-Object { $_.Lang -eq "Zephyr" }
+    $zo = $rows | Where-Object { $_.Lang -eq "Zephyr-O2" }
     $c = $rows | Where-Object { $_.Lang -eq "C" }
     $r = $rows | Where-Object { $_.Lang -eq "Rust" }
     $rust_ms = if ($r) { $r.Best_ms } else { "-" }
     $rust_kb = if ($r) { $r.PeakMem_KB } else { "-" }
     $zc = if ($c.Best_ms) { [math]::Round($z.Best_ms / $c.Best_ms, 2) } else { "-" }
     $zr = if ($r -and $r.Best_ms) { [math]::Round($z.Best_ms / $r.Best_ms, 2) } else { "-" }
+    $zoc = if ($c.Best_ms) { [math]::Round($zo.Best_ms / $c.Best_ms, 2) } else { "-" }
+    $zoz = if ($z.Best_ms) { [math]::Round($zo.Best_ms / $z.Best_ms, 2) } else { "-" }
     $csum = if ($ok) { "ok" } else { "MISMATCH" }
     $summary += [pscustomobject]@{
         Area = $b.area
-        Zephyr_ms = $z.Best_ms; C_ms = $c.Best_ms; Rust_ms = $rust_ms
-        "Z/C" = $zc; "Z/Rust" = $zr
+        Zephyr_ms = $z.Best_ms; O2_ms = $zo.Best_ms; C_ms = $c.Best_ms; Rust_ms = $rust_ms
+        "Z/C" = $zc; "Z/Rust" = $zr; "O2/C" = $zoc; "O2/Z" = $zoz
         Zephyr_KB = $z.PeakMem_KB; C_KB = $c.PeakMem_KB; Rust_KB = $rust_kb
         Checksum = $csum
     }
-    Remove-Item $ez, $ec, $er -ErrorAction SilentlyContinue
+    Remove-Item $ez, $ezo, $ec, $er -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n================ SUMMARY (best-of-$runs ms; Z/C and Z/Rust < 1.0 = Zephyr faster) ================"
-$summary | Format-Table Area, Zephyr_ms, C_ms, Rust_ms, "Z/C", "Z/Rust", Zephyr_KB, C_KB, Rust_KB, Checksum -AutoSize
+$summary | Format-Table Area, Zephyr_ms, O2_ms, C_ms, Rust_ms, "Z/C", "O2/C", "O2/Z", "Z/Rust", Zephyr_KB, C_KB, Checksum -AutoSize

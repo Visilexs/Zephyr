@@ -84,14 +84,23 @@ let irFloatStoreFrame = 51
 let irFloatConstant = 52        // immediate = bits
 let irCopy = 53                 // a (optimizations forward it away; never emitted)
 let irDataAddress = 54          // immediate = data string index: lea of a string literal
+let irDividePowerOfTwo = 55     // a / 2^immediate, rounding toward zero like idiv
+let irModuloPowerOfTwo = 56     // a % 2^immediate, sign of the dividend like idiv
+let irListLength = 57           // [a + 0]: a list's or string's length. Only runtime calls change it.
+let irListData = 58             // [a + 16]: a list's element array. Only runtime calls change it.
+let irReciprocal = 59           // floor((2^64 - 1) / a) for a > 0, else 0: the multiplier for irDivideByInvariant
+let irDivideByInvariant = 60    // a / b with c = irReciprocal(b): multiply-high plus one correction step
+let irModuloByInvariant = 61
+let irDivideByConstant = 62     // a / immediate, immediate > 1 and not a power of two
+let irModuloByConstant = 63
 // terminators
-let irJump = 60                 // successors[0]
-let irBranch = 61               // a != 0 -> successors[0] else successors[1]
-let irBranchCompare = 62        // a cond b -> successors[0] else successors[1]; immediate = condition
-let irBranchFloatCompare = 63
-let irReturn = 64               // operands = [value] or []
-let irUnreachable = 65          // panic with a fixed text: immediate = data string index
-let irPanicAt = 66              // panic: a = message string, immediate = site string index
+let irJump = 100                // successors[0]
+let irBranch = 101              // a != 0 -> successors[0] else successors[1]
+let irBranchCompare = 102       // a cond b -> successors[0] else successors[1]; immediate = condition
+let irBranchFloatCompare = 103
+let irReturn = 104              // operands = [value] or []
+let irUnreachable = 105         // panic with a fixed text: immediate = data string index
+let irPanicAt = 106             // panic: a = message string, immediate = site string index
 
 // conditions (shared by compares and branches)
 let conditionEqual = 0
@@ -693,8 +702,9 @@ fn plainListElement(listType: int) -> int {
 
 // bounds-checked element address: returns the data pointer; the caller indexes it
 fn lowerElementAddress(list: int, index: int, site: Node) -> int {
-    let checked = emitIr2(irBoundsCheck, classInteger, list, index, panicStringIndex(site, "index out of bounds"))
-    let data = emitIr1(irLoad, classInteger, list, 16)
+    let length = emitIr1(irListLength, classInteger, list, 0)
+    let checked = emitIr2(irBoundsCheck, classInteger, length, index, panicStringIndex(site, "index out of bounds"))
+    let data = emitIr1(irListData, classInteger, list, 0)
     irBorrowed[data] = true                   // a push reallocates it
     return data
 }
@@ -752,7 +762,7 @@ fn lowerCall(expression: Node) -> int {
             optimizerBail("len of kind {receiverKind}")
             return 0
         }
-        return emitIr1(irLoad, classInteger, lowerExpression(receiver), 0)
+        return emitIr1(irListLength, classInteger, lowerExpression(receiver), 0)
     }
     if callKind == callKindBits {                // bits() and floatFromBits(): same bits, retyped
         let operand = lowerExpression(expression.children[1])
@@ -1004,12 +1014,12 @@ fn lowerStatement(statement: Node) {
         let exitBlock = newBlock()
         jumpTo(headerBlock)
         currentIrBlock = headerBlock
-        let length = emitIr1(irLoad, classInteger, list, 0)
+        let length = emitIr1(irListLength, classInteger, list, 0)
         terminate(irBranchCompare, [readVariable(indexVariable, headerBlock), length], conditionLess, [bodyBlock, exitBlock])
         sealBlock(bodyBlock)
         currentLoopDepth += 1
         currentIrBlock = bodyBlock
-        let data = emitIr1(irLoad, classInteger, list, 16)
+        let data = emitIr1(irListData, classInteger, list, 0)
         irBorrowed[data] = true
         let index = readVariable(indexVariable, bodyBlock)
         var element = 0
@@ -1423,8 +1433,6 @@ var blockOrderIndex: [int] = []            // block -> position in blockOrder, -
 var blockStartPositions: [int] = []
 var blockEndPositions: [int] = []
 var instructionPositions: [int] = []
-var intervalStarts: [int] = []
-var intervalEnds: [int] = []
 var callPositions: [int] = []
 var liveIn: [[int]] = []
 var liveOut: [[int]] = []
@@ -1542,27 +1550,19 @@ fn computeLiveness() {
     }
 }
 
-fn extendInterval(value: int, position: int) {
-    if position < intervalStarts[value] { intervalStarts[value] = position }
-    if position > intervalEnds[value] { intervalEnds[value] = position }
-}
+// Positions: a block occupies [start, end]; its instructions sit at start+2,
+// start+4, ... and the phi moves into its successor at `end`. Live ranges are
+// half-open lists of [from, to): an operand's range stops AT the instruction
+// reading it, so the result may take the same register.
+var rangeStarts: [[int]] = []
+var rangeEnds: [[int]] = []
+var groupParent: [int] = []                // coalesced phi webs share one location
 
-// One hull [start, end] per value: every position where it is live lies inside.
-// ponytail: no lifetime holes or interval splitting; a value spills for its
-// whole life. Split intervals are the upgrade if register pressure bites.
-fn buildIntervals() {
+fn numberPositions() {
     let valueCount = irOpcodes.len()
-    var noPositions: [int] = []
-    instructionPositions = noPositions
-    var starts: [int] = []
-    var ends: [int] = []
-    for value in 0..valueCount {
-        instructionPositions.push(0 - 1)
-        starts.push(1 << 60)
-        ends.push(0 - 1)
-    }
-    intervalStarts = starts
-    intervalEnds = ends
+    var positions: [int] = []
+    for value in 0..valueCount { positions.push(0 - 1) }
+    instructionPositions = positions
     var blockStarts: [int] = []
     var blockEnds: [int] = []
     for block in 0..blockInstructions.len() {
@@ -1588,41 +1588,214 @@ fn buildIntervals() {
     }
     blockStartPositions = blockStarts
     blockEndPositions = blockEnds
+}
+
+fn addRange(value: int, from: int, to: int) {
+    if to <= from { return }
+    rangeStarts[value].push(from)
+    rangeEnds[value].push(to)
+}
+
+// sort a value's ranges and merge the ones that touch or overlap
+fn normalizeRanges(value: int) {
+    let starts = rangeStarts[value]
+    let ends = rangeEnds[value]
+    let count = starts.len()
+    if count < 2 { return }
+    for i in 1..count {                        // insertion sort: lists are short
+        var j = i
+        while j > 0 and starts[j - 1] > starts[j] {
+            let swappedStart = starts[j]
+            starts[j] = starts[j - 1]
+            starts[j - 1] = swappedStart
+            let swappedEnd = ends[j]
+            ends[j] = ends[j - 1]
+            ends[j - 1] = swappedEnd
+            j -= 1
+        }
+    }
+    var mergedStarts: [int] = [starts[0]]
+    var mergedEnds: [int] = [ends[0]]
+    for i in 1..count {
+        let last = mergedEnds.len() - 1
+        if starts[i] <= mergedEnds[last] {
+            if ends[i] > mergedEnds[last] { mergedEnds[last] = ends[i] }
+        } else {
+            mergedStarts.push(starts[i])
+            mergedEnds.push(ends[i])
+        }
+    }
+    rangeStarts[value] = mergedStarts
+    rangeEnds[value] = mergedEnds
+}
+
+fn buildLiveRanges() {
+    numberPositions()
+    let valueCount = irOpcodes.len()
+    var noStarts: [[int]] = []
+    rangeStarts = noStarts
+    var noEnds: [[int]] = []
+    rangeEnds = noEnds
+    var parents: [int] = []
+    var blockRangeStart: [int] = []
+    var blockRangeEnd: [int] = []
+    for value in 0..valueCount {
+        var startList: [int] = []
+        rangeStarts.push(startList)
+        var endList: [int] = []
+        rangeEnds.push(endList)
+        parents.push(value)
+        blockRangeStart.push(0 - 1)
+        blockRangeEnd.push(0)
+    }
+    groupParent = parents
     for block in blockOrder {
-        for instruction in blockInstructions[block] {
-            extendInterval(instruction, instructionPositions[instruction])
-            if irOpcodes[instruction] == irPhi {
-                let predecessors = blockPredecessors[block]
-                let operands = irOperands[instruction]
-                for i in 0..predecessors.len() {
-                    extendInterval(operands[i], blockEnds[predecessors[i]])
-                    extendInterval(instruction, blockEnds[predecessors[i]])     // the move that defines it sits there
+        let blockStart = blockStartPositions[block]
+        let blockEnd = blockEndPositions[block]
+        var touched: [int] = []
+        // live past the block end: whatever a successor needs on entry. Phi
+        // inputs are only read by the moves AT the end, which comes next.
+        var outSet = emptyBitSet()
+        for successor in blockSuccessors[block] {
+            let successorIn = liveIn[successor]
+            for word in 0..liveWordCount { outSet[word] = outSet[word] | successorIn[word] }
+        }
+        for word in 0..liveWordCount {
+            if outSet[word] == 0 { continue }
+            for bit in 0..64 {
+                if ((outSet[word] >> bit) & 1) == 1 {
+                    let value = word * 64 + bit
+                    blockRangeStart[value] = blockStart
+                    blockRangeEnd[value] = blockEnd + 1
+                    touched.push(value)
                 }
-            } else {
-                for operand in irOperands[instruction] { extendInterval(operand, instructionPositions[instruction]) }
             }
         }
-        let inSet = liveIn[block]
-        let outSet = liveOut[block]
-        for word in 0..liveWordCount {
-            if inSet[word] != 0 or outSet[word] != 0 {
-                for bit in 0..64 {
-                    let value = word * 64 + bit
-                    if value < valueCount {
-                        if ((inSet[word] >> bit) & 1) == 1 { extendInterval(value, blockStarts[block]) }
-                        if ((outSet[word] >> bit) & 1) == 1 { extendInterval(value, blockEnds[block]) }
-                    }
-                }
+        for successor in blockSuccessors[block] {
+            let edgeIndex = predecessorIndex(successor, block)
+            for instruction in blockInstructions[successor] {
+                if irOpcodes[instruction] != irPhi { continue }
+                let operand = irOperands[instruction][edgeIndex]
+                if blockRangeStart[operand] < 0 {
+                    blockRangeStart[operand] = blockStart
+                    blockRangeEnd[operand] = blockEnd
+                    touched.push(operand)
+                } else if blockRangeEnd[operand] < blockEnd { blockRangeEnd[operand] = blockEnd }
+            }
+        }
+        let instructions = blockInstructions[block]
+        var index = instructions.len() - 1
+        while index >= 0 {
+            let instruction = instructions[index]
+            index -= 1
+            let position = instructionPositions[instruction]
+            if irOpcodes[instruction] == irPhi or irOpcodes[instruction] == irParameter {
+                if blockRangeStart[instruction] >= 0 { blockRangeStart[instruction] = blockStart }
+                continue
+            }
+            if blockRangeStart[instruction] >= 0 { blockRangeStart[instruction] = position }      // the definition
+            for operand in irOperands[instruction] {
+                if blockRangeStart[operand] < 0 {
+                    blockRangeStart[operand] = blockStart
+                    blockRangeEnd[operand] = position
+                    touched.push(operand)
+                } else if blockRangeEnd[operand] < position { blockRangeEnd[operand] = position }
+            }
+        }
+        for value in touched {
+            if blockRangeStart[value] >= 0 {
+                addRange(value, blockRangeStart[value], blockRangeEnd[value])
+                blockRangeStart[value] = 0 - 1
+            }
+        }
+    }
+    // a phi's register is written by the moves at the end of each predecessor
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irPhi { continue }
+            for predecessor in blockPredecessors[block] { addRange(instruction, blockEndPositions[predecessor], blockEndPositions[predecessor] + 1) }
+        }
+    }
+    for value in 0..valueCount { normalizeRanges(value) }
+}
+
+fn groupOf(value: int) -> int {
+    var current = value
+    while groupParent[current] != current { current = groupParent[current] }
+    return current
+}
+
+fn rangesIntersect(first: int, second: int) -> bool {
+    let firstStarts = rangeStarts[first]
+    let firstEnds = rangeEnds[first]
+    let secondStarts = rangeStarts[second]
+    let secondEnds = rangeEnds[second]
+    var i = 0
+    var j = 0
+    while i < firstStarts.len() and j < secondStarts.len() {
+        if firstStarts[i] < secondEnds[j] and secondStarts[j] < firstEnds[i] { return true }
+        if firstEnds[i] <= secondEnds[j] { i += 1 } else { j += 1 }
+    }
+    return false
+}
+
+fn rangesCover(value: int, position: int) -> bool {
+    let starts = rangeStarts[value]
+    let ends = rangeEnds[value]
+    for i in 0..starts.len() {
+        if starts[i] <= position and position < ends[i] { return true }
+    }
+    return false
+}
+
+fn lastRangeEnd(value: int) -> int {
+    let ends = rangeEnds[value]
+    if ends.len() == 0 { return 0 - 1 }
+    return ends[ends.len() - 1]
+}
+
+fn crossesCall(value: int) -> bool {
+    let starts = rangeStarts[value]
+    let ends = rangeEnds[value]
+    for position in callPositions {
+        for i in 0..starts.len() {
+            if starts[i] < position and position < ends[i] { return true }
+        }
+    }
+    return false
+}
+
+fn isAllocatable(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    if not producesValue(opcode) or isImmediateConstant(value) or opcode == irFloatConstant { return false }
+    return rangeStarts[value].len() > 0
+}
+
+// Phi coalescing: a phi and an input whose live ranges never overlap can share
+// one location, and the move between them disappears. For a loop counter that
+// is the increment and the phi of the loop header.
+fn coalescePhis() {
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irPhi or not isAllocatable(instruction) { continue }
+            for operand in irOperands[instruction] {
+                if not isAllocatable(operand) or irClasses[operand] != irClasses[instruction] { continue }
+                let phiGroup = groupOf(instruction)
+                let operandGroup = groupOf(operand)
+                if phiGroup == operandGroup or rangesIntersect(phiGroup, operandGroup) { continue }
+                groupParent[operandGroup] = phiGroup
+                for i in 0..rangeStarts[operandGroup].len() { addRange(phiGroup, rangeStarts[operandGroup][i], rangeEnds[operandGroup][i]) }
+                normalizeRanges(phiGroup)
+                if irBorrowed[operandGroup] { irBorrowed[phiGroup] = true }
             }
         }
     }
 }
 
-fn crossesCall(value: int) -> bool {
-    for position in callPositions {
-        if intervalStarts[value] < position and position < intervalEnds[value] { return true }
-    }
-    return false
+fn isTwoAddressOpcode(opcode: int) -> bool {
+    if opcode == irAdd or opcode == irSubtract or opcode == irMultiply or opcode == irBitAnd or opcode == irBitOr or opcode == irBitXor { return true }
+    if opcode == irShiftLeft or opcode == irShiftRight or opcode == irNegate { return true }
+    return opcode == irFloatAdd or opcode == irFloatSubtract or opcode == irFloatMultiply or opcode == irFloatDivide or opcode == irFloatMinimum or opcode == irFloatMaximum
 }
 
 // ================= register allocation (linear scan) =================
@@ -1638,6 +1811,56 @@ var spillSlotCount = 0
 var integerRegisterUsed: [bool] = []
 var floatRegisterUsed: [bool] = []
 
+// a register this group would like: the one its two-address inputs or phi inputs already hold
+fn registerHint(group: int, members: [int]) -> int {
+    for member in members {
+        let opcode = irOpcodes[member]
+        if isTwoAddressOpcode(opcode) or opcode == irPhi or opcode == irCopy {
+            for operand in irOperands[member] {
+                let operandGroup = groupOf(operand)
+                if operandGroup != group and valueRegisters[operandGroup] >= 0 and irClasses[operandGroup] == irClasses[group] { return valueRegisters[operandGroup] }
+                if opcode != irPhi { break }        // two-address: only the first operand
+            }
+        }
+    }
+    return 0 - 1
+}
+
+// what keeping a group in memory would cost: its reads and writes, weighted
+// 8x per loop level they sit in
+var groupSpillCosts: [int] = []
+
+fn loopWeight(block: int) -> int {
+    var depth = blockLoopDepth[block]
+    if depth > 6 { depth = 6 }
+    return 1 << (3 * depth)
+}
+
+fn computeSpillCosts() {
+    var costs: [int] = []
+    for value in 0..irOpcodes.len() { costs.push(0) }
+    for block in blockOrder {
+        let weight = loopWeight(block)
+        for instruction in blockInstructions[block] {
+            if isAllocatable(instruction) { costs[groupOf(instruction)] += weight }
+            if irOpcodes[instruction] == irPhi {
+                let predecessors = blockPredecessors[block]
+                for i in 0..predecessors.len() {
+                    let operand = irOperands[instruction][i]
+                    if isAllocatable(operand) { costs[groupOf(operand)] += loopWeight(predecessors[i]) }
+                }
+            } else {
+                for operand in irOperands[instruction] {
+                    if isAllocatable(operand) { costs[groupOf(operand)] += weight }
+                }
+            }
+        }
+    }
+    groupSpillCosts = costs
+}
+
+// Linear scan over live ranges with holes (Wimmer & Franz), without splitting:
+// a group keeps one register or one stack slot for its whole life.
 fn allocateRegisters() {
     let valueCount = irOpcodes.len()
     var registers: [int] = []
@@ -1655,62 +1878,92 @@ fn allocateRegisters() {
     var floatUsed: [bool] = []
     for i in 0..floatRegisterNames.len() { floatUsed.push(false) }
     floatRegisterUsed = floatUsed
-    countUses()
+    coalescePhis()
+    computeSpillCosts()
+    var groupMembers: [[int]] = []
+    for value in 0..valueCount {
+        var members: [int] = []
+        groupMembers.push(members)
+    }
     var sortKeys: [int] = []
-    for block in blockOrder {
-        for instruction in blockInstructions[block] {
-            if producesValue(irOpcodes[instruction]) and irUseCounts[instruction] > 0 {
-                sortKeys.push(intervalStarts[instruction] * 1048576 + instruction)
-            }
-        }
+    for value in 0..valueCount {
+        if not isAllocatable(value) { continue }
+        let group = groupOf(value)
+        groupMembers[group].push(value)
+        if group == value { sortKeys.push(rangeStarts[value][0] * 1048576 + value) }
     }
     sortKeys.sort()
     var active: [int] = []
+    var inactive: [int] = []
     for key in sortKeys {
-        let value = key % 1048576
-        let start = intervalStarts[value]
-        var stillActive: [int] = []
+        let current = key % 1048576
+        let position = rangeStarts[current][0]
+        var nextActive: [int] = []
+        var nextInactive: [int] = []
         for other in active {
-            if intervalEnds[other] > start { stillActive.push(other) }
+            if lastRangeEnd(other) <= position { continue }
+            if rangesCover(other, position) { nextActive.push(other) } else { nextInactive.push(other) }
         }
-        active = stillActive
-        let valueClass = irClasses[value]
+        for other in inactive {
+            if lastRangeEnd(other) <= position { continue }
+            if rangesCover(other, position) { nextActive.push(other) } else { nextInactive.push(other) }
+        }
+        active = nextActive
+        inactive = nextInactive
+        let valueClass = irClasses[current]
         var registerCount = integerRegisterNames.len()
         if valueClass == classFloat { registerCount = floatRegisterNames.len() }
-        let needsCalleeSaved = crossesCall(value)
-        if needsCalleeSaved and irBorrowed[value] { optimizerBail("unpinned reference live across a call") }
-        var taken: [bool] = []
-        for i in 0..registerCount { taken.push(false) }
+        let needsCalleeSaved = crossesCall(current)
+        if needsCalleeSaved and irBorrowed[current] { optimizerBail("unpinned reference live across a call") }
+        var blocked: [bool] = []
+        for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
         for other in active {
-            if irClasses[other] == valueClass and valueRegisters[other] >= 0 { taken[valueRegisters[other]] = true }
+            if irClasses[other] == valueClass and valueRegisters[other] >= 0 { blocked[valueRegisters[other]] = true }
         }
-        var chosen = 0 - 1
+        for other in inactive {
+            if irClasses[other] == valueClass and valueRegisters[other] >= 0 and rangesIntersect(other, current) { blocked[valueRegisters[other]] = true }
+        }
+        var chosen = registerHint(current, groupMembers[current])
+        if chosen >= 0 and blocked[chosen] { chosen = 0 - 1 }
         for i in 0..registerCount {
-            if chosen < 0 and not taken[i] and (not needsCalleeSaved or registerIsCalleeSaved(valueClass, i)) { chosen = i }
+            if chosen < 0 and not blocked[i] { chosen = i }
         }
         if chosen < 0 {
-            // evict the active interval that lives longest, if it outlives this one
+            // evict the active group that is cheapest to keep in memory, if it is
+            // cheaper than this one and nothing inactive in its register overlaps
             var victim = 0 - 1
             for other in active {
-                if irClasses[other] == valueClass and valueRegisters[other] >= 0 and (not needsCalleeSaved or registerIsCalleeSaved(valueClass, valueRegisters[other])) {
-                    if victim < 0 or intervalEnds[other] > intervalEnds[victim] { victim = other }
+                if irClasses[other] != valueClass or valueRegisters[other] < 0 { continue }
+                let candidate = valueRegisters[other]
+                if needsCalleeSaved and not registerIsCalleeSaved(valueClass, candidate) { continue }
+                var free = true
+                for waiting in inactive {
+                    if irClasses[waiting] == valueClass and valueRegisters[waiting] == candidate and rangesIntersect(waiting, current) { free = false }
                 }
+                if free and (victim < 0 or groupSpillCosts[other] < groupSpillCosts[victim]) { victim = other }
             }
-            if victim >= 0 and intervalEnds[victim] > intervalEnds[value] {
+            if victim >= 0 and groupSpillCosts[victim] < groupSpillCosts[current] {
                 chosen = valueRegisters[victim]
                 valueRegisters[victim] = 0 - 1
                 valueSpillSlots[victim] = spillSlotCount
                 spillSlotCount += 1
             } else {
-                valueSpillSlots[value] = spillSlotCount
+                valueSpillSlots[current] = spillSlotCount
                 spillSlotCount += 1
             }
         }
         if chosen >= 0 {
-            valueRegisters[value] = chosen
+            valueRegisters[current] = chosen
             if valueClass == classFloat { floatRegisterUsed[chosen] = true } else { integerRegisterUsed[chosen] = true }
+            active.push(current)
         }
-        active.push(value)
+    }
+    // every member of a group lives where its group does
+    for value in 0..valueCount {
+        if not isAllocatable(value) { continue }
+        let group = groupOf(value)
+        valueRegisters[value] = valueRegisters[group]
+        valueSpillSlots[value] = valueSpillSlots[group]
     }
 }
 
@@ -1733,8 +1986,16 @@ fn emitCold(text: str) { optimizerColdLines.push("  " + text + "\n") }
 
 fn spillOffset(slot: int) -> int { return outgoingAreaSize + 8 * slot }
 
-// where a value lives: a register name, a stack slot, or "" (never read)
+fn fitsImmediate(value: int) -> bool { return value >= 0 - 2147483648 and value <= 2147483647 }
+
+// an int constant used as an instruction's immediate: it needs no register
+fn isImmediateConstant(value: int) -> bool { return irOpcodes[value] == irConstant and fitsImmediate(irImmediates[value]) }
+
+// where a value lives: a register name, a stack slot, an immediate, a
+// constant-pool slot, or "" (never read)
 fn locationOf(value: int) -> str {
+    if isImmediateConstant(value) { return "{irImmediates[value]}" }
+    if irOpcodes[value] == irFloatConstant { return "qword ptr " + floatConstantLabel(irImmediates[value]) }
     if valueRegisters[value] >= 0 {
         if irClasses[value] == classFloat { return floatRegisterNames[valueRegisters[value]] }
         return integerRegisterNames[valueRegisters[value]]
@@ -1743,7 +2004,8 @@ fn locationOf(value: int) -> str {
     return ""
 }
 
-fn isRegisterLocation(location: str) -> bool { return location != "" and location.byte(0) != 113 }   // not "qword ptr"
+fn isRegisterLocation(location: str) -> bool { return location != "" and (location.byte(0) == 114 or location.byte(0) == 120) }   // rax.. r15, xmm..
+fn isImmediateLocation(location: str) -> bool { return location != "" and (location.byte(0) == 45 or isDigitByte(location.byte(0))) }
 
 // the value in a GPR: its own register, or loaded into scratch
 fn integerIn(value: int, scratch: str) -> str {
@@ -1931,6 +2193,12 @@ fn emitColdPanic(stringIndex: int) -> int {
     return label
 }
 
+// cmp, or test when the right side is zero (same flags for every condition we use)
+fn compareWith(left: str, right: int) {
+    if isImmediateConstant(right) and irImmediates[right] == 0 { emitOptimized("test {left}, {left}") }
+    else { emitOptimized("cmp {left}, {locationOf(right)}") }
+}
+
 fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
     let first = locationOf(irOperands[value][0])
     let second = locationOf(irOperands[value][1])
@@ -2030,17 +2298,13 @@ fn emitInstructionFor(value: int) {
     let immediate = irImmediates[value]
     if opcode == irPhi or opcode == irParameter { return }
     if opcode == irConstant {
+        if isImmediateConstant(value) { return }          // folded into its users
         let target = resultRegister(value, "rax")
         moveImmediate(target, immediate)
         finishResult(value, target)
         return
     }
-    if opcode == irFloatConstant {
-        let target = resultRegister(value, "xmm0")
-        emitOptimized("movsd {target}, {floatConstantLabel(immediate)}")
-        finishResult(value, target)
-        return
-    }
+    if opcode == irFloatConstant { return }            // read from the constant pool by its users
     if opcode == irDataAddress {
         let target = resultRegister(value, "rax")
         emitOptimized("lea {target}, [rip + __s{immediate}]")
@@ -2068,6 +2332,24 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode == irMultiply {
+        var first = operands[0]
+        var second = operands[1]
+        if isImmediateConstant(first) {
+            first = operands[1]
+            second = operands[0]
+        }
+        if isImmediateConstant(second) {
+            let factor = irImmediates[second]
+            var source = locationOf(first)
+            if isImmediateLocation(source) {
+                emitOptimized("mov rax, {source}")
+                source = "rax"
+            }
+            let target = resultRegister(value, "rax")
+            emitOptimized("imul {target}, {source}, {factor}")
+            finishResult(value, target)
+            return
+        }
         emitIntegerBinary(value, "imul", true)
         return
     }
@@ -2083,6 +2365,14 @@ fn emitInstructionFor(value: int) {
         emitIntegerBinary(value, "xor", true)
         return
     }
+    if (opcode == irShiftLeft or opcode == irShiftRight) and isImmediateConstant(operands[1]) {
+        let target = resultRegister(value, "rax")
+        if target != locationOf(operands[0]) { emitOptimized("mov {target}, {locationOf(operands[0])}") }
+        let count = irImmediates[operands[1]] & 63
+        if opcode == irShiftLeft { emitOptimized("shl {target}, {count}") } else { emitOptimized("sar {target}, {count}") }
+        finishResult(value, target)
+        return
+    }
     if opcode == irShiftLeft or opcode == irShiftRight {
         emitOptimized("mov rcx, {locationOf(operands[1])}")
         let target = resultRegister(value, "rax")
@@ -2091,10 +2381,28 @@ fn emitInstructionFor(value: int) {
         finishResult(value, target)
         return
     }
+    if opcode == irDividePowerOfTwo or opcode == irModuloPowerOfTwo {
+        // bias negative dividends by 2^k - 1 so the arithmetic shift truncates toward zero
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("mov rcx, rax")
+        emitOptimized("sar rcx, 63")
+        emitOptimized("shr rcx, {64 - immediate}")
+        emitOptimized("add rcx, rax")
+        if opcode == irDividePowerOfTwo {
+            emitOptimized("sar rcx, {immediate}")
+            finishResult(value, "rcx")
+        } else {
+            emitOptimized("and rcx, {0 - (1 << immediate)}")
+            emitOptimized("sub rax, rcx")
+            finishResult(value, "rax")
+        }
+        return
+    }
     if opcode == irDivide or opcode == irModulo {
+        let divisor = integerIn(operands[1], "rcx")
         emitOptimized("mov rax, {locationOf(operands[0])}")
         emitOptimized("cqo")
-        emitOptimized("idiv {locationOf(operands[1])}")
+        emitOptimized("idiv {divisor}")
         if opcode == irDivide { finishResult(value, "rax") }
         else { finishResult(value, "rdx") }
         return
@@ -2108,7 +2416,7 @@ fn emitInstructionFor(value: int) {
     }
     if opcode == irCompare {
         let left = integerIn(operands[0], "rax")
-        emitOptimized("cmp {left}, {locationOf(operands[1])}")
+        compareWith(left, operands[1])
         emitSetFromFlags(value, conditionSuffix(immediate))
         return
     }
@@ -2197,7 +2505,8 @@ fn emitInstructionFor(value: int) {
     }
     if opcode == irFloatFromBits {
         let target = resultRegister(value, "xmm0")
-        emitOptimized("movq {target}, {locationOf(operands[0])}")
+        let source = integerIn(operands[0], "rax")
+        emitOptimized("movq {target}, {source}")
         finishResult(value, target)
         return
     }
@@ -2287,11 +2596,98 @@ fn emitInstructionFor(value: int) {
         emitOptimized("movsd [rip + __zephyr_globals + {8 * immediate}], {stored}")
         return
     }
-    if opcode == irBoundsCheck {
-        let list = integerIn(operands[0], "rcx")
+    if opcode == irBoundsCheck {                  // unsigned: a negative index fails too
         let index = integerIn(operands[1], "rdx")
-        emitOptimized("cmp {index}, [{list}]")
+        emitOptimized("cmp {index}, {locationOf(operands[0])}")
         emitOptimized("jae .L{emitColdPanic(immediate)}")
+        return
+    }
+    if opcode == irListLength or opcode == irListData {
+        let base = integerIn(operands[0], "rcx")
+        let target = resultRegister(value, "rax")
+        if opcode == irListLength { emitOptimized("mov {target}, [{base}]") } else { emitOptimized("mov {target}, [{base} + 16]") }
+        finishResult(value, target)
+        return
+    }
+    if opcode == irReciprocal {
+        let doneLabel = allocateLabel()
+        emitOptimized("mov rcx, {locationOf(operands[0])}")
+        emitOptimized("xor eax, eax")
+        emitOptimized("test rcx, rcx")
+        emitOptimized("jle .L{doneLabel}")
+        emitOptimized("mov rax, -1")
+        emitOptimized("xor edx, edx")
+        emitOptimized("div rcx")
+        optimizerLines.push(".L{doneLabel}:\n")
+        finishResult(value, "rax")
+        return
+    }
+    if opcode == irDivideByInvariant or opcode == irModuloByInvariant {
+        // q0 = mulhi(n, M) is q or q - 1 for any n >= 0; one correction makes it
+        // exact. n < 0 or M == 0 (a divisor <= 0) take the plain idiv.
+        let slowLabel = allocateLabel()
+        let validLabel = allocateLabel()
+        let doneLabel = allocateLabel()
+        let dividend = locationOf(operands[0])
+        let divisor = locationOf(operands[1])
+        emitOptimized("mov rax, {dividend}")
+        emitOptimized("mov rcx, {locationOf(operands[2])}")
+        emitOptimized("test rcx, rcx")
+        emitOptimized("je .L{slowLabel}")
+        emitOptimized("test rax, rax")
+        emitOptimized("js .L{slowLabel}")
+        emitOptimized("mov r11, rax")
+        emitOptimized("mul rcx")
+        emitOptimized("mov rax, rdx")
+        emitOptimized("mov rcx, {divisor}")
+        emitOptimized("imul rdx, rcx")
+        emitOptimized("sub r11, rdx")
+        emitOptimized("cmp r11, rcx")
+        emitOptimized("jb .L{validLabel}")
+        emitOptimized("add rax, 1")
+        emitOptimized("sub r11, rcx")
+        optimizerLines.push(".L{validLabel}:\n")
+        if opcode == irModuloByInvariant { emitOptimized("mov rax, r11") }
+        emitOptimized("jmp .L{doneLabel}")
+        optimizerLines.push(".L{slowLabel}:\n")
+        emitOptimized("mov rcx, {divisor}")
+        emitOptimized("cqo")
+        emitOptimized("idiv rcx")
+        if opcode == irModuloByInvariant { emitOptimized("mov rax, rdx") }
+        optimizerLines.push(".L{doneLabel}:\n")
+        finishResult(value, "rax")
+        return
+    }
+    if opcode == irDivideByConstant or opcode == irModuloByConstant {
+        let divisor = immediate
+        let halfUnsignedMaximum = 9223372036854775807     // (2^64-1)/d without unsigned ints: 2^64-1 = 2a+1
+        let magic = 2 * (halfUnsignedMaximum / divisor) + (2 * (halfUnsignedMaximum % divisor) + 1) / divisor
+        let slowLabel = allocateLabel()
+        let validLabel = allocateLabel()
+        let doneLabel = allocateLabel()
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("test rax, rax")
+        emitOptimized("js .L{slowLabel}")
+        emitOptimized("mov rcx, rax")
+        emitOptimized("movabs rdx, {magic}")
+        emitOptimized("mul rdx")
+        emitOptimized("imul rax, rdx, {divisor}")
+        emitOptimized("sub rcx, rax")
+        emitOptimized("mov rax, rdx")
+        emitOptimized("cmp rcx, {divisor}")
+        emitOptimized("jb .L{validLabel}")
+        emitOptimized("add rax, 1")
+        emitOptimized("sub rcx, {divisor}")
+        optimizerLines.push(".L{validLabel}:\n")
+        if opcode == irModuloByConstant { emitOptimized("mov rax, rcx") }
+        emitOptimized("jmp .L{doneLabel}")
+        optimizerLines.push(".L{slowLabel}:\n")
+        emitOptimized("mov rcx, {divisor}")
+        emitOptimized("cqo")
+        emitOptimized("idiv rcx")
+        if opcode == irModuloByConstant { emitOptimized("mov rax, rdx") }
+        optimizerLines.push(".L{doneLabel}:\n")
+        finishResult(value, "rax")
         return
     }
     if opcode == irZeroCheck {
@@ -2325,7 +2721,7 @@ fn emitTerminator(block: int, value: int) {
     if opcode == irBranchCompare {
         let condition = irImmediates[value]
         let left = integerIn(operands[0], "rax")
-        emitOptimized("cmp {left}, {locationOf(operands[1])}")
+        compareWith(left, operands[1])
         conditionalJump(conditionSuffix(condition), conditionSuffix(invertCondition(condition)), successors[0], successors[1])
         return
     }
@@ -2471,6 +2867,548 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     optimizerLines.push("\n")
 }
 
+// ================= constant folding and simplification =================
+
+fn isConstantValue(value: int) -> bool { return irOpcodes[value] == irConstant }
+
+fn becomeConstant(value: int, constant: int) {
+    irOpcodes[value] = irConstant
+    irClasses[value] = classInteger
+    var noOperands: [int] = []
+    irOperands[value] = noOperands
+    irImmediates[value] = constant
+}
+
+fn becomeFloatConstant(value: int, constantBits: int) {
+    irOpcodes[value] = irFloatConstant
+    irClasses[value] = classFloat
+    var noOperands: [int] = []
+    irOperands[value] = noOperands
+    irImmediates[value] = constantBits
+}
+
+fn powerOfTwoExponent(value: int) -> int {
+    if value <= 0 or (value & (value - 1)) != 0 { return 0 - 1 }
+    var exponent = 0
+    while (1 << exponent) != value { exponent += 1 }
+    return exponent
+}
+
+fn compareConstants(left: int, right: int, condition: int) -> bool {
+    if condition == conditionEqual { return left == right }
+    if condition == conditionNotEqual { return left != right }
+    if condition == conditionLess { return left < right }
+    if condition == conditionLessOrEqual { return left <= right }
+    if condition == conditionGreater { return left > right }
+    return left >= right
+}
+
+// remove the edge block -> successor (one occurrence), with its phi operands
+fn removeEdge(block: int, successor: int) {
+    var successors: [int] = []
+    var removedSuccessor = false
+    for next in blockSuccessors[block] {
+        if next == successor and not removedSuccessor { removedSuccessor = true }
+        else { successors.push(next) }
+    }
+    blockSuccessors[block] = successors
+    let edgeIndex = predecessorIndex(successor, block)
+    if edgeIndex < 0 { return }
+    var predecessors: [int] = []
+    for i in 0..blockPredecessors[successor].len() {
+        if i != edgeIndex { predecessors.push(blockPredecessors[successor][i]) }
+    }
+    blockPredecessors[successor] = predecessors
+    for instruction in blockInstructions[successor] {
+        if irOpcodes[instruction] != irPhi { continue }
+        var operands: [int] = []
+        for i in 0..irOperands[instruction].len() {
+            if i != edgeIndex { operands.push(irOperands[instruction][i]) }
+        }
+        irOperands[instruction] = operands
+    }
+}
+
+// a branch whose outcome is known becomes a jump
+fn foldBranch(block: int, terminator: int, taken: bool) {
+    let successors = blockSuccessors[block]
+    var kept = successors[1]
+    var dropped = successors[0]
+    if taken {
+        kept = successors[0]
+        dropped = successors[1]
+    }
+    removeEdge(block, dropped)
+    irOpcodes[terminator] = irJump
+    var noOperands: [int] = []
+    irOperands[terminator] = noOperands
+}
+
+// Returns true if anything changed. Values are rewritten in place, so every
+// user keeps pointing at the same value number.
+fn foldInstruction(block: int, value: int) -> bool {
+    let opcode = irOpcodes[value]
+    let operands = irOperands[value]
+    if operands.len() == 0 { return false }
+    let first = resolveValue(operands[0])
+    var second = 0 - 1
+    if operands.len() > 1 { second = resolveValue(operands[1]) }
+    let firstConstant = isConstantValue(first)
+    let secondConstant = second >= 0 and isConstantValue(second)
+    let firstValue = irImmediates[first]
+    var secondValue = 0
+    if second >= 0 { secondValue = irImmediates[second] }
+    if firstConstant and secondConstant {
+        if opcode == irBranchCompare {
+            foldBranch(block, value, compareConstants(firstValue, secondValue, irImmediates[value]))
+            return true
+        }
+        var known = true
+        var result = 0
+        if opcode == irAdd { result = firstValue + secondValue }
+        else if opcode == irSubtract { result = firstValue - secondValue }
+        else if opcode == irMultiply { result = firstValue * secondValue }
+        else if opcode == irBitAnd { result = firstValue & secondValue }
+        else if opcode == irBitOr { result = firstValue | secondValue }
+        else if opcode == irBitXor { result = firstValue ^ secondValue }
+        else if opcode == irShiftLeft { result = firstValue << (secondValue & 63) }
+        else if opcode == irShiftRight { result = firstValue >> (secondValue & 63) }
+        else if opcode == irDivide and secondValue != 0 and secondValue != 0 - 1 { result = firstValue / secondValue }
+        else if opcode == irModulo and secondValue != 0 and secondValue != 0 - 1 { result = firstValue % secondValue }
+        else if opcode == irIntegerMinimum { result = min(firstValue, secondValue) }
+        else if opcode == irIntegerMaximum { result = max(firstValue, secondValue) }
+        else if opcode == irCompare {
+            if compareConstants(firstValue, secondValue, irImmediates[value]) { result = 1 }
+        }
+        else { known = false }
+        if known {
+            becomeConstant(value, result)
+            return true
+        }
+    }
+    if firstConstant and operands.len() == 1 {
+        if opcode == irBranch {
+            foldBranch(block, value, firstValue != 0)
+            return true
+        }
+        if opcode == irZeroCheck and firstValue != 0 {
+            valueDead[value] = true
+            return true
+        }
+        if opcode == irNegate {
+            becomeConstant(value, 0 - firstValue)
+            return true
+        }
+        if opcode == irIntegerAbsolute {
+            becomeConstant(value, abs(firstValue))
+            return true
+        }
+        if opcode == irFloatFromBits {
+            becomeFloatConstant(value, firstValue)
+            return true
+        }
+        if opcode == irIntegerToFloat {
+            becomeFloatConstant(value, bits(firstValue as float))
+            return true
+        }
+    }
+    if opcode == irBitsFromFloat and irOpcodes[first] == irFloatConstant {
+        becomeConstant(value, irImmediates[first])
+        return true
+    }
+    // identities: the result is one of the operands, or a cheaper operation
+    if secondConstant and not firstConstant {
+        if secondValue == 0 and (opcode == irAdd or opcode == irSubtract or opcode == irBitOr or opcode == irBitXor or opcode == irShiftLeft or opcode == irShiftRight) {
+            valueForward[value] = first
+            return true
+        }
+        if secondValue == 1 and (opcode == irMultiply or opcode == irDivide) {
+            valueForward[value] = first
+            return true
+        }
+        if secondValue == 0 and (opcode == irMultiply or opcode == irBitAnd) {
+            becomeConstant(value, 0)
+            return true
+        }
+        let exponent = powerOfTwoExponent(secondValue)
+        if opcode == irMultiply and exponent > 0 {
+            irOpcodes[value] = irShiftLeft
+            irOperands[value] = [first, entryConstant(exponent)]
+            return true
+        }
+        if opcode == irDivide and exponent > 0 {
+            irOpcodes[value] = irDividePowerOfTwo
+            irOperands[value] = [first]
+            irImmediates[value] = exponent
+            return true
+        }
+        if opcode == irModulo and exponent > 0 and exponent < 32 {
+            irOpcodes[value] = irModuloPowerOfTwo
+            irOperands[value] = [first]
+            irImmediates[value] = exponent
+            return true
+        }
+        if (opcode == irDivide or opcode == irModulo) and exponent < 0 and secondValue > 1 and secondValue < 2147483648 {
+            if opcode == irDivide { irOpcodes[value] = irDivideByConstant } else { irOpcodes[value] = irModuloByConstant }
+            irOperands[value] = [first]
+            irImmediates[value] = secondValue
+            return true
+        }
+        // x % 2^k == 0 is x & (2^k - 1) == 0, when nothing else reads the remainder
+        if (opcode == irCompare or opcode == irBranchCompare) and secondValue == 0 and irOpcodes[first] == irModuloPowerOfTwo and irUseCounts[first] == 1 {
+            let condition = irImmediates[value]
+            if condition == conditionEqual or condition == conditionNotEqual {
+                let mask = (1 << irImmediates[first]) - 1
+                irOpcodes[first] = irBitAnd
+                irOperands[first] = [irOperands[first][0], entryConstant(mask)]
+                irImmediates[first] = 0
+                return true
+            }
+        }
+    }
+    if firstConstant and not secondConstant and second >= 0 {
+        if firstValue == 0 and (opcode == irAdd or opcode == irBitOr or opcode == irBitXor) {
+            valueForward[value] = second
+            return true
+        }
+        if firstValue == 1 and opcode == irMultiply {
+            valueForward[value] = second
+            return true
+        }
+    }
+    return false
+}
+
+// a fresh constant in the entry block, which dominates every use
+fn entryConstant(constant: int) -> int {
+    var noOperands: [int] = []
+    let created = addInstruction(0, irConstant, classInteger, noOperands, constant)
+    valueForward.push(created)
+    valueDead.push(false)
+    return created
+}
+
+fn foldIrConstants() {
+    var changed = true
+    var rounds = 0
+    var anyBranchFolded = false
+    while changed and rounds < 8 {
+        changed = false
+        rounds += 1
+        countUses()
+        for block in 0..blockInstructions.len() {
+            for instruction in blockInstructions[block] {
+                if valueDead[instruction] or valueForward[instruction] != instruction { continue }
+                let wasTerminator = isTerminatorOpcode(irOpcodes[instruction])
+                if foldInstruction(block, instruction) {
+                    changed = true
+                    if wasTerminator { anyBranchFolded = true }
+                }
+            }
+        }
+        rewriteOperands()
+    }
+    if anyBranchFolded {
+        removeUnreachableBlocks()
+        removeTrivialPhis()
+    }
+}
+
+// ================= dominators, loops, value numbering, code motion =================
+var immediateDominators: [int] = []
+var dominatorPreorder: [int] = []          // block -> preorder number in the dominator tree
+var dominatorSubtreeEnd: [int] = []        // block -> one past the last preorder number of its subtree
+var dominatorTreeOrder: [int] = []         // blocks in dominator-tree preorder
+
+fn intersectDominators(first: int, second: int) -> int {
+    var left = first
+    var right = second
+    while left != right {
+        while blockOrderIndex[left] > blockOrderIndex[right] { left = immediateDominators[left] }
+        while blockOrderIndex[right] > blockOrderIndex[left] { right = immediateDominators[right] }
+    }
+    return left
+}
+
+// Cooper, Harvey and Kennedy: iterate to the fixpoint over reverse postorder
+fn computeDominators() {
+    let blockCount = blockInstructions.len()
+    var dominators: [int] = []
+    for i in 0..blockCount { dominators.push(0 - 1) }
+    immediateDominators = dominators
+    immediateDominators[0] = 0
+    var changed = true
+    while changed {
+        changed = false
+        for orderPosition in 1..blockOrder.len() {
+            let block = blockOrder[orderPosition]
+            var newDominator = 0 - 1
+            for predecessor in blockPredecessors[block] {
+                if immediateDominators[predecessor] < 0 { continue }
+                if newDominator < 0 { newDominator = predecessor }
+                else { newDominator = intersectDominators(predecessor, newDominator) }
+            }
+            if newDominator != immediateDominators[block] {
+                immediateDominators[block] = newDominator
+                changed = true
+            }
+        }
+    }
+    var children: [[int]] = []
+    for i in 0..blockCount {
+        var noChildren: [int] = []
+        children.push(noChildren)
+    }
+    for block in blockOrder {
+        if block != 0 { children[immediateDominators[block]].push(block) }
+    }
+    var preorder: [int] = []
+    var subtreeEnd: [int] = []
+    for i in 0..blockCount {
+        preorder.push(0 - 1)
+        subtreeEnd.push(0 - 1)
+    }
+    var order: [int] = []
+    var stackBlocks: [int] = [0]
+    var stackNext: [int] = [0]
+    preorder[0] = 0
+    order.push(0)
+    while stackBlocks.len() > 0 {
+        let top = stackBlocks.len() - 1
+        let block = stackBlocks[top]
+        if stackNext[top] < children[block].len() {
+            let child = children[block][stackNext[top]]
+            stackNext[top] = stackNext[top] + 1
+            preorder[child] = order.len()
+            order.push(child)
+            stackBlocks.push(child)
+            stackNext.push(0)
+        } else {
+            subtreeEnd[block] = order.len()
+            let poppedBlock = stackBlocks.pop()
+            let poppedNext = stackNext.pop()
+        }
+    }
+    dominatorPreorder = preorder
+    dominatorSubtreeEnd = subtreeEnd
+    dominatorTreeOrder = order
+}
+
+fn blockDominates(dominator: int, block: int) -> bool {
+    return dominatorPreorder[dominator] <= dominatorPreorder[block] and dominatorPreorder[block] < dominatorSubtreeEnd[dominator]
+}
+
+// facts about memory the region can change, for which loads may be reused or moved
+var regionMakesCalls = false
+var storedFieldOffsets: [int] = []
+
+fn scanMemoryEffects() {
+    regionMakesCalls = false
+    var noOffsets: [int] = []
+    storedFieldOffsets = noOffsets
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            let opcode = irOpcodes[instruction]
+            if opcode == irCall { regionMakesCalls = true }
+            if opcode == irStore or opcode == irFloatStore { storedFieldOffsets.push(irImmediates[instruction]) }
+        }
+    }
+}
+
+fn fieldOffsetStored(offset: int) -> bool {
+    for stored in storedFieldOffsets {
+        if stored == offset { return true }
+    }
+    return false
+}
+
+// Pure, cannot trap, and reads nothing the region may change: may be computed
+// once for all equal copies, and moved to wherever its operands exist.
+fn isMovable(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    if opcode == irListLength or opcode == irListData { return not regionMakesCalls }
+    if opcode == irLoad or opcode == irFloatLoad { return not regionMakesCalls and not fieldOffsetStored(irImmediates[value]) }
+    if opcode == irConstant or opcode == irFloatConstant or opcode == irDataAddress or opcode == irReciprocal { return true }
+    if opcode >= irAdd and opcode <= irFloatAbsolute { return opcode != irDivide and opcode != irModulo }
+    if opcode == irIntegerToFloat or opcode == irFloatToInteger or opcode == irFloatFromBits or opcode == irBitsFromFloat { return true }
+    if opcode == irIntegerMinimum or opcode == irIntegerMaximum or opcode == irIntegerAbsolute { return true }
+    return opcode == irDividePowerOfTwo or opcode == irModuloPowerOfTwo or opcode == irDivideByConstant or opcode == irModuloByConstant
+}
+
+fn isCommutativeOpcode(opcode: int) -> bool {
+    return opcode == irAdd or opcode == irMultiply or opcode == irBitAnd or opcode == irBitOr or opcode == irBitXor or opcode == irFloatAdd or opcode == irFloatMultiply or opcode == irIntegerMinimum or opcode == irIntegerMaximum
+}
+
+// global value numbering over the dominator tree: an expression computed in a
+// dominating block is reused instead of computed again
+fn numberValues() {
+    var known: [str: int] = [:]
+    for block in dominatorTreeOrder {
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] or not isMovable(instruction) { continue }
+            let operands = irOperands[instruction]
+            var key = "{irOpcodes[instruction]}:{irClasses[instruction]}:{irImmediates[instruction]}"
+            if operands.len() == 2 and isCommutativeOpcode(irOpcodes[instruction]) and resolveValue(operands[0]) > resolveValue(operands[1]) {
+                key = key + ":{resolveValue(operands[1])}:{resolveValue(operands[0])}"
+            } else {
+                for operand in operands { key = key + ":{resolveValue(operand)}" }
+            }
+            if known.has(key) {
+                let earlier = known[key]
+                if blockDominates(irBlockOf[earlier], block) {
+                    valueForward[instruction] = earlier
+                    continue
+                }
+            }
+            known[key] = instruction
+        }
+    }
+    rewriteOperands()
+}
+
+var loopHeaders: [int] = []
+var loopBlockSets: [[bool]] = []
+var loopPreheaders: [int] = []
+
+// natural loops of the back edges; a loop whose header has one outside
+// predecessor ending in a plain jump gets that block as its preheader
+fn findLoops() {
+    var noHeaders: [int] = []
+    loopHeaders = noHeaders
+    var noSets: [[bool]] = []
+    loopBlockSets = noSets
+    var noPreheaders: [int] = []
+    loopPreheaders = noPreheaders
+    let blockCount = blockInstructions.len()
+    for block in blockOrder {
+        for header in blockSuccessors[block] {
+            if not blockDominates(header, block) { continue }
+            var loopIndex = 0 - 1
+            for i in 0..loopHeaders.len() {
+                if loopHeaders[i] == header { loopIndex = i }
+            }
+            if loopIndex < 0 {
+                loopIndex = loopHeaders.len()
+                loopHeaders.push(header)
+                var members: [bool] = []
+                for i in 0..blockCount { members.push(false) }
+                members[header] = true
+                loopBlockSets.push(members)
+            }
+            let members = loopBlockSets[loopIndex]
+            var worklist: [int] = [block]
+            while worklist.len() > 0 {
+                let member = worklist.pop()
+                if members[member] { continue }
+                members[member] = true
+                for predecessor in blockPredecessors[member] { worklist.push(predecessor) }
+            }
+        }
+    }
+    for i in 0..loopHeaders.len() {
+        var outside = 0 - 1
+        var outsideCount = 0
+        for predecessor in blockPredecessors[loopHeaders[i]] {
+            if not loopBlockSets[i][predecessor] {
+                outside = predecessor
+                outsideCount += 1
+            }
+        }
+        if outsideCount != 1 or blockSuccessors[outside].len() != 1 { outside = 0 - 1 }
+        loopPreheaders.push(outside)
+    }
+}
+
+fn loopSize(loopIndex: int) -> int {
+    var size = 0
+    for member in loopBlockSets[loopIndex] {
+        if member { size += 1 }
+    }
+    return size
+}
+
+// move an instruction to the end of another block (ahead of its terminator)
+fn moveInstruction(value: int, toBlock: int) {
+    let fromBlock = irBlockOf[value]
+    var kept: [int] = []
+    for instruction in blockInstructions[fromBlock] {
+        if instruction != value { kept.push(instruction) }
+    }
+    blockInstructions[fromBlock] = kept
+    let instructions = blockInstructions[toBlock]
+    let terminator = instructions.pop()
+    instructions.push(value)
+    instructions.push(terminator)
+    irBlockOf[value] = toBlock
+}
+
+// Loop-invariant code motion, innermost loops first: a movable instruction
+// whose operands are all defined outside the loop moves to the preheader.
+// Division by an invariant divisor gets its reciprocal computed there too.
+fn hoistLoopInvariants() {
+    var order: [int] = []
+    for i in 0..loopHeaders.len() { order.push(loopSize(i) * 65536 + i) }
+    order.sort()
+    for key in order {
+        let loopIndex = key % 65536
+        let preheader = loopPreheaders[loopIndex]
+        if preheader < 0 { continue }
+        let members = loopBlockSets[loopIndex]
+        var moved = true
+        while moved {
+            moved = false
+            for block in blockOrder {
+                if not members[block] { continue }
+                var candidates: [int] = []
+                for instruction in blockInstructions[block] { candidates.push(instruction) }
+                for instruction in candidates {
+                    if not isMovable(instruction) { continue }
+                    var invariant = true
+                    for operand in irOperands[instruction] {
+                        if members[irBlockOf[operand]] { invariant = false }
+                    }
+                    if invariant {
+                        moveInstruction(instruction, preheader)
+                        moved = true
+                    }
+                }
+            }
+        }
+        var divisors: [int] = []
+        var reciprocals: [int] = []
+        for block in blockOrder {
+            if not members[block] { continue }
+            for instruction in blockInstructions[block] {
+                let opcode = irOpcodes[instruction]
+                if opcode != irDivide and opcode != irModulo { continue }
+                let divisor = irOperands[instruction][1]
+                if members[irBlockOf[divisor]] or isConstantValue(divisor) { continue }
+                var reciprocal = 0 - 1
+                for i in 0..divisors.len() {
+                    if divisors[i] == divisor { reciprocal = reciprocals[i] }
+                }
+                if reciprocal < 0 {
+                    reciprocal = addInstruction(preheader, irReciprocal, classInteger, [divisor], 0)
+                    divisors.push(divisor)
+                    reciprocals.push(reciprocal)
+                }
+                if opcode == irDivide { irOpcodes[instruction] = irDivideByInvariant } else { irOpcodes[instruction] = irModuloByInvariant }
+                irOperands[instruction] = [irOperands[instruction][0], divisor, reciprocal]
+            }
+        }
+    }
+}
+
+fn optimizeLoops() {
+    computeBlockOrder()
+    computeDominators()
+    scanMemoryEffects()
+    numberValues()
+    findLoops()
+    hoistLoopInvariants()
+    resetForwarding()
+}
+
 // run every pass after lowering; false (with optimizerBailReason) if any gives up
 fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     for block in 0..blockInstructions.len() {
@@ -2480,6 +3418,9 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     resetForwarding()
     removeUnreachableBlocks()
     removeTrivialPhis()
+    foldIrConstants()
+    eliminateDeadCode()
+    optimizeLoops()
     eliminateDeadCode()
     checkBorrows()
     if optimizerBailed { return false }
@@ -2487,7 +3428,7 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     resetForwarding()
     computeBlockOrder()
     computeLiveness()
-    buildIntervals()
+    buildLiveRanges()
     allocateRegisters()
     if optimizerBailed { return false }
     emitRegionCode(label, parameterCount, registerCall)
