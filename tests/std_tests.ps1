@@ -460,6 +460,45 @@ messages.send(1)' 'channel: send after close'
 TestPanic 'sync_wait_group_underflow' 'import "std/sync.zeph"
 let group = wait_group_new()
 group.done()' 'wait_group: invalid count'
+TestSrc 'result_and_set' @'
+import "std/result.zeph"
+import "std/set.zeph"
+fn parse_port(text: str) -> Result[int, str] {
+    let port = text as int
+    if port < 1 or port > 65535 { return Result.Err("not a port: {text}") }
+    return Result.Ok(port)
+}
+let good = parse_port("8080")
+let bad = parse_port("70000")
+assert(good.is_ok() and bad.is_err(), "is_ok")
+assert(good.unwrap() == 8080 and bad.unwrap_or(1) == 1, "unwrap")
+assert(good.ok().get() == 8080 and bad.ok() == none, "ok")
+assert(bad.err().get() == "not a port: 70000" and good.err() == none, "err")
+let doubled = good.map(fn(port: int) -> int { return port * 2 })
+assert(doubled.unwrap() == 16160, "map")
+let described = good.map(fn(port: int) -> str { return "port {port}" })
+assert(described.unwrap() == "port 8080", "map type change")
+let coded = bad.map_err(fn(message: str) -> int { return message.len() })
+assert(coded.err().get() == 17, "map_err")
+let chained = good.and_then(fn(port: int) -> Result[int, str] { return parse_port("{port + 57536}") })
+assert(chained.is_err(), "and_then error")
+assert("{good} {bad}" == "Ok(8080) Err(\"not a port: 70000\")", "print")
+let seen = set_of(["a", "b", "a"])
+seen.add("c")
+seen.remove("b")
+assert(seen.len() == 2 and seen.has("a") and not seen.has("b"), "set basics")
+let other: Set[str] = Set.new()
+other.add("c")
+other.add("d")
+assert(seen.union(other).len() == 3 and seen.intersection(other).items() == ["c"], "union/intersection")
+assert(seen.difference(other).items() == ["a"] and other.intersection(seen).is_subset(seen), "difference/subset")
+let pairs = set_of([(1, 2), (1, 2), (2, 1)])
+assert(pairs.len() == 2, "tuple set")
+print("ok")
+'@
+TestPanic 'result_unwrap_err' 'import "std/result.zeph"
+let r: Result[int, str] = Result.Err("boom")
+print(r.unwrap())' 'unwrap on an Err: boom'
 TestSrc 'all_imports' @'
 import "std/string.zeph"
 import "std/math.zeph"
@@ -469,6 +508,8 @@ import "std/list.zeph"
 import "std/bytes.zeph"
 import "std/thread.zeph"
 import "std/sync.zeph"
+import "std/result.zeph"
+import "std/set.zeph"
 print(fmt_fixed(sum([1.0, 2.0]), 1))
 '@ '3.0'
 $linuxSource = Join-Path $tempRoot 'linux_build.zeph'

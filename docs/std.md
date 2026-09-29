@@ -147,6 +147,52 @@ sort_by(values, fn(left: int, right: int) -> int { return left - right })
 print(values.sum()) // 6
 ```
 
+## result.zeph
+
+```zeph
+import "std/result.zeph"
+```
+
+`enum Result[T, E] { Ok(T), Err(E) }`: what a function that can fail returns. Match on it (`Ok(value) { ... } Err(error) { ... }`) or use the methods.
+
+| Signature | Description |
+| --- | --- |
+| `r.is_ok() -> bool` / `r.is_err() -> bool` | Which member it is. |
+| `r.unwrap() -> T` | The value; panic with the error on Err. |
+| `r.unwrap_or(fallback: T) -> T` | The value, or fallback. |
+| `r.ok() -> T?` / `r.err() -> E?` | One side as an optional. |
+| `r.map[U](transform: fn(T) -> U) -> Result[U, E]` | Transform the value; an Err passes through. |
+| `r.map_err[F](transform: fn(E) -> F) -> Result[T, F]` | Transform the error; an Ok passes through. |
+| `r.and_then[U](next: fn(T) -> Result[U, E]) -> Result[U, E]` | Chain a step that can fail; the first Err wins. |
+
+```zeph
+fn parse_port(text: str) -> Result[int, str] {
+    let port = text as int
+    if port < 1 or port > 65535 { return Result.Err("not a port: {text}") }
+    return Result.Ok(port)
+}
+print(parse_port("8080").unwrap_or(80)) // 8080
+```
+
+## set.zeph
+
+```zeph
+import "std/set.zeph"
+```
+
+`struct Set[T]`: distinct values, backed by a `[T: bool]` map, so `T` must be a valid map key.
+
+| Signature | Description |
+| --- | --- |
+| `set_of[T](items: [T]) -> Set[T]` | A set of the distinct items. |
+| `Set.new() -> Set[T]` | An empty set; `T` comes from the expected type (`let s: Set[int] = Set.new()`). |
+| `s.add(item: T)` / `s.remove(item: T)` | Insert or delete (no-ops when already so). |
+| `s.has(item: T) -> bool` | Membership, O(1). |
+| `s.len() -> int` | Number of items. |
+| `s.items() -> [T]` | The items, in no particular order. |
+| `s.union(other) -> Set[T]` / `s.intersection(other)` / `s.difference(other)` | New sets. |
+| `s.is_subset(other) -> bool` | Every item of `s` is in `other`. |
+
 ## bytes.zeph
 
 ```zeph

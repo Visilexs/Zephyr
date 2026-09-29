@@ -13679,7 +13679,7 @@ fn __emb_rt() -> str {
     return p.join()
 }
 fn embedded_runtime() -> str { return __emb_rt() }
-fn embedded_count() -> int { return 9 }
+fn embedded_count() -> int { return 11 }
 fn __emb_0() -> str {
     var p: [str] = []
     p.push("// Raw byte buffers: a fixed-size, GC-managed, non-moving region you can lay C\n")
@@ -14855,6 +14855,174 @@ fn __emb_5() -> str {
 }
 fn __emb_6() -> str {
     var p: [str] = []
+    p.push("// std/result.zeph — Result[T, E]: a value, or the error that stopped it.\n")
+    p.push("//\n")
+    p.push("//     import \"std/result.zeph\"\n")
+    p.push("//     fn parse_port(text: str) -> Result[int, str] \{\n")
+    p.push("//         let port = text as int\n")
+    p.push("//         if port < 1 or port > 65535 \{ return Result.Err(\"not a port: \{text\}\") \}\n")
+    p.push("//         return Result.Ok(port)\n")
+    p.push("//     \}\n")
+    p.push("//     match parse_port(\"8080\") \{\n")
+    p.push("//         Ok(port) \{ print(\"listening on \{port\}\") \}\n")
+    p.push("//         Err(message) \{ print(message) \}\n")
+    p.push("//     \}\n")
+    p.push("//\n")
+    p.push("// Zephyr has no exceptions: a function that can fail returns a Result, or an\n")
+    p.push("// optional when there is nothing to say about the failure.\n")
+    p.push("\n")
+    p.push("enum Result[T, E] \{\n")
+    p.push("    Ok(T)\n")
+    p.push("    Err(E)\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("impl Result[T, E] \{\n")
+    p.push("    // Whether this holds a value.\n")
+    p.push("    fn is_ok(self) -> bool \{ return self is Ok \}\n")
+    p.push("\n")
+    p.push("    // Whether this holds an error.\n")
+    p.push("    fn is_err(self) -> bool \{ return self is Err \}\n")
+    p.push("\n")
+    p.push("    // The value; panics with the error on Err.\n")
+    p.push("    fn unwrap(self) -> T \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return value \}\n")
+    p.push("            Err(error) \{ panic(\"unwrap on an Err: \{error\}\") \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // The value, or fallback on Err.\n")
+    p.push("    fn unwrap_or(self, fallback: T) -> T \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return value \}\n")
+    p.push("            Err(_) \{ return fallback \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // The value as an optional; none on Err.\n")
+    p.push("    fn ok(self) -> T? \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return value \}\n")
+    p.push("            Err(_) \{ return none \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // The error as an optional; none on Ok.\n")
+    p.push("    fn err(self) -> E? \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(_) \{ return none \}\n")
+    p.push("            Err(error) \{ return error \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Transform the value, keeping an error as it is.\n")
+    p.push("    fn map[U](self, transform: fn(T) -> U) -> Result[U, E] \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return Result.Ok(transform(value)) \}\n")
+    p.push("            Err(error) \{ return Result.Err(error) \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Transform the error, keeping a value as it is.\n")
+    p.push("    fn map_err[F](self, transform: fn(E) -> F) -> Result[T, F] \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return Result.Ok(value) \}\n")
+    p.push("            Err(error) \{ return Result.Err(transform(error)) \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Chain a step that can itself fail; the first error wins.\n")
+    p.push("    fn and_then[U](self, next: fn(T) -> Result[U, E]) -> Result[U, E] \{\n")
+    p.push("        match self \{\n")
+    p.push("            Ok(value) \{ return next(value) \}\n")
+    p.push("            Err(error) \{ return Result.Err(error) \}\n")
+    p.push("        \}\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_7() -> str {
+    var p: [str] = []
+    p.push("// std/set.zeph — Set[T]: distinct values with O(1) add, has and remove.\n")
+    p.push("//\n")
+    p.push("//     import \"std/set.zeph\"\n")
+    p.push("//     let seen = set_of([\"a\", \"b\", \"a\"])\n")
+    p.push("//     seen.add(\"c\")\n")
+    p.push("//     print(seen.len())               // 3\n")
+    p.push("//\n")
+    p.push("// A set is a map from its values to true, so T must be a valid map key: int,\n")
+    p.push("// str, bool, an enum, or a list, struct, tuple or optional of those.\n")
+    p.push("\n")
+    p.push("struct Set[T] \{\n")
+    p.push("    entries: [T: bool] = [:]\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("// A set holding each distinct item once.\n")
+    p.push("fn set_of[T](items: [T]) -> Set[T] \{\n")
+    p.push("    var result: Set[T] = Set\{\}\n")
+    p.push("    for item in items \{ result.add(item) \}\n")
+    p.push("    return result\n")
+    p.push("\}\n")
+    p.push("\n")
+    p.push("impl Set[T] \{\n")
+    p.push("    // An empty set; T comes from the expected type: let s: Set[int] = Set.new().\n")
+    p.push("    fn new() -> Set[T] \{ return Set\{\} \}\n")
+    p.push("\n")
+    p.push("    // Add item; adding one already present does nothing.\n")
+    p.push("    fn add(self, item: T) \{ self.entries[item] = true \}\n")
+    p.push("\n")
+    p.push("    // Whether item is in the set.\n")
+    p.push("    fn has(self, item: T) -> bool \{ return self.entries.has(item) \}\n")
+    p.push("\n")
+    p.push("    // Remove item, if present.\n")
+    p.push("    fn remove(self, item: T) \{ self.entries.remove(item) \}\n")
+    p.push("\n")
+    p.push("    // How many items the set holds.\n")
+    p.push("    fn len(self) -> int \{ return self.entries.len() \}\n")
+    p.push("\n")
+    p.push("    // The items, in no particular order.\n")
+    p.push("    fn items(self) -> [T] \{ return self.entries.keys() \}\n")
+    p.push("\n")
+    p.push("    // Items in either set.\n")
+    p.push("    fn union(self, other: Set[T]) -> Set[T] \{\n")
+    p.push("        var result: Set[T] = Set\{\}\n")
+    p.push("        for item in self.entries.keys() \{ result.add(item) \}\n")
+    p.push("        for item in other.entries.keys() \{ result.add(item) \}\n")
+    p.push("        return result\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Items in both sets.\n")
+    p.push("    fn intersection(self, other: Set[T]) -> Set[T] \{\n")
+    p.push("        var result: Set[T] = Set\{\}\n")
+    p.push("        for item in self.entries.keys() \{\n")
+    p.push("            if other.has(item) \{ result.add(item) \}\n")
+    p.push("        \}\n")
+    p.push("        return result\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Items in this set but not the other.\n")
+    p.push("    fn difference(self, other: Set[T]) -> Set[T] \{\n")
+    p.push("        var result: Set[T] = Set\{\}\n")
+    p.push("        for item in self.entries.keys() \{\n")
+    p.push("            if not other.has(item) \{ result.add(item) \}\n")
+    p.push("        \}\n")
+    p.push("        return result\n")
+    p.push("    \}\n")
+    p.push("\n")
+    p.push("    // Whether every item of this set is in the other.\n")
+    p.push("    fn is_subset(self, other: Set[T]) -> bool \{\n")
+    p.push("        for item in self.entries.keys() \{\n")
+    p.push("            if not other.has(item) \{ return false \}\n")
+    p.push("        \}\n")
+    p.push("        return true\n")
+    p.push("    \}\n")
+    p.push("\}\n")
+    p.push("\n")
+    return p.join()
+}
+fn __emb_8() -> str {
+    var p: [str] = []
     p.push("// Byte-oriented string utilities; ASCII classification and whitespace.\n")
     p.push("fn is_digit(byteValue: int) -> bool \{ return byteValue >= 48 and byteValue <= 57 \}\n")
     p.push("fn is_upper(byteValue: int) -> bool \{ return byteValue >= 65 and byteValue <= 90 \}\n")
@@ -15218,7 +15386,7 @@ fn __emb_6() -> str {
     p.push("\n")
     return p.join()
 }
-fn __emb_7() -> str {
+fn __emb_9() -> str {
     var p: [str] = []
     p.push("// Off-heap synchronization for Windows and Linux x86-64.\n")
     p.push("// Only ints cross threads: reference counts are not atomic. Use bits/frombits\n")
@@ -15392,7 +15560,7 @@ fn __emb_7() -> str {
     p.push("\n")
     return p.join()
 }
-fn __emb_8() -> str {
+fn __emb_10() -> str {
     var p: [str] = []
     p.push("// Threads.\n")
     p.push("//\n")
@@ -15531,9 +15699,11 @@ fn embedded_name(i: int) -> str {
     if i == 3 { return "std/math.zeph" }
     if i == 4 { return "std/math_core.zeph" }
     if i == 5 { return "std/random.zeph" }
-    if i == 6 { return "std/string.zeph" }
-    if i == 7 { return "std/sync.zeph" }
-    if i == 8 { return "std/thread.zeph" }
+    if i == 6 { return "std/result.zeph" }
+    if i == 7 { return "std/set.zeph" }
+    if i == 8 { return "std/string.zeph" }
+    if i == 9 { return "std/sync.zeph" }
+    if i == 10 { return "std/thread.zeph" }
     return ""
 }
 fn embedded_src(i: int) -> str {
@@ -15546,6 +15716,8 @@ fn embedded_src(i: int) -> str {
     if i == 6 { return __emb_6() }
     if i == 7 { return __emb_7() }
     if i == 8 { return __emb_8() }
+    if i == 9 { return __emb_9() }
+    if i == 10 { return __emb_10() }
     return ""
 }
 // <<<EMBED
