@@ -1,6 +1,6 @@
 // Typed kernel32 wrappers. Linux builds route these calls through os/linux.zeph.
 // env and run currently panic explicitly on Linux. Paths/names reject NUL bytes.
-import "bytes.zeph"
+import "std/bytes.zeph"
 
 fn io_cstring(value: str) -> Bytes {
     for i in 0..value.len() { assert(value.byte(i) != 0, "io: embedded NUL") }
