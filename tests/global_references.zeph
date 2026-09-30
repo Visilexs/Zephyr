@@ -49,3 +49,28 @@ while walk.has() {
     walk = walk.get().next
 }
 print(current, history.len(), best[0], history[299], length, pair.left, pair.right)
+
+// save and restore: the saved copy must own its value while the global moves on
+var sourceName = "main"
+var visited: [str] = []
+fn visit(depth: int) -> int {
+    let saved = sourceName
+    sourceName = "file{depth}"
+    visited.push(sourceName)
+    var found = sourceName.len()
+    if depth > 0 { found += visit(depth - 1) }
+    sourceName = saved
+    return found + saved.len()
+}
+// a borrowed left operand of + while the right one calls and replaces it
+var labels: [str] = ["left", "right"]
+fn relabel(i: int) -> int {
+    labels = ["l{i}", "r{i}"]
+    return i
+}
+var joined = 0
+for i in 0..40 {
+    joined += visit(i % 5)
+    joined += (labels[i % 2] + "{relabel(i)}").len()
+}
+print(joined, sourceName, visited.len(), labels[1])

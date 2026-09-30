@@ -1486,6 +1486,7 @@ fn markOwnedLocals(node: Node) -> bool {
 // too when the region makes no call that could free what they came from
 fn needsOwnedHome(value: Node) -> bool {
     let kind = value.nodeKind
+    if kind == nodeIdentifier and value.auxiliary == identifierKindGlobal { return regionSourceMakesCalls }   // a call or store may replace the global's value
     if kind == nodeIdentifier { return value.auxiliary == identifierKindLocal and ownedLocalSlots.has(value.slot) }
     if kind == nodeMember or kind == nodeIndex { return regionSourceMakesCalls }
     return not (isPlainLiteral(value) or kind == nodeNoneLiteral)
@@ -1674,7 +1675,7 @@ fn lowerStringComparison(expression: Node) -> int {
         optimizerBail("string operator")
         return 0
     }
-    let left = lowerExpression(expression.children[0])
+    let left = lowerContainer(expression.children[0], [expression.children[1]])      // pinned if the right side may free it
     let right = lowerExpression(expression.children[1])
     if optimizerBailed { return 0 }
     if operator == tokenPlus { return ownedTemporary(lowerRuntimeCall("runtimeConcatenateStrings", [left, right])) }
@@ -3570,6 +3571,24 @@ fn liveAtAnyPosition(value: int, positions: [int]) -> bool {
     return false
 }
 
+fn describeBorrowed(value: int) -> str {
+    var text = ""
+    if irOpcodes[value] == irLoadGlobal and irImmediates[value] < globalNames.len() { text = ", global {globalNames[irImmediates[value]]}" }
+    if not optimizerReport { return text }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irCall or not irCallMayFree(instruction) or valueDead[instruction] { continue }
+            let single: [int] = [instructionPositions[instruction]]
+            if crossesAnyPosition(value, single) {
+                var callee = "indirect"
+                if irImmediates[instruction] >= 0 and irImmediates[instruction] != indirectStackCall { callee = functionDefinitions[irImmediates[instruction]].name }
+                return text + ", across {callee}"
+            }
+        }
+    }
+    return text
+}
+
 fn firstPositionAbove(positions: [int], bound: int) -> int {
     var low = 0
     var high = positions.len()
@@ -3743,7 +3762,7 @@ fn allocateRegisters() {
         var registerCount = integerRegisterNames.len()
         if valueClass == classFloat { registerCount = floatRegisterNames.len() }
         let needsCalleeSaved = crossesAnyPosition(current, callPositions)
-        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]})") }
+        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]}{describeBorrowed(current)})") }
         var blocked: [bool] = []
         for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
         if valueClass != classFloat and scratchClobberPositions.len() > 0 and liveAtAnyPosition(current, scratchClobberPositions) { blocked[scratchIntegerRegister] = true }
