@@ -768,6 +768,23 @@ fn runtimeZeroMemory(address: int, byteCount: int) {
     }
 }
 
+// count words at address set to value: -O2's fill loops (L[i] = v over a range)
+fn runtimeFillWords(address: int, value: int, count: int) {
+    let end = address + count * 8
+    var current = address
+    while current + 32 <= end {
+        store64(current, value)
+        store64(current + 8, value)
+        store64(current + 16, value)
+        store64(current + 24, value)
+        current += 32
+    }
+    while current < end {
+        store64(current, value)
+        current += 8
+    }
+}
+
 // records the globals array so the collector can scan it as a root set
 fn runtimeSetGlobalRoots(rootsAddress: int, rootCount: int) {
     runtimeGlobalRootsAddress = rootsAddress

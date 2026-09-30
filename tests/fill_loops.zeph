@@ -1,0 +1,34 @@
+// -O2 parity cases for fill loops (for i in lo..hi { L[i] = v }): a runtime
+// fill in range, the plain loop otherwise, which fails at the first bad index.
+
+fn fillInts(values: [int], low: int, high: int, value: int) {
+    for i in low..high { values[i] = value }
+}
+
+fn fillFloats(values: [float], low: int, high: int, value: float) {
+    for i in low..high { values[i] = value }
+}
+
+var ints: [int] = []
+var floats: [float] = []
+var flags: [bool] = []
+for i in 0..40 {
+    ints.push(i)
+    floats.push(i as float)
+    flags.push(false)
+}
+fillInts(ints, 3, 17, 7)
+fillInts(ints, 20, 20, 99)            // empty
+fillInts(ints, 30, 25, 99)            // reversed: empty
+fillFloats(floats, 0, 40, 2.5)
+let truth = true
+for i in 10..13 { flags[i] = truth }
+var total = 0
+for value in ints { total = total * 3 + value }
+var floatTotal = 0.0
+for value in floats { floatTotal += value }
+var flagCount = 0
+for flag in flags { if flag { flagCount += 1 } }
+print(total % 1000000007, floatTotal, flagCount, ints[2], ints[3], ints[16], ints[17])
+fillInts(ints, 35, 45, 1)             // past the end: fails at index 40
+print("unreachable")

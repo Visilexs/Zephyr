@@ -1285,7 +1285,7 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
-    if name == "runtimeNewDescribedMap" { return true }
+    if name == "runtimeNewDescribedMap" or name == "runtimeFillWords" { return true }
     if name == "runtimeFormatTypedValue" or name == "runtimeStringToInteger" or name == "runtimeStringToFloat" { return true }
     if name == "runtimePrintTypedValue" or name == "runtimeJoinStringList" or name == "runtimeCharacterFromCode" or name == "runtimeListNew" { return true }
     if name == "runtimeBeginStringInterpolation" or name == "runtimeAppendInterpolationText" or name == "runtimeAppendInterpolationValue" or name == "runtimeEndStringInterpolation" { return true }   // they write the builder's own buffer
@@ -2147,6 +2147,16 @@ fn lowerCall(expression: Node) -> int {
         if isReferenceType(elementType) { return ownedTemporary(popped) }
         return popped
     }
+    if callKind == callKindReadFile or callKind == callKindWriteFile {
+        let path = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        let site = emitIr0(irDataAddress, classInteger, addDataString(panicSite(expression)))
+        if callKind == callKindReadFile { return ownedTemporary(lowerRuntimeCall("runtimeReadFile", [path, site])) }
+        let data = lowerExpression(expression.children[2])
+        if optimizerBailed { return 0 }
+        let written = lowerRuntimeCall("runtimeWriteFile", [path, data, site])
+        return 0
+    }
     if callKind == callKindZeros {
         let zeroCount = lowerExpression(expression.children[1])
         if optimizerBailed { return 0 }
@@ -2585,6 +2595,63 @@ fn popLoopTargets() {
     let poppedMark = regionLoopTemporaryMarks.pop()
 }
 
+// for i in lo..hi { L[i] = v }: leaf bounds and value, a list of plain values
+fn isPlainFillLoop(statement: Node) -> bool {
+    let body = statement.children[2]
+    if body.children.len() != 1 or body.children[0].nodeKind != nodeAssign { return false }
+    if not isLeaf(statement.children[0]) or not isLeaf(statement.children[1]) { return false }
+    let target = body.children[0].children[0]
+    let value = body.children[0].children[1]
+    if target.nodeKind != nodeIndex or target.children[0].nodeKind != nodeIdentifier or typeKinds[target.children[0].typeIndex] != kindList { return false }
+    let elementType = typeElementIds[target.children[0].typeIndex]
+    let elementKind = typeKinds[elementType]
+    if elementKind != kindInteger and elementKind != kindFloat and elementKind != kindBoolean { return false }
+    let index = target.children[1]
+    if index.nodeKind != nodeIdentifier or index.auxiliary != identifierKindLocal or index.slot != statement.slot { return false }
+    return isLeaf(value) and not usesLocal(value, statement.slot)
+}
+
+var loweringFillFallback = false
+
+// in range: one runtime fill; otherwise the plain loop, which fails at the right element
+fn lowerFillLoop(statement: Node) {
+    let assignment = statement.children[2].children[0]
+    let list = lowerExpression(assignment.children[0].children[0])
+    let low = lowerExpression(statement.children[0])
+    let high = lowerExpression(statement.children[1])
+    var value = lowerExpression(assignment.children[1])
+    if optimizerBailed { return }
+    if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+    let checkLowBlock = newBlock()
+    let checkHighBlock = newBlock()
+    let fastBlock = newBlock()
+    let slowBlock = newBlock()
+    let joinBlock = newBlock()
+    terminate(irBranchCompare, [low, high], conditionLess, [checkLowBlock, joinBlock])
+    sealBlock(checkLowBlock)
+    currentIrBlock = checkLowBlock
+    terminate(irBranchCompare, [low, integerConstant(0)], conditionGreaterOrEqual, [checkHighBlock, slowBlock])
+    sealBlock(checkHighBlock)
+    currentIrBlock = checkHighBlock
+    let length = emitIr1(irListLength, classInteger, list, 0)
+    terminate(irBranchCompare, [high, length], conditionLessOrEqual, [fastBlock, slowBlock])
+    sealBlock(fastBlock)
+    currentIrBlock = fastBlock
+    let data = emitIr1(irListData, classInteger, list, 0)
+    irBorrowed[data] = true
+    let address = emitIr2(irAdd, classInteger, data, emitIr2(irShiftLeft, classInteger, low, integerConstant(3), 0), 0)
+    let filled = lowerRuntimeCall("runtimeFillWords", [address, value, emitIr2(irSubtract, classInteger, high, low, 0)])
+    jumpTo(joinBlock)
+    sealBlock(slowBlock)
+    currentIrBlock = slowBlock
+    loweringFillFallback = true
+    lowerStatementKind(statement)
+    loweringFillFallback = false
+    if not blockTerminated[currentIrBlock] { jumpTo(joinBlock) }
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
+}
+
 fn lowerStatementKind(statement: Node) {
     let kind = statement.nodeKind
     if kind == nodeDeclaration {
@@ -2691,6 +2758,10 @@ fn lowerStatementKind(statement: Node) {
         sealBlock(headerBlock)
         sealBlock(exitBlock)
         currentIrBlock = exitBlock
+        return
+    }
+    if kind == nodeRangeLoop and not loweringFillFallback and isPlainFillLoop(statement) {
+        lowerFillLoop(statement)
         return
     }
     if kind == nodeRangeLoop {
@@ -4604,7 +4675,17 @@ fn emitCallInstruction(value: int) {
             emitOptimized("mov qword ptr [rsp + {8 * (operands.len() - 1 - i)}], {argument}")
         }
     }
-    emitOptimized("call {functionCodeLabel(functionDefinitions[functionIndex].label)}")
+    if functionIsRegisterCall(functionIndex) and functionDefinitions[functionIndex].name == "runtimeFillWords" {
+        // (address, value, count) in rcx, rdx, r8: rep stosq, within a call's clobbers
+        emitOptimized("push rdi")
+        emitOptimized("mov rdi, rcx")
+        emitOptimized("mov rax, rdx")
+        emitOptimized("mov rcx, r8")
+        emitOptimized(".byte 243,72,171")
+        emitOptimized("pop rdi")
+    } else {
+        emitOptimized("call {functionCodeLabel(functionDefinitions[functionIndex].label)}")
+    }
     finishResult(value, "rax")
 }
 
@@ -6607,8 +6688,8 @@ fn isLoopStatement(statement: Node) -> bool {
 
 // A range loop the baseline may turn into an AVX2 kernel (tryFill, tryReduce,
 // tryScaledVectorAddition all want a one-assignment body): leave it to them.
-// The same shape checks tryFill, tryReduce and tryScaledVectorAddition make
-// before they commit to emitting their kernel.
+// The same shape checks tryReduce and tryScaledVectorAddition make before
+// they commit to emitting their kernel.
 fn baselineVectorCandidate(statement: Node) -> bool {
     if statement.nodeKind != nodeRangeLoop { return false }
     let body = statement.children[2]
@@ -6617,11 +6698,7 @@ fn baselineVectorCandidate(statement: Node) -> bool {
     let assignment = body.children[0]
     let target = assignment.children[0]
     let value = assignment.children[1]
-    // fill: L[i] = leaf
-    if target.nodeKind == nodeIndex and target.children[0].nodeKind == nodeIdentifier {
-        let index = target.children[1]
-        if index.nodeKind == nodeIdentifier and index.auxiliary == identifierKindLocal and index.slot == loopSlot and isLeaf(value) and not usesLocal(value, loopSlot) { return true }
-    }
+    // fill (L[i] = leaf) lowers here as a plain store loop: not worth a baseline function
     if value.nodeKind != nodeBinary or value.operator != tokenPlus or not expressionEquals(value.children[0], target) { return false }
     let product = value.children[1]
     if product.nodeKind != nodeBinary or product.operator != tokenStar { return false }
