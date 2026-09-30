@@ -6197,6 +6197,7 @@ var inlineEndLabels: [int] = []
 var inlineSubstitutions: [Node] = []   // substituteInlineArgument: per-param substitutions    // codegen: label stack for nested nodeInline ends
 var inlineSharedBodies: [bool] = [] // pristine still borrows the function's unchanged body
 var inlineNeedsSnapshot = false      // current caller needs a snapshot before its first rewrite
+var preInlineBodies: [Node] = []     // -O2: a big caller's body before any expansion (nodeNone if none), for the optimizer's own inliner
 
 // Only the inline eligibility threshold matters; stop walking large bodies early.
 fn nodeCount(node: Node) -> int {
@@ -6333,8 +6334,12 @@ fn expandCall(parent: Node, index: int) {
     // before changing its slots or arguments, including when it calls itself.
     if inlineNeedsSnapshot {
         let caller = functionDefinitions[inlineFunctionIndex]
-        caller.pristine = cloneNode(caller.body)
-        inlineSharedBodies[inlineFunctionIndex] = false
+        if inlineSharedBodies[inlineFunctionIndex] {
+            caller.pristine = cloneNode(caller.body)
+            inlineSharedBodies[inlineFunctionIndex] = false
+        } else {
+            preInlineBodies[inlineFunctionIndex] = cloneNode(caller.body)
+        }
         inlineNeedsSnapshot = false
     }
     let call = parent.children[index]
@@ -6746,12 +6751,13 @@ fn inlinePass(program: Node) {
     // round 1 does the bulk, later rounds touch only the recursive chains.
     var dirty: [bool] = []
     for i in 0..functionDefinitions.len() { dirty.push(true) }
+    while preInlineBodies.len() < functionDefinitions.len() { preInlineBodies.push(makeNode(nodeNone, 0)) }
     for round in 0..4 {
         for i in 0..functionDefinitions.len() {
             let functionDefinition = functionDefinitions[i]
             if functionDefinition.typeParameters.len() == 0 and dirty[i] {
                 inlineFunctionIndex = i
-                inlineNeedsSnapshot = inlineSharedBodies[i]
+                inlineNeedsSnapshot = inlineSharedBodies[i] or (optimizerEnabled and round == 0 and not functionDefinition.inlinable)
                 inlineExpansionCount = 0
                 hoistBlock(functionDefinition.body)
                 dirty[i] = inlineExpansionCount > 0

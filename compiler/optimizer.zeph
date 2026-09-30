@@ -2957,14 +2957,18 @@ fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCou
 }
 
 // lower a whole function body into a region
+var lowerPreInlineBody = false             // lowerFunctionRegion: lower preInlineBodies[] instead of the body
+
 fn lowerFunctionRegion(functionIndex: int) -> bool {
     resetIr()
     let functionDefinition = functionDefinitions[functionIndex]
     regionIsFunction = true
     regionFunctionIndex = functionIndex
     regionReturnType = functionDefinition.returnType
-    regionGlobalsInMemory = subtreeHasUserCall(functionDefinition.body) or assignsReferenceGlobal(functionDefinition.body)
-    findOwnedLocals(functionDefinition.body)
+    var body = functionDefinition.body
+    if lowerPreInlineBody { body = preInlineBodies[functionIndex] }
+    regionGlobalsInMemory = subtreeHasUserCall(body) or assignsReferenceGlobal(body)
+    findOwnedLocals(body)
     let entryBlock = newBlock()
     blockSealed[entryBlock] = true
     currentIrBlock = entryBlock
@@ -2984,7 +2988,7 @@ fn lowerFunctionRegion(functionIndex: int) -> bool {
     regionReturnBlock = newBlock()
     let hasValue = typeKinds[regionReturnType] != kindVoid
     if hasValue { regionReturnVariable = temporaryVariable(classOfType(regionReturnType), false) }
-    lowerBlock(functionDefinition.body)
+    lowerBlock(body)
     if optimizerBailed { return false }
     jumpTo(regionReturnBlock)
     sealBlock(regionReturnBlock)
@@ -6530,6 +6534,19 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
         inliningEnabled = false
         compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
         inliningEnabled = true
+    }
+    // too big once the front end inlined into it: its body from before that,
+    // left to the optimizer's own budgeted inliner
+    if not compiled and textStartsWith(optimizerBailReason, "region too large") and functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone {
+        optimizerNote("function {functionDefinition.name}: retry on the body before inlining ({optimizerBailReason})")
+        lowerPreInlineBody = true
+        compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
+        if not compiled and inlinedCallCount > 0 {
+            inliningEnabled = false
+            compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
+            inliningEnabled = true
+        }
+        lowerPreInlineBody = false
     }
     if not compiled {
         optimizerNote("function {functionDefinition.name}: baseline ({optimizerBailReason})")
