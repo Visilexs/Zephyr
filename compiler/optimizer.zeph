@@ -209,7 +209,7 @@ var blockPromotedRegisters: [[int]] = []
 var preheaderLoadGroups: [[int]] = []
 var preheaderLoadRegisters: [[int]] = []
 var emittingBlock = 0 - 1
-var nonFreeingIndirectCalls: [int] = []     // calls through a vtable whose every implementation never frees
+var nonFreeingCalls: [int] = []             // vtable calls whose every implementation never frees; early releases of plain structs
 var nextStackCallCannotFree = false         // an inlined closure body's captures
 struct InlineFrame {
     prefix: str, ownedSlots: [int: bool], sourceMakesCalls: bool, returnBlock: int, returnVariable: int,
@@ -220,6 +220,7 @@ var parameterValues: [int] = []
 
 // ---- ownership: a fresh reference carries one count the region must hand on or drop ----
 var pendingTemporaries: [int] = []         // fresh values the current statement has yet to consume or release
+var earlyReleaseVariables: [int] = []         // owned locals the current list store releases once its source is lowered
 var ownedLocalSlots: [int: bool] = [:]     // reference locals that own their value
 var ownedScopes: [[int]] = []              // per open block: the owned variables it declared, in order
 var regionLoopScopeDepths: [int] = []      // parallel to regionBreakTargets: ownedScopes.len() at the loop
@@ -326,7 +327,7 @@ fn resetIr() {
     var noPromotedGroups: [[int]] = []
     blockPromotedGroups = noPromotedGroups
     var noNonFreeingCalls: [int] = []
-    nonFreeingIndirectCalls = noNonFreeingCalls
+    nonFreeingCalls = noNonFreeingCalls
     var noParameters: [int] = []
     parameterValues = noParameters
     var noPending: [int] = []
@@ -676,12 +677,65 @@ fn assignVariable(target: Node, value: int) {
 fn lowerBlock(block: Node) {
     var noVariables: [int] = []
     ownedScopes.push(noVariables)
-    for statement in block.children {
+    for i in 0..block.children.len() {
         if optimizerBailed { return }
-        lowerStatement(statement)
+        earlyReleaseVariables = findEarlyReleases(block.children, i)
+        lowerStatement(block.children[i])
     }
     if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
     let closedScope = ownedScopes.pop()
+}
+
+// Owned plain-struct locals of this block whose last use is the source of
+// statement `index`, a list element store: released once the source is
+// lowered, so an element they were read from can be overwritten in place.
+fn findEarlyReleases(statements: [Node], index: int) -> [int] {
+    var found: [int] = []
+    let statement = statements[index]
+    if statement.nodeKind != nodeAssign or statement.children[0].nodeKind != nodeIndex { return found }
+    let target = statement.children[0]
+    if typeKinds[target.children[0].typeIndex] == kindMap or not isPlainStruct(target.typeIndex) { return found }
+    let scope = ownedScopes[ownedScopes.len() - 1]
+    for i in 0..index {
+        let declaration = statements[i]
+        if declaration.nodeKind != nodeDeclaration or declaration.auxiliary != identifierKindLocal or not isPlainStruct(declaration.typeIndex) { continue }
+        let slot = declaration.slot
+        let variable = variableForSlot(identifierKindLocal, slot, declaration.typeIndex)
+        if not listContains(scope, variable) or not mentionsSlot(statement.children[1], slot) or mentionsSlot(target, slot) { continue }
+        var usedLater = false
+        for later in (index + 1)..statements.len() {
+            if mentionsSlot(statements[later], slot) { usedLater = true }
+        }
+        if not usedLater { found.push(variable) }
+    }
+    return found
+}
+
+// conservative: closures and outlined loops count as mentioning every slot
+fn mentionsSlot(node: Node, slot: int) -> bool {
+    let kind = node.nodeKind
+    if kind == nodeFunctionLiteral or kind == nodeOutlinedLoop { return true }
+    if kind == nodeIdentifier and node.slot == slot { return true }
+    for child in node.children {
+        if mentionsSlot(child, slot) { return true }
+    }
+    return false
+}
+
+// release the variables findEarlyReleases chose; their scope forgets them
+fn releaseEarly(variables: [int]) {
+    if variables.len() == 0 { return }
+    let scopeIndex = ownedScopes.len() - 1
+    var kept: [int] = []
+    for variable in ownedScopes[scopeIndex] {
+        if listContains(variables, variable) {
+            // frees at most the struct itself, whose last use is behind: a
+            // borrowed pointer to it leans on some other holder's count
+            nonFreeingCalls.push(lowerRuntimeCall("runtimeReleaseReference", [readVariableValue(variable)]))
+        }
+        else { kept.push(variable) }
+    }
+    ownedScopes[scopeIndex] = kept
 }
 
 fn lowerExpression(expression: Node) -> int {
@@ -870,7 +924,7 @@ fn lowerStackCall(operands: [int], argumentValues: [int], resultType: int) -> in
     }
     let result = emitIr(irCall, classInteger, callOperands, indirectStackCall)
     irReferenceArguments[result] = 0
-    if nextStackCallCannotFree { nonFreeingIndirectCalls.push(result) }
+    if nextStackCallCannotFree { nonFreeingCalls.push(result) }
     nextStackCallCannotFree = false
     if typeKinds[resultType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
     return result
@@ -1079,13 +1133,11 @@ fn callKeepsHeapIntact(instruction: int) -> bool {
 
 // may this call drop a count a borrowed value leans on (it may still write memory)
 fn irCallMayFree(instruction: int) -> bool {
-    let functionIndex = irImmediates[instruction]
-    if functionIndex == indirectStackCall {
-        for call in nonFreeingIndirectCalls {
-            if call == instruction { return false }
-        }
-        return true
+    for call in nonFreeingCalls {
+        if call == instruction { return false }
     }
+    let functionIndex = irImmediates[instruction]
+    if functionIndex == indirectStackCall { return true }
     if functionIndex < 0 { return true }
     return not callKeepsHeapIntact(instruction) and functionMayFree(functionIndex)
 }
@@ -1571,6 +1623,9 @@ fn lowerMapUpdate(target: Node, source: Node) -> bool {
 // a reference into a field or list element: the slot takes the value's count
 // and drops the one it held
 fn lowerReferenceStore(target: Node, source: Node) {
+    let releasing = earlyReleaseVariables
+    var noVariables: [int] = []
+    earlyReleaseVariables = noVariables
     var address = 0
     if target.nodeKind == nodeMember {
         if typeKinds[target.children[0].typeIndex] != kindStruct {
@@ -1594,6 +1649,7 @@ fn lowerReferenceStore(target: Node, source: Node) {
     let index = lowerExpression(target.children[1])
     let value = takeOwnership(lowerExpression(source))
     if optimizerBailed { return }
+    releaseEarly(releasing)
     let data = lowerElementAddress(list, index, target)
     let offset = emitIr2(irShiftLeft, classInteger, index, integerConstant(3), 0)
     address = emitIr2(irAdd, classInteger, data, offset, 0)
