@@ -367,6 +367,7 @@ var loopNestingDepth = 0
 var localSlotCount = 0
 var atGlobal = false
 var globalCount = 0
+var globalIsMutable: [bool] = []           // by global index: false for a `let`, never reassigned
 // codegen
 var assemblyLines: [str] = []
 var nextLabelId = 0
@@ -4509,6 +4510,8 @@ fn checkStatement(statement: Node) {
             statement.auxiliary = identifierKindGlobal
             statement.slot = globalCount
             globalCount += 1
+            while globalIsMutable.len() < globalCount { globalIsMutable.push(true) }
+            globalIsMutable[statement.slot] = statement.isMutable
         } else {
             statement.auxiliary = identifierKindLocal
             statement.slot = localSlotCount
@@ -12128,9 +12131,14 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int \{\n")
+    sourceLines.push("    if leftStringAddress == rightStringAddress \{ return 1 \}\n")
     sourceLines.push("    let leftLength = load64(leftStringAddress)\n")
     sourceLines.push("    if leftLength != load64(rightStringAddress) \{ return 0 \}\n")
     sourceLines.push("    var index = 0\n")
+    sourceLines.push("    while index + 8 <= leftLength \{                 // a word at a time, then the tail bytewise\n")
+    sourceLines.push("        if load64(leftStringAddress + 8 + index) != load64(rightStringAddress + 8 + index) \{ return 0 \}\n")
+    sourceLines.push("        index += 8\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    while index < leftLength \{\n")
     sourceLines.push("        if load8(leftStringAddress + 8 + index) != load8(rightStringAddress + 8 + index) \{ return 0 \}\n")
     sourceLines.push("        index += 1\n")
@@ -18776,7 +18784,6 @@ fn streamAssembledLines() {
     assemblyLines = noLines
 }
 
-var assemblyListingEnabled = false    // --asm: write <output>.s, the assembly text before it is assembled
 var symbolMapEnabled = false    // --map: write <output>.map, "rva name" per code symbol (for profilers)
 
 fn writeSymbolMap(path: str) {
@@ -18794,7 +18801,6 @@ fn assembleAndLink(path: str) {
         return
     }
     currentAssemblySection = sectionText
-    if assemblyListingEnabled { writeFile(path + ".s", assemblyLines.join()) }
     for i in 0..assemblyLines.len() {
         assembleLine(assemblyLines[i])
     }
@@ -18836,7 +18842,6 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "-O2" { optimizerEnabled = true }
     else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--map" { symbolMapEnabled = true }
-    else if argument == "--asm" { assemblyListingEnabled = true }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true
         includeRuntime = true

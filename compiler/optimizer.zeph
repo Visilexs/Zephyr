@@ -68,6 +68,7 @@ let irStoreGlobal = 35          // immediate = global index, a = value
 let irBoundsCheck = 36          // a = list, b = index; immediate = panic string index
 let irZeroCheck = 37            // a = divisor; immediate = panic string index
 let irCall = 38                 // immediate = functionDefinitions index; operands = arguments
+let indirectStackCall = 1 << 40 // irCall immediate: operands[0] is the code address, the rest go on the stack
 let irIntegerMinimum = 39
 let irIntegerMaximum = 40
 let irIntegerAbsolute = 41
@@ -86,7 +87,7 @@ let irCopy = 53                 // a (optimizations forward it away; never emitt
 let irDataAddress = 54          // immediate = data string index: lea of a string literal
 let irDividePowerOfTwo = 55     // a / 2^immediate, rounding toward zero like idiv
 let irModuloPowerOfTwo = 56     // a % 2^immediate, sign of the dividend like idiv
-let irListLength = 57           // [a + 0]: a list's or string's length. Only runtime calls change it.
+let irListLength = 57           // [a + 0]: a list's or string's length; immediate 1 = a string's, which never changes
 let irListData = 58             // [a + 16]: a list's element array. Only runtime calls change it.
 let irReciprocal = 59           // floor((2^64 - 1) / a) for a > 0, else 0: the multiplier for irDivideByInvariant
 let irDivideByInvariant = 60    // a / b with c = irReciprocal(b): multiply-high plus one correction step
@@ -161,6 +162,7 @@ var currentIrBlock = 0
 var currentLoopDepth = 0
 var regionIsFunction = true                // whole function, or an outlined loop
 var regionFunctionIndex = 0 - 1
+var regionEnvironmentValue = 0 - 1         // a closure body's env: its captures, by value, never reassigned
 var regionParentSlotCount = 0
 var regionParentParameterCount = 0
 var regionParentRegisterCall = false
@@ -172,6 +174,8 @@ var regionContinueTargets: [int] = []
 var regionInlineEnds: [int] = []
 var regionInlineSlots: [int] = []
 var regionInlineTypes: [int] = []
+var regionInlineScopeDepths: [int] = []     // ownedScopes an inline return leaves
+var regionInlineTemporaryMarks: [int] = []  // pendingTemporaries an inline return releases
 var regionReturnBlock = 0
 var regionReturnVariable = 0 - 1
 var regionReturnType = 4
@@ -182,7 +186,19 @@ var inlinedCallCount = 0                    // calls this lowering inlined: a fa
 var inlineStack: [int] = []                 // functions being inlined, innermost last
 var inlineKeyPrefix = ""                    // variable-key namespace of the body being inlined
 var inlineInstanceCount = 0
+var variableIsInlineResult: [bool] = []     // the frontend's slot for an inlined call's result
 var variableOwnsValue: [bool] = []          // an owned reference local (decided when the variable is made)
+// closure literals this region made: the cell, its function, the values its env holds
+var knownClosureCells: [int] = []
+var knownClosureFunctions: [int] = []
+var knownClosureCaptures: [[int]] = []
+var variableKnownClosure: [int] = []        // an inlined parameter bound to a known closure (index above), else -1
+var inlineCaptureValues: [int] = []         // an inlined closure body's captures
+struct InlineFrame {
+    prefix: str, ownedSlots: [int: bool], sourceMakesCalls: bool, returnBlock: int, returnVariable: int,
+    returnType: int, returnScopeDepth: int, returnTemporaryMark: int, captureValues: [int]
+}
+var inlineFrames: [InlineFrame] = []       // what an inlined body saved of its caller's lowering state
 var parameterValues: [int] = []
 
 // ---- ownership: a fresh reference carries one count the region must hand on or drop ----
@@ -258,6 +274,10 @@ fn resetIr() {
     regionInlineSlots = noSlots
     var noTypes: [int] = []
     regionInlineTypes = noTypes
+    var noInlineDepths: [int] = []
+    regionInlineScopeDepths = noInlineDepths
+    var noInlineMarks: [int] = []
+    regionInlineTemporaryMarks = noInlineMarks
     regionFrameValue = 0 - 1
     regionReturnVariable = 0 - 1
     regionReturnScopeDepth = 0
@@ -265,9 +285,23 @@ fn resetIr() {
     inlinedCallCount = 0
     var noInlines: [int] = []
     inlineStack = noInlines
+    var noFrames: [InlineFrame] = []
+    inlineFrames = noFrames
     inlineKeyPrefix = ""
     var noOwnership: [bool] = []
     variableOwnsValue = noOwnership
+    var noInlineResults: [bool] = []
+    variableIsInlineResult = noInlineResults
+    var noCells: [int] = []
+    knownClosureCells = noCells
+    var noClosureFunctions: [int] = []
+    knownClosureFunctions = noClosureFunctions
+    var noClosureCaptures: [[int]] = []
+    knownClosureCaptures = noClosureCaptures
+    var noKnownClosures: [int] = []
+    variableKnownClosure = noKnownClosures
+    var noCaptureValues: [int] = []
+    inlineCaptureValues = noCaptureValues
     var noParameters: [int] = []
     parameterValues = noParameters
     var noPending: [int] = []
@@ -396,6 +430,8 @@ fn variableForKey(key: str, kind: int, index: int, valueClass: int, isReference:
     variableIsReference.push(isReference)
     variableDeclaredInside.push(false)
     variableOwnsValue.push(false)
+    variableIsInlineResult.push(false)
+    variableKnownClosure.push(0 - 1)
     for block in 0..currentDefinitions.len() { currentDefinitions[block].push(0 - 1) }
     return number
 }
@@ -491,8 +527,8 @@ fn loadVariableHome(variable: int, block: int) -> int {
     if kind == identifierKindGlobal {
         if valueClass == classFloat { value = addInstruction(block, irFloatLoadGlobal, classFloat, noOperands, index) }
         else { value = addInstruction(block, irLoadGlobal, classInteger, noOperands, index) }
-        if variableIsReference[variable] and regionGlobalsInMemory {
-            irBorrowed[value] = true              // a callee may reassign the global
+        if variableIsReference[variable] and regionGlobalsInMemory and (index >= globalIsMutable.len() or globalIsMutable[index]) {
+            irBorrowed[value] = true              // a callee may reassign the global (a `let` it never can)
             irFromGlobal[value] = true
         }
     } else if kind == identifierKindTemporary or (regionIsFunction and kind == identifierKindLocal) {
@@ -628,6 +664,21 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeInteger or kind == nodeBoolean { return integerConstant(expression.integerValue) }
     if kind == nodeFloat { return emitIr0(irFloatConstant, classFloat, bits(expression.floatValue)) }
     if isPlainLiteral(expression) { return emitIr0(irDataAddress, classInteger, addDataString(expression.children[0].name)) }   // static: never freed, safe anywhere
+    if kind == nodeIdentifier and expression.auxiliary == identifierKindCapture {
+        if inlineStack.len() > 0 and functionDefinitions[inlineStack[inlineStack.len() - 1]].hasEnvironment {
+            return inlineCaptureValues[expression.slot]           // the env holds it, the caller holds the env
+        }
+        if regionEnvironmentValue < 0 or inlineStack.len() > 0 {
+            optimizerBail("capture outside its closure body")
+            return 0
+        }
+        ensureOpenBlock()
+        if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatLoad, classFloat, regionEnvironmentValue, 8 * expression.slot) }
+        return emitIr1(irLoad, classInteger, regionEnvironmentValue, 8 * expression.slot)       // the env keeps it alive
+    }
+    if kind == nodeIdentifier and expression.auxiliary == identifierKindFunction {
+        return lowerClosureCell(functionDefinitions[expression.referenceIndex], integerConstant(0))
+    }
     if kind == nodeIdentifier {
         let variable = identifierVariable(expression)
         if optimizerBailed { return 0 }
@@ -693,6 +744,8 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeCall { return lowerCall(expression) }
     if kind == nodeStructLiteral { return lowerStructLiteral(expression) }
     if kind == nodeList { return lowerListLiteral(expression) }
+    if kind == nodeInterfaceBox { return lowerInterfaceBox(expression) }
+    if kind == nodeFunctionLiteral { return lowerFunctionLiteral(expression) }
     optimizerBail("expression kind {kind}")
     return 0
 }
@@ -715,6 +768,184 @@ fn lowerStructLiteral(expression: Node) -> int {
         else { let stored = emitIr2(irStore, classInteger, object, value, 8 * fieldInitializer.slot) }
     }
     return object
+}
+
+// A call through a code address, stack convention. An interface value is a
+// {vtable, data} cell: self is the data, the code sits in the vtable's slot.
+// A function value is a {code, env} cell: env goes deepest, past the arguments.
+// The cell is borrowed for the call, as the baseline does.
+fn lowerIndirectCall(expression: Node) -> int {
+    let isDispatch = expression.auxiliary == callKindInterfaceDispatch
+    var cellNode = expression.children[0]
+    if isDispatch { cellNode = cellNode.children[0] }
+    var arguments: [Node] = []
+    for i in 1..expression.children.len() { arguments.push(expression.children[i]) }
+    var pinned: [int] = []
+    let knownClosure = knownClosureOfNode(cellNode)
+    if optimizerBailed { return 0 }
+    if not isDispatch and knownClosure >= 0 and canInlineWithin(knownClosureFunctions[knownClosure], 60) {
+        let inlineArguments = lowerInlineArguments(arguments, pinned)
+        if optimizerBailed { return 0 }
+        let inlinedResult = lowerInlinedBody(knownClosureFunctions[knownClosure], inlineArguments, knownClosureCaptures[knownClosure])
+        for value in pinned { emitRelease(value) }
+        if isReferenceType(expression.typeIndex) { return ownedTemporary(inlinedResult) }
+        return inlinedResult
+    }
+    let cell = pinBeforeLaterCalls(lowerExpression(cellNode), cellNode, arguments, pinned)
+    if optimizerBailed { return 0 }
+    var argumentValues: [int] = []
+    for i in 0..arguments.len() {
+        var value = lowerExpression(arguments[i])
+        if optimizerBailed { return 0 }
+        value = pinBeforeLaterCalls(value, arguments[i], argumentsAfter(arguments, i), pinned)
+        argumentValues.push(value)
+    }
+    pinArguments(argumentValues, arguments, false, pinned)
+    if argumentValues.len() > 60 {
+        optimizerBail("too many arguments")
+        return 0
+    }
+    // a closure or box never changes: its fields load next to the call, not across the arguments
+    var operands: [int] = []
+    if isDispatch {
+        let vtable = emitIr1(irLoad, classInteger, cell, 0)
+        operands.push(emitIr1(irLoad, classInteger, vtable, 8 * expression.slot))
+        operands.push(emitIr1(irLoad, classInteger, cell, 8))             // self
+    } else {
+        operands.push(emitIr1(irLoad, classInteger, cell, 0))
+        operands.push(emitIr1(irLoad, classInteger, cell, 8))             // env
+    }
+    var result = 0
+    if isDispatch { result = lowerGuardedDispatch(expression, cellNode, operands, argumentValues) }
+    else { result = lowerStackCall(operands, argumentValues, expression.typeIndex) }
+    for value in pinned { emitRelease(value) }
+    if isReferenceType(expression.typeIndex) { return ownedTemporary(result) }
+    return result
+}
+
+// the call through operands[0] with [operands[1..], arguments...] on the stack, its result retyped
+fn lowerStackCall(operands: [int], argumentValues: [int], resultType: int) -> int {
+    var callOperands: [int] = []
+    for operand in operands { callOperands.push(operand) }
+    for value in argumentValues {
+        if irClasses[value] == classFloat { callOperands.push(emitIr1(irBitsFromFloat, classInteger, value, 0)) }
+        else { callOperands.push(value) }
+    }
+    let result = emitIr(irCall, classInteger, callOperands, indirectStackCall)
+    irReferenceArguments[result] = 0
+    if typeKinds[resultType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
+    return result
+}
+
+// a direct call (or the body inlined) of a known function on already-lowered values
+fn lowerKnownCall(functionIndex: int, argumentValues: [int]) -> int {
+    if canInline(functionIndex) { return lowerInlinedCall(functionIndex, argumentValues) }
+    let functionDefinition = functionDefinitions[functionIndex]
+    var operands: [int] = []
+    for value in argumentValues {
+        if irClasses[value] == classFloat { operands.push(emitIr1(irBitsFromFloat, classInteger, value, 0)) }
+        else { operands.push(value) }
+    }
+    let result = emitIr(irCall, classInteger, operands, functionIndex)
+    irReferenceArguments[result] = 0
+    if typeKinds[functionDefinition.returnType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
+    return result
+}
+
+// Guarded devirtualization: every (struct, interface) vtable is known by now,
+// so a dispatch on an interface with a few implementors compares the vtable
+// against each and calls (or inlines) that struct's method directly. The
+// indirect call stays as the last resort.
+fn lowerGuardedDispatch(expression: Node, cellNode: Node, operands: [int], argumentValues: [int]) -> int {
+    let interfaceIndex = typeDefinitionIds[cellNode.typeIndex]
+    let interfaceDefinition = interfaceDefinitions[interfaceIndex]
+    let methodName = interfaceDefinition.methodNames[expression.slot]
+    var tables: [int] = []
+    var methods: [int] = []
+    for table in 0..dispatchStructIndices.len() {
+        if dispatchInterfaceIndices[table] != interfaceIndex { continue }
+        let methodIndex = findFunction(structDefinitions[dispatchStructIndices[table]].name + "." + methodName)
+        if methodIndex < 0 { return lowerStackCall(operands, argumentValues, expression.typeIndex) }
+        tables.push(table)
+        methods.push(methodIndex)
+    }
+    if tables.len() == 0 or tables.len() > 4 { return lowerStackCall(operands, argumentValues, expression.typeIndex) }
+    let vtable = irOperands[operands[0]][0]           // operands[0] loads the code from the vtable
+    var directArguments: [int] = [operands[1]]
+    for value in argumentValues { directArguments.push(value) }
+    let hasValue = typeKinds[expression.typeIndex] != kindVoid
+    var result = 0 - 1
+    if hasValue { result = temporaryVariable(classOfType(expression.typeIndex), false) }
+    let joinBlock = newBlock()
+    for i in 0..tables.len() {
+        let matchBlock = newBlock()
+        let nextBlock = newBlock()
+        ensureOpenBlock()
+        terminate(irBranchCompare, [vtable, symbolAddress("__vt{tables[i]}")], conditionEqual, [matchBlock, nextBlock])
+        sealBlock(matchBlock)
+        sealBlock(nextBlock)
+        currentIrBlock = matchBlock
+        let value = lowerKnownCall(methods[i], directArguments)
+        if optimizerBailed { return 0 }
+        if hasValue { writeVariableValue(result, value) }
+        jumpTo(joinBlock)
+        currentIrBlock = nextBlock
+    }
+    let fallback = lowerStackCall(operands, argumentValues, expression.typeIndex)
+    if hasValue { writeVariableValue(result, fallback) }
+    jumpTo(joinBlock)
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
+    if hasValue { return readVariableValue(result) }
+    return 0
+}
+
+// a struct as an interface value: a fresh {vtable, data} cell that takes the data's count
+fn lowerInterfaceBox(expression: Node) -> int {
+    let data = takeOwnership(lowerExpression(expression.children[0]))
+    if optimizerBailed { return 0 }
+    let cellShape = addShapeDescriptor("1, 2, 2")
+    let descriptor = symbolAddress("__dt{cellShape}")
+    let cell = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(16), descriptor]))
+    let dataStored = emitIr2(irStore, classInteger, cell, data, 8)
+    let vtableStored = emitIr2(irStore, classInteger, cell, symbolAddress("__vt{expression.operator}"), 0)
+    return cell
+}
+
+// a function value: a fresh {code, env} cell; `environment`'s count moves into it
+fn lowerClosureCell(functionDefinition: FunctionDefinition, environment: int) -> int {
+    var cell = 0
+    if isConstantValue(environment) { cell = ownedTemporary(lowerRuntimeCall("runtimeAllocateObject", [integerConstant(16)])) }      // no env: a plain function
+    else {
+        let cellShape = addShapeDescriptor("1, 2, 2")
+        cell = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(16), symbolAddress("__dt{cellShape}")]))
+    }
+    let environmentStored = emitIr2(irStore, classInteger, cell, environment, 8)
+    let codeStored = emitIr2(irStore, classInteger, cell, symbolAddress(functionCodeLabel(functionDefinition.label)), 0)
+    return cell
+}
+
+// a closure: its captures snapshot into a fresh env, which the cell owns
+fn lowerFunctionLiteral(expression: Node) -> int {
+    let captureCount = expression.children.len() - 3
+    var captureTypes: [int] = []
+    for i in 0..captureCount { captureTypes.push(expression.children[3 + i].typeIndex) }
+    var captureValues: [int] = []
+    let environmentDescriptor = symbolAddress("__dt{slotShapeDescriptor(captureTypes)}")
+    let environment = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(8 * captureCount), environmentDescriptor]))
+    for i in 0..captureCount {
+        var value = lowerExpression(expression.children[3 + i])
+        if optimizerBailed { return 0 }
+        if isReferenceType(captureTypes[i]) { value = takeOwnership(value) }
+        if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, environment, value, 8 * i) }
+        else { let stored = emitIr2(irStore, classInteger, environment, value, 8 * i) }
+        captureValues.push(value)
+    }
+    let cell = lowerClosureCell(functionDefinitions[expression.referenceIndex], takeOwnership(environment))
+    knownClosureCells.push(cell)
+    knownClosureFunctions.push(expression.referenceIndex)
+    knownClosureCaptures.push(captureValues)
+    return cell
 }
 
 // a fresh list of known length: the elements' counts move into it
@@ -798,12 +1029,13 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
-    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeNewDescribedList"
+    if name == "runtimeMapGet" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
+    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
 
 fn callKeepsHeapIntact(instruction: int) -> bool {
     let functionIndex = irImmediates[instruction]
-    return functionIndex >= 0 and keepsHeapIntact(functionDefinitions[functionIndex].name)
+    return functionIndex >= 0 and functionIndex != indirectStackCall and keepsHeapIntact(functionDefinitions[functionIndex].name)
 }
 
 fn lowerRuntimeCall(name: str, operands: [int]) -> int {
@@ -866,17 +1098,49 @@ fn releaseTemporariesOnExit(mark: int) {
     }
 }
 
-fn releaseScopesFrom(depth: int) {
+fn releaseScopesFrom(depth: int) { releaseScopesExcept(depth, 0 - 1) }
+
+// the owned locals of scopes from `depth` on, but `kept` (a count moving elsewhere)
+fn releaseScopesExcept(depth: int, kept: int) {
     var scopeIndex = ownedScopes.len() - 1
     while scopeIndex >= depth {
         let variables = ownedScopes[scopeIndex]
         var index = variables.len() - 1
         while index >= 0 {
-            emitRelease(readVariableValue(variables[index]))
+            if variables[index] != kept { emitRelease(readVariableValue(variables[index])) }
             index -= 1
         }
         scopeIndex -= 1
     }
+}
+
+// a declaration takes an inline call's result: the frontend's result slot, read
+// once and owned in this same scope, hands its count over instead of keeping one
+fn tookInlineResult(value: int) -> bool {
+    if isPendingTemporary(value) { return false }
+    let scope = ownedScopes[ownedScopes.len() - 1]
+    var kept: [int] = []
+    var found = false
+    for variable in scope {
+        if not found and variableIsInlineResult[variable] and readVariableValue(variable) == value { found = true }
+        else { kept.push(variable) }
+    }
+    if found { ownedScopes[ownedScopes.len() - 1] = kept }
+    return found
+}
+
+// the owned local `expression` names, when its scope is at or past `depth`
+// (an exit about to release it), else -1
+fn ownedVariableLeaving(expression: Node, depth: int) -> int {
+    if expression.nodeKind != nodeIdentifier or expression.auxiliary != identifierKindLocal { return 0 - 1 }
+    let variable = identifierVariable(expression)
+    if optimizerBailed or not isOwnedVariable(variable) { return 0 - 1 }
+    for scopeIndex in depth..ownedScopes.len() {
+        for scoped in ownedScopes[scopeIndex] {
+            if scoped == variable { return variable }
+        }
+    }
+    return 0 - 1
 }
 
 fn isOwnedVariable(variable: int) -> bool { return variableOwnsValue[variable] }
@@ -889,7 +1153,8 @@ fn storeVariable(variable: int, value: int, isDeclaration: bool) {
             optimizerBail("owned local outside a block")
             return
         }
-        let owned = takeOwnership(value)
+        var owned = value
+        if not (isDeclaration and tookInlineResult(value)) { owned = takeOwnership(value) }
         if isDeclaration {
             declareVariable(variable, owned)
             ownedScopes[ownedScopes.len() - 1].push(variable)
@@ -930,6 +1195,10 @@ fn markOwnedLocals(node: Node) -> bool {
         ownedLocalSlots[slot] = true
         changed = true
     }
+    if node.nodeKind == nodeInline and isReferenceType(node.typeIndex) and not ownedLocalSlots.has(node.slot) {
+        ownedLocalSlots[node.slot] = true             // an inlined call's result is fresh
+        changed = true
+    }
     for child in node.children {
         if markOwnedLocals(child) { changed = true }
     }
@@ -952,11 +1221,24 @@ fn mayCallFreeingCode(node: Node) -> bool {
     if node.nodeKind == nodeCall {
         let callKind = node.auxiliary
         if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
-        if callKind == callKindRuntimeCall or callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect { return true }
+        if callKind == callKindRuntimeCall and not keepsHeapIntact(node.name) { return true }
+        if callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect { return true }
         if callKind == callKindInterfaceDispatch or callKind == callKindWindows or callKind == callKindFunctionPointerCall { return true }
     }
     for child in node.children {
         if mayCallFreeingCode(child) { return true }
+    }
+    return false
+}
+
+// can evaluating this subtree drop a count some other holder keeps: a freeing
+// call, or an inlined body (its statements may assign)
+fn mayFreeOrReassign(node: Node) -> bool {
+    let kind = node.nodeKind
+    if kind == nodeInline or kind == nodeInlineReturn or kind == nodeLetExpression or kind == nodeFunctionLiteral { return true }
+    if kind == nodeCall and mayCallFreeingCode(node) { return true }
+    for child in node.children {
+        if mayFreeOrReassign(child) { return true }
     }
     return false
 }
@@ -972,7 +1254,7 @@ fn findOwnedLocals(root: Node) {
 fn pinBeforeLaterCalls(value: int, argument: Node, laterArguments: [Node], pinned: [int]) -> int {
     if not irBorrowed[value] or not isReferenceType(argument.typeIndex) { return value }
     for later in laterArguments {
-        if hasCall(later) {
+        if mayFreeOrReassign(later) {
             let retained = emitRetain(value)
             pinned.push(retained)
             return retained
@@ -986,7 +1268,7 @@ fn lowerContainer(container: Node, later: [Node]) -> int {
     let value = lowerExpression(container)
     if optimizerBailed or not irBorrowed[value] or not isReferenceType(container.typeIndex) { return value }
     for operand in later {
-        if hasCall(operand) { return ownedTemporary(emitRetain(value)) }
+        if mayFreeOrReassign(operand) { return ownedTemporary(emitRetain(value)) }
     }
     return value
 }
@@ -1055,7 +1337,52 @@ fn lowerElementAddress(list: int, index: int, site: Node) -> int {
     return data
 }
 
+// m[k]: the map's lookup hands back a count of its own for a reference value
+fn lowerMapRead(expression: Node) -> int {
+    let map = lowerContainer(expression.children[0], [expression.children[1]])
+    let key = lowerExpression(expression.children[1])
+    if optimizerBailed { return 0 }
+    let site = emitIr0(irDataAddress, classInteger, addDataString(panicSite(expression)))
+    let value = lowerRuntimeCall("runtimeMapGet", [map, key, site])
+    if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatFromBits, classFloat, value, 0) }
+    if isReferenceType(expression.typeIndex) { return ownedTemporary(value) }
+    return value
+}
+
+// a reference into a field or list element: the slot takes the value's count
+// and drops the one it held
+fn lowerReferenceStore(target: Node, source: Node) {
+    var address = 0
+    if target.nodeKind == nodeMember {
+        if typeKinds[target.children[0].typeIndex] != kindStruct {
+            optimizerBail("member store to a non-struct")
+            return
+        }
+        let base = lowerContainer(target.children[0], [source])
+        let value = takeOwnership(lowerExpression(source))
+        if optimizerBailed { return }
+        address = emitIr2(irAdd, classInteger, base, integerConstant(8 * target.slot), 0)
+        let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
+        return
+    }
+    if target.nodeKind != nodeIndex {
+        optimizerBail("assignment target kind {target.nodeKind}")
+        return
+    }
+    let elementType = plainListElement(target.children[0].typeIndex)
+    if optimizerBailed { return }
+    let list = lowerContainer(target.children[0], [target.children[1], source])
+    let index = lowerExpression(target.children[1])
+    let value = takeOwnership(lowerExpression(source))
+    if optimizerBailed { return }
+    let data = lowerElementAddress(list, index, target)
+    let offset = emitIr2(irShiftLeft, classInteger, index, integerConstant(3), 0)
+    address = emitIr2(irAdd, classInteger, data, offset, 0)
+    let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
+}
+
 fn lowerIndexRead(expression: Node) -> int {
+    if typeKinds[expression.children[0].typeIndex] == kindMap { return lowerMapRead(expression) }
     let elementType = plainListElement(expression.children[0].typeIndex)
     if optimizerBailed { return 0 }
     let list = lowerContainer(expression.children[0], [expression.children[1]])
@@ -1113,7 +1440,9 @@ fn lowerCall(expression: Node) -> int {
             optimizerBail("len of kind {receiverKind}")
             return 0
         }
-        return emitIr1(irListLength, classInteger, lowerExpression(receiver), 0)
+        var immutable = 0
+        if receiverKind == kindString { immutable = 1 }
+        return emitIr1(irListLength, classInteger, lowerExpression(receiver), immutable)
     }
     if callKind == callKindLoad64 or callKind == callKindLoad32 or callKind == callKindLoad16 or callKind == callKindLoad8 {
         var addressNode = expression.children[1]
@@ -1157,6 +1486,9 @@ fn lowerCall(expression: Node) -> int {
         irReferenceArguments[result] = 0
         return result
     }
+    if callKind == callKindInterfaceDispatch or callKind == callKindIndirect {
+        return lowerIndirectCall(expression)
+    }
     if callKind == callKindPush {
         var pinned: [int] = []
         let receiver = expression.children[0].children[0]
@@ -1175,7 +1507,7 @@ fn lowerCall(expression: Node) -> int {
         let upper = lowerExpression(expression.children[2])
         if optimizerBailed { return 0 }
         let invalid = panicStringIndex(expression, "invalid substring")
-        let length = emitIr1(irListLength, classInteger, text, 0)
+        let length = emitIr1(irListLength, classInteger, text, 1)
         let upperChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, length, integerConstant(1), 0), upper, invalid)   // 0 <= upper <= length
         let lowerChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, upper, integerConstant(1), 0), lower, invalid)   // 0 <= lower <= upper
         return ownedTemporary(lowerRuntimeCall("runtimeSubstringValue", [text, lower, upper]))
@@ -1207,7 +1539,7 @@ fn lowerCall(expression: Node) -> int {
         let text = lowerContainer(expression.children[0].children[0], [expression.children[1]])
         let index = lowerExpression(expression.children[1])
         if optimizerBailed { return 0 }
-        let length = emitIr1(irListLength, classInteger, text, 0)
+        let length = emitIr1(irListLength, classInteger, text, 1)
         emitIr2(irBoundsCheck, classInteger, length, index, panicStringIndex(expression, "index out of bounds"))
         return emitIr2(irLoadByte, classInteger, text, index, 0)
     }
@@ -1255,14 +1587,9 @@ fn lowerCall(expression: Node) -> int {
     var operands: [int] = []
     var pinned: [int] = []
     var referenceMask = 0
-    if canInline(expression.referenceIndex) {
-        var argumentValues: [int] = []
-        for i in 0..callArguments.len() {
-            let value = lowerExpression(callArguments[i])
-            if optimizerBailed { return 0 }
-            argumentValues.push(pinBeforeLaterCalls(value, callArguments[i], argumentsAfter(callArguments, i), pinned))
-        }
-        pinArguments(argumentValues, callArguments, false, pinned)
+    if canInline(expression.referenceIndex) or (hasClosureArgument(callArguments) and canInlineWithin(expression.referenceIndex, 300)) {
+        let argumentValues = lowerInlineArguments(callArguments, pinned)
+        if optimizerBailed { return 0 }
         let inlinedResult = lowerInlinedCall(expression.referenceIndex, argumentValues)
         for value in pinned { emitRelease(value) }
         if isReferenceType(functionDefinition.returnType) { return ownedTemporary(inlinedResult) }
@@ -1297,29 +1624,38 @@ fn countNodes(node: Node) -> int {
 
 // small, non-recursive, no captured environment
 fn canInline(functionIndex: int) -> bool {
+    if functionDefinitions[functionIndex].hasEnvironment { return false }
+    return canInlineWithin(functionIndex, 60)
+}
+
+fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
     if not inliningEnabled or inlineStack.len() >= 3 or functionIndex == regionFunctionIndex { return false }
     let functionDefinition = functionDefinitions[functionIndex]
-    if functionDefinition.hasEnvironment or functionDefinition.name == "runtimeCollectGarbage" { return false }
+    if functionDefinition.name == "runtimeCollectGarbage" { return false }
     for active in inlineStack {
         if active == functionIndex { return false }
     }
-    return countNodes(functionDefinition.body) <= 60
+    return countNodes(functionDefinition.body) <= nodeLimit
 }
 
-// the callee's body, in place: its parameters are the argument values, its
-// returns jump to one join block
-fn lowerInlinedCall(functionIndex: int, argumentValues: [int]) -> int {
+// a closure literal argument: inlining the callee lets its calls through it inline too
+fn hasClosureArgument(callArguments: [Node]) -> bool {
+    for argument in callArguments {
+        if argument.nodeKind == nodeFunctionLiteral { return true }
+    }
+    return false
+}
+
+
+// switch lowering into a callee's key space, its parameters bound to the argument values
+fn enterInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [int]) {
     let functionDefinition = functionDefinitions[functionIndex]
     inlinedCallCount += 1
     inlineInstanceCount += 1
-    let savedPrefix = inlineKeyPrefix
-    let savedOwnedSlots = ownedLocalSlots
-    let savedSourceMakesCalls = regionSourceMakesCalls
-    let savedReturnBlock = regionReturnBlock
-    let savedReturnVariable = regionReturnVariable
-    let savedReturnType = regionReturnType
-    let savedReturnScopeDepth = regionReturnScopeDepth
-    let savedReturnTemporaryMark = regionReturnTemporaryMark
+    inlineFrames.push(InlineFrame{prefix: inlineKeyPrefix, ownedSlots: ownedLocalSlots, sourceMakesCalls: regionSourceMakesCalls,
+        returnBlock: regionReturnBlock, returnVariable: regionReturnVariable, returnType: regionReturnType,
+        returnScopeDepth: regionReturnScopeDepth, returnTemporaryMark: regionReturnTemporaryMark, captureValues: inlineCaptureValues})
+    inlineCaptureValues = captureValues
     inlineKeyPrefix = "i{inlineInstanceCount}:"
     var calleeOwnedSlots: [int: bool] = [:]
     ownedLocalSlots = calleeOwnedSlots
@@ -1327,9 +1663,52 @@ fn lowerInlinedCall(functionIndex: int, argumentValues: [int]) -> int {
     inlineStack.push(functionIndex)
     for i in 0..argumentValues.len() {
         let parameter = variableForSlot(identifierKindParameter, i, functionDefinition.parameterTypes[i])
-        if optimizerBailed { return 0 }
+        if optimizerBailed { return }
         declareVariable(parameter, argumentValues[i])
+        variableKnownClosure[parameter] = knownClosureOf(argumentValues[i])      // never reassigned: a reference parameter
     }
+}
+
+fn knownClosureOf(value: int) -> int {
+    for i in 0..knownClosureCells.len() {
+        if knownClosureCells[i] == value { return i }
+    }
+    return 0 - 1
+}
+
+// the known closure a call's function value is, else -1
+fn knownClosureOfNode(cellNode: Node) -> int {
+    if cellNode.nodeKind != nodeIdentifier or cellNode.auxiliary != identifierKindParameter or inlineKeyPrefix == "" { return 0 - 1 }
+    let variable = identifierVariable(cellNode)
+    if optimizerBailed { return 0 - 1 }
+    return variableKnownClosure[variable]
+}
+
+fn leaveInlinedBody() {
+    let frame = inlineFrames.pop()
+    let poppedInline = inlineStack.pop()
+    inlineKeyPrefix = frame.prefix
+    ownedLocalSlots = frame.ownedSlots
+    regionSourceMakesCalls = frame.sourceMakesCalls
+    regionReturnBlock = frame.returnBlock
+    regionReturnVariable = frame.returnVariable
+    regionReturnType = frame.returnType
+    regionReturnScopeDepth = frame.returnScopeDepth
+    regionReturnTemporaryMark = frame.returnTemporaryMark
+    inlineCaptureValues = frame.captureValues
+}
+
+// the callee's body, in place: its parameters are the argument values, its
+// returns jump to one join block
+fn lowerInlinedCall(functionIndex: int, argumentValues: [int]) -> int {
+    var noCaptures: [int] = []
+    return lowerInlinedBody(functionIndex, argumentValues, noCaptures)
+}
+
+fn lowerInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [int]) -> int {
+    let functionDefinition = functionDefinitions[functionIndex]
+    enterInlinedBody(functionIndex, argumentValues, captureValues)
+    if optimizerBailed { return 0 }
     regionReturnType = functionDefinition.returnType
     regionReturnBlock = newBlock()
     regionReturnScopeDepth = ownedScopes.len()
@@ -1344,16 +1723,32 @@ fn lowerInlinedCall(functionIndex: int, argumentValues: [int]) -> int {
         currentIrBlock = regionReturnBlock
         if hasValue { result = readVariable(regionReturnVariable, currentIrBlock) }
     }
-    let poppedInline = inlineStack.pop()
-    inlineKeyPrefix = savedPrefix
-    ownedLocalSlots = savedOwnedSlots
-    regionSourceMakesCalls = savedSourceMakesCalls
-    regionReturnBlock = savedReturnBlock
-    regionReturnVariable = savedReturnVariable
-    regionReturnType = savedReturnType
-    regionReturnScopeDepth = savedReturnScopeDepth
-    regionReturnTemporaryMark = savedReturnTemporaryMark
+    leaveInlinedBody()
     return result
+}
+
+// `return <expression>` and nothing else
+fn isSingleReturn(body: Node) -> bool {
+    return body.children.len() == 1 and body.children[0].nodeKind == nodeReturn and body.children[0].children[0].nodeKind != nodeNone
+}
+
+fn callArgumentNodes(expression: Node) -> [Node] {
+    var callArguments: [Node] = []
+    if expression.operator == 1 { callArguments.push(expression.children[0].children[0]) }        // UFCS receiver
+    for i in 1..expression.children.len() { callArguments.push(expression.children[i]) }
+    return callArguments
+}
+
+// the argument values of an inlined call; borrowed references that need a count go in `pinned`
+fn lowerInlineArguments(callArguments: [Node], pinned: [int]) -> [int] {
+    var argumentValues: [int] = []
+    for i in 0..callArguments.len() {
+        let value = lowerExpression(callArguments[i])
+        if optimizerBailed { return argumentValues }
+        argumentValues.push(pinBeforeLaterCalls(value, callArguments[i], argumentsAfter(callArguments, i), pinned))
+    }
+    pinArguments(argumentValues, callArguments, false, pinned)
+    return argumentValues
 }
 
 // branch to trueBlock or falseBlock; compares fuse into the branch
@@ -1387,6 +1782,25 @@ fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
         var opcode = irBranchCompare
         if condition.auxiliary == binaryCategoryFloat { opcode = irBranchFloatCompare }
         terminate(opcode, [left, right], conditionForToken(condition.operator), [trueBlock, falseBlock])
+        return
+    }
+    if kind == nodeCall and condition.auxiliary == callKindUser and canInline(condition.referenceIndex) and isSingleReturn(functionDefinitions[condition.referenceIndex].body) {
+        var pinned: [int] = []
+        let argumentValues = lowerInlineArguments(callArgumentNodes(condition), pinned)
+        if optimizerBailed { return }
+        if pinned.len() == 0 and pendingTemporaries.len() == mark {
+            var noCaptures: [int] = []
+            enterInlinedBody(condition.referenceIndex, argumentValues, noCaptures)
+            if optimizerBailed { return }
+            lowerCondition(functionDefinitions[condition.referenceIndex].body.children[0].children[0], trueBlock, falseBlock)
+            leaveInlinedBody()
+            return
+        }
+        let inlinedResult = lowerInlinedCall(condition.referenceIndex, argumentValues)
+        for pinnedValue in pinned { emitRelease(pinnedValue) }
+        ensureOpenBlock()
+        releaseTemporariesFrom(mark)
+        terminate(irBranch, [inlinedResult], 0, [trueBlock, falseBlock])
         return
     }
     let value = lowerExpression(condition)
@@ -1436,8 +1850,21 @@ fn lowerStatementKind(statement: Node) {
             assignVariable(target, value)
             return
         }
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap {
+            // the map takes the key's count and the value's
+            let map = lowerContainer(target.children[0], [target.children[1], statement.children[1]])
+            var key = lowerExpression(target.children[1])
+            if optimizerBailed { return }
+            if isReferenceType(target.children[1].typeIndex) { key = takeOwnership(key) }
+            var value = lowerExpression(statement.children[1])
+            if optimizerBailed { return }
+            if isReferenceType(target.typeIndex) { value = takeOwnership(value) }
+            if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+            let stored = lowerRuntimeCall("runtimeMapSet", [map, key, value])
+            return
+        }
         if isReferenceType(target.typeIndex) {
-            optimizerBail("reference store into memory")
+            lowerReferenceStore(target, statement.children[1])
             return
         }
         if target.nodeKind == nodeMember {
@@ -1547,16 +1974,17 @@ fn lowerStatementKind(statement: Node) {
     if kind == nodeIterableLoop {
         let elementType = plainListElement(statement.children[0].typeIndex)
         if optimizerBailed { return }
-        let list = lowerExpression(statement.children[0])
+        // a body that can free: the list holds a count for the loop, each element one for its iteration
+        let bodyMayFree = mayCallFreeingCode(statement.children[1])
+        var list = lowerExpression(statement.children[0])
         if optimizerBailed { return }
+        if bodyMayFree and irBorrowed[list] { list = ownedTemporary(emitRetain(list)) }
         let indexVariable = temporaryVariable(classInteger, false)
         writeVariableValue(indexVariable, integerConstant(0))
         let elementVariable = variableForSlot(identifierKindLocal, statement.slot, elementType)
         if optimizerBailed { return }
-        if isOwnedVariable(elementVariable) {
-            optimizerBail("owned loop element")
-            return
-        }
+        let elementOwned = isOwnedVariable(elementVariable) or (bodyMayFree and isReferenceType(elementType))
+        variableOwnsValue[elementVariable] = elementOwned
         currentLoopDepth += 1
         let headerBlock = newBlock()
         let bodyBlock = newBlock()
@@ -1579,9 +2007,17 @@ fn lowerStatementKind(statement: Node) {
             element = emitIr2(irLoadIndexed, classInteger, data, index, 0)
             if isReferenceType(elementType) { irBorrowed[element] = true }
         }
-        declareVariable(elementVariable, element)
         pushLoopTargets(exitBlock, stepBlock)
+        var elementScope: [int] = []
+        if elementOwned {
+            element = emitRetain(element)
+            elementScope.push(elementVariable)
+        }
+        ownedScopes.push(elementScope)
+        declareVariable(elementVariable, element)
         lowerBlock(statement.children[1])
+        if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
+        let closedElementScope = ownedScopes.pop()
         jumpTo(stepBlock)
         sealBlock(stepBlock)
         currentIrBlock = stepBlock
@@ -1600,15 +2036,19 @@ fn lowerStatementKind(statement: Node) {
             optimizerBail("return inside an outlined loop")
             return
         }
+        var movedVariable = 0 - 1
         if statement.children[0].nodeKind != nodeNone {
             var value = lowerExpression(statement.children[0])
             if optimizerBailed { return }
-            if isReferenceType(regionReturnType) { value = takeOwnership(value) }     // the caller gets a count
+            if isReferenceType(regionReturnType) {                                    // the caller gets a count
+                movedVariable = ownedVariableLeaving(statement.children[0], regionReturnScopeDepth)
+                if movedVariable < 0 { value = takeOwnership(value) }                // a dying local hands its own over
+            }
             writeVariableValue(regionReturnVariable, value)
         }
         ensureOpenBlock()
         releaseTemporariesOnExit(regionReturnTemporaryMark)
-        releaseScopesFrom(regionReturnScopeDepth)
+        releaseScopesExcept(regionReturnScopeDepth, movedVariable)
         jumpTo(regionReturnBlock)
         return
     }
@@ -1627,24 +2067,34 @@ fn lowerStatementKind(statement: Node) {
         return
     }
     if kind == nodeInline {
-        if isReferenceType(statement.typeIndex) {
-            optimizerBail("inlined reference result")
-            return
-        }
         let endBlock = newBlock()
         regionInlineEnds.push(endBlock)
         regionInlineSlots.push(statement.slot)
         regionInlineTypes.push(statement.typeIndex)
+        regionInlineScopeDepths.push(ownedScopes.len())
+        regionInlineTemporaryMarks.push(pendingTemporaries.len())
+        var bodyVariables: [int] = []
+        ownedScopes.push(bodyVariables)                 // the body's own locals die at its end
         for innerStatement in statement.children {
             if optimizerBailed { return }
             lowerStatement(innerStatement)
         }
+        if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
+        let closedScope = ownedScopes.pop()
         jumpTo(endBlock)
         let poppedEnd = regionInlineEnds.pop()
         let poppedSlot = regionInlineSlots.pop()
         let poppedType = regionInlineTypes.pop()
+        let poppedDepth = regionInlineScopeDepths.pop()
+        let poppedMark = regionInlineTemporaryMarks.pop()
         sealBlock(endBlock)
         currentIrBlock = endBlock
+        if isReferenceType(statement.typeIndex) {      // the result slot owns what the body returned, until its block ends
+            let resultVariable = variableForSlot(identifierKindLocal, statement.slot, statement.typeIndex)
+            variableOwnsValue[resultVariable] = true
+            variableIsInlineResult[resultVariable] = true
+            ownedScopes[ownedScopes.len() - 1].push(resultVariable)
+        }
         return
     }
     if kind == nodeInlineReturn {
@@ -1653,13 +2103,21 @@ fn lowerStatementKind(statement: Node) {
             return
         }
         let last = regionInlineEnds.len() - 1
+        var movedVariable = 0 - 1
         if statement.children[0].nodeKind != nodeNone {
-            let value = lowerExpression(statement.children[0])
+            var value = lowerExpression(statement.children[0])
             if optimizerBailed { return }
+            if isReferenceType(regionInlineTypes[last]) {
+                movedVariable = ownedVariableLeaving(statement.children[0], regionInlineScopeDepths[last])
+                if movedVariable < 0 { value = takeOwnership(value) }       // a dying local hands its count over instead
+            }
             let variable = variableForSlot(identifierKindLocal, regionInlineSlots[last], statement.children[0].typeIndex)
             if optimizerBailed { return }
             declareVariable(variable, value)
         }
+        ensureOpenBlock()
+        releaseTemporariesOnExit(regionInlineTemporaryMarks[last])
+        releaseScopesExcept(regionInlineScopeDepths[last], movedVariable)
         jumpTo(regionInlineEnds[last])
         return
     }
@@ -1713,6 +2171,7 @@ fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCou
     resetIr()
     regionIsFunction = false
     regionFunctionIndex = 0 - 1
+    regionEnvironmentValue = 0 - 1
     regionParentSlotCount = parentSlotCount
     regionParentParameterCount = parentParameterCount
     regionParentRegisterCall = parentRegisterCall
@@ -1746,6 +2205,14 @@ fn lowerFunctionRegion(functionIndex: int) -> bool {
     currentIrBlock = entryBlock
     // every parameter is defined at entry, all at once (the prologue moves them as one)
     for i in 0..functionDefinition.parameterNames.len() { parameterValues.push(emitIr0(irParameter, classInteger, i)) }
+    regionEnvironmentValue = 0 - 1
+    if functionDefinition.hasEnvironment {
+        if functionIsRegisterCall(functionIndex) {
+            optimizerBail("closure body with register arguments")
+            return false
+        }
+        regionEnvironmentValue = emitIr0(irParameter, classInteger, functionDefinition.parameterNames.len())    // deepest, past the arguments
+    }
     for i in 0..functionDefinition.parameterNames.len() {
         if typeKinds[functionDefinition.parameterTypes[i]] == kindFloat { parameterValues[i] = emitIr1(irFloatFromBits, classFloat, parameterValues[i], 0) }
     }
@@ -1908,6 +2375,59 @@ fn countUses() {
             for operand in irOperands[instruction] { irUseCounts[operand] += 1 }
         }
     }
+}
+
+fn isRuntimeCallTo(instruction: int, name: str) -> bool {
+    return irOpcodes[instruction] == irCall and functionNameIndices.has(name) and irImmediates[instruction] == functionNameIndices[name]
+}
+
+fn usesValue(instruction: int, value: int) -> bool {
+    for operand in irOperands[instruction] {
+        if resolveValue(operand) == value { return true }
+    }
+    return false
+}
+
+// `r = retain(v) ... use(r) ... release(v)` in one block: v's own count can go
+// to the use instead. Released v was owned, so it lives to the release either
+// way; nothing may read v between the use and the release, when the use may
+// already have dropped the count v now hands it.
+fn cancelCountPairs() {
+    countUses()
+    var cancelled = false
+    for block in 0..blockInstructions.len() {
+        let instructions = blockInstructions[block]
+        for releaseIndex in 0..instructions.len() {
+            let release = instructions[releaseIndex]
+            if valueDead[release] or not isRuntimeCallTo(release, "runtimeReleaseReference") { continue }
+            let value = resolveValue(irOperands[release][0])
+            var retainIndex = releaseIndex - 1
+            var lastUseIndex = 0 - 1
+            var blocked = false
+            while retainIndex >= 0 {
+                let instruction = instructions[retainIndex]
+                if not valueDead[instruction] and isRuntimeCallTo(instruction, "runtimeRetainReference") and resolveValue(irOperands[instruction][0]) == value and valueForward[instruction] == instruction { break }
+                if not valueDead[instruction] and usesValue(instruction, value) {
+                    if isRuntimeCallTo(instruction, "runtimeReleaseReference") { blocked = true }
+                    if lastUseIndex < 0 { lastUseIndex = retainIndex }
+                }
+                retainIndex -= 1
+            }
+            if blocked or retainIndex < 0 { continue }
+            let retain = instructions[retainIndex]
+            // the retained copy's one use, if any, sits between the pair and after every read of v
+            var retainUseIndex = 0 - 1
+            for i in (retainIndex + 1)..releaseIndex {
+                if not valueDead[instructions[i]] and usesValue(instructions[i], retain) { retainUseIndex = i }
+            }
+            if irUseCounts[retain] > 1 { continue }
+            if irUseCounts[retain] == 1 and (retainUseIndex < 0 or retainUseIndex < lastUseIndex) { continue }
+            valueForward[retain] = value
+            valueDead[release] = true
+            cancelled = true
+        }
+    }
+    if cancelled { rewriteOperands() }
 }
 
 fn eliminateDeadCode() {
@@ -2651,14 +3171,38 @@ fn nextBlockInOrder() -> int {
     return 0 - 1
 }
 
-fn blockLabelText(block: int) -> str { return ".L{blockLabels[block]}" }
+// the label a jump to `block` uses: past any blocks that only jump on
+fn blockLabelText(block: int) -> str { return ".L{blockLabels[jumpDestination(block)]}" }
 
-fn jumpUnlessNext(block: int) {
+// where a jump to `block` really lands: past blocks holding nothing but a jump
+// whose phi moves are all no-ops (the allocator put both ends in one place)
+fn jumpDestination(block: int) -> int {
+    var current = block
+    var steps = 0
+    while steps < 8 {
+        let instructions = blockInstructions[current]
+        if instructions.len() != 1 or irOpcodes[instructions[0]] != irJump { return current }
+        let successor = blockSuccessors[current][0]
+        if successor == current { return current }
+        let edgeIndex = predecessorIndex(successor, current)
+        for instruction in blockInstructions[successor] {
+            if irOpcodes[instruction] == irPhi and locationOf(irOperands[instruction][edgeIndex]) != locationOf(instruction) { return current }
+        }
+        current = successor
+        steps += 1
+    }
+    return current
+}
+
+fn jumpUnlessNext(target: int) {
+    let block = jumpDestination(target)
     if block != nextBlockInOrder() { emitOptimized("jmp {blockLabelText(block)}") }
 }
 
 // jump to trueBlock when `trueSuffix` holds, else falseBlock, falling through where possible
-fn conditionalJump(trueSuffix: str, falseSuffix: str, trueBlock: int, falseBlock: int) {
+fn conditionalJump(trueSuffix: str, falseSuffix: str, trueTarget: int, falseTarget: int) {
+    let trueBlock = jumpDestination(trueTarget)
+    let falseBlock = jumpDestination(falseTarget)
     if trueBlock == nextBlockInOrder() { emitOptimized("j{falseSuffix} {blockLabelText(falseBlock)}") }
     else {
         emitOptimized("j{trueSuffix} {blockLabelText(trueBlock)}")
@@ -2770,6 +3314,24 @@ fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
     let first = locationOf(irOperands[value][0])
     let second = locationOf(irOperands[value][1])
     let target = resultRegister(value, "rax")
+    // into another register: lea does the copy and the add in one
+    if (mnemonic == "add" or mnemonic == "sub") and target != first and target != second and isRegisterLocation(first) {
+        let constant = irOperands[value][1]
+        if isImmediateConstant(constant) {
+            var displacement = irImmediates[constant]
+            if mnemonic == "sub" { displacement = 0 - displacement }
+            if displacement > 0 - 2147483648 {
+                emitOptimized("lea {target}, {memoryAt(first, displacement)}")
+                finishResult(value, target)
+                return
+            }
+        }
+        if mnemonic == "add" and isRegisterLocation(second) {
+            emitOptimized("lea {target}, [{first} + {second}]")
+            finishResult(value, target)
+            return
+        }
+    }
     if target == second and target != first {
         if commutative { emitOptimized("{mnemonic} {target}, {first}") }
         else {
@@ -2845,6 +3407,7 @@ fn emitFloatCompareValue(value: int) {
 fn outgoingSlotsOfCall(instruction: int) -> int {
     let argumentCount = irOperands[instruction].len()
     if irImmediates[instruction] < 0 { return max(argumentCount, 4) }       // Win64: shadow space + stack arguments
+    if irImmediates[instruction] == indirectStackCall { return argumentCount - 1 }
     if functionIsRegisterCall(irImmediates[instruction]) { return 0 }
     return argumentCount
 }
@@ -2862,6 +3425,17 @@ fn emitCallInstruction(value: int) {
         for i in 0..min(operands.len(), 4) { addMove(locationOf(operands[i]), argumentRegisters[i]) }
         emitParallelMoves()
         emitOptimized("call {regionSymbols[0 - 1 - functionIndex]}")
+        finishResult(value, "rax")
+        return
+    }
+    if functionIndex == indirectStackCall {
+        let stackCount = operands.len() - 1
+        for i in 1..operands.len() {
+            let argument = integerIn(operands[i], "rax")
+            emitOptimized("mov qword ptr [rsp + {8 * (stackCount - i)}], {argument}")
+        }
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("call rax")
         finishResult(value, "rax")
         return
     }
@@ -3476,15 +4050,23 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
         if regionIsFunction {
             let argumentRegisters = ["rcx", "rdx", "r8", "r9"]
             if registerCall { source = argumentRegisters[parameterIndex] }
+            else if parameterIndex == parameterCount { source = "qword ptr [rbp + {16 + 8 * parameterCount}]" }     // a closure's env
             else { source = "qword ptr [rbp + {16 + 8 * (parameterCount - 1 - parameterIndex)}]" }
         }
         addMove(source, locationOf(instruction))
     }
     emitParallelMoves()
+    // blocks that only jump on are never entered: every jump goes past them
+    var emittedOrder: [int] = []
+    for orderPosition in 0..blockOrder.len() {
+        let block = blockOrder[orderPosition]
+        if orderPosition == 0 or jumpDestination(block) == block { emittedOrder.push(block) }
+    }
+    blockOrder = emittedOrder
     for orderPosition in 0..blockOrder.len() {
         currentOrderPosition = orderPosition
         let block = blockOrder[orderPosition]
-        optimizerLines.push("{blockLabelText(block)}:\n")
+        optimizerLines.push(".L{blockLabels[block]}:\n")
         for instruction in blockInstructions[block] {
             if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
             else { emitInstructionFor(instruction) }
@@ -3556,6 +4138,95 @@ fn removeEdge(block: int, successor: int) {
     }
 }
 
+fn blockHasPhis(block: int) -> bool {
+    for instruction in blockInstructions[block] {
+        if irOpcodes[instruction] == irPhi { return true }
+    }
+    return false
+}
+
+// A block that only jumps to a block nobody else reaches absorbs it.
+fn mergeStraightBlocks() {
+    for block in 0..blockInstructions.len() {
+        var merging = true
+        while merging {
+            merging = false
+            let instructions = blockInstructions[block]
+            if instructions.len() == 0 or blockSuccessors[block].len() != 1 { continue }
+            let terminator = instructions[instructions.len() - 1]
+            let successor = blockSuccessors[block][0]
+            if irOpcodes[terminator] != irJump or successor == block or successor == 0 { continue }
+            if blockPredecessors[successor].len() != 1 or blockHasPhis(successor) { continue }
+            var merged: [int] = []
+            for i in 0..(instructions.len() - 1) { merged.push(instructions[i]) }
+            for moved in blockInstructions[successor] {
+                merged.push(moved)
+                irBlockOf[moved] = block
+            }
+            blockInstructions[block] = merged
+            blockSuccessors[block] = blockSuccessors[successor]
+            for next in blockSuccessors[successor] {
+                let edgeIndex = predecessorIndex(next, successor)
+                blockPredecessors[next][edgeIndex] = block
+            }
+            var noInstructions: [int] = []
+            blockInstructions[successor] = noInstructions
+            var noSuccessors: [int] = []
+            blockSuccessors[successor] = noSuccessors
+            var noPredecessors: [int] = []
+            blockPredecessors[successor] = noPredecessors
+            merging = true
+        }
+    }
+}
+
+// Jump threading. A block holding only a phi and a branch on it (what a
+// boolean-valued inline or && / || leaves): a predecessor that feeds it a
+// constant jumps straight to the side it picks, and one that feeds it a
+// compare it just made branches on that compare itself.
+fn threadBranches() -> bool {
+    countUses()
+    var changed = false
+    for block in 0..blockInstructions.len() {
+        let instructions = blockInstructions[block]
+        if instructions.len() != 2 { continue }
+        let phi = instructions[0]
+        let terminator = instructions[1]
+        if irOpcodes[phi] != irPhi or irOpcodes[terminator] != irBranch or irUseCounts[phi] != 1 { continue }
+        if resolveValue(irOperands[terminator][0]) != phi { continue }
+        let successors = blockSuccessors[block]
+        if successors[0] == successors[1] or blockHasPhis(successors[0]) or blockHasPhis(successors[1]) { continue }
+        var index = blockPredecessors[block].len() - 1
+        while index >= 0 {
+            let predecessor = blockPredecessors[block][index]
+            let incoming = resolveValue(irOperands[phi][index])
+            let predecessorInstructions = blockInstructions[predecessor]
+            let predecessorTerminator = predecessorInstructions[predecessorInstructions.len() - 1]
+            let incomingOpcode = irOpcodes[incoming]
+            if predecessor != block and blockSuccessors[predecessor].len() == 1 and irOpcodes[predecessorTerminator] == irJump {
+                if isConstantValue(incoming) {
+                    var target = successors[1]
+                    if irImmediates[incoming] != 0 { target = successors[0] }
+                    removeEdge(predecessor, block)
+                    addEdge(predecessor, target)
+                    changed = true
+                } else if (incomingOpcode == irCompare or incomingOpcode == irFloatCompare) and irBlockOf[incoming] == predecessor and irUseCounts[incoming] == 1 {
+                    removeEdge(predecessor, block)
+                    irOpcodes[predecessorTerminator] = irBranchCompare
+                    if incomingOpcode == irFloatCompare { irOpcodes[predecessorTerminator] = irBranchFloatCompare }
+                    irOperands[predecessorTerminator] = irOperands[incoming]
+                    irImmediates[predecessorTerminator] = irImmediates[incoming]
+                    addEdge(predecessor, successors[0])
+                    addEdge(predecessor, successors[1])
+                    changed = true
+                }
+            }
+            index -= 1
+        }
+    }
+    return changed
+}
+
 // a branch whose outcome is known becomes a jump
 fn foldBranch(block: int, terminator: int, taken: bool) {
     let successors = blockSuccessors[block]
@@ -3573,10 +4244,24 @@ fn foldBranch(block: int, terminator: int, taken: bool) {
 
 // Returns true if anything changed. Values are rewritten in place, so every
 // user keeps pointing at the same value number.
+// a < b as b > a: the mirror of a condition, for swapped operands
+fn mirroredCondition(condition: int) -> int {
+    if condition == conditionLess { return conditionGreater }
+    if condition == conditionLessOrEqual { return conditionGreaterOrEqual }
+    if condition == conditionGreater { return conditionLess }
+    if condition == conditionGreaterOrEqual { return conditionLessOrEqual }
+    return condition
+}
+
 fn foldInstruction(block: int, value: int) -> bool {
     let opcode = irOpcodes[value]
     let operands = irOperands[value]
     if operands.len() == 0 { return false }
+    if (opcode == irCompare or opcode == irBranchCompare) and isConstantValue(resolveValue(operands[0])) and not isConstantValue(resolveValue(operands[1])) {
+        irOperands[value] = [operands[1], operands[0]]
+        irImmediates[value] = mirroredCondition(irImmediates[value])
+        return true
+    }
     let first = resolveValue(operands[0])
     var second = 0 - 1
     if operands.len() > 1 { second = resolveValue(operands[1]) }
@@ -3585,6 +4270,13 @@ fn foldInstruction(block: int, value: int) -> bool {
     let firstValue = irImmediates[first]
     var secondValue = 0
     if second >= 0 { secondValue = irImmediates[second] }
+    if (opcode == irCompare or opcode == irBranchCompare) and first == second and irClasses[first] == classInteger {
+        let holds = compareConstants(0, 0, irImmediates[value])       // x against itself
+        if opcode == irBranchCompare { foldBranch(block, value, holds) }
+        else if holds { becomeConstant(value, 1) }
+        else { becomeConstant(value, 0) }
+        return true
+    }
     if firstConstant and secondConstant {
         if opcode == irBranchCompare {
             foldBranch(block, value, compareConstants(firstValue, secondValue, irImmediates[value]))
@@ -3853,6 +4545,7 @@ fn fieldOffsetStored(offset: int) -> bool {
 // once for all equal copies, and moved to wherever its operands exist.
 fn isMovable(value: int) -> bool {
     let opcode = irOpcodes[value]
+    if opcode == irListLength and irImmediates[value] == 1 { return true }
     if opcode == irListLength or opcode == irListData { return not regionClobbersMemory }
     if opcode == irLoad or opcode == irFloatLoad { return not regionClobbersMemory and not fieldOffsetStored(irImmediates[value]) }
     if opcode == irConstant or opcode == irFloatConstant or opcode == irDataAddress or opcode == irSymbolAddress or opcode == irReciprocal { return true }
@@ -3866,15 +4559,79 @@ fn isCommutativeOpcode(opcode: int) -> bool {
     return opcode == irAdd or opcode == irMultiply or opcode == irBitAnd or opcode == irBitOr or opcode == irBitXor or opcode == irFloatAdd or opcode == irFloatMultiply or opcode == irIntegerMinimum or opcode == irIntegerMaximum
 }
 
+// a load that is valid until memory changes: reusable within one memory epoch
+fn isMemoryLoad(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    return opcode == irListLength or opcode == irListData or opcode == irLoad or opcode == irFloatLoad or opcode == irLoadGlobal or opcode == irFloatLoadGlobal
+}
+
+fn changesMemory(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    if opcode == irCall { return not callKeepsHeapIntact(value) }
+    return opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 or opcode == irStore or opcode == irFloatStore or opcode == irStoreIndexed or opcode == irFloatStoreIndexed
+}
+
 // global value numbering over the dominator tree: an expression computed in a
-// dominating block is reused instead of computed again
+// dominating block is reused instead of computed again. Loads the region may
+// invalidate are reused only within a memory epoch: a run of instructions with
+// no store or freeing call, carried into a block from its only predecessor.
 fn numberValues() {
     var known: [str: int] = [:]
+    var blockExitEpochs: [int] = []
+    var blockExitGlobalEpochs: [int] = []           // globals: any call may write them (the runtime's own too)
+    for block in 0..blockInstructions.len() {
+        blockExitEpochs.push(0 - 1)
+        blockExitGlobalEpochs.push(0 - 1)
+    }
+    var epochCount = 0
     for block in dominatorTreeOrder {
+        var epoch = 0 - 1
+        var globalEpoch = 0 - 1
+        if blockPredecessors[block].len() == 1 {
+            epoch = blockExitEpochs[blockPredecessors[block][0]]
+            globalEpoch = blockExitGlobalEpochs[blockPredecessors[block][0]]
+        }
+        if epoch < 0 {
+            epochCount += 1
+            epoch = epochCount
+        }
+        if globalEpoch < 0 {
+            epochCount += 1
+            globalEpoch = epochCount
+        }
         for instruction in blockInstructions[block] {
-            if valueDead[instruction] or not isMovable(instruction) { continue }
+            if valueDead[instruction] { continue }
+            if irOpcodes[instruction] == irCall or changesMemory(instruction) {
+                epochCount += 1
+                globalEpoch = epochCount
+            }
+            if changesMemory(instruction) {
+                epochCount += 1
+                epoch = epochCount
+                continue
+            }
+            let storeOpcode = irOpcodes[instruction]
+            if storeOpcode == irStoreGlobal or storeOpcode == irFloatStoreGlobal {
+                // a later load of this global in the epoch reads what was stored
+                var loadOpcode = irLoadGlobal
+                var loadClass = classInteger
+                if storeOpcode == irFloatStoreGlobal {
+                    loadOpcode = irFloatLoadGlobal
+                    loadClass = classFloat
+                }
+                known["m{globalEpoch}:{loadOpcode}:{loadClass}:{irImmediates[instruction]}"] = resolveValue(irOperands[instruction][0])
+                continue
+            }
+            let movable = isMovable(instruction)
+            let stringByte = irOpcodes[instruction] == irLoadByte              // strings never change: one key everywhere, but never hoisted
+            if not movable and not stringByte and not isMemoryLoad(instruction) { continue }
             let operands = irOperands[instruction]
             var key = "{irOpcodes[instruction]}:{irClasses[instruction]}:{irImmediates[instruction]}"
+            if stringByte { key = "s:" + key }
+            else if not movable {
+                if irOpcodes[instruction] == irLoadGlobal or irOpcodes[instruction] == irFloatLoadGlobal { key = "m{globalEpoch}:" + key }
+                else { key = "m{epoch}:" + key }
+            }
             if operands.len() == 2 and isCommutativeOpcode(irOpcodes[instruction]) and resolveValue(operands[0]) > resolveValue(operands[1]) {
                 key = key + ":{resolveValue(operands[1])}:{resolveValue(operands[0])}"
             } else {
@@ -3889,6 +4646,8 @@ fn numberValues() {
             }
             known[key] = instruction
         }
+        blockExitEpochs[block] = epoch
+        blockExitGlobalEpochs[block] = globalEpoch
     }
     rewriteOperands()
 }
@@ -3981,6 +4740,19 @@ fn hoistLoopInvariants() {
         let preheader = loopPreheaders[loopIndex]
         if preheader < 0 { continue }
         let members = loopBlockSets[loopIndex]
+        // what the loop itself may change: a load it cannot change is invariant in it
+        var loopFreesOrResizes = false
+        var loopStoresElements = false
+        var loopFieldOffsets: [int] = []
+        for block in blockOrder {
+            if not members[block] { continue }
+            for instruction in blockInstructions[block] {
+                let opcode = irOpcodes[instruction]
+                if (opcode == irCall and not callKeepsHeapIntact(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { loopFreesOrResizes = true }
+                if opcode == irStoreIndexed or opcode == irFloatStoreIndexed { loopStoresElements = true }
+                if opcode == irStore or opcode == irFloatStore { loopFieldOffsets.push(irImmediates[instruction]) }
+            }
+        }
         var moved = true
         while moved {
             moved = false
@@ -3989,7 +4761,18 @@ fn hoistLoopInvariants() {
                 var candidates: [int] = []
                 for instruction in blockInstructions[block] { candidates.push(instruction) }
                 for instruction in candidates {
-                    if not isMovable(instruction) { continue }
+                    var movable = isMovable(instruction)
+                    let opcode = irOpcodes[instruction]
+                    if not movable and not loopFreesOrResizes {
+                        if opcode == irListLength or opcode == irListData { movable = true }
+                        if (opcode == irLoad or opcode == irFloatLoad) and not loopStoresElements {
+                            movable = true
+                            for offset in loopFieldOffsets {
+                                if offset == irImmediates[instruction] { movable = false }
+                            }
+                        }
+                    }
+                    if not movable { continue }
                     var invariant = true
                     for operand in irOperands[instruction] {
                         if members[irBlockOf[operand]] { invariant = false }
@@ -4033,7 +4816,116 @@ fn optimizeLoops() {
     numberValues()
     findLoops()
     hoistLoopInvariants()
+    eliminateBoundsChecks()
     resetForwarding()
+}
+
+// ---- bounds-check elimination ----
+var knownNonNegative: [bool] = []
+
+// which integer values can never be negative: an optimistic fixpoint (loop
+// phis start out assumed non-negative, then lose it if an input disagrees).
+// Additions of non-negative values are taken not to wrap: an index grows by
+// small steps and cannot reach 2^63.
+fn computeNonNegative() {
+    var assumed: [bool] = []
+    for value in 0..irOpcodes.len() { assumed.push(true) }
+    knownNonNegative = assumed
+    var changed = true
+    while changed {
+        changed = false
+        for block in blockOrder {
+            for instruction in blockInstructions[block] {
+                let before = knownNonNegative[instruction]
+                let after = derivesNonNegative(instruction)
+                if before != after {
+                    knownNonNegative[instruction] = after
+                    changed = true
+                }
+            }
+        }
+    }
+}
+
+fn operandNonNegative(value: int) -> bool {
+    let resolved = resolveValue(value)
+    if irOpcodes[resolved] == irConstant { return irImmediates[resolved] >= 0 }
+    return knownNonNegative[resolved]
+}
+
+fn derivesNonNegative(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    let operands = irOperands[value]
+    if irClasses[value] != classInteger { return false }
+    if opcode == irConstant { return irImmediates[value] >= 0 }
+    if opcode == irListLength or opcode == irLoadByte or opcode == irLoadRaw8 or opcode == irLoadRaw16 or opcode == irLoadRaw32 or opcode == irCompare or opcode == irFloatCompare { return true }
+    if opcode == irPhi {
+        for operand in operands {
+            if resolveValue(operand) != value and not operandNonNegative(operand) { return false }
+        }
+        return true
+    }
+    if opcode == irAdd or opcode == irIntegerMinimum { return operandNonNegative(operands[0]) and operandNonNegative(operands[1]) }
+    if opcode == irBitAnd or opcode == irIntegerMaximum { return operandNonNegative(operands[0]) or operandNonNegative(operands[1]) }
+    if opcode == irShiftRight or opcode == irModulo or opcode == irModuloPowerOfTwo or opcode == irModuloByConstant or opcode == irModuloByInvariant { return operandNonNegative(operands[0]) }
+    if opcode == irDividePowerOfTwo or opcode == irDivideByConstant { return operandNonNegative(operands[0]) }
+    return false
+}
+
+// does the edge into `block` (its only predecessor branching to it) prove index < length?
+fn edgeProvesInBounds(block: int, index: int, length: int) -> bool {
+    if blockPredecessors[block].len() != 1 { return false }
+    let predecessor = blockPredecessors[block][0]
+    let successors = blockSuccessors[predecessor]
+    if successors.len() != 2 or successors[0] == successors[1] { return false }
+    let instructions = blockInstructions[predecessor]
+    let terminator = instructions[instructions.len() - 1]
+    if irOpcodes[terminator] != irBranchCompare { return false }
+    var condition = irImmediates[terminator]
+    if successors[1] == block { condition = invertCondition(condition) }
+    let left = resolveValue(irOperands[terminator][0])
+    let right = resolveValue(irOperands[terminator][1])
+    if left == index and right == length and condition == conditionLess { return true }
+    return left == length and right == index and condition == conditionGreater
+}
+
+// A bounds check whose index is never negative and sits under a branch that
+// proved index < length (same values) cannot fail.
+fn eliminateBoundsChecks() {
+    computeNonNegative()
+    for block in blockOrder {
+        var kept: [int] = []
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] == irBoundsCheck and boundsCheckProven(block, instruction) { continue }
+            // a non-negative dividend needs no sign fix-up: a mask or a shift
+            let opcode = irOpcodes[instruction]
+            if (opcode == irModuloPowerOfTwo or opcode == irDividePowerOfTwo) and operandNonNegative(irOperands[instruction][0]) {
+                let exponent = irImmediates[instruction]
+                if opcode == irModuloPowerOfTwo {
+                    irOpcodes[instruction] = irBitAnd
+                    irOperands[instruction] = [irOperands[instruction][0], entryConstant((1 << exponent) - 1)]
+                } else {
+                    irOpcodes[instruction] = irShiftRight
+                    irOperands[instruction] = [irOperands[instruction][0], entryConstant(exponent)]
+                }
+                irImmediates[instruction] = 0
+            }
+            kept.push(instruction)
+        }
+        blockInstructions[block] = kept
+    }
+}
+
+fn boundsCheckProven(block: int, check: int) -> bool {
+    let length = resolveValue(irOperands[check][0])
+    let index = resolveValue(irOperands[check][1])
+    if not operandNonNegative(index) { return false }
+    var current = block
+    while current != 0 {
+        if edgeProvesInBounds(current, index, length) { return true }
+        current = immediateDominators[current]
+    }
+    return false
 }
 
 // run every pass after lowering; false (with optimizerBailReason) if any gives up
@@ -4046,7 +4938,17 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     removeUnreachableBlocks()
     removeTrivialPhis()
     foldIrConstants()
+    var threadingRounds = 0
+    mergeStraightBlocks()
+    while threadingRounds < 4 and threadBranches() {
+        removeUnreachableBlocks()
+        removeTrivialPhis()
+        foldIrConstants()
+        mergeStraightBlocks()
+        threadingRounds += 1
+    }
     eliminateDeadCode()
+    cancelCountPairs()
     optimizeLoops()
     eliminateDeadCode()
     checkBorrows()
@@ -4072,7 +4974,7 @@ fn optimizerNote(text: str) {
 // whole function: replaces generateFunctionBody when every statement lowers
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
-    if functionDefinition.hasEnvironment or functionDefinition.name == "runtimeCollectGarbage" { return false }
+    if functionDefinition.name == "runtimeCollectGarbage" { return false }
     if containsBaselineVectorCandidate(functionDefinition.body) {
         optimizerNote("function {functionDefinition.name}: baseline (holds an AVX2 kernel loop)")
         return false

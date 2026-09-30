@@ -741,9 +741,14 @@ fn runtimeConcatenateStrings(leftStringAddress: int, rightStringAddress: int) ->
 }
 
 fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int {
+    if leftStringAddress == rightStringAddress { return 1 }
     let leftLength = load64(leftStringAddress)
     if leftLength != load64(rightStringAddress) { return 0 }
     var index = 0
+    while index + 8 <= leftLength {                 // a word at a time, then the tail bytewise
+        if load64(leftStringAddress + 8 + index) != load64(rightStringAddress + 8 + index) { return 0 }
+        index += 8
+    }
     while index < leftLength {
         if load8(leftStringAddress + 8 + index) != load8(rightStringAddress + 8 + index) { return 0 }
         index += 1
