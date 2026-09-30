@@ -143,6 +143,8 @@ var blockSealed: [bool] = []
 var blockTerminated: [bool] = []
 var blockLoopDepth: [int] = []
 var loopHeaders: [int] = []                 // findLoops: one header per natural loop
+var loopBlockSets: [[bool]] = []
+var loopPreheaders: [int] = []
 
 // SSA construction (Braun et al.): current definition of each variable per block
 var variableKeys: [str: int] = [:]        // "l5" / "p2" / "g7" / "t3" -> variable number
@@ -195,6 +197,14 @@ var knownClosureFunctions: [int] = []
 var knownClosureCaptures: [[int]] = []
 var variableKnownClosure: [int] = []        // an inlined parameter bound to a known closure (index above), else -1
 var inlineCaptureValues: [int] = []
+// spilled groups a loop reads but never writes, held in a register the whole
+// loop leaves free: loaded once at the end of the preheader, read from the
+// register in the loop's blocks. The slot stays current, so any other block reads it.
+var blockPromotedGroups: [[int]] = []
+var blockPromotedRegisters: [[int]] = []
+var preheaderLoadGroups: [[int]] = []
+var preheaderLoadRegisters: [[int]] = []
+var emittingBlock = 0 - 1
 var nonFreeingIndirectCalls: [int] = []     // calls through a vtable whose every implementation never frees
 var nextStackCallCannotFree = false         // an inlined closure body's captures
 struct InlineFrame {
@@ -305,6 +315,10 @@ fn resetIr() {
     variableKnownClosure = noKnownClosures
     var noCaptureValues: [int] = []
     inlineCaptureValues = noCaptureValues
+    var noPreheaderLoads: [[int]] = []
+    preheaderLoadGroups = noPreheaderLoads
+    var noPromotedGroups: [[int]] = []
+    blockPromotedGroups = noPromotedGroups
     var noNonFreeingCalls: [int] = []
     nonFreeingIndirectCalls = noNonFreeingCalls
     var noParameters: [int] = []
@@ -3220,6 +3234,141 @@ fn allocateRegisters() {
     }
 }
 
+fn blockInLoop(block: int, members: [bool]) -> bool {
+    if block < members.len() { return members[block] }
+    // an edge block split after the loops were found: inside when both ends are
+    for predecessor in blockPredecessors[block] {
+        if not blockInLoop(predecessor, members) { return false }
+    }
+    for successor in blockSuccessors[block] {
+        if not blockInLoop(successor, members) { return false }
+    }
+    return true
+}
+
+fn promoteSpilledLoopValues() {
+    let blockCount = blockInstructions.len()
+    var noGroups: [[int]] = []
+    blockPromotedGroups = noGroups
+    var noRegisters: [[int]] = []
+    blockPromotedRegisters = noRegisters
+    var noLoadGroups: [[int]] = []
+    preheaderLoadGroups = noLoadGroups
+    var noLoadRegisters: [[int]] = []
+    preheaderLoadRegisters = noLoadRegisters
+    for block in 0..blockCount {
+        var groups: [int] = []
+        blockPromotedGroups.push(groups)
+        var registers: [int] = []
+        blockPromotedRegisters.push(registers)
+        var loadGroups: [int] = []
+        preheaderLoadGroups.push(loadGroups)
+        var loadRegisters: [int] = []
+        preheaderLoadRegisters.push(loadRegisters)
+    }
+    var order: [int] = []
+    for i in 0..loopHeaders.len() { order.push(loopSize(i) * 65536 + i) }
+    order.sort()
+    for key in order {
+        let loopIndex = key % 65536
+        let preheader = loopPreheaders[loopIndex]
+        if preheader < 0 or preheader >= blockCount { continue }
+        let members = loopBlockSets[loopIndex]
+        var loopBlocks: [int] = []
+        for block in blockOrder {
+            if blockInLoop(block, members) { loopBlocks.push(block) }
+        }
+        var hasCall = false
+        for block in loopBlocks {
+            for instruction in blockInstructions[block] {
+                if irOpcodes[instruction] == irCall { hasCall = true }
+            }
+        }
+        // spilled integer groups read in the loop, by weight
+        var candidateGroups: [int] = []
+        var candidateUses: [int] = []
+        for block in loopBlocks {
+            for instruction in blockInstructions[block] {
+                for operand in irOperands[instruction] {
+                    if not isAllocatable(operand) or irClasses[operand] != classInteger { continue }
+                    let group = groupOf(operand)
+                    if valueRegisters[group] >= 0 or valueSpillSlots[group] < 0 { continue }
+                    var found = 0 - 1
+                    for i in 0..candidateGroups.len() {
+                        if candidateGroups[i] == group { found = i }
+                    }
+                    if found < 0 {
+                        candidateGroups.push(group)
+                        candidateUses.push(1)
+                    } else { candidateUses[found] += 1 }
+                }
+            }
+        }
+        if candidateGroups.len() == 0 { continue }
+        // written anywhere in the loop (a member defined there, or a phi fed from there): not a candidate
+        var writtenInLoop: [bool] = []
+        for i in 0..candidateGroups.len() { writtenInLoop.push(false) }
+        for value in 0..irOpcodes.len() {
+            if not isAllocatable(value) { continue }
+            let group = groupOf(value)
+            var index = 0 - 1
+            for i in 0..candidateGroups.len() {
+                if candidateGroups[i] == group { index = i }
+            }
+            if index < 0 { continue }
+            let block = irBlockOf[value]
+            if blockInLoop(block, members) { writtenInLoop[index] = true }
+            if irOpcodes[value] == irPhi {
+                for predecessor in blockPredecessors[block] {
+                    if blockInLoop(predecessor, members) { writtenInLoop[index] = true }
+                }
+            }
+        }
+        // registers nothing uses anywhere in the loop
+        var free: [bool] = []
+        for register in 0..integerRegisterNames.len() { free.push(not hasCall or integerRegisterCalleeSaved[register]) }
+        for value in 0..irOpcodes.len() {
+            if not isAllocatable(value) or irClasses[value] == classFloat or groupOf(value) != value or valueRegisters[value] < 0 { continue }
+            if not free[valueRegisters[value]] { continue }
+            let starts = rangeStarts[value]
+            let ends = rangeEnds[value]
+            for block in loopBlocks {
+                for i in 0..starts.len() {
+                    if starts[i] <= blockEndPositions[block] and ends[i] >= blockStartPositions[block] { free[valueRegisters[value]] = false }
+                }
+            }
+        }
+        for block in loopBlocks {
+            for register in blockPromotedRegisters[block] { free[register] = false }
+        }
+        // the heaviest readers take the free registers
+        var remaining = true
+        while remaining {
+            var best = 0 - 1
+            for i in 0..candidateGroups.len() {
+                if not writtenInLoop[i] and candidateUses[i] > 0 and (best < 0 or candidateUses[i] > candidateUses[best]) { best = i }
+            }
+            var register = 0 - 1
+            for candidate in 0..free.len() {
+                if register < 0 and free[candidate] { register = candidate }
+            }
+            if best < 0 or register < 0 {
+                remaining = false
+                continue
+            }
+            free[register] = false
+            candidateUses[best] = 0
+            integerRegisterUsed[register] = true            // a callee-saved one gets saved by the prologue
+            for block in loopBlocks {
+                blockPromotedGroups[block].push(candidateGroups[best])
+                blockPromotedRegisters[block].push(register)
+            }
+            preheaderLoadGroups[preheader].push(candidateGroups[best])
+            preheaderLoadRegisters[preheader].push(register)
+        }
+    }
+}
+
 fn registerIsCalleeSaved(valueClass: int, index: int) -> bool {
     if valueClass == classFloat { return floatRegisterCalleeSaved[index] }
     return integerRegisterCalleeSaved[index]
@@ -3248,6 +3397,13 @@ fn isImmediateConstant(value: int) -> bool { return irOpcodes[value] == irConsta
 // constant-pool slot, or "" (never read)
 fn locationOf(value: int) -> str {
     if isImmediateConstant(value) { return "{irImmediates[value]}" }
+    if emittingBlock >= 0 and emittingBlock < blockPromotedGroups.len() and valueRegisters[value] < 0 and blockPromotedGroups[emittingBlock].len() > 0 {
+        let group = groupOf(value)
+        let promoted = blockPromotedGroups[emittingBlock]
+        for i in 0..promoted.len() {
+            if promoted[i] == group { return integerRegisterNames[blockPromotedRegisters[emittingBlock][i]] }
+        }
+    }
     if irOpcodes[value] == irFloatConstant { return "qword ptr " + floatConstantLabel(irImmediates[value]) }
     if valueRegisters[value] >= 0 {
         if irClasses[value] == classFloat { return floatRegisterNames[valueRegisters[value]] }
@@ -3348,6 +3504,7 @@ fn jumpDestination(block: int) -> int {
     while steps < 8 {
         let instructions = blockInstructions[current]
         if instructions.len() != 1 or irOpcodes[instructions[0]] != irJump { return current }
+        if current < preheaderLoadGroups.len() and preheaderLoadGroups[current].len() > 0 { return current }
         let successor = blockSuccessors[current][0]
         if successor == current { return current }
         let edgeIndex = predecessorIndex(successor, current)
@@ -4078,6 +4235,11 @@ fn emitTerminator(block: int, value: int) {
     let successors = blockSuccessors[block]
     if opcode == irJump {
         emitPhiMoves(block)
+        if block < preheaderLoadGroups.len() {
+            for i in 0..preheaderLoadGroups[block].len() {
+                emitOptimized("mov {integerRegisterNames[preheaderLoadRegisters[block][i]]}, qword ptr [rsp + {spillOffset(valueSpillSlots[preheaderLoadGroups[block][i]])}]")
+            }
+        }
         jumpUnlessNext(successors[0])
         return
     }
@@ -4167,6 +4329,7 @@ fn emitEpilogue() {
 
 // frame: [rsp] outgoing stack arguments | spill slots | callee-saved registers
 fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
+    emittingBlock = 0 - 1
     var noLines: [str] = []
     optimizerLines = noLines
     var noColdLines: [str] = []
@@ -4232,6 +4395,7 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     for orderPosition in 0..blockOrder.len() {
         currentOrderPosition = orderPosition
         let block = blockOrder[orderPosition]
+        emittingBlock = block
         for header in loopHeaders {
             if header == block { optimizerLines.push(".balign 16\n") }     // a loop's back edges land on a fetch-block boundary
         }
@@ -4241,6 +4405,7 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
             else { emitInstructionFor(instruction) }
         }
     }
+    emittingBlock = 0 - 1
     for line in optimizerColdLines { optimizerLines.push(line) }
     optimizerLines.push("\n")
 }
@@ -4821,8 +4986,6 @@ fn numberValues() {
     rewriteOperands()
 }
 
-var loopBlockSets: [[bool]] = []
-var loopPreheaders: [int] = []
 
 // natural loops of the back edges; a loop whose header has one outside
 // predecessor ending in a plain jump gets that block as its preheader
@@ -5069,6 +5232,8 @@ fn optimizeLoops() {
     numberValues()
     findLoops()
     hoistLoopInvariants()
+    resetForwarding()
+    numberValues()                         // hoisting lands equal loads side by side in one preheader
     eliminateBoundsChecks()
     resetForwarding()
     sinkInstructions()
@@ -5213,6 +5378,7 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     computeLiveness()
     buildLiveRanges()
     allocateRegisters()
+    promoteSpilledLoopValues()
     if optimizerBailed { return false }
     emitRegionCode(label, parameterCount, registerCall)
     return not optimizerBailed
