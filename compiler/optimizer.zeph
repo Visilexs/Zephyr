@@ -1477,6 +1477,8 @@ fn storeVariable(variable: int, value: int, isDeclaration: bool) {
     if isDeclaration { declareVariable(variable, value) } else { writeVariableValue(variable, value) }
 }
 
+var declarationScopeMayFree = true            // markOwnedLocals: can the siblings after the current node free?
+
 // Which reference locals own their value: those ever given a fresh one, or a
 // copy of an owned one (a borrowed alias could outlive the count it leans on).
 // Returns whether it marked any; run to a fixpoint.
@@ -1492,18 +1494,59 @@ fn markOwnedLocals(node: Node) -> bool {
         slot = node.children[0].slot
         source = node.children[1]
     }
+    let scopeMayFree = declarationScopeMayFree
     if slot >= 0 and not ownedLocalSlots.has(slot) and needsOwnedHome(source) {
-        ownedLocalSlots[slot] = true
-        changed = true
+        // a declared load only needs a count when the rest of its block can free
+        if node.nodeKind == nodeAssign or scopeMayFree or not isLoadSource(source) {
+            ownedLocalSlots[slot] = true
+            changed = true
+        }
     }
     if node.nodeKind == nodeInline and isReferenceType(node.typeIndex) and not ownedLocalSlots.has(node.slot) {
         ownedLocalSlots[node.slot] = true             // an inlined call's result is fresh
         changed = true
     }
+    var laterMayFree: [bool] = []                    // by child: can a sibling after it free?
     for child in node.children {
-        if markOwnedLocals(child) { changed = true }
+        if child.nodeKind == nodeDeclaration and isReferenceType(child.typeIndex) and regionSourceMakesCalls and isLoadSource(child.children[0]) {
+            laterMayFree = siblingsAfterMayFree(node.children)
+            break
+        }
+    }
+    for i in 0..node.children.len() {
+        declarationScopeMayFree = true
+        if laterMayFree.len() > 0 { declarationScopeMayFree = laterMayFree[i] }
+        if markOwnedLocals(node.children[i]) { changed = true }
     }
     return changed
+}
+
+// a value read out of a global, a field or an element: borrowed from its holder
+fn isLoadSource(value: Node) -> bool {
+    let kind = value.nodeKind
+    return kind == nodeMember or kind == nodeIndex or (kind == nodeIdentifier and value.auxiliary == identifierKindGlobal)
+}
+
+fn siblingsAfterMayFree(siblings: [Node]) -> [bool] {
+    var result: [bool] = []
+    for sibling in siblings { result.push(true) }
+    var later = false
+    var i = siblings.len() - 1
+    while i >= 0 {
+        result[i] = later
+        if not later { later = mayFreeOrReassign(siblings[i]) or assignsAnyReference(siblings[i]) }
+        i -= 1
+    }
+    return result
+}
+
+// any reference store, a local's included: it releases what it overwrites
+fn assignsAnyReference(node: Node) -> bool {
+    if node.nodeKind == nodeAssign and (isReferenceType(node.children[0].typeIndex) or node.children[0].nodeKind == nodeIndex) { return true }
+    for child in node.children {
+        if assignsAnyReference(child) { return true }
+    }
+    return false
 }
 
 // borrowed sources: parameters, literals, globals and borrowed locals; loads
@@ -1626,7 +1669,10 @@ fn storesReleasingReferences(node: Node) -> bool {
 fn findOwnedLocals(root: Node) {
     regionSourceMakesCalls = mayCallFreeingCode(root) or storesReleasingReferences(root)
     var changed = true
-    while changed { changed = markOwnedLocals(root) }
+    while changed {
+        declarationScopeMayFree = true
+        changed = markOwnedLocals(root)
+    }
 }
 
 // an argument evaluated before a later one that calls: a borrowed reference

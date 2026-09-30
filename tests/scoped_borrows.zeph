@@ -1,0 +1,32 @@
+// -O2 parity cases for locals declared from a field, element or global: they
+// may borrow only when nothing later in their block can free the holder.
+
+struct Holder { text: str, items: [str] }
+
+fn make(i: int) -> Holder { return Holder{text: "text{i}", items: ["a{i}", "b"]} }
+
+var shared = "global0"
+var total = 0
+var kept: [str] = []
+for i in 0..200 {
+    var holder = make(i)
+    let text = holder.text              // the holder is replaced later: must own
+    holder = make(i + 1)
+    total += text.len() + text.byte(4)
+
+    let first = holder.items[0]         // the element is overwritten later
+    holder.items[0] = "x{i}"
+    total += first.len() + first.byte(1)
+
+    let fromGlobal = shared             // the global is replaced later
+    shared = "global{i + 1}"
+    total += fromGlobal.len() + fromGlobal.byte(6)
+
+    let late = holder.items[1]          // a call later in the block
+    kept.push(make(i).text)
+    total += late.len()
+
+    let plain = holder.text             // nothing after frees: may borrow
+    total += plain.len() + plain.byte(4)
+}
+print(total, kept.len(), kept[199], shared)
