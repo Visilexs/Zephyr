@@ -119,6 +119,10 @@ let conditionLess = 2
 let conditionLessOrEqual = 3
 let conditionGreater = 4
 let conditionGreaterOrEqual = 5
+let conditionBelowOrEqual = 6      // unsigned
+let conditionAbove = 7
+let conditionBelow = 8
+let conditionAboveOrEqual = 9
 
 // value classes
 let classInteger = 0            // int, bool, enum, pointer: a GPR
@@ -1931,6 +1935,76 @@ fn lowerInlineArguments(callArguments: [Node], pinned: [int]) -> [int] {
 }
 
 // branch to trueBlock or falseBlock; compares fuse into the branch
+// the operand an integer compare tests against a literal: 0 or 1, else -1
+fn comparedOperandIndex(compare: Node) -> int {
+    if compare.nodeKind != nodeBinary or compare.auxiliary != binaryCategoryInteger or conditionForToken(compare.operator) < 0 { return 0 - 1 }
+    if compare.children[1].nodeKind == nodeInteger and compare.children[0].nodeKind != nodeInteger { return 0 }
+    if compare.children[0].nodeKind == nodeInteger and compare.children[1].nodeKind != nodeInteger { return 1 }
+    return 0 - 1
+}
+
+// the smallest x `compare` admits (x >= c, x > c, c <= x, c < x), with found in bounds
+var rangeBoundFound = false
+fn lowerBoundOf(compare: Node, operandIndex: int) -> int {
+    let operator = compare.operator
+    rangeBoundFound = true
+    if operandIndex == 0 {
+        let constant = compare.children[1].integerValue
+        if operator == tokenGreaterOrEqual { return constant }
+        if operator == tokenGreaterThan { return constant + 1 }
+    } else {
+        let constant = compare.children[0].integerValue
+        if operator == tokenLessOrEqual { return constant }
+        if operator == tokenLessThan { return constant + 1 }
+    }
+    rangeBoundFound = false
+    return 0
+}
+
+fn upperBoundOf(compare: Node, operandIndex: int) -> int {
+    let operator = compare.operator
+    rangeBoundFound = true
+    if operandIndex == 0 {
+        let constant = compare.children[1].integerValue
+        if operator == tokenLessOrEqual { return constant }
+        if operator == tokenLessThan { return constant - 1 }
+    } else {
+        let constant = compare.children[0].integerValue
+        if operator == tokenGreaterOrEqual { return constant }
+        if operator == tokenGreaterThan { return constant - 1 }
+    }
+    rangeBoundFound = false
+    return 0
+}
+
+// `lo <= x and x <= hi` on one variable: (x - lo) <=u (hi - lo), one branch
+fn lowerRangeCheck(condition: Node, trueBlock: int, falseBlock: int) -> bool {
+    let first = condition.children[0]
+    let second = condition.children[1]
+    let firstIndex = comparedOperandIndex(first)
+    let secondIndex = comparedOperandIndex(second)
+    if firstIndex < 0 or secondIndex < 0 { return false }
+    let operand = first.children[firstIndex]
+    if not sameVariableNode(operand, second.children[secondIndex]) { return false }
+    var low = lowerBoundOf(first, firstIndex)
+    var lowFound = rangeBoundFound
+    var high = upperBoundOf(second, secondIndex)
+    var highFound = rangeBoundFound
+    if not lowFound or not highFound {                    // x <= hi and x >= lo
+        low = lowerBoundOf(second, secondIndex)
+        lowFound = rangeBoundFound
+        high = upperBoundOf(first, firstIndex)
+        highFound = rangeBoundFound
+    }
+    if not lowFound or not highFound or low > high or low < 0 - 1073741824 or high > 1073741824 { return false }
+    let value = lowerExpression(operand)
+    if optimizerBailed { return true }
+    ensureOpenBlock()
+    let offset = emitIr2(irSubtract, classInteger, value, integerConstant(low), 0)
+    terminate(irBranchCompare, [offset, integerConstant(high - low)], conditionBelowOrEqual, [trueBlock, falseBlock])
+    return true
+}
+
 fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
     if optimizerBailed { return }
     let mark = pendingTemporaries.len()
@@ -1943,6 +2017,7 @@ fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
         lowerCondition(condition.children[0], falseBlock, trueBlock)
         return
     }
+    if kind == nodeBinary and condition.operator == tokenAnd and lowerRangeCheck(condition, trueBlock, falseBlock) { return }
     if kind == nodeBinary and (condition.operator == tokenAnd or condition.operator == tokenOr) {
         let middleBlock = newBlock()
         if condition.operator == tokenAnd { lowerCondition(condition.children[0], middleBlock, falseBlock) }
@@ -3476,6 +3551,10 @@ fn conditionSuffix(condition: int) -> str {
     if condition == conditionLess { return "l" }
     if condition == conditionLessOrEqual { return "le" }
     if condition == conditionGreater { return "g" }
+    if condition == conditionBelowOrEqual { return "be" }
+    if condition == conditionAbove { return "a" }
+    if condition == conditionBelow { return "b" }
+    if condition == conditionAboveOrEqual { return "ae" }
     return "ge"
 }
 
@@ -3485,6 +3564,10 @@ fn invertCondition(condition: int) -> int {
     if condition == conditionLess { return conditionGreaterOrEqual }
     if condition == conditionLessOrEqual { return conditionGreater }
     if condition == conditionGreater { return conditionLessOrEqual }
+    if condition == conditionBelowOrEqual { return conditionAbove }
+    if condition == conditionAbove { return conditionBelowOrEqual }
+    if condition == conditionBelow { return conditionAboveOrEqual }
+    if condition == conditionAboveOrEqual { return conditionBelow }
     return conditionLess
 }
 
@@ -4438,6 +4521,15 @@ fn powerOfTwoExponent(value: int) -> int {
 }
 
 fn compareConstants(left: int, right: int, condition: int) -> bool {
+    if condition >= conditionBelowOrEqual {
+        // unsigned: flip the sign bits, then compare signed
+        let signBit = 0 - 9223372036854775807 - 1
+        var signed = conditionLessOrEqual
+        if condition == conditionAbove { signed = conditionGreater }
+        else if condition == conditionBelow { signed = conditionLess }
+        else if condition == conditionAboveOrEqual { signed = conditionGreaterOrEqual }
+        return compareConstants(left ^ signBit, right ^ signBit, signed)
+    }
     if condition == conditionEqual { return left == right }
     if condition == conditionNotEqual { return left != right }
     if condition == conditionLess { return left < right }
@@ -4582,6 +4674,10 @@ fn foldBranch(block: int, terminator: int, taken: bool) {
 fn mirroredCondition(condition: int) -> int {
     if condition == conditionLess { return conditionGreater }
     if condition == conditionLessOrEqual { return conditionGreaterOrEqual }
+    if condition == conditionBelowOrEqual { return conditionAboveOrEqual }
+    if condition == conditionAboveOrEqual { return conditionBelowOrEqual }
+    if condition == conditionBelow { return conditionAbove }
+    if condition == conditionAbove { return conditionBelow }
     if condition == conditionGreater { return conditionLess }
     if condition == conditionGreaterOrEqual { return conditionLessOrEqual }
     return condition

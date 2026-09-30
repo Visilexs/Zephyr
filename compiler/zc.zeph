@@ -10974,9 +10974,12 @@ fn assembleInstruction(mnemonic: int, operands: [Operand], operandCount: int) {
         if sourceOperand.kind == operandKindImmediate {
             var opcode = 129
             if destinationOperand.size == 8 { opcode = 128 }
-            if destinationOperand.size == 8 { trailingInstructionBytes = 1 } else { trailingInstructionBytes = 4 }
+            // an immediate that fits a signed byte takes the short 0x83 form
+            let shortImmediate = destinationOperand.size != 8 and sourceOperand.immediate >= 0 - 128 and sourceOperand.immediate <= 127
+            if shortImmediate { opcode = 131 }
+            if destinationOperand.size == 8 or shortImmediate { trailingInstructionBytes = 1 } else { trailingInstructionBytes = 4 }
             encodeRegisterMemory(wideRegisterPrefix, opcode, -1, arithmeticOpcodeExtensions[arithmeticKind], destinationOperand, false, false)
-            if destinationOperand.size == 8 {
+            if destinationOperand.size == 8 or shortImmediate {
                 var byteValue = sourceOperand.immediate % 256
                 if byteValue < 0 { byteValue += 256 }
                 writeTextByte(byteValue)
