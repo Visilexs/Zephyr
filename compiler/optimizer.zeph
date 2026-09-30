@@ -2302,6 +2302,18 @@ fn lowerCall(expression: Node) -> int {
     return result
 }
 
+// a function's body before the front end inlined into it, when it did
+fn hasPreInlineBody(functionIndex: int) -> bool {
+    if functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone { return true }
+    return functionDefinitions[functionIndex].inlinable and functionIndex < inlineSharedBodies.len() and not inlineSharedBodies[functionIndex]
+}
+
+fn preInlineBody(functionIndex: int) -> Node {
+    if functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone { return preInlineBodies[functionIndex] }
+    if hasPreInlineBody(functionIndex) { return functionDefinitions[functionIndex].pristine }
+    return functionDefinitions[functionIndex].body
+}
+
 fn countNodes(node: Node) -> int {
     var count = 1
     for child in node.children { count += countNodes(child) }
@@ -2326,7 +2338,7 @@ fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
         if active == functionIndex { return false }
     }
     if irOpcodes.len() > inlineRegionValueBudget { return false }      // a huge region costs more to allocate than calls cost to run
-    if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(functionDefinition.body) }
+    if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(preInlineBody(functionIndex)) }
     return functionNodeCounts[functionIndex] <= nodeLimit
 }
 
@@ -2351,7 +2363,7 @@ fn enterInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [i
     inlineKeyPrefix = "i{inlineInstanceCount}:"
     var calleeOwnedSlots: [int: bool] = [:]
     ownedLocalSlots = calleeOwnedSlots
-    findOwnedLocals(functionDefinition.body)
+    findOwnedLocals(preInlineBody(functionIndex))
     inlineStack.push(functionIndex)
     for i in 0..argumentValues.len() {
         let parameter = variableForSlot(identifierKindParameter, i, functionDefinition.parameterTypes[i])
@@ -2407,7 +2419,7 @@ fn lowerInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [i
     regionReturnTemporaryMark = pendingTemporaries.len()
     let hasValue = typeKinds[regionReturnType] != kindVoid
     if hasValue { regionReturnVariable = temporaryVariable(classOfType(regionReturnType), false) }
-    lowerBlock(functionDefinition.body)
+    lowerBlock(preInlineBody(functionIndex))
     var result = 0
     if not optimizerBailed {
         jumpTo(regionReturnBlock)
@@ -3473,11 +3485,7 @@ fn computeBlockOrder() {
 
 fn bitSet(set: [int], value: int) { set[value / 64] = set[value / 64] | (1 << (value % 64)) }
 fn bitTest(set: [int], value: int) -> bool { return ((set[value / 64] >> (value % 64)) & 1) == 1 }
-fn emptyBitSet() -> [int] {
-    var set: [int] = []
-    for i in 0..liveWordCount { set.push(0) }
-    return set
-}
+fn emptyBitSet() -> [int] { return zeros(liveWordCount) }
 
 fn predecessorIndex(block: int, predecessor: int) -> int {
     let predecessors = blockPredecessors[block]
@@ -3519,7 +3527,8 @@ fn computeLiveness() {
         while orderPosition >= 0 {
             let block = blockOrder[orderPosition]
             orderPosition -= 1
-            var out = emptyBitSet()
+            let out = liveOut[block]                 // rebuilt in place: sets only grow
+            for word in 0..liveWordCount { out[word] = 0 }
             for successor in blockSuccessors[block] {
                 let successorIn = liveIn[successor]
                 for word in 0..liveWordCount { out[word] = out[word] | successorIn[word] }
@@ -3530,14 +3539,14 @@ fn computeLiveness() {
             }
             let uses = useSets[block]
             let defines = defineSets[block]
-            let oldIn = liveIn[block]
-            var newIn = emptyBitSet()
+            let blockIn = liveIn[block]
             for word in 0..liveWordCount {
-                newIn[word] = uses[word] | (out[word] & (~defines[word]))
-                if newIn[word] != oldIn[word] { changed = true }
+                let newWord = uses[word] | (out[word] & (~defines[word]))
+                if newWord != blockIn[word] {
+                    blockIn[word] = newWord
+                    changed = true
+                }
             }
-            liveIn[block] = newIn
-            liveOut[block] = out
         }
     }
 }
@@ -6646,9 +6655,9 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
     }
     let label = functionCodeLabel(functionDefinition.label)
     inliningEnabled = true
-    let hasPreInlineBody = functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone
     var compiled = false
-    if hasPreInlineBody {                  // the optimizer's own inliner first: it budgets what it expands
+    let hasBigPreInlineBody = functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone
+    if hasBigPreInlineBody {                  // the optimizer's own inliner first: it budgets what it expands
         lowerPreInlineBody = true
         compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
         lowerPreInlineBody = false
@@ -6662,7 +6671,7 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
     }
     // too big once the front end inlined into it: its body from before that,
     // left to the optimizer's own budgeted inliner
-    if not compiled and textStartsWith(optimizerBailReason, "region too large") and functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone {
+    if not compiled and textStartsWith(optimizerBailReason, "region too large") and hasBigPreInlineBody {
         optimizerNote("function {functionDefinition.name}: retry on the body before inlining ({optimizerBailReason})")
         lowerPreInlineBody = true
         compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
