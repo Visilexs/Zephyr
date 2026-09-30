@@ -847,6 +847,19 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeBinary { return lowerBinary(expression) }
     if kind == nodeCast {
         let castKind = expression.auxiliary
+        if castKind == castKindToString {
+            var formatted = lowerExpression(expression.children[0])
+            if optimizerBailed { return 0 }
+            if irClasses[formatted] == classFloat { formatted = emitIr1(irBitsFromFloat, classInteger, formatted, 0) }
+            return ownedTemporary(lowerRuntimeCall("runtimeFormatTypedValue", [formatted, symbolAddress("__td{expression.slot}")]))
+        }
+        if castKind == castKindStringToInteger or castKind == castKindStringToFloat {
+            let text = lowerContainer(expression.children[0], [])
+            if optimizerBailed { return 0 }
+            let site = emitIr0(irDataAddress, classInteger, addDataString(panicSite(expression)))
+            if castKind == castKindStringToInteger { return lowerRuntimeCall("runtimeStringToInteger", [text, site]) }
+            return emitIr1(irFloatFromBits, classFloat, lowerRuntimeCall("runtimeStringToFloat", [text, site]), 0)
+        }
         if castKind != castKindNoOperation and castKind != castKindIntegerToFloat and castKind != castKindTruncate {
             optimizerBail("cast kind {castKind}")
             return 0
@@ -1249,6 +1262,7 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
+    if name == "runtimeFormatTypedValue" or name == "runtimeStringToInteger" or name == "runtimeStringToFloat" { return true }
     if name == "runtimePrintTypedValue" or name == "runtimeJoinStringList" or name == "runtimeCharacterFromCode" or name == "runtimeListNew" { return true }
     if name == "runtimeBeginStringInterpolation" or name == "runtimeAppendInterpolationText" or name == "runtimeAppendInterpolationValue" or name == "runtimeEndStringInterpolation" { return true }   // they write the builder's own buffer
     if name == "runtimeMapGet" or name == "runtimeFindMapEntry" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
@@ -5891,6 +5905,9 @@ fn isSinkable(value: int) -> bool {
     if opcode == irPhi or opcode == irParameter or opcode == irConstant or opcode == irFloatConstant { return false }
     if not isPureOpcode(opcode) { return false }
     if opcode == irLoadGlobal or opcode == irFloatLoadGlobal { return not regionGlobalsInMemory }     // memory changes only at the write-back
+    // a string's bytes never change, but the string can be freed: sunk past
+    // the release of a temporary one, the load would read a free-list link
+    if opcode == irListLength and irImmediates[value] == 1 and regionClobbersMemory { return false }
     return isMovable(value)
 }
 

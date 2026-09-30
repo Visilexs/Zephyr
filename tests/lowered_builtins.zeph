@@ -31,3 +31,27 @@ for line in saved { print(line) }
 print("nested {"inner {total % 10}"} done")
 print(1.25)
 print(stack.pop().x)
+
+// casts through the runtime: to str, and str to int / float
+enum Mood { Calm, Loud }
+var castTotal = 0
+var castFloats = 0.0
+for i in 0..500 {
+    let text = i as str
+    castTotal += text.len() + (text as int)
+    castFloats += ("{i}.25" as float) + ((i as float / 8.0) as str).len() as float
+    let mood = if i % 2 == 0 { Mood.Calm } else { Mood.Loud }
+    castTotal += (mood as str).len() + ((i % 2 == 0) as str).len()
+}
+print(castTotal, castFloats)
+
+// a temporary string's length, used past a branch: the length load must not
+// sink below the temporary's release
+let pieces = ["aa", "bb", "ccc"]
+var pieceTotal = 0
+var pieceCount = 0
+for i in 0..600 {
+    pieceTotal += pieces[i % 3].sub(0, 1 + i % 2).len()
+    if i % 2 == 0 { pieceCount += 3 } else { pieceCount += 4 }
+}
+print(pieceTotal, pieceCount)
