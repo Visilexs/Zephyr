@@ -1,0 +1,55 @@
+fn addressScaleOne(baseAddress: int, index: int) -> int { return baseAddress + index }
+fn addressScaleTwo(baseAddress: int, index: int) -> int { return baseAddress + (index << 1) }
+fn addressScaleFour(baseAddress: int, index: int) -> int { return baseAddress + (index << 2) }
+fn addressScaleEight(baseAddress: int, index: int) -> int { return baseAddress + (index << 3) }
+fn addressSwappedAdd(baseAddress: int, index: int) -> int { return (index << 3) + baseAddress }
+// Keep the shift's arithmetic result observable alongside both address uses.
+fn sharedShiftValues(baseAddress: int, index: int) -> [int] {
+    let shiftedIndex = index << 3
+    return [baseAddress + shiftedIndex, baseAddress + 40 + shiftedIndex, shiftedIndex]
+}
+fn dynamicShiftAddress(baseAddress: int, index: int, exponent: int) -> int { return baseAddress + (index << exponent) }
+fn literalFourAddress(baseAddress: int, index: int) -> int { return baseAddress + (index << 4) }
+fn phiSelectedAddress(baseAddress: int, selectedIndex: int) -> int {
+    var index = 0
+    if selectedIndex == 0 { index = -1 } else { index = 1 }
+    return baseAddress + (index << 3)
+}
+// Recursion preserves an ordinary call boundary for the computed address value.
+fn passAddress(addressValue: int, depth: int) -> int {
+    if depth > 0 { return passAddress(addressValue, depth - 1) }
+    else { return addressValue }
+}
+fn storedAddressValues(baseAddress: int, index: int) -> [int] {
+    let addressValue = baseAddress + (index << 3)
+    return [addressValue, passAddress(addressValue, 2)]
+}
+let selectedIndex = args().len() - 1
+let baseAddress = 4294967419 + selectedIndex
+let chosenIndex = selectedIndex - 1
+if addressScaleOne(baseAddress, chosenIndex) != 4294967418 { panic("scale one") }
+if addressScaleTwo(baseAddress, chosenIndex) != 4294967417 { panic("scale two") }
+if addressScaleFour(baseAddress, chosenIndex) != 4294967415 { panic("scale four") }
+if addressScaleEight(baseAddress, chosenIndex) != 4294967411 { panic("scale eight") }
+if addressSwappedAdd(baseAddress, chosenIndex) != 4294967411 { panic("swapped add") }
+let sharedValues = sharedShiftValues(baseAddress, chosenIndex)
+if sharedValues[0] != 4294967411 or sharedValues[1] != 4294967451 or sharedValues[2] != -8 { panic("shared shift") }
+if dynamicShiftAddress(baseAddress, chosenIndex, args().len() + 3) != 4294967403 { panic("dynamic shift") }
+if literalFourAddress(baseAddress, chosenIndex) != 4294967403 { panic("literal four") }
+if phiSelectedAddress(baseAddress, selectedIndex) != 4294967411 { panic("phi index") }
+let storedValues = storedAddressValues(baseAddress, chosenIndex)
+if storedValues[0] != 4294967411 or storedValues[1] != 4294967411 { panic("stored address") }
+
+// Addition supplies independent modulo-64-bit oracles without using shifts.
+let maximumBase = 9223372036854775807 + selectedIndex
+let positiveIndex = selectedIndex + 1
+let doubledIndex = positiveIndex + positiveIndex
+let wrappedAddress = addressScaleTwo(maximumBase, positiveIndex)
+if wrappedAddress != maximumBase + doubledIndex or wrappedAddress != -9223372036854775807 { panic("positive address wrap") }
+let largeIndex = 2305843009213693953 + selectedIndex
+let largeDoubled = largeIndex + largeIndex
+let largeQuadrupled = largeDoubled + largeDoubled
+let largeOctupled = largeQuadrupled + largeQuadrupled
+let largeWrappedAddress = addressScaleEight(baseAddress, largeIndex)
+if largeWrappedAddress != baseAddress + largeOctupled or largeWrappedAddress != 4294967427 { panic("positive index wrap") }
+print("scaledAddressValues", 1)

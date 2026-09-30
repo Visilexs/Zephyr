@@ -1,0 +1,99 @@
+struct Cell { value: int, label: str }
+struct PlainCell { value: int }
+
+// Recursion keeps the indexed store across an ordinary call boundary.
+fn replaceIntegerSlot(values: [int], selectedIndex: int, depth: int) {
+    if depth > 0 { replaceIntegerSlot(values, selectedIndex, depth - 1) }
+    else { values[selectedIndex] = 50 }
+}
+fn checkIntegerSlots(values: [int], selectedIndex: int) {
+    let dataAddress = load64(addr(values) + 16)
+    let typedBefore = values[selectedIndex]
+    let rawBefore = load64(dataAddress + (selectedIndex << 3))
+    if typedBefore != 10 or rawBefore != typedBefore { panic("initial slot") }
+    store8(dataAddress + (selectedIndex << 3), 20)
+    let typedAfterByte = values[selectedIndex]
+    let rawAfterByte = load64(dataAddress + (selectedIndex << 3))
+    if typedAfterByte != 20 or rawAfterByte != typedAfterByte { panic("byte store") }
+    store32(dataAddress + (selectedIndex << 3) + 4, 6)
+    let typedAfterWord = values[selectedIndex]
+    let rawAfterWord = load64(dataAddress + (selectedIndex << 3))
+    if typedAfterWord != 25769803796 or rawAfterWord != typedAfterWord { panic("word store") }
+    values[selectedIndex] = 30
+    let typedAfterIndexed = values[selectedIndex]
+    let rawAfterIndexed = load64(dataAddress + (selectedIndex << 3))
+    if typedAfterIndexed != 30 or rawAfterIndexed != typedAfterIndexed { panic("indexed store") }
+    store64(dataAddress + (selectedIndex << 3), 40)
+    let typedAfterFull = values[selectedIndex]
+    let rawAfterFull = load64(dataAddress + (selectedIndex << 3))
+    if typedAfterFull != 40 or rawAfterFull != typedAfterFull { panic("full store") }
+    let typedCommuted = values[selectedIndex]
+    let rawCommuted = load64((selectedIndex << 3) + dataAddress)
+    if typedCommuted != 40 or rawCommuted != typedCommuted { panic("commuted address") }
+    let rawFirst = load64(dataAddress + (selectedIndex << 3))
+    let typedSecond = values[selectedIndex]
+    if rawFirst != 40 or typedSecond != rawFirst { panic("raw first") }
+    replaceIntegerSlot(values, selectedIndex, 2)
+    let typedAfterCall = values[selectedIndex]
+    let rawAfterCall = load64(dataAddress + (selectedIndex << 3))
+    if typedAfterCall != 50 or rawAfterCall != typedAfterCall { panic("integer call store") }
+}
+
+// Replacing the slot releases its old reference while the caller holds it live.
+fn replaceCellSlot(cells: [Cell], selectedIndex: int, depth: int) {
+    if depth > 0 { replaceCellSlot(cells, selectedIndex, depth - 1) }
+    else {
+        let temporaryCell = Cell{value: 60 + selectedIndex, label: "replacement{selectedIndex}"}
+        cells[selectedIndex] = temporaryCell
+    }
+}
+// Allocate through recursion without changing the caller's reference slot.
+fn churnCells(depth: int) -> int {
+    let temporaryCell = Cell{value: depth, label: "temporary{depth}"}
+    if depth > 0 { return temporaryCell.value + temporaryCell.label.len() + churnCells(depth - 1) }
+    else { return temporaryCell.value + temporaryCell.label.len() }
+}
+fn checkReferenceSlots(cells: [Cell], selectedIndex: int) {
+    let dataAddress = load64(addr(cells) + 16)
+    let held = cells[selectedIndex]
+    let rawBefore = load64(dataAddress + (selectedIndex << 3))
+    let oldValue = 10 + selectedIndex
+    if held.value != oldValue or load64(rawBefore) != oldValue { panic("reference initial") }
+    replaceCellSlot(cells, selectedIndex, 2)
+    let current = cells[selectedIndex]
+    let rawAfter = load64(dataAddress + (selectedIndex << 3))
+    if held.value != oldValue or current.value != 60 + selectedIndex { panic("reference replacement") }
+    if rawBefore == rawAfter or load64(rawBefore) != oldValue { panic("held reference lifetime") }
+    if load64(rawAfter) != current.value { panic("current reference slot") }
+    let heldAcrossChurn = cells[selectedIndex]
+    let rawBeforeChurn = load64(dataAddress + (selectedIndex << 3))
+    let churnResult = churnCells(3)
+    let currentAfterChurn = cells[selectedIndex]
+    let rawAfterChurn = load64(dataAddress + (selectedIndex << 3))
+    if churnResult <= 0 { panic("reference churn") }
+    if rawBeforeChurn != rawAfterChurn or heldAcrossChurn.value != currentAfterChurn.value { panic("unchanged reference call") }
+    if currentAfterChurn.value != 60 + selectedIndex or load64(rawAfterChurn) != currentAfterChurn.value { panic("reference after churn") }
+    // Keep the original owner live beyond every raw read of its old pointer.
+    if held.value != oldValue or held.label.len() == 0 { panic("held reference after churn") }
+}
+
+// A plain reference replacement exposes the typed-read/store lowering path.
+fn updatePlainCells(cells: [PlainCell], selectedIndex: int) {
+    for updateIndex in 0..3 {
+        let current = cells[selectedIndex]
+        let oldValue = current.value
+        cells[selectedIndex] = PlainCell{value: oldValue + 10}
+    }
+    if cells[selectedIndex].value != 40 { panic("plain reference updates") }
+}
+let selectedIndex = args().len() - 1
+checkIntegerSlots([10, 30], selectedIndex)
+var cells: [Cell] = []
+for cellIndex in 0..2 { cells.push(Cell{value: 10 + cellIndex + selectedIndex, label: "original{cellIndex}"}) }
+checkReferenceSlots(cells, selectedIndex)
+let plainCells = [PlainCell{value: 10}, PlainCell{value: 20}]
+let heldPlainCell = plainCells[selectedIndex]
+updatePlainCells(plainCells, selectedIndex)
+if heldPlainCell.value != 10 { panic("held plain reference") }
+if plainCells[selectedIndex].value != 40 { panic("plain reference final value") }
+print("typedRawSlotReuse", 1)

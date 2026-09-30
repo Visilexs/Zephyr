@@ -102,6 +102,7 @@ let irStoreRaw64 = 69            // raw store: base, value, optional index and c
 let irStoreRaw32 = 70
 let irStoreRaw8 = 71
 let irSymbolAddress = 72         // lea of regionSymbols[immediate]
+let irScaledAddress = 73         // base + index*(1 << immediate), with 64-bit wrapping
 let irLoadByte = 64              // zero-extended byte [a + b + 8]: a string's bytes (strings never change)
 // terminators
 let irJump = 100                // successors[0]
@@ -3995,6 +3996,7 @@ fn addressAvoidsGlobal(value: int, globalSlot: int, depth: int) -> bool {
     if opcode == irLoadGlobal { return irImmediates[current] != globalSlot }
     if opcode == irConstant or opcode == irParameter or opcode == irLoadFrame { return true }
     if opcode == irShiftLeft or opcode == irMultiply { return true }        // a scaled index, not a pointer
+    if opcode == irScaledAddress { return addressAvoidsGlobal(irOperands[current][0], globalSlot, depth + 1) }
     if opcode == irAdd or opcode == irListData or opcode == irLoad or opcode == irLoadIndexed {
         for operand in irOperands[current] {
             if not addressAvoidsGlobal(operand, globalSlot, depth + 1) { return false }
@@ -4731,8 +4733,8 @@ fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
     finishResult(value, target)
 }
 
-// float loads read straight by the next instruction as its memory operand
-var foldedFloatLoads: [bool] = []
+// single-use loads read straight by the next instruction as its memory operand
+var foldedMemoryLoads: [bool] = []
 
 fn isFloatBinaryOpcode(opcode: int) -> bool {
     return opcode == irFloatAdd or opcode == irFloatSubtract or opcode == irFloatMultiply or opcode == irFloatDivide or opcode == irFloatMinimum or opcode == irFloatMaximum
@@ -4748,6 +4750,18 @@ fn canFoldFloatLoad(load: int, reader: int) -> bool {
     return operands[0] == load and (irOpcodes[reader] == irFloatAdd or irOpcodes[reader] == irFloatMultiply)
 }
 
+// Equality against a byte constant keeps the zero-extended comparison exact.
+fn canFoldByteLoad(load: int, reader: int) -> bool {
+    if irOpcodes[load] != irLoadByte or irUseCounts[load] != 1 or irOpcodes[reader] != irBranchCompare { return false }
+    let condition = irImmediates[reader]
+    if condition != conditionEqual and condition != conditionNotEqual { return false }
+    let operands = irOperands[reader]
+    var constant = operands[1]
+    if operands[1] == load { constant = operands[0] }
+    else if operands[0] != load { return false }
+    return isImmediateConstant(constant) and irImmediates[constant] >= 0 and irImmediates[constant] <= 255
+}
+
 fn foldedLoadOperand(load: int) -> str {
     let base = integerIn(irOperands[load][0], "rcx")
     return "qword ptr {memoryAt(base, irImmediates[load])}"
@@ -4756,11 +4770,11 @@ fn foldedLoadOperand(load: int) -> str {
 fn emitFloatBinary(value: int, mnemonic: str, commutative: bool) {
     var firstValue = irOperands[value][0]
     var secondValue = irOperands[value][1]
-    if foldedFloatLoads[firstValue] {
+    if foldedMemoryLoads[firstValue] {
         firstValue = irOperands[value][1]
         secondValue = irOperands[value][0]
     }
-    if foldedFloatLoads[secondValue] {
+    if foldedMemoryLoads[secondValue] {
         let target = resultRegister(value, "xmm0")
         let memory = foldedLoadOperand(secondValue)
         moveFloat(target, locationOf(firstValue))
@@ -4924,6 +4938,15 @@ fn emitInstructionFor(value: int) {
     }
     if opcode == irAdd {
         emitIntegerBinary(value, "add", true)
+        return
+    }
+    if opcode == irScaledAddress {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        let scale = 1 << immediate
+        let target = resultRegister(value, "rax")
+        emitOptimized("lea {target}, [{base} + {index}*{scale}]")
+        finishResult(value, target)
         return
     }
     if opcode == irSubtract {
@@ -5424,8 +5447,20 @@ fn emitTerminator(block: int, value: int) {
     }
     if opcode == irBranchCompare {
         let condition = irImmediates[value]
-        let left = integerIn(operands[0], "rax")
-        compareWith(left, operands[1])
+        var load = operands[0]
+        var constant = operands[1]
+        if foldedMemoryLoads[operands[1]] {
+            load = operands[1]
+            constant = operands[0]
+        }
+        if foldedMemoryLoads[load] {
+            let base = integerIn(irOperands[load][0], "rcx")
+            let index = integerIn(irOperands[load][1], "rdx")
+            emitOptimized("cmp byte ptr [{base} + {index} + 8], {irImmediates[constant]}")
+        } else {
+            let left = integerIn(operands[0], "rax")
+            compareWith(left, operands[1])
+        }
         conditionalJump(conditionSuffix(condition), conditionSuffix(invertCondition(condition)), successors[0], successors[1])
         return
     }
@@ -5586,8 +5621,8 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     emitParallelMoves()
     countUses()
     var noFolds: [bool] = []
-    foldedFloatLoads = noFolds
-    for value in 0..irOpcodes.len() { foldedFloatLoads.push(false) }
+    foldedMemoryLoads = noFolds
+    for value in 0..irOpcodes.len() { foldedMemoryLoads.push(false) }
     // blocks that only jump on are never entered: every jump goes past them
     var emittedOrder: [int] = []
     for orderPosition in 0..blockOrder.len() {
@@ -5606,8 +5641,8 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
         let instructions = blockInstructions[block]
         for position in 0..instructions.len() {
             let instruction = instructions[position]
-            if position + 1 < instructions.len() and canFoldFloatLoad(instruction, instructions[position + 1]) {
-                foldedFloatLoads[instruction] = true
+            if position + 1 < instructions.len() and (canFoldFloatLoad(instruction, instructions[position + 1]) or canFoldByteLoad(instruction, instructions[position + 1])) {
+                foldedMemoryLoads[instruction] = true
                 continue
             }
             if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
@@ -6260,6 +6295,34 @@ fn numberValues() {
                 known["m{globalEpoch}:{loadOpcode}:{loadClass}:{irImmediates[instruction]}"] = resolveValue(irOperands[instruction][0])
                 continue
             }
+            // Raw word reads may reuse an earlier typed slot, preserving its
+            // borrowing metadata. Never publish raw reads as typed loads.
+            if storeOpcode == irLoadRaw64 and irClasses[instruction] == classInteger and irOperands[instruction].len() == 1 {
+                let address = resolveValue(irOperands[instruction][0])
+                if irOpcodes[address] == irAdd {
+                    var base = resolveValue(irOperands[address][0])
+                    var index = resolveValue(irOperands[address][1])
+                    var scaleOperand = rawAddressScaleOperand(index)
+                    if scaleOperand < 0 {
+                        scaleOperand = rawAddressScaleOperand(base)
+                        if scaleOperand >= 0 {
+                            index = base
+                            base = resolveValue(irOperands[address][1])
+                        }
+                    }
+                    if scaleOperand >= 0 and irImmediates[scaleOperand] == 3 {
+                        let slotIndex = resolveValue(irOperands[index][0])
+                        let slotKey = "m{epoch}:{irLoadIndexed}:{classInteger}:{irImmediates[instruction]}:{base}:{slotIndex}"
+                        if known.has(slotKey) {
+                            let earlier = resolveValue(known[slotKey])
+                            if not valueDead[earlier] and irOpcodes[earlier] == irLoadIndexed and irClasses[earlier] == classInteger and blockDominates(irBlockOf[earlier], block) {
+                                valueForward[instruction] = earlier
+                                continue
+                            }
+                        }
+                    }
+                }
+            }
             let movable = isMovable(instruction)
             let stringByte = irOpcodes[instruction] == irLoadByte              // strings never change: one key everywhere, but never hoisted
             if not movable and not stringByte and not isMemoryLoad(instruction) { continue }
@@ -6743,6 +6806,28 @@ fn foldAddressArithmetic() {
                 irOperands[instruction].push(resolveValue(irOperands[index][0]))
                 irOperands[instruction].push(scaleOperand)
             } else { irOperands[instruction].push(index) }
+        }
+    }
+    // Fold surviving address values after raw operands have consumed their Adds.
+    // DCE removes a shift only when no other consumer still needs its result.
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] or irOpcodes[instruction] != irAdd or irClasses[instruction] != classInteger { continue }
+            var base = resolveValue(irOperands[instruction][0])
+            var index = resolveValue(irOperands[instruction][1])
+            if irClasses[base] != classInteger or irClasses[index] != classInteger { continue }
+            var scaleOperand = rawAddressScaleOperand(index)
+            if scaleOperand < 0 {
+                scaleOperand = rawAddressScaleOperand(base)
+                if scaleOperand >= 0 {
+                    index = base
+                    base = resolveValue(irOperands[instruction][1])
+                }
+            }
+            if scaleOperand < 0 { continue }
+            irOpcodes[instruction] = irScaledAddress
+            irOperands[instruction] = [base, resolveValue(irOperands[index][0])]
+            irImmediates[instruction] = irImmediates[scaleOperand]
         }
     }
 }

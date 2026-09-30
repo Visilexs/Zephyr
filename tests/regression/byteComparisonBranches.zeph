@@ -1,0 +1,54 @@
+// Separate branch functions keep each byte load's comparison independent.
+fn byteEqualHigh(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == 255 { return 1 } else { return 0 }
+}
+fn byteNotEqualHigh(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) != 255 { return 1 } else { return 0 }
+}
+fn byteEqualNegative(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == -1 { return 1 } else { return 0 }
+}
+fn byteSignedLess(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) < 1 { return 1 } else { return 0 }
+}
+fn byteEqualZero(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == 0 { return 1 } else { return 0 }
+}
+fn byteNotEqualZero(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) != 0 { return 1 } else { return 0 }
+}
+fn byteEqualLarge(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == 321 { return 1 } else { return 0 }
+}
+fn byteEqualOverflow(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == 256 { return 1 } else { return 0 }
+}
+fn byteEqualSwapped(text: str, selectedIndex: int) -> int {
+    if 255 == text.byte(selectedIndex) { return 1 } else { return 0 }
+}
+// The arithmetic use prevents this byte load from being a single-use branch input.
+fn byteMultipleConsumers(text: str, selectedIndex: int) -> int {
+    let selectedByte = text.byte(selectedIndex)
+    if selectedByte == 255 { return selectedByte + 1 } else { return selectedByte }
+}
+fn byteEqualLast(text: str, selectedIndex: int) -> int {
+    if text.byte(selectedIndex) == 66 { return 1 } else { return 0 }
+}
+let selectedIndex = args().len() - 1
+let highText = "prefixAB".sub(6, 8)
+let zeroText = "prefixA".sub(6, 7)
+// Finish raw mutations before any typed byte reads.
+store8(addr(highText) + 8, 255)
+store8(addr(zeroText) + 8, 0)
+if byteEqualHigh(highText, selectedIndex) != 1 { panic("byte equal high") }
+if byteNotEqualHigh(highText, selectedIndex) != 0 { panic("byte not equal high") }
+if byteEqualNegative(highText, selectedIndex) != 0 { panic("byte equal negative") }
+if byteSignedLess(highText, selectedIndex) != 0 { panic("byte signed less") }
+if byteEqualZero(zeroText, selectedIndex) != 1 { panic("byte equal zero") }
+if byteNotEqualZero(zeroText, selectedIndex) != 0 { panic("byte not equal zero") }
+if byteEqualLarge(highText, selectedIndex) != 0 { panic("byte equal large") }
+if byteEqualOverflow(highText, selectedIndex) != 0 { panic("byte equal overflow") }
+if byteEqualSwapped(highText, selectedIndex) != 1 { panic("byte equal swapped") }
+if byteMultipleConsumers(highText, selectedIndex) != 256 { panic("byte multiple consumers") }
+if byteEqualLast(highText, highText.len() - 1 + selectedIndex) != 1 { panic("byte equal last") }
+print("byteComparisonBranches", 11)

@@ -13,6 +13,9 @@ $programs = @()
 foreach ($file in Get-ChildItem examples\basics, examples\threads, tests -Filter *.zeph -File) {
     $programs += , @($file.FullName, "")
 }
+$programs += , @((Resolve-Path "tests\regression\byteComparisonBranches.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\typedRawSlotReuse.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\scaledAddressValues.zeph").Path, "")
 $benchArguments = @{ fib = "27"; matmul = "120"; mandel = "120"; sort = "20000"; strings = "20000"; hashmap = "20000"; cube = "200"; pi = "500"; liquid = "40";
                      shapes = "3000"; closures = "2000"; wordfreq = "30000"; nbody = "10"; lexer = "10000"; vectors = "20" }
 foreach ($name in $benchArguments.Keys) { $programs += , @((Resolve-Path "bench\$name.zeph").Path, $benchArguments[$name]) }
