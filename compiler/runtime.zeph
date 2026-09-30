@@ -1391,6 +1391,7 @@ fn runtimeHashTypedValue(value: int, typeDescriptor: int) -> int {
 fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
+    let hasStringKeys = load64(mapAddress + 24) == 1
     let hash = runtimeMapHash(mapAddress, key)
     let tag = (hash << 1) | 1                          // a live slot's state: its key's hash, odd
     var index = hash & (capacity - 1)
@@ -1398,7 +1399,12 @@ fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
         let slot = slots + index * 24
         let slotState = load64(slot)
         if slotState == 0 { return 0 - 1 }
-        if slotState == tag and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
+        if slotState == tag {
+            // Expose the string comparison to inlining without the structural dispatch.
+            if hasStringKeys {
+                if runtimeStringsEqual(load64(slot + 8), key) == 1 { return index }
+            } else if runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
+        }
         index = (index + 1) & (capacity - 1)
     }
     return 0 - 1

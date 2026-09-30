@@ -1,0 +1,53 @@
+// String probes preserve growth, tombstones and non-string keys.
+struct LookupKey { first: int, second: int }
+fn exerciseStringLookup(keyCount: int) {
+    var stringValues: [str: int] = [:]
+    for keyIndex in 0..keyCount { stringValues["key{keyIndex}"] = keyIndex + 1 }
+    var checksum = 0
+    var allPresent = true
+    for keyIndex in 0..keyCount {
+        let freshKey = "key{keyIndex}"
+        checksum += stringValues.get(freshKey).or(-1)
+        allPresent = allPresent and stringValues.has(freshKey)
+    }
+    print("grown", stringValues.len(), checksum, allPresent)
+    print("missing", stringValues.has("missing"), stringValues.get("missing").or(77))
+    stringValues[""] = 501
+    stringValues["λ雪"] = 502
+    let embeddedZeroKey = "a" + chr(0) + "b"
+    stringValues[embeddedZeroKey] = 503
+    stringValues["a"] = 504
+    print("special", stringValues[""], stringValues["λ雪"], stringValues["a" + chr(0) + "b"], stringValues["a"])
+    for keyIndex in 0..keyCount { if keyIndex % 2 == 0 { stringValues.remove("key{keyIndex}") } }
+    var removedAbsent = true
+    for keyIndex in 0..keyCount { if keyIndex % 2 == 0 { removedAbsent = removedAbsent and not stringValues.has("key{keyIndex}") } }
+    print("removed", stringValues.len(), removedAbsent)
+    for keyIndex in 0..keyCount { if keyIndex % 2 == 0 { stringValues["key{keyIndex}"] = keyIndex + 1001 } }
+    checksum = 0
+    for keyIndex in 0..keyCount { checksum += stringValues["key{keyIndex}"] }
+    print("reinserted", stringValues.len(), checksum)
+    var boundaryValues: [str: int] = [:]
+    for keyLength in [0, 1, 7, 8, 9, 15, 16, 17] {
+        var boundaryKey = ""
+        for characterIndex in 0..keyLength { boundaryKey = boundaryKey + "q" }
+        boundaryValues[boundaryKey] = boundaryValues.get(boundaryKey).or(0) + 1
+        boundaryKey = ""
+        for characterIndex in 0..keyLength { boundaryKey = boundaryKey + "q" }
+        boundaryValues[boundaryKey] = boundaryValues.get(boundaryKey).or(0) + 1
+    }
+    var boundaryChecksum = 0
+    for boundaryKey, boundaryValue in boundaryValues { boundaryChecksum += boundaryValue }
+    print("boundaries", boundaryValues.len(), boundaryChecksum)
+    var integerValues: [int: int] = [:]
+    integerValues[5] = 61
+    integerValues[37] = 62
+    integerValues.remove(5)
+    integerValues[5] = 63
+    print("integer", integerValues[5], integerValues[37], integerValues.get(99).or(64))
+    var structuralValues: [LookupKey: int] = [:]
+    structuralValues[LookupKey{first: 1, second: 2}] = 71
+    structuralValues[LookupKey{first: 3, second: 4}] = 72
+    let equalFreshKey = LookupKey{first: 1, second: 2}
+    print("structural", structuralValues[equalFreshKey], structuralValues.has(LookupKey{first: 3, second: 4}), structuralValues.get(LookupKey{first: 9, second: 9}).or(73))
+}
+exerciseStringLookup(127 + args().len())
