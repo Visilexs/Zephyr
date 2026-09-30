@@ -142,6 +142,7 @@ var blockSuccessors: [[int]] = []
 var blockSealed: [bool] = []
 var blockTerminated: [bool] = []
 var blockLoopDepth: [int] = []
+var loopHeaders: [int] = []                 // findLoops: one header per natural loop
 
 // SSA construction (Braun et al.): current definition of each variable per block
 var variableKeys: [str: int] = [:]        // "l5" / "p2" / "g7" / "t3" -> variable number
@@ -1294,6 +1295,24 @@ fn pinArguments(operands: [int], arguments: [Node], globalsStay: bool, pinned: [
 }
 
 // str == != < <= > >=: the runtime compares; + concatenates into a fresh string
+// strings of different lengths differ: only equal lengths call the byte compare
+fn lowerStringsEqual(left: int, right: int) -> int {
+    let leftLength = emitIr1(irListLength, classInteger, left, 1)
+    let rightLength = emitIr1(irListLength, classInteger, right, 1)
+    let result = temporaryVariable(classInteger, false)
+    writeVariableValue(result, integerConstant(0))
+    let compareBlock = newBlock()
+    let joinBlock = newBlock()
+    terminate(irBranchCompare, [leftLength, rightLength], conditionEqual, [compareBlock, joinBlock])
+    sealBlock(compareBlock)
+    currentIrBlock = compareBlock
+    writeVariableValue(result, lowerRuntimeCall("runtimeStringsEqual", [left, right]))
+    jumpTo(joinBlock)
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
+    return readVariable(result, joinBlock)
+}
+
 fn lowerStringComparison(expression: Node) -> int {
     let operator = expression.operator
     let condition = conditionForToken(operator)
@@ -1306,7 +1325,7 @@ fn lowerStringComparison(expression: Node) -> int {
     if optimizerBailed { return 0 }
     if operator == tokenPlus { return ownedTemporary(lowerRuntimeCall("runtimeConcatenateStrings", [left, right])) }
     if operator == tokenEquals or operator == tokenNotEquals {
-        let equal = lowerRuntimeCall("runtimeStringsEqual", [left, right])
+        let equal = lowerStringsEqual(left, right)
         if operator == tokenEquals { return equal }
         return emitIr2(irBitXor, classInteger, equal, integerConstant(1), 0)
     }
@@ -4066,6 +4085,9 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     for orderPosition in 0..blockOrder.len() {
         currentOrderPosition = orderPosition
         let block = blockOrder[orderPosition]
+        for header in loopHeaders {
+            if header == block { optimizerLines.push(".balign 16\n") }     // a loop's back edges land on a fetch-block boundary
+        }
         optimizerLines.push(".L{blockLabels[block]}:\n")
         for instruction in blockInstructions[block] {
             if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
@@ -4652,7 +4674,6 @@ fn numberValues() {
     rewriteOperands()
 }
 
-var loopHeaders: [int] = []
 var loopBlockSets: [[bool]] = []
 var loopPreheaders: [int] = []
 
@@ -4809,6 +4830,91 @@ fn hoistLoopInvariants() {
     }
 }
 
+// how many CFG loops hold a block (findLoops' sets)
+fn cfgLoopDepth(block: int) -> int {
+    var depth = 0
+    for members in loopBlockSets {
+        if block < members.len() and members[block] { depth += 1 }
+    }
+    return depth
+}
+
+fn isSinkable(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    if opcode == irPhi or opcode == irParameter or opcode == irConstant or opcode == irFloatConstant { return false }
+    if not isPureOpcode(opcode) { return false }
+    if opcode == irLoadGlobal or opcode == irFloatLoadGlobal { return not regionGlobalsInMemory }     // memory changes only at the write-back
+    return isMovable(value)
+}
+
+// Code sinking: a pure value moves down to the lowest block dominating all its
+// uses (a phi's use sits in its predecessor), never into a deeper loop, so a
+// path that does not need it does not compute it.
+fn sinkInstructions() {
+    var useBlocks: [[int]] = []
+    for value in 0..irOpcodes.len() {
+        var noUses: [int] = []
+        useBlocks.push(noUses)
+    }
+    for block in blockOrder {
+        for instruction in blockInstructions[block] {
+            let operands = irOperands[instruction]
+            for i in 0..operands.len() {
+                var useBlock = block
+                if irOpcodes[instruction] == irPhi { useBlock = blockPredecessors[block][i] }
+                useBlocks[resolveValue(operands[i])].push(useBlock)
+            }
+        }
+    }
+    var reverseOrder: [int] = []
+    var orderIndex = blockOrder.len() - 1
+    while orderIndex >= 0 {
+        reverseOrder.push(blockOrder[orderIndex])
+        orderIndex -= 1
+    }
+    for block in reverseOrder {
+        let instructions = blockInstructions[block]
+        var index = instructions.len() - 1
+        while index >= 0 {
+            let value = instructions[index]
+            index -= 1
+            if valueDead[value] or not isSinkable(value) or useBlocks[value].len() == 0 { continue }
+            var target = useBlocks[value][0]
+            for useBlock in useBlocks[value] { target = intersectDominators(target, useBlock) }
+            if target == block or cfgLoopDepth(target) > cfgLoopDepth(block) { continue }
+            // out of this block, in at the head of the target (after its phis)
+            var kept: [int] = []
+            for instruction in blockInstructions[block] {
+                if instruction != value { kept.push(instruction) }
+            }
+            blockInstructions[block] = kept
+            let targetInstructions = blockInstructions[target]
+            var placed: [int] = []
+            var inserted = false
+            for instruction in targetInstructions {
+                if not inserted and irOpcodes[instruction] != irPhi {
+                    placed.push(value)
+                    inserted = true
+                }
+                placed.push(instruction)
+            }
+            blockInstructions[target] = placed
+            irBlockOf[value] = target
+            // its operands are now used from the target
+            for operand in irOperands[value] {
+                let operandUses = useBlocks[resolveValue(operand)]
+                var moved = false
+                for i in 0..operandUses.len() {
+                    if not moved and operandUses[i] == block {
+                        operandUses[i] = target
+                        moved = true
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn optimizeLoops() {
     computeBlockOrder()
     computeDominators()
@@ -4818,6 +4924,7 @@ fn optimizeLoops() {
     hoistLoopInvariants()
     eliminateBoundsChecks()
     resetForwarding()
+    sinkInstructions()
 }
 
 // ---- bounds-check elimination ----

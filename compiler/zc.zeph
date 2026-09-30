@@ -10494,6 +10494,22 @@ fn writeTextByte(value: int) {
     store8(load64(addr(textSectionBytes) + 16) + textSectionLength, value)
     textSectionLength += 1
 }
+// NOPs up to the next multiple of `alignment`: long forms, so a fall-through runs few of them
+fn writeTextPadding(alignment: int) {
+    while textSectionLength % alignment != 0 {
+        let gap = alignment - textSectionLength % alignment
+        if gap >= 8 {
+            for value in [15, 31, 132, 0, 0, 0, 0, 0] { writeTextByte(value) }     // nop dword [rax + rax + 0]
+        } else if gap >= 4 {
+            for value in [15, 31, 64, 0] { writeTextByte(value) }                  // nop dword [rax + 0]
+        } else if gap >= 3 {
+            for value in [15, 31, 0] { writeTextByte(value) }                      // nop dword [rax]
+        } else {
+            writeTextByte(144)                                                     // nop
+        }
+    }
+}
+
 fn writeReadOnlyByte(value: int) {
     if (readOnlySectionLength & 7) == 0 { readOnlySectionBytes.push(0) }
     store8(load64(addr(readOnlySectionBytes) + 16) + readOnlySectionLength, value)
@@ -11201,6 +11217,8 @@ fn assembleLine(line: str) {
                     while readOnlySectionLength % alignment != 0 { writeReadOnlyByte(0) }
                 } else if currentAssemblySection == sectionZeroInitializedData {
                     while zeroSectionSize % alignment != 0 { zeroSectionSize += 1 }
+                } else if currentAssemblySection == sectionText {
+                    writeTextPadding(alignment)
                 }
                 return
             }
