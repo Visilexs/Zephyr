@@ -1,0 +1,51 @@
+// -O2 parity: storing into reference globals from optimized code. The slot
+// takes the new count and drops the old one, including when the new value
+// is the old one or hangs off it.
+
+struct Node { label: str, next: Node? }
+
+var current = "start"
+var history: [str] = []
+var best: [int] = [0]
+var chain: Node? = none
+
+struct Pair { left: str, right: str }
+var pair = Pair{left: "a", right: "b"}
+
+fn shift(i: int) {
+    pair = Pair{left: pair.right, right: "r{i}"}        // the new value reads the old one
+    if i % 9 == 0 { pair = pair }
+}
+
+fn record(text: str) { history.push(text) }
+
+fn step(i: int) {
+    current = "step{i}"
+    record(current)
+    if i % 3 == 0 { best = [i, i * 2] }
+    if i % 5 == 0 { current = history[i / 2] }
+    current = current                                   // itself
+}
+
+fn grow(i: int) {
+    chain = Node{label: "n{i}", next: chain}
+    if i % 4 == 3 and chain.has() {
+        let head = chain.get()
+        chain = head.next                                // hangs off the old value
+    }
+}
+
+for i in 0..300 {
+    step(i)
+    if i % 7 == 0 { current = "loop{i}" }
+    best = [best[0] + i]
+    grow(i)
+    shift(i)
+}
+var length = 0
+var walk = chain
+while walk.has() {
+    length += 1
+    walk = walk.get().next
+}
+print(current, history.len(), best[0], history[299], length, pair.left, pair.right)

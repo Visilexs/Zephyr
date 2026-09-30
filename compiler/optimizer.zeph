@@ -669,7 +669,8 @@ fn declareVariable(variable: int, value: int) {
 fn assignVariable(target: Node, value: int) {
     let variable = identifierVariable(target)
     if optimizerBailed { return }
-    if variableIsReference[variable] and not regionIsFunction and not variableDeclaredInside[variable] {
+    let isMemoryGlobal = variableHomeKind[variable] == identifierKindGlobal and regionGlobalsInMemory
+    if variableIsReference[variable] and not regionIsFunction and not variableDeclaredInside[variable] and not isMemoryGlobal {
         optimizerBail("reference store to a parent slot")
         return
     }
@@ -1395,6 +1396,13 @@ fn storeVariable(variable: int, value: int, isDeclaration: bool) {
             writeVariableValue(variable, owned)
             emitRelease(previous)
         }
+        return
+    }
+    if not isDeclaration and variableIsReference[variable] and variableHomeKind[variable] == identifierKindGlobal and regionGlobalsInMemory {
+        // the global's slot takes a count and drops its old one; loads of it
+        // are borrowed here, so one live across this store fails checkBorrows
+        let slotAddress = emitIr2(irAdd, classInteger, symbolAddress("__zephyr_globals"), integerConstant(8 * variableHomeIndex[variable]), 0)
+        let assigned = lowerRuntimeCall("runtimeAssignReference", [slotAddress, takeOwnership(value)])
         return
     }
     if isPendingTemporary(value) {
@@ -2722,6 +2730,15 @@ fn lowerStatementKind(statement: Node) {
 }
 
 // does any call in this subtree reach user code (which may touch globals)?
+// a reference global assigned in the region: only memory mode can store it
+fn assignsReferenceGlobal(node: Node) -> bool {
+    if node.nodeKind == nodeAssign and node.children[0].nodeKind == nodeIdentifier and node.children[0].auxiliary == identifierKindGlobal and isReferenceType(node.children[0].typeIndex) { return true }
+    for child in node.children {
+        if assignsReferenceGlobal(child) { return true }
+    }
+    return false
+}
+
 fn subtreeHasUserCall(node: Node) -> bool {
     if node.nodeKind == nodeCall {
         let callKind = node.auxiliary
@@ -2764,7 +2781,7 @@ fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCou
     regionParentSlotCount = parentSlotCount
     regionParentParameterCount = parentParameterCount
     regionParentRegisterCall = parentRegisterCall
-    regionGlobalsInMemory = subtreeHasUserCall(loopStatement)
+    regionGlobalsInMemory = subtreeHasUserCall(loopStatement) or assignsReferenceGlobal(loopStatement)
     findOwnedLocals(loopStatement)
     let entryBlock = newBlock()
     blockSealed[entryBlock] = true
@@ -2787,7 +2804,7 @@ fn lowerFunctionRegion(functionIndex: int) -> bool {
     regionIsFunction = true
     regionFunctionIndex = functionIndex
     regionReturnType = functionDefinition.returnType
-    regionGlobalsInMemory = subtreeHasUserCall(functionDefinition.body)
+    regionGlobalsInMemory = subtreeHasUserCall(functionDefinition.body) or assignsReferenceGlobal(functionDefinition.body)
     findOwnedLocals(functionDefinition.body)
     let entryBlock = newBlock()
     blockSealed[entryBlock] = true
