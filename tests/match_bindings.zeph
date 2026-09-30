@@ -1,0 +1,52 @@
+// -O2 parity: a match arm's hidden binding local lives only for its arm. In a
+// loop over mixed variants, releasing it after the join used to release an
+// earlier iteration's value a second time.
+
+enum Shape {
+    Circle(float)
+    Rect(float, float)
+    Label(str)
+    Empty
+}
+
+impl Shape {
+    fn area(self) -> float {
+        return match self {
+            Circle(r) { 3.0 * r * r }
+            Rect(w, h) { w * h }
+            else { 0.0 }
+        }
+    }
+}
+
+fn name(shape: Shape) -> str {
+    return match shape {
+        Label(text) { text }
+        Circle(r) { "circle" }
+        else { "other" }
+    }
+}
+
+fn makeLabel(i: int) -> Shape { return Shape.Label("label{i}") }
+
+fn makeShapes() -> [Shape] {
+    var made: [Shape] = []
+    for i in 0..400 {
+        if i % 4 == 0 { made.push(Shape.Circle(i as float)) }
+        else if i % 4 == 1 { made.push(Shape.Rect(i as float, 0.5)) }
+        else if i % 4 == 2 { made.push(makeLabel(i)) }
+        else { made.push(Shape.Empty) }
+    }
+    return made
+}
+
+let shapes = makeShapes()
+var total = 0.0
+for round in 0..3 {
+    for s in shapes { total += s.area() }
+}
+var names = 0
+for s in shapes { names += name(s).len() }
+for i in 0..50 { names += name(makeLabel(i)).len() }   // the subject is fresh: the arm's value outlives it
+print(total, names)
+print(shapes[2], name(shapes[6]))

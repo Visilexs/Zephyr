@@ -1,0 +1,33 @@
+// -O2 parity for builtins the optimizing tier lowers itself: string
+// interpolation, print, pop, zeros, join and chr.
+
+struct Point { x: int, y: float }
+
+fn describe(point: Point, label: str) -> str { return "{label}: ({point.x}, {point.y}) {[1, 2, 3]} {true}" }
+
+var total = 0
+var saved: [str] = []
+var stack: [Point] = []
+var floats: [float] = []
+for i in 0..3000 {
+    let text = describe(Point{x: i, y: i as float / 4.0}, "p{i % 7}")
+    total += text.len()
+    if i % 700 == 0 { saved.push("{i}:{text}") }
+    stack.push(Point{x: i, y: 0.5})
+    floats.push(i as float * 1.5)
+    if i % 3 == 0 {
+        let top = stack.pop()
+        total += top.x
+        total += floats.pop() as int
+    }
+    var counts = zeros(i % 5 + 1)
+    counts[i % counts.len()] += i
+    total += counts[0]
+    let letters = [chr(97 + i % 26), chr(65 + i % 26), "{i % 10}"]
+    total += letters.join().len() + letters.join().byte(0)
+}
+print(total, stack.len(), floats.len())
+for line in saved { print(line) }
+print("nested {"inner {total % 10}"} done")
+print(1.25)
+print(stack.pop().x)

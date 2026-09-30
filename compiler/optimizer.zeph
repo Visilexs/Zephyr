@@ -876,8 +876,20 @@ fn lowerExpression(expression: Node) -> int {
         return readVariableValue(result)
     }
     if kind == nodeLetExpression {
+        // The hidden local dies with the expression. Left to the enclosing
+        // scope, it would be released after a join, where on the paths that
+        // never ran this arm its SSA value is an older, already released one.
+        var letVariables: [int] = []
+        ownedScopes.push(letVariables)
         lowerStatement(expression.children[0])
-        return lowerExpression(expression.children[1])
+        var value = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        if ownedScopes[ownedScopes.len() - 1].len() > 0 and isReferenceType(expression.typeIndex) and not isPendingTemporary(value) {
+            value = ownedTemporary(emitRetain(value))       // it may lean on the hidden local
+        }
+        if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
+        let closedScope = ownedScopes.pop()
+        return value
     }
     if kind == nodeIndex { return lowerIndexRead(expression) }
     if kind == nodeMember {
@@ -896,8 +908,29 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeList { return lowerListLiteral(expression) }
     if kind == nodeInterfaceBox { return lowerInterfaceBox(expression) }
     if kind == nodeFunctionLiteral { return lowerFunctionLiteral(expression) }
+    if kind == nodeStringLiteral { return lowerInterpolation(expression) }
     optimizerBail("expression kind {kind}")
     return 0
+}
+
+// "text {value} text": parts append to the runtime's string builder, one
+// string at the end (as the baseline does); the parts' temporaries go with
+// the statement
+fn lowerInterpolation(expression: Node) -> int {
+    var noOperands: [int] = []
+    let mark = lowerRuntimeCall("runtimeBeginStringInterpolation", noOperands)
+    for part in expression.children {
+        if part.nodeKind == nodeStringText {
+            let text = emitIr0(irDataAddress, classInteger, addDataString(part.name))
+            let appendedText = lowerRuntimeCall("runtimeAppendInterpolationText", [text])
+        } else {
+            var value = lowerExpression(part.children[0])
+            if optimizerBailed { return 0 }
+            if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+            let appendedValue = lowerRuntimeCall("runtimeAppendInterpolationValue", [value, symbolAddress("__td{part.slot}")])
+        }
+    }
+    return ownedTemporary(lowerRuntimeCall("runtimeEndStringInterpolation", [mark]))
 }
 
 fn symbolAddress(symbol: str) -> int {
@@ -1192,6 +1225,8 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
+    if name == "runtimePrintTypedValue" or name == "runtimeJoinStringList" or name == "runtimeCharacterFromCode" or name == "runtimeListNew" { return true }
+    if name == "runtimeBeginStringInterpolation" or name == "runtimeAppendInterpolationText" or name == "runtimeAppendInterpolationValue" or name == "runtimeEndStringInterpolation" { return true }   // they write the builder's own buffer
     if name == "runtimeMapGet" or name == "runtimeFindMapEntry" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
     return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
@@ -1921,6 +1956,47 @@ fn lowerCall(expression: Node) -> int {
         lowerListPush(list, value)
         for pinnedValue in pinned { emitRelease(pinnedValue) }
         return 0
+    }
+    if callKind == callKindPrint {
+        var printed = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        if irClasses[printed] == classFloat { printed = emitIr1(irBitsFromFloat, classInteger, printed, 0) }
+        let printedResult = lowerRuntimeCall("runtimePrintTypedValue", [printed, symbolAddress("__td{expression.slot}")])
+        return 0
+    }
+    if callKind == callKindPop {
+        let receiver = expression.children[0].children[0]
+        let elementType = plainListElement(receiver.typeIndex)
+        let list = lowerContainer(receiver, [])
+        if optimizerBailed { return 0 }
+        // inline: an empty list fails the check (count - 1 is not below count),
+        // and the element's count moves out of the list
+        let count = emitIr1(irListLength, classInteger, list, 0)
+        let lastIndex = emitIr2(irSubtract, classInteger, count, integerConstant(1), 0)
+        let checkedIndex = emitIr2(irBoundsCheck, classInteger, count, lastIndex, panicStringIndex(expression, "pop from empty list"))
+        let data = emitIr1(irListData, classInteger, list, 0)
+        irBorrowed[data] = true
+        let lengthStored = emitIr2(irStoreRaw64, classInteger, list, lastIndex, 0)
+        if typeKinds[elementType] == kindFloat { return emitIr2(irFloatLoadIndexed, classFloat, data, lastIndex, 0) }
+        let popped = emitIr2(irLoadIndexed, classInteger, data, lastIndex, 0)
+        if isReferenceType(elementType) { return ownedTemporary(popped) }
+        return popped
+    }
+    if callKind == callKindZeros {
+        let zeroCount = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        return ownedTemporary(lowerRuntimeCall("runtimeListNew", [zeroCount]))
+    }
+    if callKind == callKindJoin {
+        let joined = lowerContainer(expression.children[0].children[0], [])
+        if optimizerBailed { return 0 }
+        return ownedTemporary(lowerRuntimeCall("runtimeJoinStringList", [joined]))
+    }
+    if callKind == callKindCharacter {
+        let code = lowerExpression(expression.children[1])
+        if optimizerBailed { return 0 }
+        let checkedCode = emitIr2(irBoundsCheck, classInteger, integerConstant(256), code, panicStringIndex(expression, "chr out of range"))
+        return ownedTemporary(lowerRuntimeCall("runtimeCharacterFromCode", [code]))
     }
     if callKind == callKindSubstring {
         let text = lowerContainer(expression.children[0].children[0], [expression.children[1], expression.children[2]])
