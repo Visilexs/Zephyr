@@ -10794,6 +10794,7 @@ fn parseOperand(text: str, lowerBound: int, upperBound: int, operand: Operand) {
 
 // emit REX + opcodes + modrm/sib/disp; opc2 < 0 means single-byte opcode
 fn encodeRegisterMemory(wideRegisterPrefix: int, primaryOpcode: int, secondaryOpcode: int, register: int, registerOrMemory: Operand, prefix66: bool, prefixF2: bool) {
+    if registerOrMemory.kind == operandKindImmediate { panic("assembler: an immediate where a register or memory operand belongs") }
     if prefix66 { writeTextByte(102) }
     if prefixF2 { writeTextByte(242) }
     var registerExtensionPrefix = 0

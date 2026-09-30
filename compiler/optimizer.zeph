@@ -5142,17 +5142,25 @@ fn numberValues() {
     var known: [str: int] = [:]
     var blockExitEpochs: [int] = []
     var blockExitGlobalEpochs: [int] = []           // globals: any call may write them (the runtime's own too)
+    var blockExitShapeEpochs: [int] = []            // list lengths and data arrays: only calls and raw stores change them
     for block in 0..blockInstructions.len() {
         blockExitEpochs.push(0 - 1)
         blockExitGlobalEpochs.push(0 - 1)
+        blockExitShapeEpochs.push(0 - 1)
     }
     var epochCount = 0
     for block in dominatorTreeOrder {
         var epoch = 0 - 1
         var globalEpoch = 0 - 1
+        var shapeEpoch = 0 - 1
         if blockPredecessors[block].len() == 1 {
             epoch = blockExitEpochs[blockPredecessors[block][0]]
             globalEpoch = blockExitGlobalEpochs[blockPredecessors[block][0]]
+            shapeEpoch = blockExitShapeEpochs[blockPredecessors[block][0]]
+        }
+        if shapeEpoch < 0 {
+            epochCount += 1
+            shapeEpoch = epochCount
         }
         if epoch < 0 {
             epochCount += 1
@@ -5167,6 +5175,11 @@ fn numberValues() {
             if irOpcodes[instruction] == irCall or changesMemory(instruction) {
                 epochCount += 1
                 globalEpoch = epochCount
+            }
+            let changedOpcode = irOpcodes[instruction]
+            if (changedOpcode == irCall and changesMemory(instruction)) or changedOpcode == irStoreRaw64 or changedOpcode == irStoreRaw32 or changedOpcode == irStoreRaw8 {
+                epochCount += 1
+                shapeEpoch = epochCount
             }
             if changesMemory(instruction) {
                 epochCount += 1
@@ -5193,6 +5206,7 @@ fn numberValues() {
             if stringByte { key = "s:" + key }
             else if not movable {
                 if irOpcodes[instruction] == irLoadGlobal or irOpcodes[instruction] == irFloatLoadGlobal { key = "m{globalEpoch}:" + key }
+                else if irOpcodes[instruction] == irListLength or irOpcodes[instruction] == irListData { key = "l{shapeEpoch}:" + key }
                 else { key = "m{epoch}:" + key }
             }
             if operands.len() == 2 and isCommutativeOpcode(irOpcodes[instruction]) and resolveValue(operands[0]) > resolveValue(operands[1]) {
@@ -5211,6 +5225,7 @@ fn numberValues() {
         }
         blockExitEpochs[block] = epoch
         blockExitGlobalEpochs[block] = globalEpoch
+        blockExitShapeEpochs[block] = shapeEpoch
     }
     rewriteOperands()
 }
@@ -5533,8 +5548,15 @@ fn edgeProvesInBounds(block: int, index: int, length: int) -> bool {
     if successors[1] == block { condition = invertCondition(condition) }
     let left = resolveValue(irOperands[terminator][0])
     let right = resolveValue(irOperands[terminator][1])
-    if left == index and right == length and condition == conditionLess { return true }
-    return left == length and right == index and condition == conditionGreater
+    if left == index and boundNotAbove(right, length, 0) and condition == conditionLess { return true }
+    return boundNotAbove(left, length, 0) and right == index and condition == conditionGreater
+}
+
+// bound <= length for certain: length itself, or a min() one of whose inputs is
+fn boundNotAbove(bound: int, length: int, depth: int) -> bool {
+    if bound == length { return true }
+    if depth > 3 or irOpcodes[bound] != irIntegerMinimum { return false }
+    return boundNotAbove(resolveValue(irOperands[bound][0]), length, depth + 1) or boundNotAbove(resolveValue(irOperands[bound][1]), length, depth + 1)
 }
 
 // A bounds check whose index is never negative and sits under a branch that

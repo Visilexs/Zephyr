@@ -39,6 +39,7 @@ symbol) for profiling.
 - unreachable-block removal
 - trivial phi removal
 - constant folding, including canonical compares and `x cmp x`
+- `lo <= x and x <= hi` fused into one unsigned compare, `(x - lo) <=u (hi - lo)`
 - jump threading
 - straight-block merging
 - DCE
@@ -51,20 +52,28 @@ symbol) for profiling.
   store or freeing call, with store-to-load forwarding for globals. String
   bytes count as immutable.
 - LICM: loads that the loop itself cannot change are hoisted per loop.
-- GVN runs again after hoisting.
+- GVN runs again after hoisting. List lengths and data pointers have their own
+  epoch: element stores don't invalidate them, only calls and raw stores do.
 - Bounds-check elimination from a non-negative fixpoint plus dominating
-  compares.
+  compares against the length, or against a `min()` of it.
 - `x % 2^k` and `x / 2^k` on non-negative x become a mask or shift.
 - Code sinking to the lowest dominator of a value's uses.
 
 **Backend:**
 
 - critical-edge splitting;
-- linear scan over live ranges with holes, with phi coalescing and spill costs
-  weighted by loop depth;
+- linear scan over live ranges with holes, with phi coalescing; eviction
+  compares loop-weighted uses per live position;
+- 11 integer registers: r11 is allocatable except across an invariant
+  division, which uses it as scratch;
 - register promotion of spilled values that a loop only reads;
+- `load64(a + b + c)` and friends use the addressing mode `[a + b + c]`;
+  a single-use float load feeds its reader as a memory operand; constant
+  stores use immediates;
+- loop rotation: a back edge to a header holding only phis and a compare
+  repeats the compare instead of jumping back;
 - `lea` peepholes, fused compare-and-branch, and forwarder-block skipping;
-- loop headers aligned to 16 bytes.
+- loop headers aligned to 16 bytes; 8-bit immediates use the short encoding.
 
 ## Gates (all must pass before a commit)
 
@@ -77,37 +86,42 @@ symbol) for profiling.
 - The baseline corpus (no `-O2`) must stay byte-identical unless a runtime
   change is intended.
 
+The runtime side (compiler/runtime.zeph, embedded by `scripts/embed-gen.ps1`):
+size-class free lists hand small blocks back inline on release and
+allocation, and a live map slot's state word holds `(hash << 1) | 1`, so
+probes skip foreign keys without dereferencing them and a rehash never
+rehashes.
+
 ## Measurements (2026-09-30)
 
 Best of 3, in ms, from `bench/run_suite.ps1 3` on the dev machine (Windows 11).
 
 | area | baseline | -O2 | C | Rust | -O2/C |
 |---|---:|---:|---:|---:|---:|
-| recursion (fib) | 20 | 12 | 10 | 20 | 1.20 |
+| recursion (fib) | 20 | 11 | 10 | 20 | 1.10 |
 | integer SIMD | 39 | 38 | 72 | 69 | 0.53 |
-| float compute | 97 | 93 | 88 | 91 | 1.06 |
-| sorting | 86 | 91 | 297 | 43 | 0.31 |
-| alloc / GC | 130 | 104 | 171 | 154 | 0.61 |
-| hash map | 35 | 31 | 30 | 68 | 1.03 |
+| float compute | 98 | 93 | 89 | 91 | 1.04 |
+| sorting | 87 | 83 | 296 | 43 | 0.28 |
+| alloc / GC | 122 | 95 | 171 | 155 | 0.56 |
+| hash map | 42 | 36 | 30 | 70 | 1.20 |
 | rasterization | 7 | 7 | 9 | 10 | 0.78 |
-| bignum | 57 | 56 | 85 | 92 | 0.66 |
-| fluid / neighbours | 2840 | 2500 | 2250 | 2506 | 1.11 |
-| dynamic dispatch | 301 | 175 | 158 | 154 | 1.11 |
-| closures / HOFs | 202 | 126 | 102 | 40 | 1.24 |
-| string hash map | 245 | 124 | 68 | 95 | 1.82 |
-| struct floats | 481 | 166 | 150 | 152 | 1.11 |
-| tokenizer | 360 | 201 | 120 | 104 | 1.68 |
+| bignum | 56 | 56 | 85 | 92 | 0.66 |
+| fluid / neighbours | 2893 | 2471 | 2242 | 2510 | 1.10 |
+| dynamic dispatch | 300 | 168 | 157 | 164 | 1.07 |
+| closures / HOFs | 207 | 124 | 102 | 40 | 1.22 |
+| string hash map | 230 | 98 | 68 | 97 | 1.44 |
+| struct floats | 483 | 165 | 151 | 151 | 1.09 |
+| tokenizer | 357 | 188 | 120 | 104 | 1.57 |
 
 ## Known limits and next steps
 
 - **No live-range splitting.** A group keeps one register or one slot for its
   whole life, and promotion only helps loops that have a free register. Dense
   inlined regions (the closures driver loop) still spill.
-- **Where the remaining gaps come from.** The string map and the tokenizer
-  spend their time in the runtime: FNV byte hashing, 24-byte map slots, and
-  allocating substrings and tokens. The next wins there are runtime changes: a
-  word-at-a-time hash, a hash cached in the slot, and an inline small-object
-  allocation fast path.
+- **Where the remaining gaps come from.** The C tokenizer slices its source
+  and the C word counter builds words in a stack buffer; Zephyr allocates a
+  string per token or word. Int maps use 24-byte slots (state, key, value)
+  where C uses 16, so the table is 1.5x bigger and misses more.
 - **Unlowered constructs.** Reference assignment to globals ("fresh value into
   a borrowed variable") and packed `[byte]` lists fall back to the baseline.
 - **Phases not yet started.** Tier-up inside `zc run`, speculation and
