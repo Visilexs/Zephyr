@@ -449,6 +449,13 @@ fn runtimeReleaseReference(value: int) {
     }
     if referenceCount < 1 { runtimeFail("reference count underflow") }
     store64(value - 24, 0)
+    if load64(value - 16) == 0 and runtimeRegisteredThreadCount == 0 {
+        // nothing inside to release (a string, a buffer): straight back on its free list
+        let size = load64(value - 8) & (0 - 8)
+        store64(value - 8, size | runtimeHeapFlagFree)
+        runtimePushFreeBlock(value, size)
+        return
+    }
     runtimeReleaseObject(value)
 }
 
@@ -636,6 +643,20 @@ fn runtimeAllocateObject(size: int) -> int {
 // which words, so dropping it can drop them. Count starts at 1 - the caller
 // owns the fresh object.
 fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
+    if runtimeRegisteredThreadCount == 0 and runtimeHeapInitialized != 0 and size > 0 and size <= 8 * runtimeSmallAllocationClassCount {
+        // a small block its size class can hand back at once
+        let need = (size + 7) & (0 - 8)
+        let listHead = runtimeFreeListHeads + need            // class need / 8, 8 bytes a head
+        let block = load64(listHead)
+        if block != 0 {
+            store64(listHead, load64(block))
+            store64(block - 8, need)                          // live again, flags cleared
+            runtimeZeroMemory(block, need)
+            store64(block - 24, 1)
+            store64(block - 16, descriptor)
+            return block
+        }
+    }
     runtimeLockHeap()
     let result = runtimeAllocateObjectPayload(size)
     store64(result - 24, 1)
