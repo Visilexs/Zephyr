@@ -3439,38 +3439,48 @@ fn promoteSpilledLoopValues() {
             }
         }
         if candidateGroups.len() == 0 { continue }
-        // written anywhere in the loop (a member defined there, or a phi fed from there): not a candidate
+        // written anywhere in the loop (a member defined there, or an exit's phi fed from there): not a candidate
         var writtenInLoop: [bool] = []
         for i in 0..candidateGroups.len() { writtenInLoop.push(false) }
-        for value in 0..irOpcodes.len() {
-            if not isAllocatable(value) { continue }
-            let group = groupOf(value)
-            var index = 0 - 1
-            for i in 0..candidateGroups.len() {
-                if candidateGroups[i] == group { index = i }
-            }
-            if index < 0 { continue }
-            let block = irBlockOf[value]
-            if blockInLoop(block, members) { writtenInLoop[index] = true }
-            if irOpcodes[value] == irPhi {
-                for predecessor in blockPredecessors[block] {
-                    if blockInLoop(predecessor, members) { writtenInLoop[index] = true }
+        var definedHere: [int] = []
+        for block in loopBlocks {
+            for instruction in blockInstructions[block] { definedHere.push(instruction) }
+            for successor in blockSuccessors[block] {
+                if blockInLoop(successor, members) { continue }
+                for instruction in blockInstructions[successor] {
+                    if irOpcodes[instruction] == irPhi { definedHere.push(instruction) }
                 }
             }
         }
-        // registers nothing uses anywhere in the loop
+        for value in definedHere {
+            if not isAllocatable(value) { continue }
+            let group = groupOf(value)
+            for i in 0..candidateGroups.len() {
+                if candidateGroups[i] == group { writtenInLoop[i] = true }
+            }
+        }
+        // registers nothing uses anywhere in the loop: no value live into a
+        // loop block or defined in one holds them
         var free: [bool] = []
         for register in 0..integerRegisterNames.len() { free.push((not hasCall or integerRegisterCalleeSaved[register]) and not (clobbersScratch and register == scratchIntegerRegister)) }
-        for value in 0..irOpcodes.len() {
-            if not isAllocatable(value) or irClasses[value] == classFloat or groupOf(value) != value or valueRegisters[value] < 0 { continue }
-            if not free[valueRegisters[value]] { continue }
-            let starts = rangeStarts[value]
-            let ends = rangeEnds[value]
-            for block in loopBlocks {
-                for i in 0..starts.len() {
-                    if starts[i] <= blockEndPositions[block] and ends[i] >= blockStartPositions[block] { free[valueRegisters[value]] = false }
+        var occupants: [int] = []
+        for block in loopBlocks {
+            for instruction in blockInstructions[block] { occupants.push(instruction) }
+            let words = liveIn[block]
+            for word in 0..words.len() {
+                var remainingBits = words[word]
+                var bit = 0
+                while remainingBits != 0 {
+                    if (remainingBits & 1) != 0 { occupants.push(word * 64 + bit) }
+                    remainingBits = (remainingBits >> 1) & 9223372036854775807        // logical: the sign bit must not refill
+                    bit += 1
                 }
             }
+        }
+        for value in occupants {
+            if not isAllocatable(value) or irClasses[value] == classFloat { continue }
+            let register = valueRegisters[groupOf(value)]
+            if register >= 0 { free[register] = false }
         }
         for block in loopBlocks {
             for register in blockPromotedRegisters[block] { free[register] = false }
