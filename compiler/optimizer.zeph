@@ -1473,6 +1473,32 @@ fn lowerMapRead(expression: Node) -> int {
     return value
 }
 
+// list.push(value), the list taking value's count: with room, store and
+// bump the length inline; the runtime grows the buffer otherwise. The length
+// is written with a raw store, which ends the shape epoch lengths are
+// numbered in.
+fn lowerListPush(list: int, value: int) {
+    let count = emitIr1(irListLength, classInteger, list, 0)
+    let capacity = emitIr1(irLoadRaw64, classInteger, list, 8)
+    let roomBlock = newBlock()
+    let growBlock = newBlock()
+    let joinBlock = newBlock()
+    terminate(irBranchCompare, [count, capacity], conditionLess, [roomBlock, growBlock])
+    sealBlock(roomBlock)
+    currentIrBlock = roomBlock
+    let data = emitIr1(irListData, classInteger, list, 0)
+    irBorrowed[data] = true
+    let stored = emitIr(irStoreIndexed, classInteger, [data, count, value], 0)
+    let lengthStored = emitIr2(irStoreRaw64, classInteger, list, emitIr2(irAdd, classInteger, count, integerConstant(1), 0), 0)
+    jumpTo(joinBlock)
+    sealBlock(growBlock)
+    currentIrBlock = growBlock
+    let pushed = lowerRuntimeCall("runtimeListPush", [list, value])
+    jumpTo(joinBlock)
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
+}
+
 fn sameVariableNode(left: Node, right: Node) -> bool {
     return left.nodeKind == nodeIdentifier and right.nodeKind == nodeIdentifier and left.auxiliary == right.auxiliary and left.slot == right.slot and left.auxiliary != identifierKindCapture and left.auxiliary != identifierKindFunction
 }
@@ -1666,7 +1692,7 @@ fn lowerCall(expression: Node) -> int {
         if optimizerBailed { return 0 }
         if isReferenceType(expression.children[1].typeIndex) { value = takeOwnership(value) }   // the list keeps the count
         if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
-        let pushed = lowerRuntimeCall("runtimeListPush", [list, value])
+        lowerListPush(list, value)
         for pinnedValue in pinned { emitRelease(pinnedValue) }
         return 0
     }
