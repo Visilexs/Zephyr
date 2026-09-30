@@ -1,0 +1,66 @@
+import "std/list.zeph"
+struct StableRecord { key: int, originalOrder: int, label: str }
+var comparisonCalls = 0
+var comparisonTrace = ""
+fn integerCompare(left: int, right: int) -> int { return left - right }
+fn floatCompare(left: float, right: float) -> int {
+    if left < right { return -1 }
+    if left > right { return 1 }
+    return 0
+}
+fn tracedCompare(left: int, right: int) -> int {
+    comparisonCalls += 1
+    comparisonTrace = comparisonTrace + "{left},{right}|"
+    return left - right
+}
+fn exerciseSizes(maximumSize: int) {
+    var integerErrors = 0
+    var floatErrors = 0
+    var integerChecksum = 0
+    var floatChecksum = 0
+    for size in 0..maximumSize {
+        var integerValues: [int] = []
+        var floatValues: [float] = []
+        for valueIndex in 0..size {
+            let value = (valueIndex * 7 + 3) % 11
+            integerValues.push(value)
+            floatValues.push(value as float + 0.25)
+        }
+        sortBy(integerValues, integerCompare)
+        sortBy(floatValues, floatCompare)
+        for valueIndex in 0..size {
+            if valueIndex > 0 {
+                if integerValues[valueIndex - 1] > integerValues[valueIndex] { integerErrors += 1 }
+                if floatValues[valueIndex - 1] > floatValues[valueIndex] { floatErrors += 1 }
+            }
+            integerChecksum += integerValues[valueIndex] * (valueIndex + 1) + size
+            floatChecksum += ((floatValues[valueIndex] * 4.0) as int) * (valueIndex + 1) + size
+        }
+    }
+    print("sizes", integerErrors, floatErrors, integerChecksum, floatChecksum)
+}
+fn exerciseStable(size: int) {
+    var records: [StableRecord] = []
+    for recordIndex in 0..size { records.push(StableRecord{key: recordIndex % 4, originalOrder: recordIndex, label: "v{recordIndex}"}) }
+    sortBy(records, fn(left: StableRecord, right: StableRecord) -> int { return left.key - right.key })
+    var errors = 0
+    var checksum = 0
+    for recordIndex in 0..size {
+        let record = records[recordIndex]
+        if record.label != "v{record.originalOrder}" { errors += 1 }
+        if recordIndex > 0 {
+            let previous = records[recordIndex - 1]
+            if previous.key > record.key or (previous.key == record.key and previous.originalOrder > record.originalOrder) { errors += 1 }
+        }
+        checksum += record.originalOrder * (recordIndex + 1)
+    }
+    print("stable", records.len(), errors, checksum)
+}
+exerciseSizes(40 + args().len())
+exerciseStable(32 + args().len())
+var tracedValues: [int] = []
+for valueIndex in 0..(16 + args().len()) { tracedValues.push((valueIndex * 7 + 3) % 11) }
+sortBy(tracedValues, tracedCompare)
+var traceChecksum = 0
+for characterIndex in 0..comparisonTrace.len() { traceChecksum = traceChecksum * 31 + comparisonTrace.byte(characterIndex) }
+print("trace", comparisonCalls, traceChecksum)

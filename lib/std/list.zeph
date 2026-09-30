@@ -130,14 +130,21 @@ fn sortBy[T](items: [T], compare: fn(T, T) -> int) {
             let end = min(middle + width, length)
             var leftIndex = start
             var rightIndex = middle
-            for i in start..end {
-                if leftIndex < middle and (rightIndex >= end or compare(source[leftIndex], source[rightIndex]) <= 0) {
-                    target[i] = source[leftIndex]
+            var writeIndex = start
+            while leftIndex < middle and rightIndex < end {
+                if compare(source[leftIndex], source[rightIndex]) <= 0 {
+                    target[writeIndex] = source[leftIndex]
                     leftIndex += 1
                 } else {
-                    target[i] = source[rightIndex]
+                    target[writeIndex] = source[rightIndex]
                     rightIndex += 1
                 }
+                writeIndex += 1
+            }
+            if leftIndex == middle { leftIndex = rightIndex }
+            for i in writeIndex..end {
+                target[i] = source[leftIndex]
+                leftIndex += 1
             }
             start = end
         }
