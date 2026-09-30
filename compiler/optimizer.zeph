@@ -2815,6 +2815,10 @@ fn cancelCountPairs() {
             let release = instructions[releaseIndex]
             if valueDead[release] or not isRuntimeCallTo(release, "runtimeReleaseReference") { continue }
             let value = resolveValue(irOperands[release][0])
+            if cancelsRetainedCopy(instructions, releaseIndex, value) {
+                cancelled = true
+                continue
+            }
             var retainIndex = releaseIndex - 1
             var lastUseIndex = 0 - 1
             var blocked = false
@@ -2842,6 +2846,27 @@ fn cancelCountPairs() {
         }
     }
     if cancelled { rewriteOperands() }
+}
+
+// release(retain(v)) in one block with no freeing call between and every use of the
+// copy inside the pair: nothing can free v meanwhile, so v may go borrowed
+fn cancelsRetainedCopy(instructions: [int], releaseIndex: int, retain: int) -> bool {
+    if valueDead[retain] or not isRuntimeCallTo(retain, "runtimeRetainReference") or valueForward[retain] != retain { return false }
+    var usesInside = 1
+    var index = releaseIndex - 1
+    while index >= 0 {
+        let instruction = instructions[index]
+        if instruction == retain { break }
+        if not valueDead[instruction] {
+            if irOpcodes[instruction] == irCall and irCallMayFree(instruction) { return false }
+            if usesValue(instruction, retain) { usesInside += 1 }
+        }
+        index -= 1
+    }
+    if index < 0 or usesInside != irUseCounts[retain] { return false }
+    valueForward[retain] = resolveValue(irOperands[retain][0])
+    valueDead[instructions[releaseIndex]] = true
+    return true
 }
 
 fn eliminateDeadCode() {
