@@ -3201,6 +3201,17 @@ fn computeSpillCosts() {
     groupSpillCosts = costs
 }
 
+// what keeping a group in memory costs per position it is live: a short temp
+// between two instructions is worth more of a register than a long-lived
+// value read now and then
+fn spillWeight(group: int) -> int {
+    var length = 0
+    let starts = rangeStarts[group]
+    let ends = rangeEnds[group]
+    for i in 0..starts.len() { length += ends[i] - starts[i] }
+    return groupSpillCosts[group] * 4096 / (length + 16)
+}
+
 // Linear scan over live ranges with holes (Wimmer & Franz), without splitting:
 // a group keeps one register or one stack slot for its whole life.
 fn allocateRegisters() {
@@ -3282,9 +3293,9 @@ fn allocateRegisters() {
                 for waiting in inactive {
                     if irClasses[waiting] == valueClass and valueRegisters[waiting] == candidate and rangesIntersect(waiting, current) { free = false }
                 }
-                if free and (victim < 0 or groupSpillCosts[other] < groupSpillCosts[victim]) { victim = other }
+                if free and (victim < 0 or spillWeight(other) < spillWeight(victim)) { victim = other }
             }
-            if victim >= 0 and groupSpillCosts[victim] < groupSpillCosts[current] {
+            if victim >= 0 and spillWeight(victim) < spillWeight(current) {
                 chosen = valueRegisters[victim]
                 valueRegisters[victim] = 0 - 1
                 valueSpillSlots[victim] = spillSlotCount
@@ -4106,7 +4117,11 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode >= irLoadRaw64 and opcode <= irLoadRaw8 {
-        let base = integerIn(operands[0], "rcx")
+        var base = integerIn(operands[0], "rcx")
+        if operands.len() > 1 {
+            let index = integerIn(operands[1], "rdx")
+            base = "{base} + {index}"
+        }
         let target = resultRegister(value, "rax")
         let address = memoryAt(base, immediate)
         if opcode == irLoadRaw64 { emitOptimized("mov {target}, {address}") }
@@ -4121,9 +4136,17 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode >= irStoreRaw64 and opcode <= irStoreRaw8 {
-        let base = integerIn(operands[0], "rcx")
+        var base = integerIn(operands[0], "rcx")
+        if operands.len() > 2 {
+            let index = integerIn(operands[2], "rdx")
+            base = "{base} + {index}"
+        }
         let address = memoryAt(base, immediate)
         if opcode == irStoreRaw64 {
+            if isImmediateConstant(operands[1]) {
+                emitOptimized("mov qword ptr {address}, {irImmediates[operands[1]]}")
+                return
+            }
             let stored = integerIn(operands[1], "rax")
             emitOptimized("mov {address}, {stored}")
             return
@@ -4158,6 +4181,10 @@ fn emitInstructionFor(value: int) {
     }
     if opcode == irStore or opcode == irStoreFrame {
         let base = integerIn(operands[0], "rcx")
+        if isImmediateConstant(operands[1]) {
+            emitOptimized("mov qword ptr {memoryAt(base, immediate)}, {irImmediates[operands[1]]}")
+            return
+        }
         let stored = integerIn(operands[1], "rax")
         emitOptimized("mov {memoryAt(base, immediate)}, {stored}")
         return
@@ -4176,6 +4203,8 @@ fn emitInstructionFor(value: int) {
         if opcode == irFloatStoreIndexed {
             let stored = floatIn(operands[2], "xmm0")
             emitOptimized("movsd {address}, {stored}")
+        } else if isImmediateConstant(operands[2]) {
+            emitOptimized("mov qword ptr {address}, {irImmediates[operands[2]]}")
         } else {
             let stored = integerIn(operands[2], "rax")
             emitOptimized("mov {address}, {stored}")
@@ -4323,6 +4352,13 @@ fn emitTerminator(block: int, value: int) {
                 emitOptimized("mov {integerRegisterNames[preheaderLoadRegisters[block][i]]}, qword ptr [rsp + {spillOffset(valueSpillSlots[preheaderLoadGroups[block][i]])}]")
             }
         }
+        let destination = jumpDestination(successors[0])
+        if canRepeatBranch(block, destination) {
+            // a back edge to a header that only tests: test here, no jump back
+            let instructions = blockInstructions[destination]
+            emitTerminator(destination, instructions[instructions.len() - 1])
+            return
+        }
         jumpUnlessNext(successors[0])
         return
     }
@@ -4391,6 +4427,32 @@ fn emitTerminator(block: int, value: int) {
         return
     }
     optimizerBail("cannot emit terminator {opcode}")
+}
+
+// may `block` end with `header`'s branch in place of jumping back to it: the
+// header holds only phis (already moved) and a compare, and both blocks see
+// the same promoted registers
+fn canRepeatBranch(block: int, header: int) -> bool {
+    let instructions = blockInstructions[header]
+    if instructions.len() == 0 or header == block { return false }
+    let terminator = instructions[instructions.len() - 1]
+    if irOpcodes[terminator] != irBranchCompare and irOpcodes[terminator] != irBranch { return false }
+    for i in 0..instructions.len() - 1 {
+        if irOpcodes[instructions[i]] != irPhi { return false }
+    }
+    var headerPosition = 0 - 1
+    for position in 0..blockOrder.len() {
+        if blockOrder[position] == header { headerPosition = position }
+    }
+    if headerPosition < 0 or headerPosition >= currentOrderPosition { return false }        // backward jumps only
+    if block >= blockPromotedGroups.len() or header >= blockPromotedGroups.len() { return block >= blockPromotedGroups.len() and header >= blockPromotedGroups.len() }
+    let blockGroups = blockPromotedGroups[block]
+    let headerGroups = blockPromotedGroups[header]
+    if blockGroups.len() != headerGroups.len() { return false }
+    for i in 0..blockGroups.len() {
+        if blockGroups[i] != headerGroups[i] or blockPromotedRegisters[block][i] != blockPromotedRegisters[header][i] { return false }
+    }
+    return true
 }
 
 fn saveAreaOffset(index: int) -> int { return outgoingAreaSize + 8 * spillSlotCount + 8 * index }
@@ -5443,6 +5505,41 @@ fn boundsCheckProven(block: int, check: int) -> bool {
     return false
 }
 
+// load64(a + b + c) and store64(...): the add becomes the addressing mode,
+// [a + b + c]. A raw load then carries an index operand, a raw store a third one.
+fn foldAddressArithmetic() {
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            let opcode = irOpcodes[instruction]
+            var indexPosition = 0 - 1
+            if opcode >= irLoadRaw64 and opcode <= irLoadRaw8 and irOperands[instruction].len() == 1 { indexPosition = 1 }
+            if opcode >= irStoreRaw64 and opcode <= irStoreRaw8 and irOperands[instruction].len() == 2 { indexPosition = 2 }
+            if indexPosition < 0 { continue }
+            let address = resolveValue(irOperands[instruction][0])
+            if irOpcodes[address] != irAdd or valueDead[address] { continue }
+            let first = resolveValue(irOperands[address][0])
+            let second = resolveValue(irOperands[address][1])
+            if isImmediateConstant(second) or isImmediateConstant(first) {
+                var constant = second
+                var base = first
+                if isImmediateConstant(first) {
+                    constant = first
+                    base = second
+                }
+                if isImmediateConstant(base) { continue }
+                let displacement = irImmediates[instruction] + irImmediates[constant]
+                if displacement < 0 - 1073741824 or displacement > 1073741824 { continue }
+                irOperands[instruction][0] = base
+                irImmediates[instruction] = displacement
+                continue
+            }
+            if irClasses[first] != classInteger or irClasses[second] != classInteger { continue }
+            irOperands[instruction][0] = first
+            irOperands[instruction].push(second)
+        }
+    }
+}
+
 // run every pass after lowering; false (with optimizerBailReason) if any gives up
 fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     for block in 0..blockInstructions.len() {
@@ -5465,6 +5562,7 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     eliminateDeadCode()
     cancelCountPairs()
     optimizeLoops()
+    foldAddressArithmetic()
     eliminateDeadCode()
     checkBorrows()
     if optimizerBailed { return false }

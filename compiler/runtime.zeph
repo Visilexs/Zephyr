@@ -550,7 +550,7 @@ fn runtimeReleaseObjectChildren(object: int, descriptor: int) {
         var index = 0
         while index < capacity {
             let slot = slots + index * 24
-            if load64(slot) == 1 {
+            if (load64(slot) & 1) == 1 {
                 if mapKeyIsReference == 1 { runtimeReleaseChildReference(load64(slot + 8)) }
                 if mapValueIsReference == 1 { runtimeReleaseChildReference(load64(slot + 16)) }
             }
@@ -1205,7 +1205,7 @@ fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> i
         var index = 0
         while index < capacity {
             let slot = slots + index * 24
-            if load64(slot) == 1 {
+            if (load64(slot) & 1) == 1 {
                 let foundIndex = runtimeFindMapEntry(rightValue, load64(slot + 8))
                 if foundIndex < 0 { return 0 }
                 if runtimeValueEquals(load64(slot + 16), load64(load64(rightValue + 16) + foundIndex * 24 + 16), valueTypeDescriptor) == 0 { return 0 }
@@ -1272,12 +1272,14 @@ fn runtimeHashTypedValue(value: int, typeDescriptor: int) -> int {
 fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
-    var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
+    let hash = runtimeMapHash(mapAddress, key)
+    let tag = (hash << 1) | 1                          // a live slot's state: its key's hash, odd
+    var index = hash & (capacity - 1)
     while true {
         let slot = slots + index * 24
         let slotState = load64(slot)
         if slotState == 0 { return 0 - 1 }
-        if slotState == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
+        if slotState == tag and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 { return index }
         index = (index + 1) & (capacity - 1)
     }
     return 0 - 1
@@ -1285,12 +1287,14 @@ fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
 fn runtimeInsertGenericMapEntry(mapAddress: int, key: int, value: int) {
     let capacity = load64(mapAddress + 8)
     let slots = load64(mapAddress + 16)
-    var index = runtimeMapHash(mapAddress, key) & (capacity - 1)
+    let hash = runtimeMapHash(mapAddress, key)
+    let tag = (hash << 1) | 1
+    var index = hash & (capacity - 1)
     var tombstoneIndex = 0 - 1
     while true {
         let slot = slots + index * 24
         let slotState = load64(slot)
-        if slotState == 1 and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 {
+        if slotState == tag and runtimeKeyEquals(mapAddress, load64(slot + 8), key) == 1 {
             if runtimeMapValueIsReference(mapAddress) == 1 { runtimeAssignReference(slot + 16, value) }   // update in place
             else { store64(slot + 16, value) }
             if runtimeMapKeyIsReference(mapAddress) == 1 { runtimeReleaseReference(key) }                    // the old key stays
@@ -1305,7 +1309,7 @@ fn runtimeInsertGenericMapEntry(mapAddress: int, key: int, value: int) {
             }
             store64(destination + 8, key)
             store64(destination + 16, value)
-            store64(destination, 1)
+            store64(destination, tag)
             store64(mapAddress, load64(mapAddress) + 1)
             return
         }
@@ -1333,9 +1337,18 @@ fn runtimeMapRehash(mapAddress: int, newCapacity: int) {
     var index = 0
     while index < oldCapacity {
         let slot = oldSlots + index * 24
-        if load64(slot) == 1 {
+        if (load64(slot) & 1) == 1 {
             if isInteger { runtimeIntegerMapInsert(mapAddress, load64(slot + 8), load64(slot + 16)) }
-            else { runtimeInsertGenericMapEntry(mapAddress, load64(slot + 8), load64(slot + 16)) }
+            else {
+                // the state keeps the key's hash: no rehashing, and keys are distinct
+                var target = (load64(slot) >> 1) & (newCapacity - 1)
+                while load64(newSlots + target * 24) != 0 { target = (target + 1) & (newCapacity - 1) }
+                let destination = newSlots + target * 24
+                store64(destination + 8, load64(slot + 8))
+                store64(destination + 16, load64(slot + 16))
+                store64(destination, load64(slot))
+                store64(mapAddress, load64(mapAddress) + 1)
+            }
         }
         index += 1
     }
@@ -1471,7 +1484,7 @@ fn runtimeMapKeys(mapAddress: int) -> int {
     var index = 0
     while index < capacity {
         let slot = slots + index * 24
-        if load64(slot) == 1 {
+        if (load64(slot) & 1) == 1 {
             let key = load64(slot + 8)
             if keyIsReference == 1 { let retainedKey = runtimeRetainReference(key) }
             runtimeListPush(output, key)
@@ -1490,7 +1503,7 @@ fn runtimeMapValues(mapAddress: int) -> int {
     var index = 0
     while index < capacity {
         let slot = slots + index * 24
-        if load64(slot) == 1 {
+        if (load64(slot) & 1) == 1 {
             let value = load64(slot + 16)
             if valueIsReference == 1 { let retainedValue = runtimeRetainReference(value) }
             runtimeListPush(output, value)
@@ -2447,7 +2460,7 @@ fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation
         var index = 0
         while index < capacity {
             let slot = slots + index * 24
-            if load64(slot) == 1 {
+            if (load64(slot) & 1) == 1 {
                 if shown > 0 {
                     runtimeAppendStringBuilderByte(44)
                     runtimeAppendStringBuilderByte(32)
