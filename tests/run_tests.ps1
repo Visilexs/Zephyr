@@ -1608,6 +1608,7 @@ foreach ($name in $moduleErrors.Keys) {
 
 # Fixed-output optimizer regressions also run through the standard gate.
 $optimizerRegressions = [ordered]@{
+    "scaled_raw_addresses" = "raw 4470 16 4660`nheader 10 2 70 4 10"
     "numeric_codegen" = "signed 0`nfloat 0`nnearMiss 0"
     "sort_merge" = "sizes 0 0 100537 347208`nstable 33 0 9848`ntrace 62 -4764252242437029482"
     "substring_ranges" = "ranges 0 abcdef 0 def`ntemporary oken`nbounds bcd abcdef changed-end 2`nretained 256 1024 oken oken"

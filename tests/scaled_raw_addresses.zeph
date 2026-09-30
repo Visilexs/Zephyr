@@ -1,0 +1,52 @@
+// Raw addressing preserves modular shifts and invalidates list metadata caches.
+fn exerciseRawAddresses(rounds: int) {
+    let backing = zeros(32)
+    let dataAddress = load64(addr(backing) + 16)
+    var checksum = 0
+    for index in 0..rounds {
+        let selectedIndex = index % 4
+        store8(dataAddress + (selectedIndex << 1), 11 + selectedIndex)
+        checksum += load8((selectedIndex << 1) + dataAddress)
+        store32(dataAddress + 32 + (selectedIndex << 2), 101 + selectedIndex)
+        checksum += load32((selectedIndex << 2) + dataAddress + 32)
+        store64(dataAddress + 64 + (selectedIndex << 3), 1001 + selectedIndex)
+        checksum += load64((selectedIndex << 3) + dataAddress + 64)
+    }
+    store32(dataAddress + 120, 4660)
+    let negativeIndex = 0 - rounds
+    let centeredAddress = dataAddress + 120 + (rounds << 3)
+    assert(load64(centeredAddress + (negativeIndex << 3)) == 4660)
+    assert(load16(dataAddress + 120) == 4660)
+    let halfwordBase = dataAddress + 120 - (rounds << 1)
+    assert(load16(halfwordBase + (rounds << 1)) == 4660)
+    let wrappingWordIndex = (0 - 9223372036854775807 - 1) + rounds
+    store8(dataAddress + (wrappingWordIndex << 1), 55)
+    assert(load8(dataAddress + (rounds << 1)) == 55)
+    let wrappingDwordIndex = 4611686018427387904 + rounds
+    store32(dataAddress + (wrappingDwordIndex << 2), 919)
+    assert(load32(dataAddress + (rounds << 2)) == 919)
+    let wrappingIndex = 2305843009213693952 + rounds
+    store64(dataAddress + (wrappingIndex << 3), 777)
+    assert(load64(dataAddress + (rounds << 3)) == 777)
+    let shiftedOffset = rounds << 2
+    store32(dataAddress + shiftedOffset, 313)
+    assert(load32(shiftedOffset + dataAddress) == 313)
+    print("raw", checksum, shiftedOffset, load16(dataAddress + 120))
+}
+
+fn exerciseHeaderWrites(values: [int], replacement: [int], selectedIndex: int) {
+    let headerAddress = addr(values)
+    let originalLength = values.len()
+    let originalData = load64(headerAddress + 16)
+    let beforeValue = values[selectedIndex]
+    store64(headerAddress + (selectedIndex << 3), 2)
+    let shorterLength = values.len()
+    store64(headerAddress + ((selectedIndex + 2) << 3), load64(addr(replacement) + 16))
+    let replacedValue = values[selectedIndex]
+    store64(headerAddress + 16, originalData)
+    store64(headerAddress, originalLength)
+    print("header", beforeValue, shorterLength, replacedValue, values.len(), values[selectedIndex])
+}
+
+exerciseRawAddresses(3 + args().len())
+exerciseHeaderWrites([10, 20, 30, 40], [70, 80, 90, 100], args().len() - 1)
