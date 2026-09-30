@@ -1,0 +1,54 @@
+// -O2 parity cases for scalar replacement: struct values the optimizer may
+// keep in registers, and ones that must stay in memory.
+
+struct Point { x: int, y: int }
+struct Pair { left: float, right: float }
+struct Named { label: str, value: int }
+
+fn add(a: Point, b: Point) -> Point { return Point{x: a.x + b.x, y: a.y + b.y} }
+fn swap(pair: Pair) -> Pair { return Pair{left: pair.right, right: pair.left} }
+
+// too big to inline: the struct escapes into a real call
+fn describe(point: Point) -> int {
+    var total = 0
+    for i in 0..3 {
+        total += point.x * i + point.y
+        if total > 1000 { total = total % 1000 }
+        if total < 0 { total = 0 - total }
+    }
+    return total
+}
+
+let labels = ["a", "bb", "ccc", "dddd"]
+var kept: [Point] = []
+var checksum = 0
+for i in 0..200 {
+    // replaced: temporaries whose fields are only read
+    let sum = add(Point{x: i, y: 2 * i}, Point{x: 3, y: 4})
+    checksum = checksum * 7 + sum.x - sum.y
+    let pair = swap(Pair{left: i as float, right: 0.5})
+    checksum += (pair.left * 10.0) as int + (pair.right) as int
+
+    // mutated after creation: stays in memory
+    var moving = Point{x: i, y: i}
+    moving.x = moving.x + 5
+    checksum += moving.x * 3 + moving.y
+
+    // chosen through a branch
+    var chosen = Point{x: 1, y: 1}
+    if i % 3 == 0 { chosen = Point{x: i, y: 0} }
+    checksum += chosen.x + chosen.y
+
+    // escapes: into a list, into a call, printed
+    let stored = Point{x: i, y: i + 1}
+    if i % 50 == 0 { kept.push(stored) }
+    checksum += describe(Point{x: i, y: 7})
+
+    // a reference field: never replaced
+    let named = Named{label: labels[i % 4], value: i}
+    checksum += named.label.len() + named.value
+    checksum = checksum % 1000000007
+}
+print(checksum)
+for point in kept { print(point.x, point.y) }
+print(add(Point{x: 1, y: 2}, Point{x: 3, y: 4}).x)

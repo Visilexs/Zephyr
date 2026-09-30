@@ -225,6 +225,7 @@ var ownedScopes: [[int]] = []              // per open block: the owned variable
 var regionLoopScopeDepths: [int] = []      // parallel to regionBreakTargets: ownedScopes.len() at the loop
 var regionLoopTemporaryMarks: [int] = []   // parallel to regionBreakTargets: pendingTemporaries.len() at the loop
 var irFromGlobal: [bool] = []              // a global's value: runtime primitives never reassign a global
+var irScalarCandidates: [bool] = []        // a struct literal's allocation whose fields hold no references
 var regionSourceMakesCalls = false         // the region's source calls something: loads may be freed under a local
 
 fn optimizerBail(reason: str) {
@@ -243,6 +244,7 @@ fn resetIr() {
     irBlockOf = [0]
     irBorrowed = [false]
     irFromGlobal = [false]
+    irScalarCandidates = [false]
     irReferenceArguments = [0]
     irUseCounts = [0]
     var noLists: [[int]] = []
@@ -368,6 +370,7 @@ fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], imm
     irBlockOf.push(block)
     irBorrowed.push(false)
     irFromGlobal.push(false)
+    irScalarCandidates.push(false)
     irReferenceArguments.push(0)
     irUseCounts.push(0)
     let value = irOpcodes.len() - 1
@@ -781,8 +784,15 @@ fn symbolAddress(symbol: str) -> int {
 // a fresh object: the fields' counts move into it
 fn lowerStructLiteral(expression: Node) -> int {
     let structDefinition = structDefinitions[expression.referenceIndex]
-    let descriptor = symbolAddress("__dt{slotShapeDescriptor(structDefinition.fieldTypes)}")
+    var holdsReferences = false
+    for fieldType in structDefinition.fieldTypes {
+        if isReferenceType(fieldType) { holdsReferences = true }
+    }
+    // no reference fields: descriptor 0, so a release frees it straight onto its free list
+    var descriptor = integerConstant(0)
+    if holdsReferences { descriptor = symbolAddress("__dt{slotShapeDescriptor(structDefinition.fieldTypes)}") }
     let object = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(8 * structDefinition.fieldNames.len()), descriptor]))
+    irScalarCandidates[object] = not holdsReferences
     for fieldInitializer in expression.children {
         var value = lowerExpression(fieldInitializer.children[0])
         if optimizerBailed { return 0 }
@@ -1349,8 +1359,22 @@ fn mayFreeOrReassign(node: Node) -> bool {
     return false
 }
 
+// a store that releases what it overwrites: a reference into a field, an
+// element, a global or a map
+fn storesReleasingReferences(node: Node) -> bool {
+    if node.nodeKind == nodeAssign {
+        let target = node.children[0]
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap { return true }
+        if isReferenceType(target.typeIndex) and not (target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindLocal) { return true }
+    }
+    for child in node.children {
+        if storesReleasingReferences(child) { return true }
+    }
+    return false
+}
+
 fn findOwnedLocals(root: Node) {
-    regionSourceMakesCalls = mayCallFreeingCode(root)
+    regionSourceMakesCalls = mayCallFreeingCode(root) or storesReleasingReferences(root)
     var changed = true
     while changed { changed = markOwnedLocals(root) }
 }
@@ -5669,6 +5693,98 @@ fn foldAddressArithmetic() {
     }
 }
 
+fn listContains(values: [int], wanted: int) -> bool {
+    for value in values {
+        if value == wanted { return true }
+    }
+    return false
+}
+
+// Scalar replacement: a struct of plain fields that never leaves the region
+// (only its own fields are read and written, and it is counted and released)
+// needs no memory. Its field loads become the values stored at creation, and
+// the allocation, the stores and the count traffic go away.
+fn replaceScalarAggregates() {
+    var users: [[int]] = []
+    for value in 0..irOpcodes.len() {
+        var noUsers: [int] = []
+        users.push(noUsers)
+    }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] { continue }
+            for operand in irOperands[instruction] { users[operand].push(instruction) }
+        }
+    }
+    var replaced = false
+    for block in 0..blockInstructions.len() {
+        let instructions = blockInstructions[block]
+        for allocationIndex in 0..instructions.len() {
+            let allocation = instructions[allocationIndex]
+            if valueDead[allocation] or not irScalarCandidates[allocation] { continue }
+            // the allocation and its retained aliases, and everything that reads them
+            var aliases: [int] = [allocation]
+            var fieldOffsets: [int] = []
+            var fieldValues: [int] = []
+            var loads: [int] = []
+            var countCalls: [int] = []
+            var escapes = false
+            var aliasIndex = 0
+            while aliasIndex < aliases.len() and not escapes {
+                let alias = aliases[aliasIndex]
+                aliasIndex += 1
+                for user in users[alias] {
+                    let opcode = irOpcodes[user]
+                    let operands = irOperands[user]
+                    if (opcode == irStore or opcode == irFloatStore) and operands[0] == alias and operands[1] != alias and listContains(instructions, user) {
+                        for offset in fieldOffsets {
+                            if offset == irImmediates[user] { escapes = true }         // written twice
+                        }
+                        fieldOffsets.push(irImmediates[user])
+                        fieldValues.push(operands[1])
+                        countCalls.push(user)
+                    } else if (opcode == irLoad or opcode == irFloatLoad) and operands[0] == alias {
+                        loads.push(user)
+                    } else if isRuntimeCallTo(user, "runtimeReleaseReference") and operands.len() == 1 {
+                        countCalls.push(user)
+                    } else if isRuntimeCallTo(user, "runtimeRetainReference") and operands.len() == 1 {
+                        countCalls.push(user)
+                        aliases.push(user)
+                    } else {
+                        escapes = true
+                    }
+                }
+            }
+            if escapes { continue }
+            // every load reads a stored field, of its class, after the stores
+            var lastStorePosition = 0 - 1
+            for position in allocationIndex..instructions.len() {
+                for stored in countCalls {
+                    if instructions[position] == stored and (irOpcodes[stored] == irStore or irOpcodes[stored] == irFloatStore) { lastStorePosition = position }
+                }
+            }
+            var forwardedValues: [int] = []
+            for load in loads {
+                var found = 0 - 1
+                for i in 0..fieldOffsets.len() {
+                    if fieldOffsets[i] == irImmediates[load] and irClasses[fieldValues[i]] == irClasses[load] { found = fieldValues[i] }
+                }
+                if found < 0 { escapes = true }
+                for position in 0..(lastStorePosition + 1) {
+                    if instructions[position] == load { escapes = true }
+                }
+                forwardedValues.push(found)
+            }
+            if escapes { continue }
+            for i in 0..loads.len() { valueForward[loads[i]] = forwardedValues[i] }
+            for dead in countCalls { valueDead[dead] = true }
+            for alias in aliases { valueDead[alias] = true }
+            replaced = true
+        }
+    }
+    if replaced { rewriteOperands() }
+}
+
 // run every pass after lowering; false (with optimizerBailReason) if any gives up
 fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     for block in 0..blockInstructions.len() {
@@ -5690,6 +5806,7 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     }
     eliminateDeadCode()
     cancelCountPairs()
+    replaceScalarAggregates()
     optimizeLoops()
     foldAddressArithmetic()
     eliminateDeadCode()

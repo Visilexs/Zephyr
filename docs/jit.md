@@ -44,6 +44,10 @@ symbol) for profiling.
 - straight-block merging
 - DCE
 - cancelling of retain/release pairs around a single use
+- scalar replacement: a struct with no reference fields whose value is only
+  read field by field, counted and released never touches memory; its loads
+  become the values stored at creation. Such structs are also allocated with
+  descriptor 0, so releasing one skips the shape walk.
 
 **Loops:**
 
@@ -112,6 +116,7 @@ Best of 3, in ms, from `bench/run_suite.ps1 3` on the dev machine (Windows 11).
 | string hash map | 230 | 98 | 68 | 97 | 1.44 |
 | struct floats | 483 | 165 | 151 | 151 | 1.09 |
 | tokenizer | 357 | 188 | 120 | 104 | 1.57 |
+| small structs (vectors) | 677 | 104 | 69 | 90 | 1.51 |
 
 ## Known limits and next steps
 

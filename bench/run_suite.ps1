@@ -1,4 +1,4 @@
-# Zephyr benchmark suite: one harness across the major workload areas, each
+﻿# Zephyr benchmark suite: one harness across the major workload areas, each
 # compared head-to-head against gcc -O2 and rustc -O. Every benchmark is the
 # same algorithm in all three languages and prints one checksum line, which the
 # harness verifies is byte-identical before it trusts any timing.
@@ -57,6 +57,7 @@ $suite = @(
     @{ name = "wordfreq"; area = "string hash map"; arg = "3000000"; gcc = "" }
     @{ name = "nbody";   area = "struct floats";   arg = "100";     gcc = "-ffp-contract=off -lm" }
     @{ name = "lexer";   area = "tokenizer";       arg = "1000000"; gcc = "" }
+    @{ name = "vectors"; area = "small structs";   arg = "1000";    gcc = "-ffp-contract=off" }
 )
 
 function Median($xs) { $s = $xs | Sort-Object; return $s[[int]($s.Count / 2)] }
