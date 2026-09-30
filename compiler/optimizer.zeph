@@ -4607,6 +4607,24 @@ fn emitInstructionFor(value: int) {
         finishResult(value, target)
         return
     }
+    if opcode == irCall and heapBumpGlobalIndex >= 0 and heapBaseGlobalIndex >= 0 and isRuntimeCallTo(value, "runtimeReleaseReference") {
+        // the common case, another holder remains, in place; the call only frees
+        let callLabel = allocateLabel()
+        let doneLabel = allocateLabel()
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("cmp rax, qword ptr [rip + __zephyr_globals + {8 * heapBaseGlobalIndex}]")
+        emitOptimized("jb .L{doneLabel}")
+        emitOptimized("cmp rax, qword ptr [rip + __zephyr_globals + {8 * heapBumpGlobalIndex}]")
+        emitOptimized("jae .L{doneLabel}")
+        emitOptimized("cmp qword ptr [rax - 24], 1")
+        emitOptimized("jle .L{callLabel}")
+        emitOptimized("sub qword ptr [rax - 24], 1")
+        emitOptimized("jmp .L{doneLabel}")
+        optimizerLines.push(".L{callLabel}:\n")
+        emitCallInstruction(value)
+        optimizerLines.push(".L{doneLabel}:\n")
+        return
+    }
     if opcode == irCall {
         emitCallInstruction(value)
         return
