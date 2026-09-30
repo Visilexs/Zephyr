@@ -220,6 +220,8 @@ var parameterValues: [int] = []
 
 // ---- ownership: a fresh reference carries one count the region must hand on or drop ----
 var pendingTemporaries: [int] = []         // fresh values the current statement has yet to consume or release
+var movableVariables: [int] = []              // owned locals the current statement may hand their count over (findMovableVariables)
+var movableLoweringDepth = 0                    // inline, loop and scope depth at that statement: deeper code runs repeatedly or conditionally
 var earlyReleaseVariables: [int] = []         // owned locals the current list store releases once its source is lowered
 var ownedLocalSlots: [int: bool] = [:]     // reference locals that own their value
 var ownedScopes: [[int]] = []              // per open block: the owned variables it declared, in order
@@ -677,11 +679,27 @@ fn assignVariable(target: Node, value: int) {
 fn lowerBlock(block: Node) {
     var noVariables: [int] = []
     ownedScopes.push(noVariables)
+    let outerMovable = movableVariables
+    let outerMoveDepth = movableLoweringDepth
+    let lastMentions = lastMentionIndices(block.children)
+    var declarations: [int] = []
+    for i in 0..block.children.len() {
+        let statement = block.children[i]
+        if statement.nodeKind == nodeDeclaration and statement.auxiliary == identifierKindLocal and isReferenceType(statement.typeIndex) { declarations.push(i) }
+    }
     for i in 0..block.children.len() {
         if optimizerBailed { return }
-        earlyReleaseVariables = findEarlyReleases(block.children, i)
+        var dying: [int] = []
+        for declarationIndex in declarations {
+            if declarationIndex < i and lastMentionOf(lastMentions, block.children[declarationIndex].slot, declarationIndex) == i { dying.push(declarationIndex) }
+        }
+        earlyReleaseVariables = findEarlyReleases(block.children, i, dying)
+        movableVariables = findMovableVariables(block.children, i, dying)
+        movableLoweringDepth = movingDepth()
         lowerStatement(block.children[i])
     }
+    movableVariables = outerMovable
+    movableLoweringDepth = outerMoveDepth
     if not blockTerminated[currentIrBlock] { releaseScopesFrom(ownedScopes.len() - 1) }
     let closedScope = ownedScopes.pop()
 }
@@ -689,26 +707,78 @@ fn lowerBlock(block: Node) {
 // Owned plain-struct locals of this block whose last use is the source of
 // statement `index`, a list element store: released once the source is
 // lowered, so an element they were read from can be overwritten in place.
-fn findEarlyReleases(statements: [Node], index: int) -> [int] {
+// `dying`: declarations whose last mention is that statement.
+fn findEarlyReleases(statements: [Node], index: int, dying: [int]) -> [int] {
     var found: [int] = []
+    if dying.len() == 0 { return found }
     let statement = statements[index]
     if statement.nodeKind != nodeAssign or statement.children[0].nodeKind != nodeIndex { return found }
     let target = statement.children[0]
     if typeKinds[target.children[0].typeIndex] == kindMap or not isPlainStruct(target.typeIndex) { return found }
     let scope = ownedScopes[ownedScopes.len() - 1]
-    for i in 0..index {
-        let declaration = statements[i]
-        if declaration.nodeKind != nodeDeclaration or declaration.auxiliary != identifierKindLocal or not isPlainStruct(declaration.typeIndex) { continue }
+    for declarationIndex in dying {
+        let declaration = statements[declarationIndex]
+        if not isPlainStruct(declaration.typeIndex) { continue }
         let slot = declaration.slot
         let variable = variableForSlot(identifierKindLocal, slot, declaration.typeIndex)
-        if not listContains(scope, variable) or not mentionsSlot(statement.children[1], slot) or mentionsSlot(target, slot) { continue }
-        var usedLater = false
-        for later in (index + 1)..statements.len() {
-            if mentionsSlot(statements[later], slot) { usedLater = true }
-        }
-        if not usedLater { found.push(variable) }
+        if listContains(scope, variable) and mentionsSlot(statement.children[1], slot) and not mentionsSlot(target, slot) { found.push(variable) }
     }
     return found
+}
+
+// Owned locals of this block that statement `index` mentions last, once and
+// on its straight-line path: a consumer taking their value takes the local's
+// own count (takeOwnership).
+fn findMovableVariables(statements: [Node], index: int, dying: [int]) -> [int] {
+    var found: [int] = []
+    let scope = ownedScopes[ownedScopes.len() - 1]
+    for declarationIndex in dying {
+        let declaration = statements[declarationIndex]
+        let slot = declaration.slot
+        let variable = variableForSlot(identifierKindLocal, slot, declaration.typeIndex)
+        if listContains(scope, variable) and countStraightMentions(statements[index], slot, true) == 1 { found.push(variable) }
+    }
+    return found
+}
+
+// slot -> the last statement mentioning it; key -1: the last one holding a
+// closure or an outlined loop, which may mention any slot
+fn lastMentionIndices(statements: [Node]) -> [int: int] {
+    var lastMentions: [int: int] = [:]
+    for i in 0..statements.len() { markMentions(statements[i], i, lastMentions) }
+    return lastMentions
+}
+
+fn markMentions(node: Node, index: int, lastMentions: [int: int]) {
+    let kind = node.nodeKind
+    if kind == nodeFunctionLiteral or kind == nodeOutlinedLoop {
+        lastMentions[0 - 1] = index
+        return
+    }
+    if kind == nodeIdentifier { lastMentions[node.slot] = index }
+    for child in node.children { markMentions(child, index, lastMentions) }
+}
+
+fn lastMentionOf(lastMentions: [int: int], slot: int, declarationIndex: int) -> int {
+    var last = declarationIndex
+    if lastMentions.has(slot) { last = lastMentions[slot] }
+    if lastMentions.has(0 - 1) and lastMentions[0 - 1] > last { last = lastMentions[0 - 1] }
+    return last
+}
+
+// mentions of a local slot; one off the straight-line path (a branch, a loop,
+// short-circuit, an inlined body, a closure) counts as two
+fn countStraightMentions(node: Node, slot: int, straight: bool) -> int {
+    let kind = node.nodeKind
+    if kind == nodeFunctionLiteral or kind == nodeOutlinedLoop { return 2 }
+    if kind == nodeIdentifier and node.slot == slot {
+        if straight { return 1 }
+        return 2
+    }
+    let childStraight = straight and (kind == nodeExpressionStatement or kind == nodeDeclaration or kind == nodeAssign or kind == nodeCall or kind == nodeStructLiteral or kind == nodeFieldInitializer or kind == nodeList or kind == nodeIndex or kind == nodeMember or kind == nodeCast)
+    var count = 0
+    for child in node.children { count += countStraightMentions(child, slot, childStraight) }
+    return count
 }
 
 // conservative: closures and outlined loops count as mentioning every slot
@@ -1181,8 +1251,31 @@ fn takeOwnership(value: int) -> int {
         else { remaining.push(pending) }
     }
     pendingTemporaries = remaining
-    if not found { return emitRetain(value) }
-    return value
+    if found { return value }
+    if movableVariables.len() > 0 and movableLoweringDepth == movingDepth() {
+        for variable in movableVariables {
+            if readVariableValue(variable) == value { return moveVariableCount(variable) }
+        }
+    }
+    return emitRetain(value)
+}
+
+fn movingDepth() -> int { return (inlineStack.len() * 4096 + regionBreakTargets.len()) * 4096 + ownedScopes.len() }
+
+// the statement's consumer takes the local's count: its scope forgets it
+fn moveVariableCount(variable: int) -> int {
+    var remainingMovable: [int] = []
+    for other in movableVariables {
+        if other != variable { remainingMovable.push(other) }
+    }
+    movableVariables = remainingMovable
+    let scopeIndex = ownedScopes.len() - 1
+    var kept: [int] = []
+    for scoped in ownedScopes[scopeIndex] {
+        if scoped != variable { kept.push(scoped) }
+    }
+    ownedScopes[scopeIndex] = kept
+    return readVariableValue(variable)
 }
 
 // drop the temporaries made since `mark`: the statement or branch is over

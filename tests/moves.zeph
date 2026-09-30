@@ -1,0 +1,39 @@
+// -O2 parity cases for handing an owned local's count to its last consumer:
+// only a single, unconditional, non-repeated last use may move it.
+
+struct Named { label: str, value: int }
+
+fn label(prefix: str, number: int) -> str { return "{prefix}{number}" }
+
+fn pushThrice(list: [str], text: str) {
+    for k in 0..3 { list.push(text) }
+}
+
+var kept: [str] = []
+var named: [Named] = []
+for i in 0..40 {
+    let looped = label("loop", i)
+    for j in 0..2 { kept.push(looped) }             // a loop repeats the use: no move
+
+    let maybe = label("maybe", i)
+    if i % 3 == 0 { kept.push(maybe) }              // only on one path: no move
+
+    let twice = label("twice", i)
+    named.push(Named{label: twice, value: twice.len()})   // two mentions: no move
+
+    let inlined = label("inlined", i)
+    pushThrice(kept, inlined)                       // the callee's loop repeats it
+
+    let moved = label("moved", i)
+    let copy = moved                                // moves into copy
+    named.push(Named{label: copy, value: i})        // moves into the struct
+
+    let stored = label("stored", i)
+    kept[i] = stored                                // moves into the list slot
+}
+var checksum = 0
+for text in kept { checksum = checksum * 31 + text.len() + text.byte(0) }
+for entry in named { checksum = checksum * 7 + entry.label.len() + entry.value }
+print(kept.len(), named.len(), checksum % 1000000007)
+print(kept[0], kept[5], kept[39], kept[kept.len() - 1])
+print(named[0].label, named[1].label, named[79].label)
