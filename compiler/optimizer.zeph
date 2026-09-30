@@ -908,10 +908,33 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeStructLiteral { return lowerStructLiteral(expression) }
     if kind == nodeList { return lowerListLiteral(expression) }
     if kind == nodeInterfaceBox { return lowerInterfaceBox(expression) }
+    if kind == nodeSome { return lowerSome(expression) }
+    if kind == nodeNoneLiteral { return integerConstant(0) }            // no cell: counting skips it
     if kind == nodeFunctionLiteral { return lowerFunctionLiteral(expression) }
     if kind == nodeStringLiteral { return lowerInterpolation(expression) }
     optimizerBail("expression kind {kind}")
     return 0
+}
+
+// some(x): a one-word cell holding x (and its count, for a reference)
+fn lowerSome(expression: Node) -> int {
+    let valueType = expression.children[0].typeIndex
+    var value = lowerExpression(expression.children[0])
+    if optimizerBailed { return 0 }
+    if isReferenceType(valueType) { value = takeOwnership(value) }
+    let descriptor = symbolAddress("__dt{slotShapeDescriptor([valueType])}")
+    let cell = ownedTemporary(lowerRuntimeCall("runtimeAllocateDescribedObject", [integerConstant(8), descriptor]))
+    if irClasses[value] == classFloat { let storedFloat = emitIr2(irFloatStore, classFloat, cell, value, 0) }
+    else { let stored = emitIr2(irStore, classInteger, cell, value, 0) }
+    return cell
+}
+
+// an optional's value, borrowed from its cell like a list element
+fn loadBoxedValue(cell: int, valueType: int) -> int {
+    if typeKinds[valueType] == kindFloat { return emitIr1(irFloatLoad, classFloat, cell, 0) }
+    let value = emitIr1(irLoad, classInteger, cell, 0)
+    if isReferenceType(valueType) { irBorrowed[value] = true }
+    return value
 }
 
 // "text {value} text": parts append to the runtime's string builder, one
@@ -1964,6 +1987,37 @@ fn lowerCall(expression: Node) -> int {
         lowerListPush(list, value)
         for pinnedValue in pinned { emitRelease(pinnedValue) }
         return 0
+    }
+    if callKind == callKindOptionalHas {
+        let optional = lowerContainer(expression.children[0].children[0], [])
+        if optimizerBailed { return 0 }
+        return emitIr2(irCompare, classInteger, optional, integerConstant(0), conditionNotEqual)
+    }
+    if callKind == callKindOptionalGet {
+        let optional = lowerContainer(expression.children[0].children[0], [])
+        if optimizerBailed { return 0 }
+        let checked = emitIr1(irZeroCheck, classInteger, optional, panicStringIndex(expression, "called .get() on a none value"))
+        return loadBoxedValue(optional, expression.typeIndex)
+    }
+    if callKind == callKindOptionalOr {
+        let optional = lowerContainer(expression.children[0].children[0], [expression.children[1]])
+        if optimizerBailed { return 0 }
+        let result = temporaryVariable(classOfType(expression.typeIndex), isReferenceType(expression.typeIndex))
+        let someBlock = newBlock()
+        let noneBlock = newBlock()
+        let joinBlock = newBlock()
+        terminate(irBranchCompare, [optional, integerConstant(0)], conditionNotEqual, [someBlock, noneBlock])
+        sealBlock(someBlock)
+        sealBlock(noneBlock)
+        currentIrBlock = someBlock
+        writeVariableValue(result, loadBoxedValue(optional, expression.typeIndex))
+        jumpTo(joinBlock)
+        currentIrBlock = noneBlock
+        lowerBranchValue(result, expression.children[1])
+        jumpTo(joinBlock)
+        sealBlock(joinBlock)
+        currentIrBlock = joinBlock
+        return readVariableValue(result)
     }
     if callKind == callKindPrint {
         var printed = lowerExpression(expression.children[1])

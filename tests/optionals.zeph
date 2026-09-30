@@ -1,0 +1,49 @@
+// -O2 parity for optionals: some(x) cells, .has(), .get() (and its panic
+// message elsewhere), .or(default), for ints, floats and references.
+
+struct Item { name: str, weight: float }
+
+fn find(items: [Item], wanted: str) -> Item? {
+    for item in items {
+        if item.name == wanted { return item }
+    }
+    return none
+}
+
+fn half(value: int) -> int? {
+    if value % 2 == 0 { return value / 2 }
+    return none
+}
+
+fn ratio(value: int) -> float? {
+    if value == 0 { return none }
+    return 1.0 / value as float
+}
+
+var items: [Item] = []
+for i in 0..50 { items.push(Item{name: "item{i}", weight: i as float * 0.5}) }
+var total = 0
+var weights = 0.0
+var names = 0
+for i in 0..400 {
+    let halved = half(i)
+    if halved.has() { total += halved.get() }
+    total += half(i + 1).or(-1)
+    weights += ratio(i % 7).or(0.25)
+    let found = find(items, "item{i % 60}")
+    if found.has() {
+        let item = found.get()
+        weights += item.weight
+        names += item.name.len()
+    }
+    let label = find(items, "item{i % 55}")
+    names += label.or(Item{name: "missing", weight: 0.0}).name.len()
+}
+var chain: [str]? = none
+for i in 0..10 {
+    var list: [str] = []
+    if chain.has() { list = chain.get() }
+    list.push("c{i}")
+    chain = list
+}
+print(total, weights, names, chain.get().len(), chain.get()[9])
