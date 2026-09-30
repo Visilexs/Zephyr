@@ -1290,6 +1290,9 @@ fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimePrintTypedValue" or name == "runtimeJoinStringList" or name == "runtimeCharacterFromCode" or name == "runtimeListNew" { return true }
     if name == "runtimeBeginStringInterpolation" or name == "runtimeAppendInterpolationText" or name == "runtimeAppendInterpolationValue" or name == "runtimeEndStringInterpolation" { return true }   // they write the builder's own buffer
     if name == "runtimeMapGet" or name == "runtimeFindMapEntry" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
+    // what an inlined lookup calls: hashing and comparing only read (recursion is not freeing here)
+    if name == "runtimeFindGenericMapEntry" or name == "runtimeIntegerMapLookup" or name == "runtimeKeyEquals" or name == "runtimeValueEquals" { return true }
+    if name == "runtimeMapHash" or name == "runtimeHashTypedValue" or name == "runtimeHashString" or name == "runtimeHashMix" or name == "runtimePackedLoad" { return true }
     return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
 
@@ -2324,10 +2327,18 @@ fn countNodes(node: Node) -> int {
 let inlineRegionValueBudget = 16000
 let regionValueLimit = 24000
 var functionNodeCounts: [int: int] = [:]      // function index -> countNodes of its body, for inlining decisions
+var preInlineNodeCounts: [int: int] = [:]     // the same, of the body before front-end expansion
 
 fn canInline(functionIndex: int) -> bool {
     if functionDefinitions[functionIndex].hasEnvironment { return false }
     return canInlineWithin(functionIndex, 60)
+}
+
+// what an inlined call lowers: the expanded body, unless only its
+// pre-expansion one fit (see canInlineWithin)
+fn inlinedBody(functionIndex: int) -> Node {
+    if functionNodeCounts.has(functionIndex) and functionNodeCounts[functionIndex] > 60 { return preInlineBody(functionIndex) }
+    return functionDefinitions[functionIndex].body
 }
 
 fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
@@ -2338,8 +2349,13 @@ fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
         if active == functionIndex { return false }
     }
     if irOpcodes.len() > inlineRegionValueBudget { return false }      // a huge region costs more to allocate than calls cost to run
-    if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(preInlineBody(functionIndex)) }
-    return functionNodeCounts[functionIndex] <= nodeLimit
+    // sized as the front end expanded it, except a runtime helper in a user
+    // loop: its fast path is what matters there (runtimeU8Push, say)
+    if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(functionDefinition.body) }
+    if functionNodeCounts[functionIndex] <= nodeLimit { return true }
+    if currentLoopDepth == 0 or not textStartsWith(functionDefinition.name, "runtime") or (regionFunctionIndex >= 0 and textStartsWith(functionDefinitions[regionFunctionIndex].name, "runtime")) { return false }
+    if not preInlineNodeCounts.has(functionIndex) { preInlineNodeCounts[functionIndex] = countNodes(preInlineBody(functionIndex)) }
+    return preInlineNodeCounts[functionIndex] <= nodeLimit
 }
 
 // a closure literal argument: inlining the callee lets its calls through it inline too
@@ -2363,7 +2379,7 @@ fn enterInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [i
     inlineKeyPrefix = "i{inlineInstanceCount}:"
     var calleeOwnedSlots: [int: bool] = [:]
     ownedLocalSlots = calleeOwnedSlots
-    findOwnedLocals(preInlineBody(functionIndex))
+    findOwnedLocals(inlinedBody(functionIndex))
     inlineStack.push(functionIndex)
     for i in 0..argumentValues.len() {
         let parameter = variableForSlot(identifierKindParameter, i, functionDefinition.parameterTypes[i])
@@ -2419,7 +2435,7 @@ fn lowerInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [i
     regionReturnTemporaryMark = pendingTemporaries.len()
     let hasValue = typeKinds[regionReturnType] != kindVoid
     if hasValue { regionReturnVariable = temporaryVariable(classOfType(regionReturnType), false) }
-    lowerBlock(preInlineBody(functionIndex))
+    lowerBlock(inlinedBody(functionIndex))
     var result = 0
     if not optimizerBailed {
         jumpTo(regionReturnBlock)
