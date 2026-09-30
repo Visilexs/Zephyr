@@ -98,6 +98,9 @@ symbol) for profiling.
   tests), run with a compiler variant whose default is `optimizerEnabled =
   true`.
 - A compiler built with `-O2` must rebuild itself to a byte-identical fixpoint.
+- That compiler, copied alone into an empty directory, must compile and run a
+  program from its embedded runtime (the fixpoint never exercises it, because
+  a runtime.zeph sits beside the compiler in the repo).
 - The baseline corpus (no `-O2`) must stay byte-identical unless a runtime
   change is intended.
 

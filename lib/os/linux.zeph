@@ -690,6 +690,7 @@ fn kernel32ResumeThread(threadHandle: int) -> int {
 fn kernel32SuspendThread(threadHandle: int) -> int { return 0 - 1 }
 // No stopped register context is available on this platform yet.
 fn kernel32GetThreadContext(threadHandle: int, contextAddress: int) -> int { return 0 }
+fn kernel32RtlCaptureContext(contextAddress: int) -> int { return 0 }
 
 // Wait on CHILD_CLEARTID using shared futexes (the kernel's wake convention).
 fn kernel32WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {

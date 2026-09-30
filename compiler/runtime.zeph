@@ -336,6 +336,10 @@ fn runtimeCollectGarbage() {
     let lowLimitAddress = runtimeCollectorScratchAddress
     let highLimitAddress = lowLimitAddress + 8
     let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)   // returns VOID
+    // -O2 code keeps references in callee-saved registers, and the frames
+    // below may never have saved them: scan this thread's registers too
+    let capturedIgnored = win("RtlCaptureContext", runtimeThreadContextAddress)   // returns VOID
+    runtimeScanRootRange(runtimeThreadContextAddress + 120, runtimeThreadContextAddress + 248)
     runtimeScanRootRange(stackPointer(), load64(highLimitAddress))
     runtimeScanThreadRoots()
     // trace

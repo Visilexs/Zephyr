@@ -180,6 +180,7 @@ fn kernel32LeaveCriticalSection(address: int) -> int { return 0 }
 fn kernel32SuspendThread(handle: int) -> int { return 0 - 1 }
 fn kernel32ResumeThread(handle: int) -> int { return 0 - 1 }
 fn kernel32GetThreadContext(handle: int, context: int) -> int { return 0 }
+fn kernel32RtlCaptureContext(contextAddress: int) -> int { return 0 }
 
 var wasmThreadLocalStorage = 0
 var wasmThreadLocalSlotCount = 0
