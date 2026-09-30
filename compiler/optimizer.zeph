@@ -1597,7 +1597,60 @@ fn lowerReferenceStore(target: Node, source: Node) {
     let data = lowerElementAddress(list, index, target)
     let offset = emitIr2(irShiftLeft, classInteger, index, integerConstant(3), 0)
     address = emitIr2(irAdd, classInteger, data, offset, 0)
+    if isPlainStruct(elementType) {
+        lowerReusingStore(address, value, structDefinitions[typeDefinitionIds[elementType]])
+        return
+    }
     let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
+}
+
+// a struct type none of whose fields is a reference
+fn isPlainStruct(typeIndex: int) -> bool {
+    if typeKinds[typeIndex] != kindStruct { return false }
+    for fieldType in structDefinitions[typeDefinitionIds[typeIndex]].fieldTypes {
+        if isReferenceType(fieldType) { return false }
+    }
+    return true
+}
+
+// *address = value (owned) for a plain struct. When the element it replaces
+// has no other holder, the same shape and no descriptor, its fields are
+// overwritten in place and value is released: once scalar replacement
+// dissolves value, only the fallback allocates.
+fn lowerReusingStore(address: int, value: int, structDefinition: StructDefinition) {
+    let fieldCount = structDefinition.fieldTypes.len()
+    let old = emitIr1(irLoadRaw64, classInteger, address, 0)
+    let count = emitIr1(irLoadRaw64, classInteger, old, 0 - 24)
+    let shapeBlock = newBlock()
+    let reuseBlock = newBlock()
+    let assignBlock = newBlock()
+    let joinBlock = newBlock()
+    terminate(irBranchCompare, [count, integerConstant(1)], conditionEqual, [shapeBlock, assignBlock])
+    sealBlock(shapeBlock)
+    currentIrBlock = shapeBlock
+    let descriptor = emitIr1(irLoadRaw64, classInteger, old, 0 - 16)
+    let size = emitIr1(irLoadRaw64, classInteger, old, 0 - 8)
+    let mismatch = emitIr2(irBitOr, classInteger, descriptor, emitIr2(irBitXor, classInteger, size, integerConstant(8 * fieldCount), 0), 0)
+    terminate(irBranchCompare, [mismatch, integerConstant(0)], conditionEqual, [reuseBlock, assignBlock])
+    sealBlock(reuseBlock)
+    currentIrBlock = reuseBlock
+    for slot in 0..fieldCount {
+        if typeKinds[structDefinition.fieldTypes[slot]] == kindFloat {
+            let field = emitIr1(irFloatLoad, classFloat, value, 8 * slot)
+            let stored = emitIr2(irFloatStore, classFloat, old, field, 8 * slot)
+        } else {
+            let field = emitIr1(irLoad, classInteger, value, 8 * slot)
+            let stored = emitIr2(irStore, classInteger, old, field, 8 * slot)
+        }
+    }
+    emitRelease(value)
+    jumpTo(joinBlock)
+    sealBlock(assignBlock)
+    currentIrBlock = assignBlock
+    let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
+    jumpTo(joinBlock)
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
 }
 
 fn lowerIndexRead(expression: Node) -> int {
@@ -5022,6 +5075,14 @@ fn foldInstruction(block: int, value: int) -> bool {
 }
 
 // a fresh constant in the entry block, which dominates every use
+// an instruction made by a pass after lowering: it needs its forwarding entries too
+fn addLateInstruction(block: int, opcode: int, valueClass: int, operands: [int], immediate: int) -> int {
+    let created = addInstruction(block, opcode, valueClass, operands, immediate)
+    valueForward.push(created)
+    valueDead.push(false)
+    return created
+}
+
 fn entryConstant(constant: int) -> int {
     var noOperands: [int] = []
     let created = addInstruction(0, irConstant, classInteger, noOperands, constant)
@@ -5728,6 +5789,7 @@ fn replaceScalarAggregates() {
             var fieldValues: [int] = []
             var loads: [int] = []
             var countCalls: [int] = []
+            var assignments: [int] = []               // runtimeAssignReference(address, the struct): rebuilt there
             var escapes = false
             var aliasIndex = 0
             while aliasIndex < aliases.len() and not escapes {
@@ -5750,6 +5812,8 @@ fn replaceScalarAggregates() {
                     } else if isRuntimeCallTo(user, "runtimeRetainReference") and operands.len() == 1 {
                         countCalls.push(user)
                         aliases.push(user)
+                    } else if isRuntimeCallTo(user, "runtimeAssignReference") and operands[1] == alias and operands[0] != alias {
+                        assignments.push(user)
                     } else {
                         escapes = true
                     }
@@ -5775,14 +5839,48 @@ fn replaceScalarAggregates() {
                 }
                 forwardedValues.push(found)
             }
+            // rebuilt at most once, with every field known. The count ops go with the rest:
+            // a correct program ends each path with the struct held by the slot (count 1)
+            // or by nothing, which the rebuilt allocation reproduces
+            if assignments.len() > 1 or (assignments.len() == 1 and fieldOffsets.len() * 8 != irImmediates[irOperands[allocation][0]]) { escapes = true }
             if escapes { continue }
             for i in 0..loads.len() { valueForward[loads[i]] = forwardedValues[i] }
+            for assignment in assignments { materializeBefore(assignment, allocation, fieldOffsets, fieldValues) }
             for dead in countCalls { valueDead[dead] = true }
             for alias in aliases { valueDead[alias] = true }
             replaced = true
         }
     }
     if replaced { rewriteOperands() }
+}
+
+// rebuild a dissolved struct where it escapes: a fresh allocation and its
+// field stores right before `user`, which then takes it instead
+fn materializeBefore(user: int, allocation: int, fieldOffsets: [int], fieldValues: [int]) {
+    var block = 0 - 1
+    for candidate in 0..blockInstructions.len() {
+        if block < 0 and listContains(blockInstructions[candidate], user) { block = candidate }
+    }
+    let noDescriptor = entryConstant(0)
+    let object = addLateInstruction(block, irCall, classInteger, [irOperands[allocation][0], noDescriptor], irImmediates[allocation])
+    irReferenceArguments[object] = 0
+    var inserted: [int] = [object]
+    for i in 0..fieldOffsets.len() {
+        var opcode = irStore
+        if irClasses[fieldValues[i]] == classFloat { opcode = irFloatStore }
+        inserted.push(addLateInstruction(block, opcode, irClasses[fieldValues[i]], [object, fieldValues[i]], fieldOffsets[i]))
+    }
+    // addInstruction appended them; move them in front of the user
+    var reordered: [int] = []
+    for instruction in blockInstructions[block] {
+        if listContains(inserted, instruction) { continue }
+        if instruction == user {
+            for newInstruction in inserted { reordered.push(newInstruction) }
+        }
+        reordered.push(instruction)
+    }
+    blockInstructions[block] = reordered
+    irOperands[user][1] = object
 }
 
 // run every pass after lowering; false (with optimizerBailReason) if any gives up

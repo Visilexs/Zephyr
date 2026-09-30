@@ -51,4 +51,19 @@ for i in 0..200 {
 }
 print(checksum)
 for point in kept { print(point.x, point.y) }
+
+// element stores: a unique old element is overwritten in place, a shared one never
+var grid: [Point] = []
+for i in 0..6 { grid.push(Point{x: i, y: -i}) }
+let held = grid[2]
+for round in 0..3 {
+    for i in 0..6 {
+        let current = grid[i]
+        grid[i] = Point{x: current.x + round, y: current.y * 2}
+    }
+}
+grid[4] = grid[5]
+grid[5] = Point{x: 500, y: 501}
+print(held.x, held.y)
+for point in grid { print(point.x, point.y) }
 print(add(Point{x: 1, y: 2}, Point{x: 3, y: 4}).x)
