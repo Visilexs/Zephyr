@@ -29,7 +29,14 @@ symbol) for profiling.
   probes once.
 - Reference counting: fresh values are pending temporaries, and owned locals
   are chosen by a fixpoint.
-  - A returned or inline-result owned local moves its count.
+  - A returned or inline-result owned local moves its count. So does any
+    owned local at its last mention in a block, when that mention is single
+    and on the statement's straight-line path (no branch, loop, closure or
+    inlined body around it).
+  - A plain-struct local whose last use is the source of a list element
+    store is released before the store, so the element it came from can be
+    overwritten in place (a uniquely held element of the same shape gets its
+    fields rewritten instead of a new allocation).
   - Borrowed values are pinned only when later code may free. An
     interprocedural may-free summary covers user calls and every
     implementation behind an interface call.
@@ -43,7 +50,8 @@ symbol) for profiling.
 - jump threading
 - straight-block merging
 - DCE
-- cancelling of retain/release pairs around a single use
+- cancelling of retain/release pairs around a single use, and of
+  `release(retain(v))` in one block with no freeing call between
 - scalar replacement: a struct with no reference fields whose value is only
   read field by field, counted and released never touches memory; its loads
   become the values stored at creation. Such structs are also allocated with
@@ -77,11 +85,14 @@ symbol) for profiling.
 - loop rotation: a back edge to a header holding only phis and a compare
   repeats the compare instead of jumping back;
 - `lea` peepholes, fused compare-and-branch, and forwarder-block skipping;
-- loop headers aligned to 16 bytes; 8-bit immediates use the short encoding.
+- loop headers aligned to 16 bytes; 8-bit immediates use the short encoding;
+- retains are inlined (a heap-range check and an increment) and no longer
+  count as calls for register allocation; releases decrement inline and call
+  the runtime only when the count would reach zero.
 
 ## Gates (all must pass before a commit)
 
-- `tests/optimizer_parity.ps1 -Compiler .\zc_new.exe`: the 29 programs must
+- `tests/optimizer_parity.ps1 -Compiler .\zc_new.exe`: the 32 programs must
   produce identical output with and without `-O2`.
 - The full suites (`tests/run_tests.ps1`, 201 tests, and `std_tests.ps1`, 40
   tests), run with a compiler variant whose default is `optimizerEnabled =
@@ -102,21 +113,21 @@ Best of 3, in ms, from `bench/run_suite.ps1 3` on the dev machine (Windows 11).
 
 | area | baseline | -O2 | C | Rust | -O2/C |
 |---|---:|---:|---:|---:|---:|
-| recursion (fib) | 20 | 11 | 10 | 20 | 1.10 |
+| recursion (fib) | 20 | 12 | 10 | 20 | 1.20 |
 | integer SIMD | 39 | 38 | 72 | 69 | 0.53 |
-| float compute | 98 | 93 | 89 | 91 | 1.04 |
-| sorting | 87 | 83 | 296 | 43 | 0.28 |
-| alloc / GC | 122 | 95 | 171 | 155 | 0.56 |
-| hash map | 42 | 36 | 30 | 70 | 1.20 |
+| float compute | 97 | 93 | 88 | 91 | 1.06 |
+| sorting | 87 | 83 | 346 | 43 | 0.24 |
+| alloc / GC | 123 | 96 | 170 | 155 | 0.56 |
+| hash map | 39 | 31 | 30 | 69 | 1.03 |
 | rasterization | 7 | 7 | 9 | 10 | 0.78 |
-| bignum | 56 | 56 | 85 | 92 | 0.66 |
-| fluid / neighbours | 2893 | 2471 | 2242 | 2510 | 1.10 |
-| dynamic dispatch | 300 | 168 | 157 | 164 | 1.07 |
-| closures / HOFs | 207 | 124 | 102 | 40 | 1.22 |
-| string hash map | 230 | 98 | 68 | 97 | 1.44 |
-| struct floats | 483 | 165 | 151 | 151 | 1.09 |
-| tokenizer | 357 | 188 | 120 | 104 | 1.57 |
-| small structs (vectors) | 677 | 104 | 69 | 90 | 1.51 |
+| bignum | 56 | 56 | 85 | 91 | 0.66 |
+| fluid / neighbours | 2866 | 2436 | 2249 | 2511 | 1.08 |
+| dynamic dispatch | 283 | 151 | 158 | 155 | 0.96 |
+| closures / HOFs | 201 | 115 | 103 | 40 | 1.12 |
+| string hash map | 220 | 95 | 67 | 94 | 1.42 |
+| struct floats | 484 | 164 | 151 | 152 | 1.09 |
+| tokenizer | 360 | 174 | 119 | 104 | 1.46 |
+| small structs (vectors) | 480 | 21 | 12 | 11 | 1.75 |
 
 ## Known limits and next steps
 
