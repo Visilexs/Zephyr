@@ -1,0 +1,102 @@
+// Boolean values returned and stored, with short-circuit side effects and temporaries.
+var predicateCalls = 0
+
+fn asciiRange(character: int) -> bool {
+    return character >= 65 and character <= 90
+}
+
+fn strictReversedRange(character: int) -> bool {
+    return 64 < character and 91 > character
+}
+
+fn nestedRange(character: int) -> bool {
+    return not (character < 65 or character > 90) and (character == 65 or character > 65)
+}
+
+fn countedPredicate(value: bool) -> bool {
+    predicateCalls = predicateCalls + 1
+    return value
+}
+
+fn freshText(number: int) -> str {
+    return "item{number}"
+}
+
+fn temporaryPredicate(number: int) -> bool {
+    return number >= 0 and (freshText(number) == "item7" or freshText(number).len() > 5)
+}
+
+for character in [-1, 64, 65, 66, 89, 90, 91, 255] {
+    let storedRange = asciiRange(character)
+    print(character, storedRange, strictReversedRange(character), nestedRange(character))
+}
+let hasArguments = args().len() > 1
+let skippedAnd = hasArguments and countedPredicate(true)
+let skippedOr = not hasArguments or countedPredicate(false)
+let takenAnd = not hasArguments and countedPredicate(true)
+let takenOr = hasArguments or countedPredicate(false)
+let nestedSideEffect = not (hasArguments or countedPredicate(false)) and countedPredicate(true)
+print(skippedAnd, skippedOr, takenAnd, takenOr, nestedSideEffect, predicateCalls)
+for number in [-1, 0, 7, 10] {
+    let storedTemporary = temporaryPredicate(number)
+    print(number, storedTemporary)
+}
+
+fn isLetter(character: int) -> bool {
+    return (character >= 65 and character <= 90) or (character >= 97 and character <= 122) or character == 95
+}
+
+fn separatedIntervals(character: int) -> bool {
+    return (character >= 64 and character <= 67) or (character >= 96 and character <= 99)
+}
+
+fn unequalIntervals(character: int) -> bool {
+    return (character >= 64 and character <= 66) or (character >= 96 and character <= 99)
+}
+
+fn crossingIntervals(character: int) -> bool {
+    return (character >= 30 and character <= 33) or (character >= 62 and character <= 65)
+}
+
+fn distantIntervals(character: int) -> bool {
+    return (character >= 1073741824 and character <= 1073741827) or (character >= 1073741856 and character <= 1073741859)
+}
+
+for character in [-1, 65, 90, 95, 97, 122, 123] {
+    var branchResult = false
+    if isLetter(character) { branchResult = true }
+    print("letter", character, isLetter(character), branchResult)
+}
+for character in [-1, 30, 31, 32, 33, 34, 62, 63, 64, 65, 66, 67, 68, 95, 96, 98, 99, 100] {
+    var separatedBranch = false
+    var unequalBranch = false
+    var crossingBranch = false
+    if separatedIntervals(character) { separatedBranch = true }
+    if unequalIntervals(character) { unequalBranch = true }
+    if crossingIntervals(character) { crossingBranch = true }
+    print("interval", character, separatedIntervals(character), unequalIntervals(character), crossingIntervals(character), separatedBranch, unequalBranch, crossingBranch)
+}
+for character in [1073741823, 1073741824, 1073741827, 1073741828, 1073741856, 1073741859, 1073741860] {
+    var distantBranch = false
+    if distantIntervals(character) { distantBranch = true }
+    print("distant", character, distantIntervals(character), distantBranch)
+}
+
+fn reversedIntervals(character: int) -> bool {
+    if (99 >= character and 96 <= character) or (67 >= character and 64 <= character) { return true }
+    return false
+}
+
+fn negativeIntervals(character: int) -> bool {
+    if (character >= -64 and character <= -61) or (character >= -32 and character <= -29) { return true }
+    return false
+}
+
+fn differentVariables(firstCharacter: int, secondCharacter: int) -> bool {
+    if (firstCharacter >= 64 and firstCharacter <= 67) or (secondCharacter >= 96 and secondCharacter <= 99) { return true }
+    return false
+}
+
+for character in [-65, -64, -61, -60, -33, -32, -29, -28, 63, 64, 67, 68, 95, 96, 99, 100] {
+    print("extra", character, reversedIntervals(character), negativeIntervals(character), differentVariables(character, 99 - character))
+}

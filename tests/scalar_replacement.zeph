@@ -67,3 +67,56 @@ grid[5] = Point{x: 500, y: 501}
 print(held.x, held.y)
 for point in grid { print(point.x, point.y) }
 print(add(Point{x: 1, y: 2}, Point{x: 3, y: 4}).x)
+
+// Top-level ordinary objects carry the baseline descriptor.
+let replacementRounds = args().len()
+var ordinaryPoints = [Point{x: 10, y: 20}, Point{x: 30, y: 40}]
+let heldOrdinary = ordinaryPoints[1]
+for replacementRound in 0..replacementRounds {
+    ordinaryPoints[0] = Point{x: 50, y: 60}
+    ordinaryPoints[1] = Point{x: 70, y: 80}
+}
+print("ordinary", ordinaryPoints[0].x, ordinaryPoints[0].y, ordinaryPoints[1].x, ordinaryPoints[1].y, heldOrdinary.x, heldOrdinary.y)
+
+struct EmptyRecord { }
+var emptyRecords = [EmptyRecord{}, EmptyRecord{}]
+let heldEmptyRecord = emptyRecords[0]
+for replacementRound in 0..replacementRounds {
+    emptyRecords[0] = EmptyRecord{}
+    emptyRecords[1] = EmptyRecord{}
+}
+print("empty", emptyRecords.len(), heldEmptyRecord)
+
+enum StoredVariant {
+    Text(str)
+    Number(int)
+    Empty
+}
+
+fn variantText(value: StoredVariant) -> str {
+    return match value {
+        Text(text) { text }
+        Number(number) { "number{number}" }
+        else { "empty" }
+    }
+}
+
+let variantNumber = args().len()
+var storedVariants = [StoredVariant.Text("old{variantNumber}"), StoredVariant.Text("unique{variantNumber}")]
+let heldVariant = storedVariants[0]
+for replacementRound in 0..replacementRounds {
+    storedVariants[0] = StoredVariant.Number(12)
+    storedVariants[1] = StoredVariant.Number(34)
+}
+print("variant", variantText(heldVariant), variantText(storedVariants[0]), variantText(storedVariants[1]))
+for replacementRound in 0..replacementRounds {
+    storedVariants[0] = StoredVariant.Text("new{variantNumber}")
+    storedVariants[1] = StoredVariant.Empty
+}
+print("variant", variantText(heldVariant), variantText(storedVariants[0]), variantText(storedVariants[1]))
+
+// Empty variants must not be reused as a larger payload variant.
+var storedEmptyVariants = [StoredVariant.Empty]
+for replacementRound in 0..replacementRounds { storedEmptyVariants[0] = StoredVariant.Empty }
+for replacementRound in 0..replacementRounds { storedEmptyVariants[0] = StoredVariant.Number(71) }
+print("emptyVariant", variantText(storedEmptyVariants[0]))

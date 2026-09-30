@@ -1,0 +1,48 @@
+// Indexed loads may be reused only while their memory remains unchanged.
+fn repeatedInteger(values: [int], index: int) -> int {
+    return values[index] * 3 + values[index] * 5
+}
+
+fn repeatedFloat(values: [float], index: int) -> float {
+    return values[index] * 3.0 + values[index] * 5.0
+}
+
+fn mutateInteger(values: [int], index: int) {
+    values[index] = values[index] + 7
+}
+
+fn mutateFloat(values: [float], index: int) {
+    values[index] = values[index] + 0.5
+}
+
+fn exerciseIndexedReads(integerValues: [int], floatValues: [float], selectedIndex: int) {
+    print(repeatedInteger(integerValues, selectedIndex), repeatedFloat(floatValues, selectedIndex) as int)
+    let integerBeforeStore = integerValues[selectedIndex]
+    integerValues[selectedIndex] = 25
+    print(integerBeforeStore, integerValues[selectedIndex])
+    let floatBeforeStore = floatValues[selectedIndex]
+    floatValues[selectedIndex] = 2.5
+    print((floatBeforeStore * 10.0) as int, (floatValues[selectedIndex] * 10.0) as int)
+    let integerAlias = integerValues
+    let floatAlias = floatValues
+    let integerBeforeAlias = integerValues[selectedIndex]
+    integerAlias[selectedIndex] = 50
+    let floatBeforeAlias = floatValues[selectedIndex]
+    floatAlias[selectedIndex] = 5.0
+    print(integerBeforeAlias, integerValues[selectedIndex], (floatBeforeAlias * 10.0) as int, (floatValues[selectedIndex] * 10.0) as int)
+    let integerBeforeCall = integerValues[selectedIndex]
+    mutateInteger(integerAlias, selectedIndex)
+    let floatBeforeCall = floatValues[selectedIndex]
+    mutateFloat(floatAlias, selectedIndex)
+    print(integerBeforeCall, integerValues[selectedIndex], (floatBeforeCall * 10.0) as int, (floatValues[selectedIndex] * 10.0) as int)
+    let integerBeforeFill = integerValues[selectedIndex]
+    let floatBeforeFill = floatValues[selectedIndex]
+    for elementIndex in 0..4 { integerValues[elementIndex] = 9 }
+    for elementIndex in 0..4 { floatValues[elementIndex] = 1.5 }
+    print(integerBeforeFill, integerValues[selectedIndex], (floatBeforeFill * 10.0) as int, (floatValues[selectedIndex] * 10.0) as int)
+    print(repeatedInteger(integerValues, selectedIndex), repeatedFloat(floatValues, selectedIndex) as int)
+}
+
+var integerValues = [10, 20, 30, 40]
+var floatValues = [1.0, 2.0, 3.0, 4.0]
+exerciseIndexedReads(integerValues, floatValues, args().len())

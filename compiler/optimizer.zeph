@@ -2026,34 +2026,40 @@ fn lowerReferenceStore(target: Node, source: Node) {
     let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
 }
 
-// a struct type none of whose fields is a reference
+// A fixed-layout struct with no reference fields; a union tag hides its payload.
 fn isPlainStruct(typeIndex: int) -> bool {
     if typeKinds[typeIndex] != kindStruct { return false }
-    for fieldType in structDefinitions[typeDefinitionIds[typeIndex]].fieldTypes {
+    let structDefinition = structDefinitions[typeDefinitionIds[typeIndex]]
+    if structDefinition.node.isMutable { return false }
+    for fieldType in structDefinition.fieldTypes {
         if isReferenceType(fieldType) { return false }
     }
     return true
 }
 
-// *address = value (owned) for a plain struct. When the element it replaces
-// has no other holder, the same shape and no descriptor, its fields are
-// overwritten in place and value is released: once scalar replacement
-// dissolves value, only the fallback allocates.
+// *address = value (owned) for a plain struct. A unique ordinary struct keeps
+// its header and has its fields overwritten; variant layouts still need shape
+// checks. Once scalar replacement dissolves value, only the fallback allocates.
 fn lowerReusingStore(address: int, value: int, structDefinition: StructDefinition) {
     let fieldCount = structDefinition.fieldTypes.len()
     let old = emitIr1(irLoadRaw64, classInteger, address, 0)
     let count = emitIr1(irLoadRaw64, classInteger, old, 0 - 24)
-    let shapeBlock = newBlock()
     let reuseBlock = newBlock()
     let assignBlock = newBlock()
     let joinBlock = newBlock()
-    terminate(irBranchCompare, [count, integerConstant(1)], conditionEqual, [shapeBlock, assignBlock])
-    sealBlock(shapeBlock)
-    currentIrBlock = shapeBlock
-    let descriptor = emitIr1(irLoadRaw64, classInteger, old, 0 - 16)
-    let size = emitIr1(irLoadRaw64, classInteger, old, 0 - 8)
-    let mismatch = emitIr2(irBitOr, classInteger, descriptor, emitIr2(irBitXor, classInteger, size, integerConstant(8 * fieldCount), 0), 0)
-    terminate(irBranchCompare, [mismatch, integerConstant(0)], conditionEqual, [reuseBlock, assignBlock])
+    if not structDefinition.node.isMutable and structDefinition.unionIndex < 0 {
+        // Nominal ordinary types have the right plain fields; preserve the old header.
+        terminate(irBranchCompare, [count, integerConstant(1)], conditionEqual, [reuseBlock, assignBlock])
+    } else {
+        let shapeBlock = newBlock()
+        terminate(irBranchCompare, [count, integerConstant(1)], conditionEqual, [shapeBlock, assignBlock])
+        sealBlock(shapeBlock)
+        currentIrBlock = shapeBlock
+        let descriptor = emitIr1(irLoadRaw64, classInteger, old, 0 - 16)
+        let size = emitIr1(irLoadRaw64, classInteger, old, 0 - 8)
+        let mismatch = emitIr2(irBitOr, classInteger, descriptor, emitIr2(irBitXor, classInteger, size, integerConstant(8 * fieldCount), 0), 0)
+        terminate(irBranchCompare, [mismatch, integerConstant(0)], conditionEqual, [reuseBlock, assignBlock])
+    }
     sealBlock(reuseBlock)
     currentIrBlock = reuseBlock
     for slot in 0..fieldCount {
@@ -2615,31 +2621,61 @@ fn upperBoundOf(compare: Node, operandIndex: int) -> int {
     return 0
 }
 
-// `lo <= x and x <= hi` on one variable: (x - lo) <=u (hi - lo), one branch
-fn lowerRangeCheck(condition: Node, trueBlock: int, falseBlock: int) -> bool {
-    let first = condition.children[0]
-    let second = condition.children[1]
-    let firstIndex = comparedOperandIndex(first)
-    let secondIndex = comparedOperandIndex(second)
-    if firstIndex < 0 or secondIndex < 0 { return false }
-    let operand = first.children[firstIndex]
-    if not sameVariableNode(operand, second.children[secondIndex]) { return false }
-    var low = lowerBoundOf(first, firstIndex)
-    var lowFound = rangeBoundFound
-    var high = upperBoundOf(second, secondIndex)
-    var highFound = rangeBoundFound
-    if not lowFound or not highFound {                    // x <= hi and x >= lo
-        low = lowerBoundOf(second, secondIndex)
-        lowFound = rangeBoundFound
-        high = upperBoundOf(first, firstIndex)
-        highFound = rangeBoundFound
+var matchedRangeOperand = makeNode(nodeNone, 0)
+var matchedRangeLowerBound = 0
+var matchedRangeUpperBound = 0
+
+// Match a constant integer interval on one variable without evaluating it.
+fn matchIntegerRange(condition: Node) -> bool {
+    if condition.nodeKind != nodeBinary or condition.operator != tokenAnd { return false }
+    let firstComparison = condition.children[0]
+    let secondComparison = condition.children[1]
+    let firstOperandIndex = comparedOperandIndex(firstComparison)
+    let secondOperandIndex = comparedOperandIndex(secondComparison)
+    if firstOperandIndex < 0 or secondOperandIndex < 0 { return false }
+    let comparedOperand = firstComparison.children[firstOperandIndex]
+    if not sameVariableNode(comparedOperand, secondComparison.children[secondOperandIndex]) { return false }
+    var lowerBound = lowerBoundOf(firstComparison, firstOperandIndex)
+    var foundLowerBound = rangeBoundFound
+    var upperBound = upperBoundOf(secondComparison, secondOperandIndex)
+    var foundUpperBound = rangeBoundFound
+    if not foundLowerBound or not foundUpperBound {
+        lowerBound = lowerBoundOf(secondComparison, secondOperandIndex)
+        foundLowerBound = rangeBoundFound
+        upperBound = upperBoundOf(firstComparison, firstOperandIndex)
+        foundUpperBound = rangeBoundFound
     }
-    if not lowFound or not highFound or low > high or low < 0 - 1073741824 or high > 1073741824 { return false }
-    let value = lowerExpression(operand)
+    if not foundLowerBound or not foundUpperBound or lowerBound > upperBound or lowerBound < 0 - 1073741824 or upperBound > 1073741824 { return false }
+    matchedRangeOperand = comparedOperand
+    matchedRangeLowerBound = lowerBound
+    matchedRangeUpperBound = upperBound
+    return true
+}
+
+// One unsigned check for an interval, or two intervals differing in one fixed bit.
+fn lowerRangeCheck(condition: Node, trueBlock: int, falseBlock: int) -> bool {
+    var rangeMask = 0
+    if condition.operator == tokenOr {
+        if not matchIntegerRange(condition.children[0]) { return false }
+        let firstOperand = matchedRangeOperand
+        let firstLowerBound = matchedRangeLowerBound
+        let firstUpperBound = matchedRangeUpperBound
+        if not matchIntegerRange(condition.children[1]) or not sameVariableNode(firstOperand, matchedRangeOperand) { return false }
+        rangeMask = firstLowerBound ^ matchedRangeLowerBound
+        if rangeMask <= 0 or (rangeMask & (rangeMask - 1)) != 0 or (firstUpperBound ^ matchedRangeUpperBound) != rangeMask { return false }
+        // The interval must stay in one mask-sized block: its mask bit cannot change.
+        if (firstLowerBound & (0 - rangeMask)) != (firstUpperBound & (0 - rangeMask)) { return false }
+        matchedRangeLowerBound = firstLowerBound | rangeMask
+        matchedRangeUpperBound = firstUpperBound | rangeMask
+    } else if not matchIntegerRange(condition) { return false }
+    let lowerBound = matchedRangeLowerBound
+    let upperBound = matchedRangeUpperBound
+    var value = lowerExpression(matchedRangeOperand)
     if optimizerBailed { return true }
     ensureOpenBlock()
-    let offset = emitIr2(irSubtract, classInteger, value, integerConstant(low), 0)
-    terminate(irBranchCompare, [offset, integerConstant(high - low)], conditionBelowOrEqual, [trueBlock, falseBlock])
+    if rangeMask != 0 { value = emitIr2(irBitOr, classInteger, value, integerConstant(rangeMask), 0) }
+    let offset = emitIr2(irSubtract, classInteger, value, integerConstant(lowerBound), 0)
+    terminate(irBranchCompare, [offset, integerConstant(upperBound - lowerBound)], conditionBelowOrEqual, [trueBlock, falseBlock])
     return true
 }
 
@@ -2655,7 +2691,7 @@ fn lowerCondition(condition: Node, trueBlock: int, falseBlock: int) {
         lowerCondition(condition.children[0], falseBlock, trueBlock)
         return
     }
-    if kind == nodeBinary and condition.operator == tokenAnd and lowerRangeCheck(condition, trueBlock, falseBlock) { return }
+    if kind == nodeBinary and (condition.operator == tokenAnd or condition.operator == tokenOr) and lowerRangeCheck(condition, trueBlock, falseBlock) { return }
     if kind == nodeBinary and (condition.operator == tokenAnd or condition.operator == tokenOr) {
         let middleBlock = newBlock()
         if condition.operator == tokenAnd { lowerCondition(condition.children[0], middleBlock, falseBlock) }
@@ -6082,12 +6118,12 @@ fn isCommutativeOpcode(opcode: int) -> bool {
 // a load that is valid until memory changes: reusable within one memory epoch
 fn isMemoryLoad(value: int) -> bool {
     let opcode = irOpcodes[value]
-    return opcode == irListLength or opcode == irListData or opcode == irLoad or opcode == irFloatLoad or opcode == irLoadGlobal or opcode == irFloatLoadGlobal
+    return opcode == irListLength or opcode == irListData or opcode == irLoad or opcode == irFloatLoad or opcode == irLoadGlobal or opcode == irFloatLoadGlobal or opcode == irLoadIndexed or opcode == irFloatLoadIndexed
 }
 
 fn changesMemory(value: int) -> bool {
     let opcode = irOpcodes[value]
-    if opcode == irCall { return not callKeepsHeapIntact(value) }
+    if opcode == irCall { return isRuntimeCallTo(value, "runtimeFillWords") or not callKeepsHeapIntact(value) }
     return opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 or opcode == irStore or opcode == irFloatStore or opcode == irStoreIndexed or opcode == irFloatStoreIndexed
 }
 
@@ -6632,6 +6668,15 @@ fn listContains(values: [int], wanted: int) -> bool {
 // needs no memory. Its field loads become the values stored at creation, and
 // the allocation, the stores and the count traffic go away.
 fn replaceScalarAggregates() {
+    // Most regions have no scalar candidates, so need no users analysis.
+    var hasScalarCandidate = false
+    for value in 0..irScalarCandidates.len() {
+        if irScalarCandidates[value] and not valueDead[value] {
+            hasScalarCandidate = true
+            break
+        }
+    }
+    if not hasScalarCandidate { return }
     var users: [[int]] = []
     for value in 0..irOpcodes.len() {
         var noUsers: [int] = []
