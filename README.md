@@ -32,9 +32,13 @@ stops for a collection: the worst frame under heavy churn is under 50 µs, again
 and struct fields are declared. `int` widens to `float` implicitly. Every other
 conversion is written out: `n as str`, `"3.14" as float`.
 
-**Native performance.** `bench\run_suite.ps1` runs each workload as the same
+**Native performance.** `python bench\bench.py run` runs each workload as the same
 algorithm in Zephyr, C (`gcc -O2`) and Rust (`rustc -O`), and checks the output
-checksums match across all three before reporting a number. Best of at least 7 runs on a
+checksums match across all three before reporting a number. `bench.py compare`
+diffs two saved runs, `bench.py ab` pits two compilers against each other, and
+`bench.py compile` measures compile-time scaling against C, C++, Rust, Java and C#.
+Current figures, including `-O2`, are in [docs/jit.md](docs/jit.md). The table below
+predates that harness: baseline code generator, best of at least 7 runs on a
 Ryzen 7 9800X3D, Windows x86-64, gcc 16.1, rustc 1.98.1:
 
 | Area | Zephyr | C `-O2` | Rust `-O` | |

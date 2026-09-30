@@ -29,3 +29,6 @@ __pycache__/
 *.ckpt
 *.ckpt.tmp.*
 optim-child.log
+
+# Per-machine benchmark results (bench/bench.py run)
+bench/results/

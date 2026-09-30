@@ -110,27 +110,55 @@ allocation, and a live map slot's state word holds `(hash << 1) | 1`, so
 probes skip foreign keys without dereferencing them and a rehash never
 rehashes.
 
-## Measurements (2026-09-30)
+## Measurements (2026-09-30, commit b44b77a)
 
-Best of 3, in ms, from `bench/run_suite.ps1 3` on the dev machine (Windows 11).
+From `python bench/bench.py run`: the median of 10 runs in ms, pinned to one CPU at high
+priority, on a Ryzen 7 9800X3D (Windows 11). Every workload is sized so the fastest
+language takes at least ~250 ms. Run-to-run spread (median absolute deviation) is
+under 1% except the string hash map baseline (1.2%). Peak memory is peak committed
+memory for the whole process tree.
 
-| area | baseline | -O2 | C | Rust | -O2/C |
-|---|---:|---:|---:|---:|---:|
-| recursion (fib) | 20 | 12 | 10 | 20 | 1.20 |
-| integer SIMD | 39 | 38 | 72 | 69 | 0.53 |
-| float compute | 97 | 93 | 88 | 91 | 1.06 |
-| sorting | 87 | 83 | 346 | 43 | 0.24 |
-| alloc / GC | 123 | 96 | 170 | 155 | 0.56 |
-| hash map | 39 | 31 | 30 | 69 | 1.03 |
-| rasterization | 7 | 7 | 9 | 10 | 0.78 |
-| bignum | 56 | 56 | 85 | 91 | 0.66 |
-| fluid / neighbours | 2866 | 2436 | 2249 | 2511 | 1.08 |
-| dynamic dispatch | 283 | 151 | 158 | 155 | 0.96 |
-| closures / HOFs | 201 | 115 | 103 | 40 | 1.12 |
-| string hash map | 220 | 95 | 67 | 94 | 1.42 |
-| struct floats | 484 | 164 | 151 | 152 | 1.09 |
-| tokenizer | 360 | 174 | 119 | 104 | 1.46 |
-| small structs (vectors) | 480 | 21 | 12 | 11 | 1.75 |
+| area | baseline | -O2 | C | Rust | -O2/C | -O2 MB | C MB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| recursion (fib) | 787 | 378 | 295 | 732 | 1.28 | 8.7 | 0.6 |
+| integer SIMD | 185 | 183 | 342 | 326 | 0.54 | 53.3 | 28.4 |
+| float compute | 336 | 304 | 304 | 312 | 1.00 | 8.7 | 0.6 |
+| sorting | 170 | 128 | 592 | 84 | 0.22 | 56.8 | 46.5 |
+| alloc / GC | 259 | 190 | 348 | 302 | 0.55 | 8.7 | 0.6 |
+| hash map | 329 | 244 | 289 | 836 | 0.85 | 85.6 | 34.7 |
+| rasterization | 187 | 177 | 268 | 290 | 0.66 | 8.7 | 0.7 |
+| bignum | 210 | 204 | 325 | 352 | 0.63 | 8.7 | 0.7 |
+| fluid / neighbours | 672 | 594 | 531 | 591 | 1.12 | 8.7 | 1.4 |
+| dynamic dispatch | 596 | 323 | 374 | 368 | 0.87 | 419.2 | 94.5 |
+| closures / HOFs | 558 | 329 | 341 | 113 | 0.97 | 65.5 | 18.3 |
+| string hash map | 985 | 363 | 276 | 398 | 1.31 | 33.0 | 14.4 |
+| struct floats | 957 | 324 | 296 | 298 | 1.09 | 8.7 | 0.7 |
+| tokenizer | 913 | 473 | 305 | 268 | 1.55 | 520.7 | 162.7 |
+| small structs (vectors) | 16491 | 409 | 266 | 239 | 1.54 | 8.7 | 0.8 |
+| megamorphic dispatch | 368 | 243 | 238 | 215 | 1.02 | 179.4 | 41.2 |
+| struct records | 1142 | 567 | 429 | 433 | 1.32 | 203.8 | 61.8 |
+| string building | 774 | 360 | 313 | 263 | 1.15 | 8.7 | 0.7 |
+| binary trees | 627 | 300 | 355 | 388 | 0.85 | 41.1 | 9.7 |
+
+The last four rows target known gaps in the tier: dispatch past the 4-vtable
+guard, lists of boxed structs, per-substring allocation, and allocation-heavy
+recursion. 8.7 MB is the runtime's initial heap reservation.
+
+**Compile-time scaling** (`python bench/bench.py compile`): 200 generated call
+chains, each 200 functions deep (40,000 functions), in µs per function, median of 3.
+
+| | check | object / `.s` | build | optimized build |
+|---|---:|---:|---:|---:|
+| Zephyr | - | 63 | 73 | 251 (-O2) |
+| C (gcc) | 5 | 326 | 334 | 88 |
+| C++ (g++) | 12 | 354 | 361 | 95 |
+| Rust | 59 | 107 | 109 | 206 |
+| C# (csc) | - | - | 120 | 112 |
+| Java (javac, 114x114) | - | - | 54 | - |
+
+The -O2 build costs 3.5x the baseline on this input. zc compiles itself in 937 ms
+(baseline) and 2727 ms (-O2), with a peak of 468 MB and 936 MB respectively. Both
+figures are for zc_new.exe, which is not itself built with -O2.
 
 ## Known limits and next steps
 
