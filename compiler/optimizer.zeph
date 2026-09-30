@@ -2134,6 +2134,10 @@ fn countNodes(node: Node) -> int {
 }
 
 // small, non-recursive, no captured environment
+let inlineRegionValueBudget = 16000
+let regionValueLimit = 24000
+var functionNodeCounts: [int: int] = [:]      // function index -> countNodes of its body, for inlining decisions
+
 fn canInline(functionIndex: int) -> bool {
     if functionDefinitions[functionIndex].hasEnvironment { return false }
     return canInlineWithin(functionIndex, 60)
@@ -2146,7 +2150,9 @@ fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
     for active in inlineStack {
         if active == functionIndex { return false }
     }
-    return countNodes(functionDefinition.body) <= nodeLimit
+    if irOpcodes.len() > inlineRegionValueBudget { return false }      // a huge region costs more to allocate than calls cost to run
+    if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(functionDefinition.body) }
+    return functionNodeCounts[functionIndex] <= nodeLimit
 }
 
 // a closure literal argument: inlining the callee lets its calls through it inline too
@@ -3457,13 +3463,13 @@ fn lastRangeEnd(value: int) -> int {
     return ends[ends.len() - 1]
 }
 
+// `positions` ascend (they are pushed in block order): one binary search per range
 fn crossesAnyPosition(value: int, positions: [int]) -> bool {
     let starts = rangeStarts[value]
     let ends = rangeEnds[value]
-    for position in positions {
-        for i in 0..starts.len() {
-            if starts[i] < position and position < ends[i] { return true }
-        }
+    for i in 0..starts.len() {
+        let next = firstPositionAbove(positions, starts[i])
+        if next < positions.len() and positions[next] < ends[i] { return true }
     }
     return false
 }
@@ -3472,12 +3478,21 @@ fn crossesAnyPosition(value: int, positions: [int]) -> bool {
 fn liveAtAnyPosition(value: int, positions: [int]) -> bool {
     let starts = rangeStarts[value]
     let ends = rangeEnds[value]
-    for position in positions {
-        for i in 0..starts.len() {
-            if starts[i] < position and position <= ends[i] { return true }
-        }
+    for i in 0..starts.len() {
+        let next = firstPositionAbove(positions, starts[i])
+        if next < positions.len() and positions[next] <= ends[i] { return true }
     }
     return false
+}
+
+fn firstPositionAbove(positions: [int], bound: int) -> int {
+    var low = 0
+    var high = positions.len()
+    while low < high {
+        let middle = (low + high) / 2
+        if positions[middle] <= bound { low = middle + 1 } else { high = middle }
+    }
+    return low
 }
 
 fn isAllocatable(value: int) -> bool {
@@ -6174,6 +6189,7 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     for block in 0..blockInstructions.len() {
         if not blockSealed[block] { optimizerBail("internal: unsealed block") }
     }
+    if irOpcodes.len() > regionValueLimit { optimizerBail("region too large ({irOpcodes.len()} values)") }
     if optimizerBailed { return false }
     resetForwarding()
     removeUnreachableBlocks()
@@ -6236,7 +6252,7 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
         optimizerNote("function {functionDefinition.name}: baseline ({optimizerBailReason})")
         return false
     }
-    optimizerNote("function {functionDefinition.name}: optimized, {spillSlotCount} spills")
+    optimizerNote("function {functionDefinition.name}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values")
     for line in optimizerLines { assemblyLines.push(line) }
     return true
 }
@@ -6329,7 +6345,7 @@ fn outlineLoops(statements: [Node], slotCount: int, parameterCount: int, registe
                 inliningEnabled = true
             }
             if compiled {
-                optimizerNote("loop at {functionName}:{statement.line}: optimized, {spillSlotCount} spills")
+                optimizerNote("loop at {functionName}:{statement.line}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values")
                 for line in optimizerLines { pendingRegionLines.push(line) }
                 var original = makeNode(statement.nodeKind, statement.line)
                 original.operator = statement.operator

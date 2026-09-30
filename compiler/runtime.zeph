@@ -755,6 +755,13 @@ fn runtimeAllocateObjectPayload(size: int) -> int {
 
 fn runtimeZeroMemory(address: int, byteCount: int) {
     var index = 0
+    while index + 32 <= byteCount {                 // four words a step: big buffers are common
+        store64(address + index, 0)
+        store64(address + index + 8, 0)
+        store64(address + index + 16, 0)
+        store64(address + index + 24, 0)
+        index += 32
+    }
     while index < byteCount {
         store64(address + index, 0)
         index += 8
@@ -770,6 +777,13 @@ fn runtimeSetGlobalRoots(rootsAddress: int, rootCount: int) {
 // ---- raw byte copy ----
 fn runtimeCopyMemory(destination: int, source: int, byteCount: int) {
     var index = 0
+    while index + 32 <= byteCount {
+        store64(destination + index, load64(source + index))
+        store64(destination + index + 8, load64(source + index + 8))
+        store64(destination + index + 16, load64(source + index + 16))
+        store64(destination + index + 24, load64(source + index + 24))
+        index += 32
+    }
     while index + 8 <= byteCount {
         store64(destination + index, load64(source + index))
         index += 8
