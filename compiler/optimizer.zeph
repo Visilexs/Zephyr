@@ -194,7 +194,9 @@ var knownClosureCells: [int] = []
 var knownClosureFunctions: [int] = []
 var knownClosureCaptures: [[int]] = []
 var variableKnownClosure: [int] = []        // an inlined parameter bound to a known closure (index above), else -1
-var inlineCaptureValues: [int] = []         // an inlined closure body's captures
+var inlineCaptureValues: [int] = []
+var nonFreeingIndirectCalls: [int] = []     // calls through a vtable whose every implementation never frees
+var nextStackCallCannotFree = false         // an inlined closure body's captures
 struct InlineFrame {
     prefix: str, ownedSlots: [int: bool], sourceMakesCalls: bool, returnBlock: int, returnVariable: int,
     returnType: int, returnScopeDepth: int, returnTemporaryMark: int, captureValues: [int]
@@ -303,6 +305,8 @@ fn resetIr() {
     variableKnownClosure = noKnownClosures
     var noCaptureValues: [int] = []
     inlineCaptureValues = noCaptureValues
+    var noNonFreeingCalls: [int] = []
+    nonFreeingIndirectCalls = noNonFreeingCalls
     var noParameters: [int] = []
     parameterValues = noParameters
     var noPending: [int] = []
@@ -817,7 +821,11 @@ fn lowerIndirectCall(expression: Node) -> int {
         operands.push(emitIr1(irLoad, classInteger, cell, 8))             // env
     }
     var result = 0
-    if isDispatch { result = lowerGuardedDispatch(expression, cellNode, operands, argumentValues) }
+    if isDispatch {
+        nextStackCallCannotFree = not dispatchMayFree(expression)
+        result = lowerGuardedDispatch(expression, cellNode, operands, argumentValues)
+        nextStackCallCannotFree = false
+    }
     else { result = lowerStackCall(operands, argumentValues, expression.typeIndex) }
     for value in pinned { emitRelease(value) }
     if isReferenceType(expression.typeIndex) { return ownedTemporary(result) }
@@ -834,6 +842,8 @@ fn lowerStackCall(operands: [int], argumentValues: [int], resultType: int) -> in
     }
     let result = emitIr(irCall, classInteger, callOperands, indirectStackCall)
     irReferenceArguments[result] = 0
+    if nextStackCallCannotFree { nonFreeingIndirectCalls.push(result) }
+    nextStackCallCannotFree = false
     if typeKinds[resultType] == kindFloat { return emitIr1(irFloatFromBits, classFloat, result, 0) }
     return result
 }
@@ -1039,6 +1049,19 @@ fn callKeepsHeapIntact(instruction: int) -> bool {
     return functionIndex >= 0 and functionIndex != indirectStackCall and keepsHeapIntact(functionDefinitions[functionIndex].name)
 }
 
+// may this call drop a count a borrowed value leans on (it may still write memory)
+fn irCallMayFree(instruction: int) -> bool {
+    let functionIndex = irImmediates[instruction]
+    if functionIndex == indirectStackCall {
+        for call in nonFreeingIndirectCalls {
+            if call == instruction { return false }
+        }
+        return true
+    }
+    if functionIndex < 0 { return true }
+    return not callKeepsHeapIntact(instruction) and functionMayFree(functionIndex)
+}
+
 fn lowerRuntimeCall(name: str, operands: [int]) -> int {
     if not functionNameIndices.has(name) {
         optimizerBail("no {name}")
@@ -1218,14 +1241,78 @@ fn needsOwnedHome(value: Node) -> bool {
 
 // can this subtree run a call that releases a count (user code, a runtime
 // method, a list push or pop, a call through a value)?
-fn mayCallFreeingCode(node: Node) -> bool {
-    if node.nodeKind == nodeCall {
-        let callKind = node.auxiliary
-        if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
-        if callKind == callKindRuntimeCall and not keepsHeapIntact(node.name) { return true }
-        if callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect { return true }
-        if callKind == callKindInterfaceDispatch or callKind == callKindWindows or callKind == callKindFunctionPointerCall { return true }
+// ---- which functions can drop a count some caller relies on ----
+// A function frees if it (or anything it calls) stores a reference into memory
+// that outlives it (a global, a field, an element, a map), pops, pushes, calls
+// the runtime's freeing entry points, or calls through a value it cannot see.
+// Releasing its own locals cannot free what a caller holds: whatever a caller
+// lent it still has the caller's owner's count. Recursion counts as freeing.
+var functionFreeStates: [int] = []          // by function: 0 unknown, 1 being scanned, 2 never frees, 3 may free
+
+fn functionMayFree(functionIndex: int) -> bool {
+    while functionFreeStates.len() < functionDefinitions.len() { functionFreeStates.push(0) }
+    let state = functionFreeStates[functionIndex]
+    if state == 1 or state == 3 { return true }
+    if state == 2 { return false }
+    let functionDefinition = functionDefinitions[functionIndex]
+    if functionDefinition.name == "runtimeFail" { return false }
+    if functionDefinition.name == "runtimeCollectGarbage" or keepsHeapIntact(functionDefinition.name) {
+        functionFreeStates[functionIndex] = 3
+        if keepsHeapIntact(functionDefinition.name) { functionFreeStates[functionIndex] = 2 }
+        return functionFreeStates[functionIndex] == 3
     }
+    functionFreeStates[functionIndex] = 1
+    let frees = bodyMayFree(functionDefinition.body)
+    functionFreeStates[functionIndex] = 2
+    if frees { functionFreeStates[functionIndex] = 3 }
+    return frees
+}
+
+// every implementation an interface call can reach, or true if one is unknown
+fn dispatchMayFree(call: Node) -> bool {
+    let cellType = call.children[0].children[0].typeIndex
+    if typeKinds[cellType] != kindInterface { return true }
+    let interfaceIndex = typeDefinitionIds[cellType]
+    let methodName = interfaceDefinitions[interfaceIndex].methodNames[call.slot]
+    for table in 0..dispatchStructIndices.len() {
+        if dispatchInterfaceIndices[table] != interfaceIndex { continue }
+        let methodIndex = findFunction(structDefinitions[dispatchStructIndices[table]].name + "." + methodName)
+        if methodIndex < 0 or functionMayFree(methodIndex) { return true }
+    }
+    return false
+}
+
+fn bodyMayFree(node: Node) -> bool {
+    let kind = node.nodeKind
+    if kind == nodeFunctionLiteral {
+        for i in 3..node.children.len() {                // only the captures run here
+            if bodyMayFree(node.children[i]) { return true }
+        }
+        return false
+    }
+    if kind == nodeAssign {
+        let target = node.children[0]
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap { return true }
+        if isReferenceType(target.typeIndex) and not (target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindLocal) { return true }
+    }
+    if kind == nodeCall and callMayFree(node) { return true }
+    for child in node.children {
+        if bodyMayFree(child) { return true }
+    }
+    return false
+}
+
+// the call itself (its arguments aside)
+fn callMayFree(node: Node) -> bool {
+    let callKind = node.auxiliary
+    if callKind == callKindUser { return functionMayFree(node.referenceIndex) }
+    if callKind == callKindRuntimeCall { return not keepsHeapIntact(node.name) }
+    if callKind == callKindInterfaceDispatch { return dispatchMayFree(node) }
+    return callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect or callKind == callKindWindows or callKind == callKindFunctionPointerCall
+}
+
+fn mayCallFreeingCode(node: Node) -> bool {
+    if node.nodeKind == nodeCall and callMayFree(node) { return true }
     for child in node.children {
         if mayCallFreeingCode(child) { return true }
     }
@@ -2745,7 +2832,7 @@ fn numberPositions() {
             else {
                 instructionPositions[instruction] = position
                 if irOpcodes[instruction] == irCall { callPositions.push(position) }
-                if irOpcodes[instruction] == irCall and not callKeepsHeapIntact(instruction) { freeingCallPositions.push(position) }
+                if irOpcodes[instruction] == irCall and irCallMayFree(instruction) { freeingCallPositions.push(position) }
                 position += 2
             }
         }
