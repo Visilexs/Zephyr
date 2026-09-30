@@ -922,11 +922,34 @@ fn lowerExpression(expression: Node) -> int {
     if kind == nodeList { return lowerListLiteral(expression) }
     if kind == nodeInterfaceBox { return lowerInterfaceBox(expression) }
     if kind == nodeSome { return lowerSome(expression) }
+    if kind == nodeMapLiteral { return lowerMapLiteral(expression) }
     if kind == nodeNoneLiteral { return integerConstant(0) }            // no cell: counting skips it
     if kind == nodeFunctionLiteral { return lowerFunctionLiteral(expression) }
     if kind == nodeStringLiteral { return lowerInterpolation(expression) }
     optimizerBail("expression kind {kind}")
     return 0
+}
+
+// [k: v, ...]: a fresh map, each pair's counts moving into it
+fn lowerMapLiteral(expression: Node) -> int {
+    let mapType = expression.typeIndex
+    var keyKind = integerConstant(mapKeyKind(mapType))
+    if mapKeyKind(mapType) == 2 { keyKind = symbolAddress("__td{typeDescriptorIndex(typeDefinitionIds[mapType])}") }
+    let map = ownedTemporary(lowerRuntimeCall("runtimeNewDescribedMap", [keyKind, symbolAddress("__dt{mapShapeDescriptor(mapType)}")]))
+    var keyIndex = 0
+    while keyIndex < expression.children.len() {
+        var key = lowerExpression(expression.children[keyIndex])
+        if optimizerBailed { return 0 }
+        if isReferenceType(expression.children[keyIndex].typeIndex) { key = takeOwnership(key) }
+        if irClasses[key] == classFloat { key = emitIr1(irBitsFromFloat, classInteger, key, 0) }
+        var value = lowerExpression(expression.children[keyIndex + 1])
+        if optimizerBailed { return 0 }
+        if isReferenceType(expression.children[keyIndex + 1].typeIndex) { value = takeOwnership(value) }
+        if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
+        let stored = lowerRuntimeCall(mapSetterFunction(mapType), [map, key, value])
+        keyIndex += 2
+    }
+    return map
 }
 
 // some(x): a one-word cell holding x (and its count, for a reference)
@@ -1262,6 +1285,7 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
+    if name == "runtimeNewDescribedMap" { return true }
     if name == "runtimeFormatTypedValue" or name == "runtimeStringToInteger" or name == "runtimeStringToFloat" { return true }
     if name == "runtimePrintTypedValue" or name == "runtimeJoinStringList" or name == "runtimeCharacterFromCode" or name == "runtimeListNew" { return true }
     if name == "runtimeBeginStringInterpolation" or name == "runtimeAppendInterpolationText" or name == "runtimeAppendInterpolationValue" or name == "runtimeEndStringInterpolation" { return true }   // they write the builder's own buffer
@@ -1938,7 +1962,7 @@ fn lowerCall(expression: Node) -> int {
     if callKind == callKindLength {
         let receiver = expression.children[0].children[0]
         let receiverKind = typeKinds[receiver.typeIndex]
-        if receiverKind != kindList and receiverKind != kindString {
+        if receiverKind != kindList and receiverKind != kindString and receiverKind != kindMap {
             optimizerBail("len of kind {receiverKind}")
             return 0
         }
@@ -3177,7 +3201,8 @@ fn checkBorrows() {
             if irOpcodes[instruction] != irCall { continue }
             let operands = irOperands[instruction]
             for i in 0..operands.len() {
-                if ((irReferenceArguments[instruction] >> i) & 1) == 1 and irBorrowed[operands[i]] { optimizerBail("unpinned reference passed to a call") }
+                // a callee that never frees cannot drop what a borrowed argument leans on
+                if ((irReferenceArguments[instruction] >> i) & 1) == 1 and irBorrowed[operands[i]] and irCallMayFree(instruction) { optimizerBail("unpinned reference passed to a call") }
             }
         }
     }

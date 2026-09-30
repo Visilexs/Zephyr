@@ -55,3 +55,17 @@ for i in 0..600 {
     if i % 2 == 0 { pieceCount += 3 } else { pieceCount += 4 }
 }
 print(pieceTotal, pieceCount)
+
+// map literals: empty, int and str keys, reference values, a struct key
+struct Key { a: int, b: str }
+var mapTotal = 0
+for i in 0..300 {
+    var counts: [str: int] = [:]
+    counts["k{i % 5}"] = i
+    let fixed = ["one": 1, "two{i % 3}": 2, "three": i]
+    let lists = [i: ["x{i}"], i + 1: ["y", "z"]]
+    let keyed = [Key{a: i % 4, b: "b"}: 1.5 * i as float]
+    mapTotal += counts.len() + fixed["three"] + fixed.len() + lists[i + 1].len() + lists[i][0].len()
+    mapTotal += keyed[Key{a: i % 4, b: "b"}] as int
+}
+print(mapTotal)
