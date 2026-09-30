@@ -1,0 +1,48 @@
+// -O2 parity cases for loans kept across releases: a release frees only what
+// no other holder keeps, so a value borrowed from a global, a parameter or
+// another owned value survives it; one borrowed from the released value does not.
+
+struct Row { name: str, cells: [str] }
+
+var table: [Row] = []
+var counts: [str: int] = [:]
+
+fn scanTable() -> int {
+    var total = 0
+    for row in table {                       // borrowed from the global
+        for cell in row.cells {
+            let label = "{row.name}:{cell}"  // a temporary released each round
+            counts[label] = counts.get(label).or(0) + 1
+            total += cell.len() + label.len()
+        }
+    }
+    return total
+}
+
+fn scanRows(rows: [Row]) -> int {
+    var total = 0
+    for row in rows {                        // borrowed from the parameter
+        var text = row.name
+        for cell in row.cells { text = text + cell }
+        total += text.len() + row.cells[0].len()
+    }
+    return total
+}
+
+fn rebuild(seed: int) -> int {
+    var total = 0
+    for i in 0..20 {
+        var owned = Row{name: "own{seed}", cells: ["a{i}", "b"]}
+        let first = owned.cells[0]           // borrowed from owned
+        owned = Row{name: "next", cells: ["c"]}   // released: first must hold its own count
+        total += first.len() + owned.cells[0].len()
+    }
+    return total
+}
+
+for i in 0..50 { table.push(Row{name: "row{i}", cells: ["x{i}", "y", "z{i % 3}"]}) }
+var checksum = 0
+for round in 0..4 {
+    checksum += scanTable() + scanRows(table) + rebuild(round)
+}
+print(checksum, counts.len(), counts["row7:x7"])

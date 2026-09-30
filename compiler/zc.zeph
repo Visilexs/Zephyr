@@ -383,6 +383,7 @@ var functionRegisterCall: [bool] = []   // per-function: register convention (se
 // -O2: the optimizing tier (optimizer.zeph)
 var optimizerEnabled = false
 var optimizerReport = false                // --opt-report: say what was optimized and why not
+var optimizerDump = false                  // --opt-dump: print the IR of a region that fails its borrow check
 var pendingRegionLines: [str] = []         // outlined loop bodies, emitted after their parent
 var excludedLocalSlots: [bool] = []        // parent slots an outlined loop owns: never promoted
 var excludedParameterSlots: [bool] = []
@@ -19009,6 +19010,7 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
     else if argument == "-O2" { optimizerEnabled = true }
     else if argument == "--opt-report" { optimizerReport = true }
+    else if argument == "--opt-dump" { optimizerDump = true }
     else if argument == "--map" { symbolMapEnabled = true }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true

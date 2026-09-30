@@ -1613,7 +1613,7 @@ fn bodyMayFree(node: Node) -> bool {
     }
     if kind == nodeAssign {
         let target = node.children[0]
-        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap { return true }
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap and isReferenceType(target.typeIndex) { return true }     // plain values: only the key count handed over drops
         if isReferenceType(target.typeIndex) and not (target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindLocal) { return true }
     }
     if kind == nodeCall and callMayFree(node) { return true }
@@ -1657,7 +1657,7 @@ fn mayFreeOrReassign(node: Node) -> bool {
 fn storesReleasingReferences(node: Node) -> bool {
     if node.nodeKind == nodeAssign {
         let target = node.children[0]
-        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap { return true }
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap and isReferenceType(target.typeIndex) { return true }     // plain values: only the key count handed over drops
         if isReferenceType(target.typeIndex) and not (target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindLocal) { return true }
     }
     for child in node.children {
@@ -1875,6 +1875,7 @@ fn lowerMapUpdate(target: Node, source: Node) -> bool {
     var ownedKey = key
     if isReferenceType(target.children[1].typeIndex) { ownedKey = emitRetain(key) }       // the map keeps the key
     let inserted = lowerRuntimeCall("runtimeMapSet", [map, ownedKey, emitIr2(combine, classInteger, fallback, deltaValue, 0)])
+    nonFreeingCalls.push(inserted)
     jumpTo(joinBlock)
     sealBlock(joinBlock)
     currentIrBlock = joinBlock
@@ -2615,6 +2616,7 @@ fn lowerStatementKind(statement: Node) {
             if isReferenceType(target.typeIndex) { value = takeOwnership(value) }
             if irClasses[value] == classFloat { value = emitIr1(irBitsFromFloat, classInteger, value, 0) }
             let stored = lowerRuntimeCall("runtimeMapSet", [map, key, value])
+            if not isReferenceType(target.typeIndex) { nonFreeingCalls.push(stored) }    // it can only drop the key count it was handed
             return
         }
         if isReferenceType(target.typeIndex) {
@@ -2729,7 +2731,7 @@ fn lowerStatementKind(statement: Node) {
         let elementType = plainListElement(statement.children[0].typeIndex)
         if optimizerBailed { return }
         // a body that can free: the list holds a count for the loop, each element one for its iteration
-        let bodyMayFree = mayCallFreeingCode(statement.children[1])
+        let bodyMayFree = mayCallFreeingCode(statement.children[1]) or storesReleasingReferences(statement.children[1])
         var list = lowerExpression(statement.children[0])
         if optimizerBailed { return }
         if bodyMayFree and irBorrowed[list] { list = ownedTemporary(emitRetain(list)) }
@@ -3660,6 +3662,61 @@ fn liveAtAnyPosition(value: int, positions: [int]) -> bool {
     return false
 }
 
+// --opt-dump: every live instruction by block, `*` marking borrowed values
+fn dumpIr(focus: int) {
+    print("ir: borrow check fails on v{focus}")
+    for block in blockOrder {
+        print("  b{block} (preds {blockPredecessors[block]}, succs {blockSuccessors[block]}):")
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] { continue }
+            var operands = ""
+            for operand in irOperands[instruction] { operands = operands + " v{resolveValue(operand)}" }
+            var mark = ""
+            if irBorrowed[instruction] { mark = "*" }
+            var callee = ""
+            if irOpcodes[instruction] == irCall and irImmediates[instruction] >= 0 and irImmediates[instruction] < functionDefinitions.len() { callee = " " + functionDefinitions[irImmediates[instruction]].name }
+            if irOpcodes[instruction] == irCall and irCallMayFree(instruction) { callee = callee + "!" }
+            print("    v{instruction}{mark} = op{irOpcodes[instruction]}{callee}{operands} #{irImmediates[instruction]} @{instructionPositions[instruction]}")
+        }
+    }
+}
+
+// What holds a borrowed value's count, down its load chain: -2 for a holder
+// no release in this region can drop (a global, a parameter, the parent
+// frame, static data), -1 when unknown, else the owned value itself.
+fn borrowRoot(value: int) -> int {
+    var current = resolveValue(value)
+    for step in 0..32 {
+        let opcode = irOpcodes[current]
+        if opcode == irLoadGlobal or opcode == irParameter or opcode == irLoadFrame or opcode == irDataAddress { return 0 - 2 }
+        if opcode == irLoad or opcode == irLoadIndexed or opcode == irListData {
+            current = resolveValue(irOperands[current][0])
+        } else {
+            if irBorrowed[current] { return 0 - 1 }            // a phi of loans, a call's borrowed result
+            return current
+        }
+    }
+    return 0 - 1
+}
+
+// A release drops one count, freeing only what no other holder keeps: a
+// borrowed value crosses one safely unless it releases the value's own root.
+fn survivesCrossedCalls(value: int) -> bool {
+    let root = borrowRoot(value)
+    if root == 0 - 1 { return false }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] != irCall or valueDead[instruction] or not irCallMayFree(instruction) { continue }
+            let single: [int] = [instructionPositions[instruction]]
+            if not crossesAnyPosition(value, single) { continue }
+            // runtimeAppendString frees at most its left operand, as a release would
+            if not isRuntimeCallTo(instruction, "runtimeReleaseReference") and not isRuntimeCallTo(instruction, "runtimeAppendString") { return false }
+            if root >= 0 and resolveValue(irOperands[instruction][0]) == root { return false }
+        }
+    }
+    return true
+}
+
 fn describeBorrowed(value: int) -> str {
     var text = ""
     if irOpcodes[value] == irLoadGlobal and irImmediates[value] < globalNames.len() { text = ", global {globalNames[irImmediates[value]]}" }
@@ -3851,7 +3908,10 @@ fn allocateRegisters() {
         var registerCount = integerRegisterNames.len()
         if valueClass == classFloat { registerCount = floatRegisterNames.len() }
         let needsCalleeSaved = crossesAnyPosition(current, callPositions)
-        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]}{describeBorrowed(current)})") }
+        if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) and not survivesCrossedCalls(current) {
+            if optimizerDump { dumpIr(current) }
+            optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]}{describeBorrowed(current)})")
+        }
         var blocked: [bool] = []
         for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
         if valueClass != classFloat and scratchClobberPositions.len() > 0 and liveAtAnyPosition(current, scratchClobberPositions) { blocked[scratchIntegerRegister] = true }
