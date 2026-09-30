@@ -2898,10 +2898,47 @@ fn assignsReferenceGlobal(node: Node) -> bool {
     return false
 }
 
+// A callee that never reads or writes a global (nor calls one that does) can
+// run while the region keeps globals in registers.
+var functionGlobalStates: [int] = []        // by function: 0 unknown, 1 being scanned, 2 touches none, 3 touches some
+
+fn functionTouchesGlobals(functionIndex: int) -> bool {
+    while functionGlobalStates.len() < functionDefinitions.len() { functionGlobalStates.push(0) }
+    let state = functionGlobalStates[functionIndex]
+    if state == 1 or state == 3 { return true }
+    if state == 2 { return false }
+    functionGlobalStates[functionIndex] = 1
+    let functionDefinition = functionDefinitions[functionIndex]
+    let touches = functionDefinition.hasEnvironment or subtreeTouchesGlobals(functionDefinition.body)
+    functionGlobalStates[functionIndex] = 2
+    if touches { functionGlobalStates[functionIndex] = 3 }
+    return touches
+}
+
+fn subtreeTouchesGlobals(node: Node) -> bool {
+    if node.nodeKind == nodeIdentifier and node.auxiliary == identifierKindGlobal { return true }
+    if node.nodeKind == nodeDeclaration and node.auxiliary == identifierKindGlobal { return true }
+    if node.nodeKind == nodeFunctionLiteral { return true }
+    if subtreeHasUserCallAt(node) { return true }
+    for child in node.children {
+        if subtreeTouchesGlobals(child) { return true }
+    }
+    return false
+}
+
+// this node itself: a call that may reach code touching the region's globals
+fn subtreeHasUserCallAt(node: Node) -> bool {
+    if node.nodeKind != nodeCall { return false }
+    let callKind = node.auxiliary
+    if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return functionTouchesGlobals(node.referenceIndex) }
+    if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows { return true }
+    return callKind == callKindRuntimeCall and hasFunctionArgument(node)
+}
+
 fn subtreeHasUserCall(node: Node) -> bool {
     if node.nodeKind == nodeCall {
         let callKind = node.auxiliary
-        if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return true }
+        if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" and functionTouchesGlobals(node.referenceIndex) { return true }
         if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows { return true }
         if callKind == callKindRuntimeCall and hasFunctionArgument(node) { return true }
     }
@@ -6528,7 +6565,14 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
     }
     let label = functionCodeLabel(functionDefinition.label)
     inliningEnabled = true
-    var compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
+    let hasPreInlineBody = functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone
+    var compiled = false
+    if hasPreInlineBody {                  // the optimizer's own inliner first: it budgets what it expands
+        lowerPreInlineBody = true
+        compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
+        lowerPreInlineBody = false
+    }
+    if not compiled { compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex)) }
     if not compiled and inlinedCallCount > 0 {
         optimizerNote("function {functionDefinition.name}: retry without inlining ({optimizerBailReason})")
         inliningEnabled = false
