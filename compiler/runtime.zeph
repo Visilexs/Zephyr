@@ -153,14 +153,37 @@ fn runtimeScanRootRange(lowerBound: int, upperBound: int) {
 fn runtimeTryMarkObject(candidate: int) {
     if candidate < runtimeHeapBaseAddress { return }
     if candidate >= runtimeHeapBumpAddress { return }
-    if (candidate & 7) != 0 { return }
-    let bitIndex = (candidate - runtimeHeapBaseAddress) >> 3
-    if runtimeGetBitmapBit(runtimeObjectStartBitmap, bitIndex) == 0 { return }     // not an object payload
+    var bitIndex = (candidate - runtimeHeapBaseAddress) >> 3
+    if (candidate & 7) != 0 or runtimeGetBitmapBit(runtimeObjectStartBitmap, bitIndex) == 0 {
+        // -O2 code may keep only a derived pointer (a string's bytes, an element's
+        // address, one past the end) live across an allocation: it keeps its object
+        bitIndex = runtimeFindObjectStart(bitIndex)
+        if bitIndex < 0 { return }
+        let start = runtimeHeapBaseAddress + (bitIndex << 3)
+        if candidate > start + (load64(start - 8) & (0 - 8)) { return }       // in a header or a gap
+    }
     if runtimeGetBitmapBit(runtimeObjectMarkBitmap, bitIndex) == 1 { return }      // already marked
-    let objectHeader = load64(candidate - 8)
-    if (objectHeader & runtimeHeapFlagFree) != 0 { return }
+    let object = runtimeHeapBaseAddress + (bitIndex << 3)
+    if (load64(object - 8) & runtimeHeapFlagFree) != 0 { return }
     runtimeSetBitmapBit(runtimeObjectMarkBitmap, bitIndex)
-    runtimePushMarkWorklist(candidate)
+    runtimePushMarkWorklist(object)
+}
+
+// the nearest object start at or below bitIndex, else -1
+fn runtimeFindObjectStart(bitIndex: int) -> int {
+    var byteIndex = bitIndex >> 3
+    var startBits = load8(runtimeObjectStartBitmap + byteIndex) & ((2 << (bitIndex & 7)) - 1)
+    while startBits == 0 {
+        if byteIndex == 0 { return 0 - 1 }
+        byteIndex -= 1
+        if (byteIndex & 7) == 7 {                  // a whole bitmap word at a time
+            while byteIndex >= 8 and load64(runtimeObjectStartBitmap + byteIndex - 7) == 0 { byteIndex -= 8 }
+        }
+        startBits = load8(runtimeObjectStartBitmap + byteIndex)
+    }
+    var highestBit = 7
+    while (startBits >> highestBit) == 0 { highestBit -= 1 }
+    return (byteIndex << 3) + highestBit
 }
 
 // ---------------- threads ----------------

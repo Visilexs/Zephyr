@@ -1470,7 +1470,9 @@ fn storeVariable(variable: int, value: int, isDeclaration: bool) {
         return
     }
     if isPendingTemporary(value) {
-        optimizerBail("fresh value into a borrowed variable")
+        var inlinedName = ""
+        if inlineStack.len() > 0 { inlinedName = " in " + functionDefinitions[inlineStack[inlineStack.len() - 1]].name }
+        optimizerBail("fresh value into a borrowed variable (slot {variableHomeIndex[variable]}{inlinedName})")
         return
     }
     if variableIsReference[variable] and variableHomeKind[variable] == identifierKindParameter {
@@ -1519,9 +1521,108 @@ fn markOwnedLocals(node: Node) -> bool {
     for i in 0..node.children.len() {
         declarationScopeMayFree = true
         if laterMayFree.len() > 0 { declarationScopeMayFree = laterMayFree[i] }
-        if markOwnedLocals(node.children[i]) { changed = true }
+        let child = node.children[i]
+        if declarationScopeMayFree and laterMayFree.len() > 0 and child.nodeKind == nodeDeclaration and isReferenceType(child.typeIndex) {
+            // an element of an unaliased list global: only that global's own stores can drop it
+            let elementGlobal = unaliasedElementGlobal(child.children[0])
+            if elementGlobal >= 0 { declarationScopeMayFree = laterDisturbsGlobal(node.children, i + 1, elementGlobal, child.slot) }
+        }
+        if markOwnedLocals(child) { changed = true }
     }
     return changed
+}
+
+// ---- unaliased list globals ----
+// A list global only ever given fresh list literals and only used as a
+// receiver (indexed, pushed, popped, measured, iterated) is the one holder of
+// its list: no other name can reach its slots.
+var unaliasedGlobals: [bool] = []            // by global slot
+
+fn computeUnaliasedGlobals(program: Node) {
+    var candidates: [bool] = []
+    for statement in program.children {
+        if statement.nodeKind == nodeDeclaration and statement.auxiliary == identifierKindGlobal and typeKinds[statement.typeIndex] == kindList and statement.children.len() > 0 and statement.children[0].nodeKind == nodeList {
+            while candidates.len() <= statement.slot { candidates.push(false) }
+            candidates[statement.slot] = true
+        }
+    }
+    unaliasedGlobals = candidates
+    for statement in program.children {
+        if statement.nodeKind != nodeFunction { markEscapingGlobals(statement, statement, statement) }
+    }
+    for functionDefinition in functionDefinitions {
+        if functionDefinition.body.nodeKind != nodeNone { markEscapingGlobals(functionDefinition.body, functionDefinition.body, functionDefinition.body) }
+    }
+}
+
+fn markEscapingGlobals(node: Node, parent: Node, grandparent: Node) {
+    if node.nodeKind == nodeIdentifier and node.auxiliary == identifierKindGlobal and node.slot < unaliasedGlobals.len() and unaliasedGlobals[node.slot] {
+        var allowed = false
+        if (parent.nodeKind == nodeIndex or parent.nodeKind == nodeIterableLoop) and parent.children.len() > 0 and parent.children[0] == node { allowed = true }
+        if parent.nodeKind == nodeMember and grandparent.nodeKind == nodeCall and grandparent.children.len() > 0 and grandparent.children[0] == parent {
+            let callKind = grandparent.auxiliary
+            allowed = callKind == callKindPush or callKind == callKindPop or callKind == callKindLength
+        }
+        if parent.nodeKind == nodeAssign and parent.children[0] == node and parent.children[1].nodeKind == nodeList { allowed = true }
+        if not allowed { unaliasedGlobals[node.slot] = false }
+    }
+    for child in node.children { markEscapingGlobals(child, node, parent) }
+}
+
+// G[i] with G an unaliased list global: G's slot, else -1
+fn unaliasedElementGlobal(source: Node) -> int {
+    if source.nodeKind != nodeIndex or source.children[0].nodeKind != nodeIdentifier { return 0 - 1 }
+    let container = source.children[0]
+    if container.auxiliary != identifierKindGlobal or container.slot >= unaliasedGlobals.len() or not unaliasedGlobals[container.slot] { return 0 - 1 }
+    return container.slot
+}
+
+// A store into the global itself releases its old element only after its
+// own operands were read: it disturbs the local only if the local is read later.
+fn laterDisturbsGlobal(siblings: [Node], start: int, globalSlot: int, localSlot: int) -> bool {
+    for i in start..siblings.len() {
+        let sibling = siblings[i]
+        if isStoreIntoGlobal(sibling, globalSlot) {
+            for child in sibling.children {
+                if disturbsGlobal(child, globalSlot) { return true }
+            }
+            for j in (i + 1)..siblings.len() {
+                if usesLocal(siblings[j], localSlot) { return true }
+            }
+        } else if disturbsGlobal(sibling, globalSlot) { return true }
+    }
+    return false
+}
+
+// G = ... or G[i] = ... as a statement
+fn isStoreIntoGlobal(statement: Node, globalSlot: int) -> bool {
+    if statement.nodeKind != nodeAssign { return false }
+    var target = statement.children[0]
+    if target.nodeKind == nodeIndex { target = target.children[0] }
+    return target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindGlobal and target.slot == globalSlot
+}
+
+// can this drop a count one of the global's slots holds: a store to the
+// global or its elements, a pop from it, or a call that may free anything
+fn disturbsGlobal(node: Node, globalSlot: int) -> bool {
+    let kind = node.nodeKind
+    if kind == nodeInline or kind == nodeInlineReturn or kind == nodeLetExpression or kind == nodeFunctionLiteral { return true }
+    if kind == nodeCall {
+        let callKind = node.auxiliary
+        if callKind == callKindPush or callKind == callKindPop {
+            let receiver = node.children[0].children[0]
+            if callKind == callKindPop and receiver.nodeKind == nodeIdentifier and receiver.auxiliary == identifierKindGlobal and receiver.slot == globalSlot { return true }
+        } else if callMayFree(node) { return true }
+    }
+    if kind == nodeAssign {
+        var target = node.children[0]
+        if target.nodeKind == nodeIndex { target = target.children[0] }
+        if target.nodeKind == nodeIdentifier and target.auxiliary == identifierKindGlobal and target.slot == globalSlot { return true }
+    }
+    for child in node.children {
+        if disturbsGlobal(child, globalSlot) { return true }
+    }
+    return false
 }
 
 // a value read out of a global, a field or an element: borrowed from its holder
@@ -3838,7 +3939,37 @@ fn borrowRoot(value: int) -> int {
 
 // A release drops one count, freeing only what no other holder keeps: a
 // borrowed value crosses one safely unless it releases the value's own root.
+// the global slot an element load reads straight out of: G[i] as
+// irLoadIndexed(irListData(irLoadGlobal G)) with G unaliased, else -1
+fn loadedElementGlobal(value: int) -> int {
+    let current = resolveValue(value)
+    if irOpcodes[current] != irLoadIndexed { return 0 - 1 }
+    let data = resolveValue(irOperands[current][0])
+    if irOpcodes[data] != irListData { return 0 - 1 }
+    let list = resolveValue(irOperands[data][0])
+    if irOpcodes[list] != irLoadGlobal or irImmediates[list] >= unaliasedGlobals.len() or not unaliasedGlobals[irImmediates[list]] { return 0 - 1 }
+    return irImmediates[list]
+}
+
+// an address built only from arithmetic, loads and list data, none reading global slot g
+fn addressAvoidsGlobal(value: int, globalSlot: int, depth: int) -> bool {
+    if depth > 6 { return false }
+    let current = resolveValue(value)
+    let opcode = irOpcodes[current]
+    if opcode == irLoadGlobal { return irImmediates[current] != globalSlot }
+    if opcode == irConstant or opcode == irParameter or opcode == irLoadFrame { return true }
+    if opcode == irShiftLeft or opcode == irMultiply { return true }        // a scaled index, not a pointer
+    if opcode == irAdd or opcode == irListData or opcode == irLoad or opcode == irLoadIndexed {
+        for operand in irOperands[current] {
+            if not addressAvoidsGlobal(operand, globalSlot, depth + 1) { return false }
+        }
+        return true
+    }
+    return false
+}
+
 fn survivesCrossedCalls(value: int) -> bool {
+    let elementGlobal = loadedElementGlobal(value)
     let root = borrowRoot(value)
     if root == 0 - 1 { return false }
     for block in 0..blockInstructions.len() {
@@ -3846,6 +3977,10 @@ fn survivesCrossedCalls(value: int) -> bool {
             if irOpcodes[instruction] != irCall or valueDead[instruction] or not irCallMayFree(instruction) { continue }
             let single: [int] = [instructionPositions[instruction]]
             if not crossesAnyPosition(value, single) { continue }
+            // an unaliased global's element: a push never frees elements, a
+            // store frees only what its own slot held
+            if elementGlobal >= 0 and isRuntimeCallTo(instruction, "runtimeListPush") { continue }
+            if elementGlobal >= 0 and isRuntimeCallTo(instruction, "runtimeAssignReference") and addressAvoidsGlobal(irOperands[instruction][0], elementGlobal, 0) { continue }
             // runtimeAppendString frees at most its left operand, as a release would
             if not isRuntimeCallTo(instruction, "runtimeReleaseReference") and not isRuntimeCallTo(instruction, "runtimeAppendString") { return false }
             if root >= 0 and resolveValue(irOperands[instruction][0]) == root { return false }

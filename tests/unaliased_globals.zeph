@@ -1,0 +1,48 @@
+// -O2 parity cases for list globals no other name can reach: an element
+// borrowed from one survives stores into other lists, never stores into its own.
+
+struct Cell { value: int, label: str }
+
+var first: [Cell] = []
+var second: [Cell] = []
+var shared: [Cell] = []
+var alias: [Cell] = []
+var popped: [Cell] = []
+var reset: [Cell] = []
+
+fn fill(list: [Cell], count: int) {
+    for i in 0..count { list.push(Cell{value: i, label: "c{i}"}) }
+}
+
+for i in 0..30 {
+    first.push(Cell{value: i, label: "f{i}"})
+    second.push(Cell{value: 100 + i, label: "s{i}"})
+    popped.push(Cell{value: i, label: "p{i}"})
+    reset.push(Cell{value: i, label: "r{i}"})
+}
+fill(shared, 30)
+alias = shared                             // shared escapes: no longer unaliased
+var total = 0
+for round in 0..3 {
+    for i in 0..30 {
+        let a = first[i]                   // survives the store into second
+        second[i] = Cell{value: a.value + round, label: "n{i}"}
+        total += a.value + a.label.len() + second[i].value
+
+        let b = first[i]                   // its own slot replaced, then read again
+        first[i] = Cell{value: b.value + 1, label: "g{i}"}
+        total += b.value + b.label.len()
+
+        let c = shared[i]                  // alias[i] is the same slot
+        alias[i] = Cell{value: 7, label: "alias"}
+        total += c.value + c.label.len()
+    }
+    let last = popped[popped.len() - 1]
+    let gone = popped.pop()
+    total += last.value + last.label.len() + gone.value
+
+    let head = reset[0]
+    reset = [Cell{value: 99, label: "fresh"}]
+    total += head.value + head.label.len()
+}
+print(total, first[5].value, first[5].label, second[7].value, shared[3].label, popped.len(), reset[0].label)
