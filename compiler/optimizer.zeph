@@ -2791,6 +2791,10 @@ fn countUses() {
     }
 }
 
+fn isInlineRetain(instruction: int) -> bool {
+    return heapBumpGlobalIndex >= 0 and heapBaseGlobalIndex >= 0 and isRuntimeCallTo(instruction, "runtimeRetainReference")
+}
+
 fn isRuntimeCallTo(instruction: int, name: str) -> bool {
     return irOpcodes[instruction] == irCall and functionNameIndices.has(name) and irImmediates[instruction] == functionNameIndices[name]
 }
@@ -3107,7 +3111,7 @@ fn numberPositions() {
             if irOpcodes[instruction] == irPhi or irOpcodes[instruction] == irParameter { instructionPositions[instruction] = blockStarts[block] }
             else {
                 instructionPositions[instruction] = position
-                if irOpcodes[instruction] == irCall { callPositions.push(position) }
+                if irOpcodes[instruction] == irCall and not isInlineRetain(instruction) { callPositions.push(position) }
                 if irOpcodes[instruction] == irDivideByInvariant or irOpcodes[instruction] == irModuloByInvariant { scratchClobberPositions.push(position) }
                 if irOpcodes[instruction] == irCall and irCallMayFree(instruction) { freeingCallPositions.push(position) }
                 position += 2
@@ -4587,6 +4591,20 @@ fn emitInstructionFor(value: int) {
         let divisor = integerIn(operands[0], "rax")
         emitOptimized("test {divisor}, {divisor}")
         emitOptimized("je .L{emitColdPanic(immediate)}")
+        return
+    }
+    if opcode == irCall and isInlineRetain(value) {
+        // runtimeRetainReference in place: count only what lives in the heap
+        let skipLabel = allocateLabel()
+        let target = resultRegister(value, "rax")
+        emitOptimized("mov {target}, {locationOf(operands[0])}")
+        emitOptimized("cmp {target}, qword ptr [rip + __zephyr_globals + {8 * heapBaseGlobalIndex}]")
+        emitOptimized("jb .L{skipLabel}")
+        emitOptimized("cmp {target}, qword ptr [rip + __zephyr_globals + {8 * heapBumpGlobalIndex}]")
+        emitOptimized("jae .L{skipLabel}")
+        emitOptimized("inc qword ptr [{target} - 24]")
+        optimizerLines.push(".L{skipLabel}:\n")
+        finishResult(value, target)
         return
     }
     if opcode == irCall {

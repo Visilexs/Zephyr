@@ -368,6 +368,8 @@ var localSlotCount = 0
 var atGlobal = false
 var globalCount = 0
 var globalIsMutable: [bool] = []           // by global index: false for a `let`, never reassigned
+var heapBaseGlobalIndex = 0 - 1            // the runtime's heap bounds, when the program carries the runtime: -O2 inlines retains
+var heapBumpGlobalIndex = 0 - 1
 // codegen
 var assemblyLines: [str] = []
 var nextLabelId = 0
@@ -4512,6 +4514,8 @@ fn checkStatement(statement: Node) {
             globalCount += 1
             while globalIsMutable.len() < globalCount { globalIsMutable.push(true) }
             globalIsMutable[statement.slot] = statement.isMutable
+            if statement.name == "runtimeHeapBaseAddress" { heapBaseGlobalIndex = statement.slot }
+            if statement.name == "runtimeHeapBumpAddress" { heapBumpGlobalIndex = statement.slot }
         } else {
             statement.auxiliary = identifierKindLocal
             statement.slot = localSlotCount
