@@ -8937,7 +8937,7 @@ fn generateCall(expression: Node) {
         emitInstruction("jg {labelText(failLabel)}")
         deferredColdBlocks.push(".L{failLabel}:\n")
         coldPanic(expression, "invalid substring")
-        emitRuntimeCall("runtimeSubstringValue")
+        emitRuntimeCall("runtimeSubstringFromCheckedBounds")
         popTemporaryKeepResult(ownsTemporary)
         return
     }
@@ -14316,6 +14316,13 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    if handle == 0 - 1 \{ runtimeFail(\"cannot write file\") \}\n")
     sourceLines.push("    runtimeWriteOutputBytes(handle, data + 8, load64(data))\n")
     sourceLines.push("    let closeResult = win(\"CloseHandle\", handle)\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// Callers must establish 0 <= lowerBound <= upperBound <= the string length.\n")
+    sourceLines.push("fn runtimeSubstringFromCheckedBounds(stringAddress: int, lowerBound: int, upperBound: int) -> int \{\n")
+    sourceLines.push("    let result = runtimeAllocateString(upperBound - lowerBound)\n")
+    sourceLines.push("    runtimeCopyMemory(result + 8, stringAddress + 8 + lowerBound, upperBound - lowerBound)\n")
+    sourceLines.push("    return result\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     return sourceLines.join()

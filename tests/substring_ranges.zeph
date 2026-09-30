@@ -1,0 +1,32 @@
+// Substring bounds preserve receiver evaluation and temporary lifetimes.
+var globalReceiver = "abcdef"
+var boundCalls = 0
+
+fn freshText(number: int) -> str { return "token{number}" }
+fn sideEffectStart() -> int {
+    boundCalls += 1
+    globalReceiver = "changed-start"
+    return 1
+}
+fn sideEffectEnd() -> int {
+    boundCalls += 1
+    globalReceiver = "changed-end"
+    return 4
+}
+fn exerciseSubstring(source: str, allocationCount: int) {
+    print("ranges", source.sub(0, 0).len(), source.sub(0, source.len()), source.sub(source.len(), source.len()).len(), source.sub(3, source.len()))
+    print("temporary", freshText(7).sub(1, 5))
+    let originalReceiver = globalReceiver
+    let changedDuringBounds = globalReceiver.sub(sideEffectStart(), sideEffectEnd())
+    print("bounds", changedDuringBounds, originalReceiver, globalReceiver, boundCalls)
+    var retainedSlices: [str] = []
+    for allocationIndex in 0..allocationCount {
+        retainedSlices.push(freshText(allocationIndex).sub(1, 5))
+        let allocationNoise = "noise{allocationIndex}{allocationIndex}"
+        if allocationNoise.len() == 0 { print("unexpected") }
+    }
+    var retainedLength = 0
+    for retainedSlice in retainedSlices { retainedLength += retainedSlice.len() }
+    print("retained", retainedSlices.len(), retainedLength, retainedSlices[0], retainedSlices[retainedSlices.len() - 1])
+}
+exerciseSubstring("abcdef", 255 + args().len())

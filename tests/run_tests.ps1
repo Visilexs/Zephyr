@@ -1606,6 +1606,25 @@ foreach ($name in $moduleErrors.Keys) {
     Check "error:$name" ($r.code -eq -1 -and $r.out -match "error:") "expected compile error, got($($r.code)): $($r.out)"
 }
 
+# Fixed-output optimizer regressions also run through the standard gate.
+$optimizerRegressions = [ordered]@{
+    "numeric_codegen" = "signed 0`nfloat 0`nnearMiss 0"
+    "substring_ranges" = "ranges 0 abcdef 0 def`ntemporary oken`nbounds bcd abcdef changed-end 2`nretained 256 1024 oken oken"
+}
+foreach ($regressionName in $optimizerRegressions.Keys) {
+    $regressionExecutable = Join-Path $tmp "$regressionName.exe"
+    Remove-Item $regressionExecutable -ErrorAction SilentlyContinue
+    $regressionBuild = (& .\zc.exe --rt "tests\$regressionName.zeph" $regressionExecutable 2>&1 | Out-String).Trim()
+    $regressionBuildCode = $LASTEXITCODE
+    $regressionOutput = ""
+    $regressionRunCode = -1
+    if ($regressionBuildCode -eq 0 -and (Test-Path $regressionExecutable)) {
+        $regressionOutput = (& $regressionExecutable 2>&1 | Out-String).Trim() -replace "`r", ""
+        $regressionRunCode = $LASTEXITCODE
+    }
+    Check "optimizer:$regressionName" ($regressionBuildCode -eq 0 -and $regressionRunCode -eq 0 -and $regressionOutput -eq $optimizerRegressions[$regressionName]) "build($regressionBuildCode) run($regressionRunCode): $regressionBuild $regressionOutput"
+}
+
 Write-Host ""
 Write-Host "$pass passed, $fail failed"
 if ($fail) { exit 1 }

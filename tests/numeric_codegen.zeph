@@ -1,0 +1,52 @@
+// Arithmetic signed comparison and exact positive-double strength reduction.
+var randomState = 12345
+fn nextPattern() -> int {
+    randomState = randomState * 6364136223846793005 + 1442695040888963407
+    return randomState
+}
+fn arithmeticLess(first: int, second: int) -> int {
+    return ((((first - second) ^ ((first ^ second) & ((first - second) ^ first))) >> 63) & 1)
+}
+fn checkSigned(first: int, second: int) -> int {
+    var branchLess = 0
+    if first < second { branchLess = 1 }
+    if arithmeticLess(first, second) != branchLess { return 1 }
+    return 0
+}
+fn checkNearMiss(first: int, second: int, expectedMask: int, expectedShift: int, expectedCorrection: int) -> int {
+    let maskedValue = ((((first - second) ^ ((first ^ second) & ((first - second) ^ first))) >> 63) & 3)
+    let shiftedValue = ((((first - second) ^ ((first ^ second) & ((first - second) ^ first))) >> 62) & 1)
+    let changedCorrection = ((((first - second) ^ ((first ^ second) & ((first - second) ^ second))) >> 63) & 1)
+    var differences = 0
+    if maskedValue != expectedMask { differences += 1 }
+    if shiftedValue != expectedShift { differences += 1 }
+    if changedCorrection != expectedCorrection { differences += 1 }
+    return differences
+}
+fn checkDouble(rawPattern: int) -> int {
+    let inputValue = floatFromBits(rawPattern)
+    let multiplied = inputValue * 2.0
+    let added = inputValue + inputValue
+    if bits(multiplied) != bits(added) { return 1 }
+    return 0
+}
+let minimumSigned = 0 - 9223372036854775807 - 1
+let maximumSigned = 9223372036854775807
+let boundaries = [minimumSigned, minimumSigned + 1, -1, 0, 1, maximumSigned - 1, maximumSigned]
+var signedDifferences = 0
+for first in boundaries { for second in boundaries { signedDifferences += checkSigned(first, second) } }
+for patternIndex in 0..10000 { signedDifferences += checkSigned(nextPattern(), nextPattern()) }
+var nearMissDifferences = checkNearMiss(-1, 0, 3, 1, 0)
+nearMissDifferences += checkNearMiss(4611686018427387904, 0, 0, 1, 0)
+nearMissDifferences += checkNearMiss(minimumSigned, maximumSigned, 3, 0, 0)
+nearMissDifferences += checkNearMiss(0, -1, 0, 0, 1)
+print("signed", signedDifferences)
+let positivePatterns = [0, 1, 4503599627370495, 4503599627370496, 9218868437227405311, 9218868437227405312, 9221120237041090560, 9221140253039434428, 9218868437227405313, 9218888453225749172]
+var floatDifferences = 0
+for rawPattern in positivePatterns {
+    floatDifferences += checkDouble(rawPattern)
+    floatDifferences += checkDouble(rawPattern ^ minimumSigned)
+}
+for patternIndex in 0..10000 { floatDifferences += checkDouble(nextPattern()) }
+print("float", floatDifferences)
+print("nearMiss", nearMissDifferences)

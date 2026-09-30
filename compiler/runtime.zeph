@@ -2890,3 +2890,10 @@ fn runtimeWriteFile(path: int, data: int) {
     runtimeWriteOutputBytes(handle, data + 8, load64(data))
     let closeResult = win("CloseHandle", handle)
 }
+
+// Callers must establish 0 <= lowerBound <= upperBound <= the string length.
+fn runtimeSubstringFromCheckedBounds(stringAddress: int, lowerBound: int, upperBound: int) -> int {
+    let result = runtimeAllocateString(upperBound - lowerBound)
+    runtimeCopyMemory(result + 8, stringAddress + 8 + lowerBound, upperBound - lowerBound)
+    return result
+}

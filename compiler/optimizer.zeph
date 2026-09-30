@@ -1293,7 +1293,7 @@ fn keepsHeapIntact(name: str) -> bool {
     // what an inlined lookup calls: hashing and comparing only read (recursion is not freeing here)
     if name == "runtimeFindGenericMapEntry" or name == "runtimeIntegerMapLookup" or name == "runtimeKeyEquals" or name == "runtimeValueEquals" { return true }
     if name == "runtimeMapHash" or name == "runtimeHashTypedValue" or name == "runtimeHashString" or name == "runtimeHashMix" or name == "runtimePackedLoad" { return true }
-    return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
+    return name == "runtimeSubstringValue" or name == "runtimeSubstringFromCheckedBounds" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
 
 fn callKeepsHeapIntact(instruction: int) -> bool {
@@ -2292,7 +2292,7 @@ fn lowerCall(expression: Node) -> int {
         let length = emitIr1(irListLength, classInteger, text, 1)
         let upperChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, length, integerConstant(1), 0), upper, invalid)   // 0 <= upper <= length
         let lowerChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, upper, integerConstant(1), 0), lower, invalid)   // 0 <= lower <= upper
-        return ownedTemporary(lowerRuntimeCall("runtimeSubstringValue", [text, lower, upper]))
+        return ownedTemporary(lowerRuntimeCall("runtimeSubstringFromCheckedBounds", [text, lower, upper]))
     }
     if callKind == callKindRuntimeCall {         // a method the runtime implements: every argument borrowed
         if not functionNameIndices.has(expression.name) {
@@ -5801,6 +5801,54 @@ fn mirroredCondition(condition: int) -> int {
     return condition
 }
 
+// The sign of (x-y) corrected for signed overflow is exactly x < y.
+// Recognize its normalized bit expression without changing integer arithmetic elsewhere.
+fn foldSignedLessThan(value: int) -> bool {
+    let maskOperands = irOperands[value]
+    let firstMaskOperand = resolveValue(maskOperands[0])
+    let secondMaskOperand = resolveValue(maskOperands[1])
+    var shiftedValue = firstMaskOperand
+    if isConstantValue(secondMaskOperand) and irImmediates[secondMaskOperand] == 1 {
+        shiftedValue = firstMaskOperand
+    } else if isConstantValue(firstMaskOperand) and irImmediates[firstMaskOperand] == 1 {
+        shiftedValue = secondMaskOperand
+    } else { return false }
+    if irOpcodes[shiftedValue] != irShiftRight { return false }
+    let shiftOperands = irOperands[shiftedValue]
+    let shiftAmount = resolveValue(shiftOperands[1])
+    if not isConstantValue(shiftAmount) or irImmediates[shiftAmount] != 63 { return false }
+    let correctedSign = resolveValue(shiftOperands[0])
+    if irOpcodes[correctedSign] != irBitXor { return false }
+    let signOperands = irOperands[correctedSign]
+    for differencePosition in 0..2 {
+        let difference = resolveValue(signOperands[differencePosition])
+        let correction = resolveValue(signOperands[1 - differencePosition])
+        if irOpcodes[difference] != irSubtract or irOpcodes[correction] != irBitAnd { continue }
+        let leftValue = resolveValue(irOperands[difference][0])
+        let rightValue = resolveValue(irOperands[difference][1])
+        let correctionOperands = irOperands[correction]
+        for signPosition in 0..2 {
+            let operandSigns = resolveValue(correctionOperands[signPosition])
+            let differenceSign = resolveValue(correctionOperands[1 - signPosition])
+            if irOpcodes[operandSigns] != irBitXor or irOpcodes[differenceSign] != irBitXor { continue }
+            let signLeft = resolveValue(irOperands[operandSigns][0])
+            let signRight = resolveValue(irOperands[operandSigns][1])
+            if not ((signLeft == leftValue and signRight == rightValue) or (signLeft == rightValue and signRight == leftValue)) { continue }
+            let differenceSignOperands = irOperands[differenceSign]
+            for correctedPosition in 0..2 {
+                let correctedDifference = resolveValue(differenceSignOperands[correctedPosition])
+                if resolveValue(differenceSignOperands[1 - correctedPosition]) != leftValue or irOpcodes[correctedDifference] != irSubtract { continue }
+                if resolveValue(irOperands[correctedDifference][0]) != leftValue or resolveValue(irOperands[correctedDifference][1]) != rightValue { continue }
+                irOpcodes[value] = irCompare
+                irOperands[value] = [leftValue, rightValue]
+                irImmediates[value] = conditionLess
+                return true
+            }
+        }
+    }
+    return false
+}
+
 fn foldInstruction(block: int, value: int) -> bool {
     let opcode = irOpcodes[value]
     let operands = irOperands[value]
@@ -5882,6 +5930,19 @@ fn foldInstruction(block: int, value: int) -> bool {
     if opcode == irBitsFromFloat and irOpcodes[first] == irFloatConstant {
         becomeConstant(value, irImmediates[first])
         return true
+    }
+    if opcode == irBitAnd and foldSignedLessThan(value) { return true }
+    if opcode == irFloatMultiply {
+        var doubledValue = 0 - 1
+        if irOpcodes[first] == irFloatConstant and irImmediates[first] == bits(2.0) { doubledValue = second }
+        else if second >= 0 and irOpcodes[second] == irFloatConstant and irImmediates[second] == bits(2.0) { doubledValue = first }
+        if doubledValue >= 0 {
+            // Positive doubling preserves rounding, signed zero and NaN payloads.
+            irOpcodes[value] = irFloatAdd
+            irOperands[value] = [doubledValue, doubledValue]
+            irImmediates[value] = 0
+            return true
+        }
     }
     // identities: the result is one of the operands, or a cheaper operation
     if secondConstant and not firstConstant {
