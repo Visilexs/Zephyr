@@ -2772,6 +2772,7 @@ var blockStartPositions: [int] = []
 var blockEndPositions: [int] = []
 var instructionPositions: [int] = []
 var callPositions: [int] = []
+var scratchClobberPositions: [int] = []   // instructions that use r11 as scratch
 var freeingCallPositions: [int] = []      // calls that may release memory a borrowed reference points into
 var liveIn: [[int]] = []
 var liveOut: [[int]] = []
@@ -2912,6 +2913,8 @@ fn numberPositions() {
     callPositions = noCalls
     var noFreeingCalls: [int] = []
     freeingCallPositions = noFreeingCalls
+    var noClobbers: [int] = []
+    scratchClobberPositions = noClobbers
     var position = 0
     for block in blockOrder {
         blockStarts[block] = position
@@ -2921,6 +2924,7 @@ fn numberPositions() {
             else {
                 instructionPositions[instruction] = position
                 if irOpcodes[instruction] == irCall { callPositions.push(position) }
+                if irOpcodes[instruction] == irDivideByInvariant or irOpcodes[instruction] == irModuloByInvariant { scratchClobberPositions.push(position) }
                 if irOpcodes[instruction] == irCall and irCallMayFree(instruction) { freeingCallPositions.push(position) }
                 position += 2
             }
@@ -3107,6 +3111,18 @@ fn crossesAnyPosition(value: int, positions: [int]) -> bool {
     return false
 }
 
+// live across or read at one of `positions` (a value defined there is written last)
+fn liveAtAnyPosition(value: int, positions: [int]) -> bool {
+    let starts = rangeStarts[value]
+    let ends = rangeEnds[value]
+    for position in positions {
+        for i in 0..starts.len() {
+            if starts[i] < position and position <= ends[i] { return true }
+        }
+    }
+    return false
+}
+
 fn isAllocatable(value: int) -> bool {
     let opcode = irOpcodes[value]
     if not producesValue(opcode) or isImmediateConstant(value) or opcode == irFloatConstant { return false }
@@ -3141,9 +3157,12 @@ fn isTwoAddressOpcode(opcode: int) -> bool {
 }
 
 // ================= register allocation (linear scan) =================
-// rax rcx rdx r11 and xmm0 xmm1 are scratch for the emitter and never allocated.
-let integerRegisterNames = ["r8", "r9", "r10", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"]
-let integerRegisterCalleeSaved = [false, false, false, true, true, true, true, true, true, true]
+// rax rcx rdx and xmm0 xmm1 are scratch for the emitter and never allocated.
+// r11 is allocated last: the invariant division uses it as scratch, so no
+// value live at one may take it (see scratchClobberPositions).
+let integerRegisterNames = ["r8", "r9", "r10", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15", "r11"]
+let integerRegisterCalleeSaved = [false, false, false, true, true, true, true, true, true, true, false]
+let scratchIntegerRegister = 10
 let floatRegisterNames = ["xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"]
 let floatRegisterCalleeSaved = [false, false, false, false, true, true, true, true, true, true, true, true, true, true]
 
@@ -3270,6 +3289,7 @@ fn allocateRegisters() {
         if irBorrowed[current] and crossesAnyPosition(current, freeingCallPositions) { optimizerBail("unpinned reference live across a call (opcode {irOpcodes[current]})") }
         var blocked: [bool] = []
         for i in 0..registerCount { blocked.push(needsCalleeSaved and not registerIsCalleeSaved(valueClass, i)) }
+        if valueClass != classFloat and scratchClobberPositions.len() > 0 and liveAtAnyPosition(current, scratchClobberPositions) { blocked[scratchIntegerRegister] = true }
         for other in active {
             if irClasses[other] == valueClass and valueRegisters[other] >= 0 { blocked[valueRegisters[other]] = true }
         }
@@ -3365,9 +3385,11 @@ fn promoteSpilledLoopValues() {
             if blockInLoop(block, members) { loopBlocks.push(block) }
         }
         var hasCall = false
+        var clobbersScratch = false
         for block in loopBlocks {
             for instruction in blockInstructions[block] {
                 if irOpcodes[instruction] == irCall { hasCall = true }
+                if irOpcodes[instruction] == irDivideByInvariant or irOpcodes[instruction] == irModuloByInvariant { clobbersScratch = true }
             }
         }
         // spilled integer groups read in the loop, by weight
@@ -3412,7 +3434,7 @@ fn promoteSpilledLoopValues() {
         }
         // registers nothing uses anywhere in the loop
         var free: [bool] = []
-        for register in 0..integerRegisterNames.len() { free.push(not hasCall or integerRegisterCalleeSaved[register]) }
+        for register in 0..integerRegisterNames.len() { free.push((not hasCall or integerRegisterCalleeSaved[register]) and not (clobbersScratch and register == scratchIntegerRegister)) }
         for value in 0..irOpcodes.len() {
             if not isAllocatable(value) or irClasses[value] == classFloat or groupOf(value) != value or valueRegisters[value] < 0 { continue }
             if not free[valueRegisters[value]] { continue }
@@ -3650,9 +3672,12 @@ fn isFloatRegister(location: str) -> bool { return location.len() > 3 and locati
 fn emitOneMove(source: str, destination: str) {
     let sourceIsFloat = isFloatRegister(source)
     let destinationIsFloat = isFloatRegister(destination)
-    if not isRegisterLocation(source) and not isRegisterLocation(destination) {
-        emitOptimized("mov r11, {source}")
-        emitOptimized("mov {destination}, r11")
+    if isImmediateLocation(source) and not isRegisterLocation(destination) {
+        if destination.byte(0) == 91 { emitOptimized("mov qword ptr {destination}, {source}") }      // a bare [address]
+        else { emitOptimized("mov {destination}, {source}") }
+    } else if not isRegisterLocation(source) and not isRegisterLocation(destination) {
+        emitOptimized("movsd xmm1, {source}")            // r11 may be allocated; xmm1 never is
+        emitOptimized("movsd {destination}, xmm1")
     } else if sourceIsFloat and destinationIsFloat {
         emitOptimized("movapd {destination}, {source}")
     } else if sourceIsFloat or destinationIsFloat {
@@ -3763,7 +3788,43 @@ fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
     finishResult(value, target)
 }
 
+// float loads read straight by the next instruction as its memory operand
+var foldedFloatLoads: [bool] = []
+
+fn isFloatBinaryOpcode(opcode: int) -> bool {
+    return opcode == irFloatAdd or opcode == irFloatSubtract or opcode == irFloatMultiply or opcode == irFloatDivide or opcode == irFloatMinimum or opcode == irFloatMaximum
+}
+
+// a single-use float load whose only reader comes right after it, as the
+// second operand (or either, when the operation commutes)
+fn canFoldFloatLoad(load: int, reader: int) -> bool {
+    if irOpcodes[load] != irFloatLoad or irUseCounts[load] != 1 or not isFloatBinaryOpcode(irOpcodes[reader]) { return false }
+    let operands = irOperands[reader]
+    if operands[0] == operands[1] { return false }
+    if operands[1] == load { return true }
+    return operands[0] == load and (irOpcodes[reader] == irFloatAdd or irOpcodes[reader] == irFloatMultiply)
+}
+
+fn foldedLoadOperand(load: int) -> str {
+    let base = integerIn(irOperands[load][0], "rcx")
+    return "qword ptr {memoryAt(base, irImmediates[load])}"
+}
+
 fn emitFloatBinary(value: int, mnemonic: str, commutative: bool) {
+    var firstValue = irOperands[value][0]
+    var secondValue = irOperands[value][1]
+    if foldedFloatLoads[firstValue] {
+        firstValue = irOperands[value][1]
+        secondValue = irOperands[value][0]
+    }
+    if foldedFloatLoads[secondValue] {
+        let target = resultRegister(value, "xmm0")
+        let memory = foldedLoadOperand(secondValue)
+        moveFloat(target, locationOf(firstValue))
+        emitOptimized("{mnemonic} {target}, {memory}")
+        finishResult(value, target)
+        return
+    }
     let first = locationOf(irOperands[value][0])
     let second = locationOf(irOperands[value][1])
     let target = resultRegister(value, "xmm0")
@@ -4530,6 +4591,10 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
         addMove(source, locationOf(instruction))
     }
     emitParallelMoves()
+    countUses()
+    var noFolds: [bool] = []
+    foldedFloatLoads = noFolds
+    for value in 0..irOpcodes.len() { foldedFloatLoads.push(false) }
     // blocks that only jump on are never entered: every jump goes past them
     var emittedOrder: [int] = []
     for orderPosition in 0..blockOrder.len() {
@@ -4545,7 +4610,13 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
             if header == block { optimizerLines.push(".balign 16\n") }     // a loop's back edges land on a fetch-block boundary
         }
         optimizerLines.push(".L{blockLabels[block]}:\n")
-        for instruction in blockInstructions[block] {
+        let instructions = blockInstructions[block]
+        for position in 0..instructions.len() {
+            let instruction = instructions[position]
+            if position + 1 < instructions.len() and canFoldFloatLoad(instruction, instructions[position + 1]) {
+                foldedFloatLoads[instruction] = true
+                continue
+            }
             if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
             else { emitInstructionFor(instruction) }
         }
