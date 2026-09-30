@@ -89,7 +89,7 @@ Roughly the order you meet things in:
 | `compiler/` | `zc.zeph` (the compiler, in Zephyr) and `runtime.zeph` (allocation + counting, strings, threads) |
 | `scripts/` | `selfbuild` `package` `clean` `embed-gen` `build-shaders` |
 | `tools/` | `vkgen.c` (Vulkan bindings from the SDK headers), `zspv.zeph` (Zephyr → SPIR-V) |
-| `tests/` `bench/` `docs/` | suite, benchmarks vs C/Rust, spec and tour |
+| `tests/` `bench/` `docs/` | suite, benchmarks vs C/Rust (`python bench/bench.py`, see AGENTS.md), spec and tour |
 | `bootstrap/` | the C seed. Rebuilds `zc.exe` from nothing; not part of the normal loop |
 | `dist/` | packaging output |
 
