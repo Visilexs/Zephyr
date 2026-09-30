@@ -1,4 +1,4 @@
-// std/list.zeph — generic list algorithms, written in Zephyr.
+// std/list.zeph â€” generic list algorithms, written in Zephyr.
 //
 // These used to be compiler builtins, because without generics there was no way
 // to write "works for any element type" in the language itself. They are plain
@@ -9,7 +9,7 @@
 //
 // Instantiation is what type-checks each use: `contains` compiles `item == target` for
 // the concrete T, so it works for int/str/enum and is rejected for element types
-// that have no ==. No trait system needed — the monomorphisation is the contract.
+// that have no ==. No trait system needed â€” the monomorphisation is the contract.
 
 fn contains[T](items: [T], target: T) -> bool {
     for item in items {
@@ -97,12 +97,32 @@ fn count[T](items: [T], target: T) -> int {
 }
 
 // Stable bottom-up merge sort: O(n log n) comparisons, O(n) scratch space.
+// Runs of 8 are insertion-sorted first; merges alternate between the list and
+// the scratch copy instead of copying back after every pass.
 // compare(left, right) < 0 when left should come first; ties retain their original order.
 fn sortBy[T](items: [T], compare: fn(T, T) -> int) {
     let length = items.len()
     if length < 2 { return }
-    let scratch = slice(items, 0, length)
-    var width = 1
+    let runLength = 8
+    var runStart = 0
+    while runStart < length {
+        let runEnd = min(runStart + runLength, length)
+        for i in (runStart + 1)..runEnd {
+            let value = items[i]
+            var position = i
+            while position > runStart and compare(items[position - 1], value) > 0 {
+                items[position] = items[position - 1]
+                position -= 1
+            }
+            items[position] = value
+        }
+        runStart = runEnd
+    }
+    if length <= runLength { return }
+    var source = items
+    var target = slice(items, 0, length)
+    var inScratch = false
+    var width = runLength
     while width < length {
         var start = 0
         while start < length {
@@ -111,18 +131,24 @@ fn sortBy[T](items: [T], compare: fn(T, T) -> int) {
             var leftIndex = start
             var rightIndex = middle
             for i in start..end {
-                if leftIndex < middle and (rightIndex >= end or compare(items[leftIndex], items[rightIndex]) <= 0) {
-                    scratch[i] = items[leftIndex]
+                if leftIndex < middle and (rightIndex >= end or compare(source[leftIndex], source[rightIndex]) <= 0) {
+                    target[i] = source[leftIndex]
                     leftIndex += 1
                 } else {
-                    scratch[i] = items[rightIndex]
+                    target[i] = source[rightIndex]
                     rightIndex += 1
                 }
             }
             start = end
         }
-        for i in 0..length { items[i] = scratch[i] }
+        let merged = target
+        target = source
+        source = merged
+        inScratch = not inScratch
         width *= 2
+    }
+    if inScratch {
+        for i in 0..length { items[i] = source[i] }
     }
 }
 
