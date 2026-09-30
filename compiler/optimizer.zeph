@@ -1030,7 +1030,7 @@ fn lowerBinary(expression: Node) -> int {
 // and loads need not be redone after them
 fn keepsHeapIntact(name: str) -> bool {
     if name == "runtimeStringsEqual" or name == "runtimeCompareStrings" or name == "runtimeRetainReference" { return true }
-    if name == "runtimeMapGet" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
+    if name == "runtimeMapGet" or name == "runtimeFindMapEntry" or name == "runtimeMapGetOrReference" or name == "runtimeMapGetOrValue" or name == "runtimeMapHas" { return true }     // lookups: they retain, never release
     return name == "runtimeSubstringValue" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
 
@@ -1368,6 +1368,51 @@ fn lowerMapRead(expression: Node) -> int {
     return value
 }
 
+fn sameVariableNode(left: Node, right: Node) -> bool {
+    return left.nodeKind == nodeIdentifier and right.nodeKind == nodeIdentifier and left.auxiliary == right.auxiliary and left.slot == right.slot and left.auxiliary != identifierKindCapture and left.auxiliary != identifierKindFunction
+}
+
+// m[k] = m.get(k).or(d) + x (or - x) on int values: one probe. A hit updates
+// the slot in place; a miss inserts d + x, the map taking a count of the key.
+fn lowerMapUpdate(target: Node, source: Node) -> bool {
+    if typeKinds[target.typeIndex] != kindInteger or source.nodeKind != nodeBinary or source.auxiliary != binaryCategoryInteger { return false }
+    if source.operator != tokenPlus and source.operator != tokenMinus { return false }
+    let lookup = source.children[0]
+    let delta = source.children[1]
+    if lookup.nodeKind != nodeCall or lookup.auxiliary != callKindRuntimeCall { return false }
+    if lookup.name != "runtimeMapGetOrReference" and lookup.name != "runtimeMapGetOrValue" { return false }
+    if not sameVariableNode(lookup.children[0].children[0], target.children[0]) or not sameVariableNode(lookup.children[1], target.children[1]) { return false }
+    if hasCall(delta) or hasCall(lookup.children[2]) or not functionNameIndices.has("runtimeFindMapEntry") { return false }
+    let map = lowerExpression(target.children[0])
+    let key = lowerExpression(target.children[1])
+    let fallback = lowerExpression(lookup.children[2])
+    let deltaValue = lowerExpression(delta)
+    if optimizerBailed { return true }
+    var combine = irAdd
+    if source.operator == tokenMinus { combine = irSubtract }
+    let index = lowerRuntimeCall("runtimeFindMapEntry", [map, key])
+    let hitBlock = newBlock()
+    let missBlock = newBlock()
+    let joinBlock = newBlock()
+    terminate(irBranchCompare, [index, integerConstant(0)], conditionGreaterOrEqual, [hitBlock, missBlock])
+    sealBlock(hitBlock)
+    currentIrBlock = hitBlock
+    let slots = emitIr1(irLoad, classInteger, map, 16)
+    let slot = emitIr2(irAdd, classInteger, slots, emitIr2(irMultiply, classInteger, index, integerConstant(24), 0), 0)
+    let updated = emitIr2(combine, classInteger, emitIr1(irLoad, classInteger, slot, 16), deltaValue, 0)
+    let stored = emitIr2(irStore, classInteger, slot, updated, 16)
+    jumpTo(joinBlock)
+    sealBlock(missBlock)
+    currentIrBlock = missBlock
+    var ownedKey = key
+    if isReferenceType(target.children[1].typeIndex) { ownedKey = emitRetain(key) }       // the map keeps the key
+    let inserted = lowerRuntimeCall("runtimeMapSet", [map, ownedKey, emitIr2(combine, classInteger, fallback, deltaValue, 0)])
+    jumpTo(joinBlock)
+    sealBlock(joinBlock)
+    currentIrBlock = joinBlock
+    return true
+}
+
 // a reference into a field or list element: the slot takes the value's count
 // and drops the one it held
 fn lowerReferenceStore(target: Node, source: Node) {
@@ -1540,6 +1585,20 @@ fn lowerCall(expression: Node) -> int {
         for i in 1..expression.children.len() { arguments.push(expression.children[i]) }
         var operands: [int] = []
         var pinned: [int] = []
+        let runtimeIndex = functionNameIndices[expression.name]
+        if canInline(runtimeIndex) and not hasFunctionArgument(expression) {
+            // a small runtime helper: its body in place, on the raw words
+            var argumentValues = lowerInlineArguments(arguments, pinned)
+            if optimizerBailed { return 0 }
+            for i in 0..argumentValues.len() {
+                if irClasses[argumentValues[i]] == classFloat { argumentValues[i] = emitIr1(irBitsFromFloat, classInteger, argumentValues[i], 0) }
+            }
+            let inlinedResult = lowerInlinedCall(runtimeIndex, argumentValues)
+            for value in pinned { emitRelease(value) }
+            if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatFromBits, classFloat, inlinedResult, 0) }
+            if isReferenceType(expression.typeIndex) { return ownedTemporary(inlinedResult) }
+            return inlinedResult
+        }
         for i in 0..arguments.len() {
             var value = lowerExpression(arguments[i])
             if optimizerBailed { return 0 }
@@ -1869,6 +1928,7 @@ fn lowerStatementKind(statement: Node) {
             assignVariable(target, value)
             return
         }
+        if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap and lowerMapUpdate(target, statement.children[1]) { return }
         if target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] == kindMap {
             // the map takes the key's count and the value's
             let map = lowerContainer(target.children[0], [target.children[1], statement.children[1]])
