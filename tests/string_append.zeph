@@ -1,0 +1,37 @@
+// -O2 parity cases for x = x + y on a str local, which may grow x in place:
+// only when nothing else can see x.
+
+let parts = ["ka", "lo", "mi", "ust", "ble"]
+var kept: [str] = []
+var counts: [str: int] = [:]
+var total = 0
+for i in 0..300 {
+    var word = parts[i % 5]                  // starts as a shared element
+    for j in 0..(i % 7) { word = word + parts[(i + j) % 5] }
+
+    let copy = word                          // an alias: word must not grow under it
+    word = word + "!"
+    total += copy.len() * 3 + word.len()
+
+    kept.push(word)                          // the list holds it now
+    word = word + "?"
+    counts[word] = counts.get(word).or(0) + 1   // so does the map
+    word = word + "#"
+
+    var seen = 0
+    for character in word {                  // iterating while appending
+        if seen < 3 { word = word + "+" }
+        seen += 1
+    }
+    word = word + word                       // appending itself
+    total += word.len() + seen
+}
+var longText = ""
+for i in 0..2000 { longText = longText + parts[i % 5] }
+print(total, kept.len(), kept[17], kept[299], counts.len(), longText.len(), longText.sub(1990, 2010))
+for key, value in counts { if value > 50 { print(key, value) } }
+if total > 0 {
+    var blockText = "start"                  // a block local grown by an outlined loop
+    for i in 0..500 { blockText = blockText + parts[i % 5] }
+    print(blockText.len(), blockText.sub(0, 12))
+}

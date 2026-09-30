@@ -1738,6 +1738,23 @@ fn lowerStringsEqual(left: int, right: int) -> int {
     return readVariable(result, joinBlock)
 }
 
+// x = x + y on an owned str local: x's count goes to runtimeAppendString,
+// which may grow the string in place (nothing else holds it then)
+fn lowerStringAppend(target: Node, source: Node) -> bool {
+    if source.nodeKind != nodeBinary or source.auxiliary != binaryCategoryString or source.operator != tokenPlus or source.slot > 0 { return false }
+    if not sameVariableNode(source.children[0], target) or mayFreeOrReassign(source.children[1]) { return false }
+    if target.auxiliary != identifierKindLocal or not functionNameIndices.has("runtimeAppendString") { return false }
+    let variable = identifierVariable(target)
+    if optimizerBailed or not isOwnedVariable(variable) or ownedScopes.len() == 0 { return false }
+    if not regionIsFunction and not variableDeclaredInside[variable] { return false }     // a parent's slot: assignVariable bails
+    let right = lowerExpression(source.children[1])
+    if optimizerBailed { return true }
+    let previous = readVariableValue(variable)
+    let appended = lowerRuntimeCall("runtimeAppendString", [previous, right])
+    writeVariableValue(variable, appended)
+    return true
+}
+
 fn lowerStringComparison(expression: Node) -> int {
     let operator = expression.operator
     let condition = conditionForToken(operator)
@@ -2579,6 +2596,7 @@ fn lowerStatementKind(statement: Node) {
     }
     if kind == nodeAssign {
         let target = statement.children[0]
+        if target.nodeKind == nodeIdentifier and lowerStringAppend(target, statement.children[1]) { return }
         if target.nodeKind == nodeIdentifier {
             let value = lowerExpression(statement.children[1])
             if optimizerBailed { return }
@@ -6161,12 +6179,24 @@ fn boundNotAbove(bound: int, length: int, depth: int) -> bool {
 
 // A bounds check whose index is never negative and sits under a branch that
 // proved index < length (same values) cannot fail.
+// A check of the same index against the same length that dominates it passed
+// already (blocks run in reverse postorder: a dominator's checks come first).
 fn eliminateBoundsChecks() {
     computeNonNegative()
+    var checkedBlocks: [int: [int]] = [:]           // length/index pair -> blocks with a kept check of it
     for block in blockOrder {
         var kept: [int] = []
         for instruction in blockInstructions[block] {
-            if irOpcodes[instruction] == irBoundsCheck and boundsCheckProven(block, instruction) { continue }
+            if irOpcodes[instruction] == irBoundsCheck {
+                if boundsCheckProven(block, instruction) { continue }
+                let pairKey = resolveValue(irOperands[instruction][0]) * 4194304 + resolveValue(irOperands[instruction][1])
+                if checkedBlocks.has(pairKey) {
+                    if checkDominates(checkedBlocks[pairKey], block) { continue }
+                    checkedBlocks[pairKey].push(block)
+                } else {
+                    checkedBlocks[pairKey] = [block]
+                }
+            }
             // a non-negative dividend needs no sign fix-up: a mask or a shift
             let opcode = irOpcodes[instruction]
             if (opcode == irModuloPowerOfTwo or opcode == irDividePowerOfTwo) and operandNonNegative(irOperands[instruction][0]) {
@@ -6184,6 +6214,21 @@ fn eliminateBoundsChecks() {
         }
         blockInstructions[block] = kept
     }
+}
+
+// is one of these blocks the given block or a dominator of it?
+fn checkDominates(checkBlocks: [int], block: int) -> bool {
+    var current = block
+    var depth = 0
+    while depth < 64 {
+        for checkBlock in checkBlocks {
+            if checkBlock == current { return true }
+        }
+        if current == 0 { return false }
+        current = immediateDominators[current]
+        depth += 1
+    }
+    return false
 }
 
 fn boundsCheckProven(block: int, check: int) -> bool {

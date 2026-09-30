@@ -810,6 +810,28 @@ fn runtimeConcatenateStrings(leftStringAddress: int, rightStringAddress: int) ->
     return text
 }
 
+// x = x + y where x's owner hands over its count: grows x in place when no one
+// else holds it and its block has room, else copies into a block with room to
+// grow (appends tend to repeat) and drops x.
+fn runtimeAppendString(leftStringAddress: int, rightStringAddress: int) -> int {
+    let leftLength = load64(leftStringAddress)
+    let rightLength = load64(rightStringAddress)
+    let totalLength = leftLength + rightLength
+    if leftStringAddress >= runtimeHeapBaseAddress and leftStringAddress < runtimeHeapBumpAddress and load64(leftStringAddress - 24) == 1 and 8 + totalLength <= (load64(leftStringAddress - 8) & (0 - 8)) {
+        runtimeCopyMemory(leftStringAddress + 8 + leftLength, rightStringAddress + 8, rightLength)
+        store64(leftStringAddress, totalLength)
+        return leftStringAddress
+    }
+    var capacity = totalLength + (totalLength >> 1)
+    if capacity < 24 { capacity = 24 }
+    let text = runtimeAllocateObject(8 + capacity)
+    store64(text, totalLength)
+    runtimeCopyMemory(text + 8, leftStringAddress + 8, leftLength)
+    runtimeCopyMemory(text + 8 + leftLength, rightStringAddress + 8, rightLength)
+    runtimeReleaseReference(leftStringAddress)
+    return text
+}
+
 fn runtimeStringsEqual(leftStringAddress: int, rightStringAddress: int) -> int {
     if leftStringAddress == rightStringAddress { return 1 }
     let leftLength = load64(leftStringAddress)
