@@ -39,7 +39,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - The compiler's own hot data never touches the reference-counted heap.
      Today 43% of compile time is reference counting, allocation and GC [M3].
    - The flat pipeline runs at 0.23–0.27 µs per value in Zephyr [M4b], against
-     7.3 µs for today's -O2 [M5].
+     7.3 µs for today's -O2 [M5]. An 11-pass version with dominators, loops,
+     LICM and range analysis costs 0.18–0.23 µs per value in C, ~0.3–0.55 µs in
+     Zephyr [M47].
    - Cold compile target ≈ 5–10 µs per small function [E]. Today zc takes
      165 µs, about gcc -O2's speed; tcc takes 1.6 µs [M32].
    - A flat lexer in Zephyr scans ~55 MB/s including token storage [M14:
@@ -1654,6 +1656,31 @@ link (~1–3 ms) ≈ **5–15 ms**. That confirms, from measured parts, the
 "10–30 ms" projection and step 1's ≤ 30 ms gate, without any of the other
 steps.
 
+### M47. A heavier optimizer pipeline: cost per value (cycle 55)
+
+`research/proto/flatopt.c` with `extended = 1` adds, on the same flat arrays:
+
+- dominators (Cooper–Harvey–Kennedy);
+- natural-loop detection;
+- loop-invariant code motion of pure ops;
+- interval range analysis for bounds-check elimination, with widening at loop
+  headers;
+- a second fold/copy-propagation/GVN round and a second DCE.
+
+That makes 11 passes in total. C, ns per SSA value, one core [M]:
+
+| Function size | Basic 6 passes | Extended 11 passes | Added passes alone |
+|---|---:|---:|---:|
+| ~500 values | 123 | 179 (+46%) | 52 |
+| ~2000 values | 140 | 226 (+61%) | 79 |
+
+Using Zephyr's measured 1.6–2.4× factor (M4b), the extended pipeline is
+~0.3–0.55 µs per value in Zephyr [E]. Not yet included: inlining, reference
+count optimization, the vectorizer, interval splitting and pattern-based
+instruction selection. Even if those double the cost again, the total stays at
+~0.6–1.1 µs per value: within the 0.7–1.4 µs estimate used in the cycle 2
+evaluation, toward its low end, and below the 2 µs copy-and-patch gate.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2014,3 +2041,7 @@ steps.
   - User code is ≤ 10 ms of a ~310 ms small-program build (M46). With a cached
     runtime, small builds take ~5–15 ms; step 1's gate is confirmed by
     measured parts.
+- **2026-10-01, cycle 55.**
+  - Extended the prototype to 11 passes (M47): 0.18–0.23 µs per value in C,
+    ~0.3–0.55 µs projected for Zephyr.
+  - The production estimate of 0.7–1.4 µs holds, at its low end.

@@ -12,7 +12,8 @@
 // Every structure is a preallocated int array indexed by value or block number.
 //
 // Build: gcc -O2 -o flatopt research/proto/flatopt.c
-// Usage: flatopt [values-per-function] [functions]
+// Usage: flatopt [values-per-function] [functions] [extended: 1 adds dominators,
+//        loops, LICM, range analysis and a second fold + DCE round]
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -264,23 +265,100 @@ static void encode(void) {
     }
 }
 
+
+// --- extra passes for the "production-like" pipeline (cycle 55) ---
+// 7. dominators (Cooper, Harvey & Kennedy iterative algorithm over RPO)
+static int idom[MAXB], loopDepth[MAXB], loopHeader[MAXB];
+static int intersect(int a, int b) { while (a != b) { while (rpoIndex[a] > rpoIndex[b]) a = idom[a]; while (rpoIndex[b] > rpoIndex[a]) b = idom[b]; } return a; }
+static void dominators(void) {
+    for (int b = 0; b < nb; b++) idom[b] = -1;
+    idom[rpo[0]] = rpo[0];
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 1; i < nb; i++) {
+            int b = rpo[i], d = -1;
+            for (int k = predOff[b]; k < predOff[b + 1]; k++) { int p = preds[k]; if (idom[p] < 0) continue; d = d < 0 ? p : intersect(p, d); }
+            if (d >= 0 && idom[b] != d) { idom[b] = d; changed = 1; }
+        }
+    }
+}
+static int dominates(int a, int b) { while (b != a && idom[b] != b) b = idom[b]; return a == b; }
+// 8. natural loops: back edge t -> h with h dominating t; mark blocks by walking preds
+static int loopStack[MAXB];
+static void loops(void) {
+    memset(loopDepth, 0, sizeof(int) * nb); memset(loopHeader, -1, sizeof(int) * nb);
+    for (int t = 0; t < nb; t++) for (int s = 0; s < 2; s++) {
+        int h = s ? succ1[t] : succ0[t]; if (h < 0 || !dominates(h, t)) continue;
+        int sp = 0; loopStack[sp++] = t; static int mark[MAXB]; static int gen = 0; gen++;
+        mark[h] = gen; loopDepth[h]++;
+        while (sp) { int b = loopStack[--sp]; if (mark[b] == gen) continue; mark[b] = gen; loopDepth[b]++; loopHeader[b] = h;
+            for (int k = predOff[b]; k < predOff[b + 1]; k++) loopStack[sp++] = preds[k]; }
+    }
+}
+// 9. LICM: a pure op whose operands are defined outside the loop is hoisted (re-blocked to the
+//    header's immediate dominator); iterate to a fixpoint over RPO
+static void licm(void) {
+    for (int i = 0; i < nb; i++) {
+        int b = rpo[i]; if (loopHeader[b] < 0) continue;
+        int h = loopHeader[b], pre = idom[h];
+        for (int v = bstart[b]; v < bend[b]; v++) {
+            if (!live[v] || repl[v] != v) continue;
+            int o = op[v]; if (!(o >= OP_ADD && o <= OP_LT)) continue;
+            int x = a0[v], y = a1[v];
+            int xin = x >= 0 && loopDepth[blk[x]] >= loopDepth[b] && blk[x] != pre;
+            int yin = y >= 0 && loopDepth[blk[y]] >= loopDepth[b] && blk[y] != pre;
+            if (!xin && !yin) blk[v] = pre;            // hoisted (the scheduler would place it)
+        }
+    }
+}
+// 10. range analysis for bounds-check elimination: interval per value, forward over RPO,
+//     one widening step at loop headers; a LOAD whose index range is within [0, 7] is "proved"
+static int64_t lo[MAXV], hi[MAXV]; static long checksProved;
+static void ranges(void) {
+    for (int i = 0; i < nb; i++) {
+        int b = rpo[i];
+        for (int v = bstart[b]; v < bend[b]; v++) {
+            int64_t L = INT64_MIN / 4, H = INT64_MAX / 4;
+            int x = a0[v], y = a1[v];
+            switch (op[v]) {
+            case OP_CONST: L = H = imm[v]; break;
+            case OP_AND: if (y >= 0 && lo[y] >= 0 && hi[y] < (1 << 20)) { L = 0; H = hi[y]; } break;
+            case OP_ADD: if (x >= 0 && y >= 0) { L = lo[x] + lo[y]; H = hi[x] + hi[y]; } break;
+            case OP_SUB: if (x >= 0 && y >= 0) { L = lo[x] - hi[y]; H = hi[x] - lo[y]; } break;
+            case OP_LT: L = 0; H = 1; break;
+            case OP_LOAD: if (x >= 0 && lo[x] >= 0 && hi[x] <= 7) checksProved++; break;
+            default: break;
+            }
+            if (loopDepth[b] > 0 && op[v] == OP_PARAM) { L = INT64_MIN / 4; H = INT64_MAX / 4; }   // widened
+            lo[v] = L; hi[v] = H;
+        }
+    }
+}
+
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 int main(int argc, char **argv) {
     int size = argc > 1 ? atoi(argv[1]) : 500, count = argc > 2 ? atoi(argv[2]) : 2000;
-    double phase[7] = { 0 }; long totalValues = 0, totalBytes = 0, spills = 0, removed = 0;
+    int extended = argc > 3 && atoi(argv[3]);
+    double phase[8] = { 0 }; long totalValues = 0, totalBytes = 0, spills = 0, removed = 0;
     for (int f = 0; f < count; f++) {
         double t0 = now(); generate(size); double t1 = now();
         cfg(); double t2 = now(); fold(); double t3 = now(); dce(); double t4 = now();
+        phase[3] += t4 - t3;
+        if (extended) {                          // dominators, loops, LICM, ranges, then a second fold + DCE
+            dominators(); loops(); licm(); ranges(); fold(); dce();
+            double e1 = now(); phase[7] += e1 - t4; t4 = e1;
+        }
         liveness(); double t5 = now(); regalloc(); double t6 = now(); encode(); double t7 = now();
-        phase[0] += t1 - t0; phase[1] += t2 - t1; phase[2] += t3 - t2; phase[3] += t4 - t3; phase[4] += t5 - t4; phase[5] += t6 - t5; phase[6] += t7 - t6;
+        phase[0] += t1 - t0; phase[1] += t2 - t1; phase[2] += t3 - t2; phase[4] += t5 - t4; phase[5] += t6 - t5; phase[6] += t7 - t6;
         totalValues += nv; totalBytes += clen; spills += nspill;
         for (int v = 0; v < nv; v++) removed += !live[v] || repl[v] != v;
     }
-    double opt = phase[1] + phase[2] + phase[3] + phase[4] + phase[5] + phase[6];
+    double opt = phase[1] + phase[2] + phase[3] + phase[4] + phase[5] + phase[6] + phase[7];
     printf("%d functions x ~%d values: %ld values, %.1f%% removed, %ld spills, %ld code bytes\n", count, size, totalValues, 100.0 * removed / totalValues, spills, totalBytes);
-    const char *names[] = { "generate (not counted)", "cfg", "fold/copyprop/gvn", "dce", "liveness", "intervals+linear scan", "encode" };
-    for (int i = 0; i < 7; i++) printf("  %-24s %7.1f ns/value\n", names[i], 1e9 * phase[i] / totalValues);
+    const char *names[] = { "generate (not counted)", "cfg", "fold/copyprop/gvn", "dce", "liveness", "intervals+linear scan", "encode", "dom+loops+licm+ranges+refold" };
+    for (int i = 0; i < 8; i++) printf("  %-24s %7.1f ns/value\n", names[i], 1e9 * phase[i] / totalValues);
     printf("  %-24s %7.1f ns/value  (%.3f us/value)\n", "TOTAL pipeline", 1e9 * opt / totalValues, 1e6 * opt / totalValues);
     return 0;
 }
