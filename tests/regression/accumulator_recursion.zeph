@@ -1,0 +1,131 @@
+// Only the four accumulator functions match the integer right-tail pattern.
+fn accumulatorFib(n: int) -> int {
+    if n < 2 { return n }
+    return accumulatorFib(n - 1) + accumulatorFib(n - 2)
+}
+
+fn accumulatorSum(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n + accumulatorSum(n - 1)
+}
+
+fn accumulatorWrap(n: int) -> int {
+    if n <= 0 { return 7 }
+    return (9223372036854775807 + n) + accumulatorWrap(n - 1)
+}
+
+fn accumulatorBase(n: int) -> int {
+    if n <= 2 { return n * 3 + 1 }
+    return (n * 2) + accumulatorBase(n - 2)
+}
+
+var trace = 0
+var globalOffset = 4
+
+// Preserve the order of calls that mutate a global; this is ineligible.
+fn recordTerm(n: int) -> int {
+    trace = trace * 10 + n
+    return n
+}
+
+fn sideEffectSum(n: int) -> int {
+    if n <= 0 { return 0 }
+    return recordTerm(n) + sideEffectSum(n - 1)
+}
+
+fn globalReadSum(n: int) -> int {
+    if n <= 0 { return 0 }
+    return globalOffset + globalReadSum(n - 1)
+}
+
+fn floatSum(n: int) -> float {
+    if n <= 0 { return 0.0 }
+    return (n as float) + floatSum(n - 1)
+}
+
+fn mutualLeft(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n + mutualRight(n - 1)
+}
+
+fn mutualRight(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n + mutualLeft(n - 1)
+}
+
+fn subtractRecursion(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n - subtractRecursion(n - 1)
+}
+
+fn rightNotSelf(n: int) -> int {
+    if n <= 0 { return 0 }
+    return rightNotSelf(n - 1) + n
+}
+
+fn twoParameters(n: int, scale: int) -> int {
+    if n <= 0 { return 0 }
+    return n * scale + twoParameters(n - 1, scale)
+}
+
+// Calls and global reads are forbidden separately in guard, base, and next.
+var globalLimit = 0
+var globalStep = 1
+
+fn guardCall(n: int) -> int {
+    if recordTerm(n) <= 0 { return 0 }
+    return n + guardCall(n - 1)
+}
+
+fn baseCall(n: int) -> int {
+    if n <= 0 { return recordTerm(7) }
+    return n + baseCall(n - 1)
+}
+
+fn nextCall(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n + nextCall(recordTerm(n - 1))
+}
+
+fn guardGlobal(n: int) -> int {
+    if n <= globalLimit { return 0 }
+    return n + guardGlobal(n - 1)
+}
+
+fn baseGlobal(n: int) -> int {
+    if n <= 0 { return globalOffset }
+    return n + baseGlobal(n - 1)
+}
+
+fn nextGlobal(n: int) -> int {
+    if n <= 0 { return 0 }
+    return n + nextGlobal(n - globalStep)
+}
+
+fn multipleBranches(n: int) -> int {
+    if n <= 0 { return 0 }
+    if n == 1 { return 7 }
+    return n + multipleBranches(n - 1)
+}
+
+print("fib", accumulatorFib(-3), accumulatorFib(-1), accumulatorFib(0), accumulatorFib(1), accumulatorFib(2), accumulatorFib(3), accumulatorFib(5), accumulatorFib(10))
+print("sum", accumulatorSum(-3), accumulatorSum(0), accumulatorSum(1), accumulatorSum(5), accumulatorSum(10))
+print("wrap", accumulatorWrap(0), accumulatorWrap(1), accumulatorWrap(2), accumulatorWrap(3))
+print("base", accumulatorBase(-2), accumulatorBase(0), accumulatorBase(1), accumulatorBase(2), accumulatorBase(3), accumulatorBase(6))
+print("effects", sideEffectSum(3), trace)
+print("global", globalReadSum(3))
+print("float", floatSum(5))
+print("mutual", mutualLeft(5), mutualRight(6))
+print("subtract", subtractRecursion(5))
+print("right-not-self", rightNotSelf(5))
+print("two-parameters", twoParameters(5, 2))
+trace = 0
+print("guard-call", guardCall(3), trace)
+trace = 0
+print("base-call", baseCall(3), trace)
+trace = 0
+print("next-call", nextCall(3), trace)
+print("guard-global", guardGlobal(3))
+print("base-global", baseGlobal(3))
+print("next-global", nextGlobal(3))
+print("multiple-branches", multipleBranches(3))

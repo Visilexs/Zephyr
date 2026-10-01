@@ -1,0 +1,71 @@
+// Inlining benchmark (deep call chain): step0 calls step1 ... calls step39,
+// each a one-op function (add, xor-shift, odd multiply, rotate) on a 32-bit
+// value. Flattening the whole chain into the hot loop removes 40 calls per
+// element; a depth-limited inliner leaves call overhead behind.
+// Usage: inl_chain [rounds]   (default 1000)
+
+fn step0(value: int) -> int { return step1((value + 1000) & 4294967295) }
+fn step1(value: int) -> int { return step2(value ^ (value >> 4)) }
+fn step2(value: int) -> int { return step3((value * 31677) & 4294967295) }
+fn step3(value: int) -> int { return step4(((value << 8) | (value >> 24)) & 4294967295) }
+fn step4(value: int) -> int { return step5((value + 1148) & 4294967295) }
+fn step5(value: int) -> int { return step6(value ^ (value >> 8)) }
+fn step6(value: int) -> int { return step7((value * 95029) & 4294967295) }
+fn step7(value: int) -> int { return step8(((value << 12) | (value >> 20)) & 4294967295) }
+fn step8(value: int) -> int { return step9((value + 1296) & 4294967295) }
+fn step9(value: int) -> int { return step10(value ^ (value >> 12)) }
+fn step10(value: int) -> int { return step11((value * 58381) & 4294967295) }
+fn step11(value: int) -> int { return step12(((value << 16) | (value >> 16)) & 4294967295) }
+fn step12(value: int) -> int { return step13((value + 1444) & 4294967295) }
+fn step13(value: int) -> int { return step14(value ^ (value >> 5)) }
+fn step14(value: int) -> int { return step15((value * 21733) & 4294967295) }
+fn step15(value: int) -> int { return step16(((value << 7) | (value >> 25)) & 4294967295) }
+fn step16(value: int) -> int { return step17((value + 1592) & 4294967295) }
+fn step17(value: int) -> int { return step18(value ^ (value >> 9)) }
+fn step18(value: int) -> int { return step19((value * 85085) & 4294967295) }
+fn step19(value: int) -> int { return step20(((value << 11) | (value >> 21)) & 4294967295) }
+fn step20(value: int) -> int { return step21((value + 1740) & 4294967295) }
+fn step21(value: int) -> int { return step22(value ^ (value >> 13)) }
+fn step22(value: int) -> int { return step23((value * 48437) & 4294967295) }
+fn step23(value: int) -> int { return step24(((value << 15) | (value >> 17)) & 4294967295) }
+fn step24(value: int) -> int { return step25((value + 1888) & 4294967295) }
+fn step25(value: int) -> int { return step26(value ^ (value >> 6)) }
+fn step26(value: int) -> int { return step27((value * 11789) & 4294967295) }
+fn step27(value: int) -> int { return step28(((value << 6) | (value >> 26)) & 4294967295) }
+fn step28(value: int) -> int { return step29((value + 2036) & 4294967295) }
+fn step29(value: int) -> int { return step30(value ^ (value >> 10)) }
+fn step30(value: int) -> int { return step31((value * 75141) & 4294967295) }
+fn step31(value: int) -> int { return step32(((value << 10) | (value >> 22)) & 4294967295) }
+fn step32(value: int) -> int { return step33((value + 2184) & 4294967295) }
+fn step33(value: int) -> int { return step34(value ^ (value >> 3)) }
+fn step34(value: int) -> int { return step35((value * 38493) & 4294967295) }
+fn step35(value: int) -> int { return step36(((value << 14) | (value >> 18)) & 4294967295) }
+fn step36(value: int) -> int { return step37((value + 2332) & 4294967295) }
+fn step37(value: int) -> int { return step38(value ^ (value >> 7)) }
+fn step38(value: int) -> int { return step39((value * 1845) & 4294967295) }
+fn step39(value: int) -> int { return ((value << 5) | (value >> 27)) & 4294967295 }
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const dataSize = 4096
+
+fn run(data: [int], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            total = total * 31 + step0(data[i] + round)
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(data, rounds))

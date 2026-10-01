@@ -1,0 +1,40 @@
+// Loop exits and each subsequent store must invalidate cached global values.
+var globalInt = 0
+var globalFloat = 0.0
+
+fn readInt() -> int { return globalInt + 1 }
+fn readFloat() -> float { return globalFloat + 0.25 }
+
+// Keep stores and exit reads in one body larger than the inline threshold.
+fn checkLoopExit(count: int) {
+    for i in 0..count { globalInt = i + 10 }
+    print("int-exit", globalInt + readInt(), globalInt)
+    for i in 0..count { globalFloat = (i as float) + 0.5 }
+    print("float-exit", globalFloat + readFloat(), globalFloat)
+
+    globalInt = 21
+    let firstInt = globalInt
+    globalInt = 34
+    let secondInt = globalInt
+    print("int-stores", firstInt, secondInt, readInt())
+
+    globalFloat = 2.5
+    let firstFloat = globalFloat
+    globalFloat = 4.5
+    let secondFloat = globalFloat
+    print("float-stores", firstFloat, secondFloat, readFloat())
+
+    // The loop PHI advances to 11, but the final stored value must remain 10.
+    for i in 0..11 { globalInt = i }
+    let intExit = globalInt
+    print("int-fixed-exit", intExit + readInt(), intExit)
+    var floatIndex = 0.0
+    while floatIndex < 11.0 {
+        globalFloat = floatIndex
+        floatIndex += 1.0
+    }
+    let floatExit = globalFloat
+    print("float-fixed-exit", floatExit + readFloat(), floatExit)
+}
+
+checkLoopExit(4)

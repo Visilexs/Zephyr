@@ -1,0 +1,53 @@
+// Inlining benchmark (non-tail recursion): (a) treeWalk recurses left and
+// right over an implicit complete binary tree, (b) sumScaled is a linear
+// non-tail recursion over 64-element chunks. Recursive inlining (unrolling a
+// level or two into the caller) cuts call overhead; plain inlining can't.
+// Usage: inl_recursive [rounds]   (default 100)
+
+const valueMask = 16777215
+const treeDepth = 16
+const listSize = 65536
+const chunkSize = 64
+
+fn treeWalk(nodeIndex: int, depth: int, values: [int]) -> int {
+    let nodeValue = values[nodeIndex & 4095]
+    if depth == 0 { return nodeValue }
+    let left = treeWalk(nodeIndex * 2 + 1, depth - 1, values)
+    let right = treeWalk(nodeIndex * 2 + 2, depth - 1, values)
+    return ((left * 3) ^ right ^ nodeValue) & valueMask
+}
+
+fn scaleValue(value: int) -> int { return ((value * 7) ^ (value >> 3)) & valueMask }
+
+fn sumScaled(list: [int], index: int, end: int, offset: int) -> int {
+    if index == end { return 0 }
+    return scaleValue(list[index] + offset) + sumScaled(list, index + 1, end, offset)
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn run(values: [int], list: [int], rounds: int) -> int {
+    var checksum = 0
+    for round in 0..rounds {
+        checksum = checksum * 31 + treeWalk(round, treeDepth, values)
+        var listTotal = 0
+        for start in 0..listSize step chunkSize {
+            listTotal += sumScaled(list, start, start + chunkSize, round)
+        }
+        checksum = checksum * 31 + listTotal
+    }
+    return checksum
+}
+
+var rounds = 100
+if args().len() > 1 { rounds = args()[1] as int }
+var values: [int] = []
+for i in 0..4096 { values.push(nextRandom() & valueMask) }
+var list: [int] = []
+for i in 0..listSize { list.push(nextRandom() & valueMask) }
+print(run(values, list, rounds))

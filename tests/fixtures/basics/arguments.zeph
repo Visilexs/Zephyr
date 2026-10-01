@@ -1,0 +1,7 @@
+// Length-prefixed lines preserve spaces, tabs, and empty argument contents.
+let arguments = args()
+print(arguments.len())
+for i in 1..arguments.len() {
+    print(arguments[i].len())
+    print(arguments[i])
+}

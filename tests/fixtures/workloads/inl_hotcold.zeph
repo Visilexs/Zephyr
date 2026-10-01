@@ -1,0 +1,79 @@
+// Inlining benchmark (hot code, never-firing error handling): scaleReading,
+// combineReadings and filterReading validate their inputs and call
+// reportError (string building, formatting, a global error count) or the
+// assert-like checkThat. The data never fails, but the compiler can't know:
+// inlining the hot functions must not drag the error paths in with them.
+// Usage: inl_hotcold [rounds]   (default 1000)
+import "std/io.zeph"
+
+const maxReading = 2147483647
+const maxScaled = 1073741823
+const dataSize = 4096
+
+var errorCount = 0
+var lastErrorMessage = ""
+
+fn reportError(context: str, value: int, limit: int) {
+    errorCount += 1
+    var parts: [str] = []
+    parts.push("error #{errorCount} in {context}: ")
+    parts.push("value {value} outside 0..{limit}")
+    if value < 0 {
+        parts.push(" (negative)")
+    } else {
+        parts.push(" (over by {value - limit})")
+    }
+    lastErrorMessage = parts.join()
+    if errorCount <= 3 { printError(lastErrorMessage) }
+}
+
+fn checkThat(condition: bool, context: str, value: int) {
+    if not condition { reportError(context, value, -1) }
+}
+
+fn scaleReading(value: int, gain: int) -> int {
+    if value < 0 or value > maxReading { reportError("scaleReading", value, maxReading) }
+    let scaled = value * gain
+    checkThat(scaled >= 0, "scaleReading result", scaled)
+    return scaled & maxScaled
+}
+
+fn combineReadings(first: int, second: int) -> int {
+    if first > maxScaled { reportError("combineReadings first", first, maxScaled) }
+    checkThat(second <= maxScaled, "combineReadings second", second)
+    return (first * 7 + second) & maxScaled
+}
+
+fn filterReading(value: int, previous: int) -> int {
+    checkThat(value >= 0 and previous >= 0, "filterReading", value)
+    return (value + previous * 3) / 4
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn runBenchmark(data: [int], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        let gain = (round & 7) + 1
+        var previous = round
+        for i in 0..dataSize {
+            let first = scaleReading(data[i], gain)
+            let second = scaleReading(data[i ^ 1], gain + 1)
+            let combined = combineReadings(first, second)
+            previous = filterReading(combined, previous)
+            total = total * 31 + previous
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(runBenchmark(data, rounds) + errorCount)

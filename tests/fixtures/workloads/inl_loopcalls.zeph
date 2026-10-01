@@ -1,0 +1,52 @@
+// Inlining benchmark (loops containing calls, calls containing loops): the hot
+// loop calls shortLoop, whose loop runs a data-dependent 0-7 times calling
+// tinyStep; a reduction loop calls the 2-line weigh per element. Inlining
+// exposes the inner loops to the caller's loop optimizations.
+// Usage: inl_loopcalls [rounds]   (default 1000)
+
+const valueMask = 1073741823
+const dataSize = 4096
+
+fn tinyStep(value: int, index: int) -> int { return (value * 3 + index) & valueMask }
+
+fn shortLoop(value: int, tripCount: int) -> int {
+    var result = value
+    for index in 0..tripCount {
+        result = tinyStep(result, index)
+    }
+    return result
+}
+
+fn weigh(value: int) -> int {
+    let folded = value ^ (value >> 9)
+    return folded & 4095
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn run(data: [int], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            let value = data[i] + round
+            total = total * 31 + shortLoop(value, value & 7)
+        }
+        var weightSum = 0
+        for i in 0..dataSize {
+            weightSum += weigh(data[i] + round)
+        }
+        total = total * 31 + weightSum
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(data, rounds))

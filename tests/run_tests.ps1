@@ -32,6 +32,7 @@ $expected = @{
     "hello"   = "Hello, Zephyr!"
     "convert" = "10.5`n6.28`n13`ncount is 13`n3.5`n-7"
     "shapes"  = "5`n5`nPoint{x: 6, y: 8}`n3`n(0, 0)`n(3, 4)`n(6, 8)"
+    "integer_formatting" = "0 7 9 10 99 100 101 1234567890 9223372036854775807 -1 -10 -99 -100 -9223372036854775808"
 }
 foreach ($name in $expected.Keys) {
     $exe = Join-Path $tmp "$name.exe"
@@ -1353,9 +1354,13 @@ $optimizerRegressions = [ordered]@{
     "numeric_codegen" = "signed 0`nfloat 0`nnearMiss 0"
     "sort_merge" = "sizes 0 0 100537 347208`nstable 33 0 9848`ntrace 62 -4764252242437029482"
     "substring_ranges" = "ranges 0 abcdef 0 def`ntemporary oken`nbounds bcd abcdef changed-end 2`nretained 256 1024 oken oken"
+    "regression/evaluation_order" = "inline 12 11`ncall 12 50`nassign 12`ncompound 12`nfloat 2 9`nindex 7 99`nalias 12 30`narguments 1031 11`nlist [10, 2, 11]`ntuple (10, 2, 11)`nstruct 10 2 11`nmap 2 11`nfield-assignment 12 9`nindex-assignment 123 9`nbyte-assignment 123 9`nfloat-assignment 123 2.5`nref-field field-original replaced`nref-list list-original replaced`ncaptured-list 42 99`nshort-global false`nshort-member false`nfunction-field 12 9`nfunction-index 123 9`nfunction-byte 123 9`nfunction-float 123 2.5`nfunction-ref-field field-original replaced`nfunction-ref-list list-original replaced`nfunction-captured-list 42 99"
+    "regression/global_store_exit" = "int-exit 27 13`nfloat-exit 7.25 3.5`nint-stores 21 34 35`nfloat-stores 2.5 4.5 4.75`nint-fixed-exit 21 10`nfloat-fixed-exit 20.25 10"
+    "regression/accumulator_recursion" = "fib -3 -1 0 1 1 2 5 55`nsum 0 0 1 15 55`nwrap 7 -9223372036854775801 8 -9223372036854775798`nbase -5 1 4 7 10 27`neffects 6 321`nglobal 12`nfloat 15`nmutual 15 21`nsubtract 3`nright-not-self 15`ntwo-parameters 30`nguard-call 6 3210`nbase-call 13 7`nnext-call 6 210`nguard-global 6`nbase-global 10`nnext-global 6`nmultiple-branches 12"
+    "regression/entry_return" = "lt 3 4329`nle 4 4359`ngt 2 4329`nge -9 4329`neq 3 4329`nne 2 4323`nextreme -3 9223372036854775807 -9223372036854775808`nliterals 9223372036854775806 9223372036854775807 -9223372036854775808 0`nleft 37 9223372036854775770`nthree -3 917`nfib -1 0 1 55`neffect -3 12 1`nglobals -2 3 0 3`ncalls -2 3 -2 3 4`narithmetic -2 3 -1 4`ntypes -2 3 -2 3`nfive 5 54329`nvalues -2 3 7 9"
 }
 foreach ($regressionName in $optimizerRegressions.Keys) {
-    $regressionExecutable = Join-Path $tmp "$regressionName.exe"
+    $regressionExecutable = Join-Path $tmp ((Split-Path $regressionName -Leaf) + ".exe")
     Remove-Item $regressionExecutable -ErrorAction SilentlyContinue
     $regressionBuild = (& .\zc.exe --rt "tests\$regressionName.zeph" $regressionExecutable 2>&1 | Out-String).Trim()
     $regressionBuildCode = $LASTEXITCODE

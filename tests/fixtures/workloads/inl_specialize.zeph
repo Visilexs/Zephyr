@@ -1,0 +1,72 @@
+// Inlining benchmark (constant-argument specialization): mixTree recurses with
+// a mode and a divisor that are literals at its two call sites and pass through
+// the recursion unchanged; filterBlock is a loop too big to inline, called with
+// three different flag sets. A clone per constant vector folds the mode
+// dispatch, turns divisions by constants into multiplies and drops dead arms.
+// Usage: inl_specialize [rounds]   (default 100)
+
+const valueMask = 16777215
+const treeDepth = 12
+const dataSize = 4096
+const blockSize = 256
+
+fn mixTree(nodeIndex: int, depth: int, mode: int, divisor: int, values: [int]) -> int {
+    let nodeValue = values[nodeIndex & 4095]
+    if depth == 0 {
+        if mode == 1 { return nodeValue / divisor }
+        if mode == 2 { return nodeValue % divisor }
+        return nodeValue
+    }
+    let left = mixTree(nodeIndex * 2 + 1, depth - 1, mode, divisor, values)
+    let right = mixTree(nodeIndex * 2 + 2, depth - 1, mode, divisor, values)
+    if mode == 1 { return ((left + right) / divisor + nodeValue) & valueMask }
+    if mode == 2 { return ((left * 3) ^ (right % divisor) ^ nodeValue) & valueMask }
+    return (left ^ right ^ nodeValue) & valueMask
+}
+
+fn filterBlock(data: [int], start: int, length: int, shift: int, clampHigh: int, squareFlag: bool, wrapMode: int) -> int {
+    var total = 0
+    for i in start..start + length {
+        var value = data[i] >> shift
+        if squareFlag { value = (value & 4095) * (value & 4095) }
+        if value > clampHigh { value = clampHigh }
+        if wrapMode == 1 {
+            value = value % 1000 + value / 1000
+        } else if wrapMode == 2 {
+            value = (value ^ (value >> 5)) % 4093
+        } else if wrapMode == 3 {
+            value = value / 7 + value % 7
+        }
+        total = (total * 17 + value) & valueMask
+    }
+    return total
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn run(values: [int], data: [int], rounds: int) -> int {
+    var checksum = 0
+    for round in 0..rounds {
+        checksum = checksum * 31 + mixTree(round, treeDepth, 1, 10, values)
+        checksum = checksum * 31 + mixTree(round + 7, treeDepth, 2, 1000, values)
+        for start in 0..dataSize step blockSize {
+            checksum = checksum * 31 + filterBlock(data, start, blockSize, 3, 100000, true, 1)
+            checksum = checksum * 31 + filterBlock(data, start, blockSize, 0, 1048576, false, 2)
+            checksum = checksum * 31 + filterBlock(data, start, blockSize, 5, 50000, false, 3)
+        }
+    }
+    return checksum
+}
+
+var rounds = 100
+if args().len() > 1 { rounds = args()[1] as int }
+var values: [int] = []
+for i in 0..4096 { values.push(nextRandom() & valueMask) }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(values, data, rounds))

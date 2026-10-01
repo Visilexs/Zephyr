@@ -1,0 +1,94 @@
+// Inlining benchmark (indirect calls, dominant target): calls through plain
+// function values, through capturing closures and through an interface, each
+// picking ~99% one target and ~1% one of three others (chosen by LCG). A
+// guarded inline of the dominant target (speculative devirtualization) wins.
+// Usage: inl_indirect [rounds]   (default 1000)
+
+const valueMask = 1073741823
+const dataSize = 4096
+
+fn doubleAndMask(value: int) -> int { return (value * 2 + 1) & valueMask }
+fn xorFold(value: int) -> int { return value ^ (value >> 7) }
+fn addPrime(value: int) -> int { return (value + 1000003) & valueMask }
+fn rotateBits(value: int) -> int { return ((value << 5) | (value >> 25)) & valueMask }
+
+interface Scorer {
+    fn score(self, value: int) -> int
+}
+
+struct LinearScorer { weight: int }
+impl LinearScorer {
+    fn score(self, value: int) -> int { return (value & 65535) * self.weight }
+}
+
+struct MaskScorer { mask: int }
+impl MaskScorer {
+    fn score(self, value: int) -> int { return value & self.mask }
+}
+
+struct ShiftScorer { shift: int }
+impl ShiftScorer {
+    fn score(self, value: int) -> int { return value >> self.shift }
+}
+
+struct ConstantScorer { amount: int }
+impl ConstantScorer {
+    fn score(self, value: int) -> int { return self.amount }
+}
+
+fn makeClosures(bias: int, multiplier: int) -> [fn(int) -> int] {
+    var closures: [fn(int) -> int] = []
+    closures.push(fn(value: int) -> int { return (value + bias) & valueMask })
+    closures.push(fn(value: int) -> int { return (value * multiplier) & valueMask })
+    closures.push(fn(value: int) -> int { return value ^ bias })
+    closures.push(fn(value: int) -> int { return (value >> 1) + multiplier })
+    return closures
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+// ~99% target 0, ~1% spread over targets 1..3.
+fn pickTarget() -> int {
+    let roll = nextRandom() % 1000
+    return if roll < 990 { 0 } else { 1 + roll % 3 }
+}
+
+fn run(data: [int], functionTargets: [int], closureTargets: [int], scorerTargets: [int],
+       functions: [fn(int) -> int], closures: [fn(int) -> int], scorers: [Scorer], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            var value = (data[i] + round) & valueMask
+            value = functions[functionTargets[i]](value)
+            value = closures[closureTargets[i]](value)
+            total = total * 31 + scorers[scorerTargets[i]].score(value)
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+var functionTargets: [int] = []
+var closureTargets: [int] = []
+var scorerTargets: [int] = []
+for i in 0..dataSize {
+    data.push(nextRandom())
+    functionTargets.push(pickTarget())
+    closureTargets.push(pickTarget())
+    scorerTargets.push(pickTarget())
+}
+let functions: [fn(int) -> int] = [doubleAndMask, xorFold, addPrime, rotateBits]
+let closures = makeClosures(nextRandom() % 1000, nextRandom() % 64 * 2 + 1)
+var scorers: [Scorer] = []
+scorers.push(LinearScorer{weight: nextRandom() % 100 + 1})
+scorers.push(MaskScorer{mask: nextRandom() & 65535})
+scorers.push(ShiftScorer{shift: nextRandom() % 16})
+scorers.push(ConstantScorer{amount: nextRandom() % 1000})
+print(run(data, functionTargets, closureTargets, scorerTargets, functions, closures, scorers, rounds))
