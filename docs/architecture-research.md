@@ -127,7 +127,7 @@ read after the value.
    - **Region inference** for structures that die at the end of a statement or
      call. bintrees: 3.0–3.1× → 0.28–0.29× C [M7, M53]. Regions must be
      passed into callees that return fresh results: frame-local analysis alone
-     proves ~19% of allocations, regions passed in ~83% [M58]. Tracing GC was
+     proves ~19% of allocations, regions passed in ~84% [M58]. Tracing GC was
      evaluated as an alternative and rejected: no faster than regions, and it
      breaks the spec's peak-memory promise [M52].
    - **Allocation and release specialized per type** instead of the generic
@@ -2366,7 +2366,7 @@ Three analysis levels:
 | lexer | 13.0 M | `tokenize` returns a fresh list of fresh `Token`s and substrings, dropped at the end of the caller's pass | **~0%** | ~100% | ~100% |
 | wordfreq | 10.5 M | the word dies at the end of the iteration unless it is a new map key (69,904 times) | **0%** | 0% | 99.3% |
 | strbuild | 16.0 M | substrings and interpolated pieces die in their own frame; `buildLine`'s result dies at the end of the caller's iteration | ~84% [E] | ~100% [E] | ~100% [E] |
-| **All four, by allocation** | 69.4 M | | **~19%** | **~83%** | **~98%** |
+| **All four, by allocation** | 69.4 M | | **~19%** | **~84%** | **~99%** |
 
 Notes:
 
@@ -2391,7 +2391,7 @@ frame-local (stack) allocation, which these workloads barely use.
   captures ~19% of these allocations and none of bintrees, which is the
   workload regions were chosen for (M7).
 - **Region inference must pass regions into callees for fresh results
-  (L2).** That is the step from ~19% to ~83%. It is interprocedural, but
+  (L2).** That is the step from ~19% to ~84%. It is interprocedural, but
   needs only one summary bit per function ("result graph is fresh; allocate
   it into a region the caller provides") plus the existing non-capture bits.
   It works with per-declaration caching, because the summary is part of the
@@ -2546,8 +2546,8 @@ All rows are bintrees unless noted, same checksum, one core.
   spills cancel its gain.
 - **Q5. Answered (cycles 48, 61 and 86, M43, M50, M58):** in the
   allocation-heavy workloads, a Go-style frame-local analysis proves ~19% of
-  allocations. Regions passed into callees for fresh results prove ~83%, and
-  promotion on escape ~98%. M43's "in frame" share actually measured "dies
+  allocations. Regions passed into callees for fresh results prove ~84%, and
+  promotion on escape ~99%. M43's "in frame" share actually measured "dies
   within a few frames", so it is the L2 bound. Still open: the same
   classification for the compiler itself (M50's 50–66%).
 - **Q6. Answered (cycle 51, M44):** wordfreq's gap is entirely
@@ -2954,6 +2954,6 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 86.**
   - Q5: classified the allocation sites of four workloads by analysis level
     (M58). Frame-local escape analysis proves ~19% of allocations, regions
-    passed into fresh-result callees ~83%, and promotion on escape ~98%.
+    passed into fresh-result callees ~84%, and promotion on escape ~99%.
   - Corrected M43's reading: its slack counts deaths in nearby callers.
   - Region inference needs a one-bit "fresh result" summary per function.
