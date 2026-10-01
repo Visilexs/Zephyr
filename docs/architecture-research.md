@@ -161,6 +161,56 @@ M40]. The spec should state left-to-right evaluation.
      per value, or for cold builds of programs above ~100 k lines without a
      shared cache (scenario S7).
 
+### Flat IR design sketch for step 3 (cycle 65)
+
+**Today** (`compiler/optimizer.zeph` lines 135–232):
+
+- 73 opcodes, all fairly low-level: loads, stores, `irListData`,
+  `irBoundsCheck`, `irCall`.
+- Parallel lists, but each instruction's operands are a separate heap list
+  (`irOperands: [[int]]`).
+- Struct, list, interface and reference-count semantics are already lowered
+  into loads, stores and calls. The representation passes of layer 4 therefore
+  have nothing high-level to work on.
+
+**Proposed layout:** structure-of-arrays, every array preallocated and grown
+by doubling, no per-instruction heap objects.
+
+| Array | Per value | Meaning |
+|---|---|---|
+| `op`, `type` | int, int | opcode; type id (int, float, bool, or a reference to type T) |
+| `a0`, `a1`, `a2` | int ×3 | fixed operands: value ids, or −1 |
+| `imm` | int | immediate, field index, site id, or type id |
+| `block` | int | owning block |
+| `extra`, `extraCount` | int ×2 | start and length in one shared `args` pool, for calls, block arguments and multi-way switches |
+
+Blocks get parallel arrays: first and last value, parameter start and count,
+successors, and the terminator's argument range in `args`. That is ~9 ints per
+value, ~72 bytes. All of zc (622 k values) is ~45 MB, freed as a few arrays.
+
+**Three levels in one IR**, where lowering replaces ops in place:
+
+1. **Semantic.** `alloc T`, `field.get` / `field.set`, `list.get` / `set` /
+   `len` / `push`, `iface.call slot`, `closure.make`, `str.*` as intrinsics,
+   `retain` / `release`, `check.bounds` / `check.zero` carrying a panic site, and
+   plain calls with Zephyr's evaluation order already explicit (left to right).
+   **The IR interpreter executes this level: it is the executable spec.**
+2. **Representation.** After layer 4's decisions: flattened fields and SoA
+   lists (`soa.get`, `soa.set`), regions (`region.enter`, `region.alloc`,
+   `region.exit`), reference-count ops removed or specialized per type, and
+   interface values as object pointers.
+3. **Machine.** Loads, stores and address modes, the internal calling
+   convention, and instruction-selected x86 or ARM64 ops before register
+   allocation.
+
+**Effects per opcode**, from a static table: reads and writes by memory class
+(type id plus field, which gives type-based alias analysis for free), may-free,
+may-panic and may-call. Optimizations query effects, never opcode lists.
+
+**Differential checking between levels:** the interpreter runs level 1, and an
+instrumented build runs levels 2 and 3. Lowering bugs like M39's are then caught
+at the level where they happen.
+
 ### What changes on Apple Silicon (cycle 63)
 
 These numbers combine the repository's own M5 results with components measured
@@ -2259,3 +2309,9 @@ evaluation order. Does an interpreted design prevent that by construction?
     1.253).
   - Per-workload noise is up to ±10%, which is why same-session A/B
     comparisons are required.
+- **2026-10-01, cycle 65.**
+  - Wrote the flat IR design sketch: structure-of-arrays with an operand pool,
+    three levels (semantic, representation, machine) with the interpreter on
+    the semantic level, and an effects table.
+  - Based on the existing 73-opcode IR, whose per-instruction `[[int]]`
+    operands are a measured cost (M3).
