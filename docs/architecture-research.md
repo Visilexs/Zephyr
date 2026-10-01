@@ -1521,6 +1521,39 @@ The forwarded value of the global after the loop is off by one iteration. It
 only reproduces together with a later call that modifies `acc` (`f1(…, f0(1),
 …)`); in simpler programs the read goes back to memory and the result is right.
 
+**Diagnosis of the loop-exit class (cycle 80, from reading the code;
+read-only, not yet confirmed by instrumentation):**
+
+1. With calls present, `regionGlobalsInMemory` holds, so global writes become
+   `irStoreGlobal` (`writeVariableValue`, `optimizer.zeph` ~line 645).
+2. `numberValues` (line 6238) records each store as
+   `known["m{globalEpoch}:…:{global}"] = storedValue` (line 6295). Memory
+   epochs are carried into a block from **its only predecessor**. After loop
+   rotation, the exit block's only predecessor is the loop body.
+3. A later load of the global after the loop finds that key and is forwarded,
+   under the check `blockDominates(irBlockOf[earlier], block)` (line 6344).
+   That checks the stored **value's** block (the loop phi `i`), not the
+   store's block.
+4. The load after the loop now uses phi `i`, which is live past the definition
+   of `i + 1` on the exit edge. The emitted code puts `i` and `i + 1` in one
+   register (`r8`), so the read sees the incremented value. That is the
+   classic lost-copy problem of leaving SSA after copy propagation.
+   `coalescePhis` (line ~4255) does test `rangesIntersect`, so either the live
+   ranges miss the forwarded use, or another coalescing path merges them.
+
+**Candidate fixes:**
+
+- (a) When recording a global store in `numberValues`, remember the store
+  instruction and require `blockDominates(storeBlock, loadBlock)`, with no back
+  edge between. Don't forward across a loop exit when the stored value is a
+  loop phi.
+- (b) Make sure live ranges are built from forwarded operands
+  (`resolveValue`), so the interference check in `coalescePhis` sees the
+  extended range.
+
+Either should make `research/fuzz/repro/loop-exit-global-1009.zeph` and
+`pure-1292.zeph` print baseline's result.
+
 **Classification of the 18 (cycle 39):**
 
 - `PURE=1 genprog.py` makes called functions never assign globals or push to
@@ -2600,3 +2633,9 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 78.**
   - Added WebAssembly as build step 13: a structuring pass from flat IR to
     wasm control flow. The current AST backend stays until then.
+- **2026-10-01, cycle 80.**
+  - Read-only diagnosis of the loop-exit miscompile: `numberValues` forwards a
+    global store's value across a rotated loop exit, checking the value's block
+    instead of the store's (lines 6295/6344). This becomes a lost-copy register
+    conflict.
+  - Two candidate fixes recorded in M39.
