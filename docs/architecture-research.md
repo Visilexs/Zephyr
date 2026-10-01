@@ -1707,7 +1707,11 @@ Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
 - bintrees is limited by `malloc` lock contention and its serial phases (the
   stretch tree and the long-lived tree).
 - In the proposed design, per-thread regions (M7) remove the allocator
-  contention [E].
+  contention. Measured in cycle 57: `research/oracle/parallel/bintrees_region_omp.c`
+  (one bump arena per thread) goes from 48.6 ms on 1 thread to **18.0 ms on 4
+  threads (2.7×; the serial stretch and long-lived trees bound the rest)**,
+  with the same checksum. That is ~16× faster than serial malloc C (284 ms)
+  [M].
 - The safety conditions from M8 hold for all three: index-disjoint writes,
   integer reductions, no shared reference-count traffic. A Zephyr compiler
   could prove each of them.
@@ -2079,3 +2083,6 @@ Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
 - **2026-10-01, cycle 56.**
   - OpenMP versions of the C references (M48): mandel 3.94×, matmul 3.69×,
     bintrees 1.76× on 4 cores, all bit-identical.
+- **2026-10-01, cycle 57.**
+  - Parallel bintrees with per-thread regions: 2.7× on 4 threads (18 ms),
+    against 1.76× with malloc. Confirms that regions remove the contention.
