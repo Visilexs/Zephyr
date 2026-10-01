@@ -1982,6 +1982,40 @@ fact flip is a rare, bounded rebuild in the hundreds of milliseconds, against
 explicitly. This adds one item to step 8's gate: a forced fact flip rebuilds
 correctly, verified by a byte-compare against a clean build.
 
+### M55. An end-to-end backend prototype: flat IR to running x86 (cycle 73)
+
+`research/proto/minijit.c`:
+
+- flat SSA with block parameters;
+- linear scan over all GPRs except the argument registers;
+- the lean internal convention (callee saves rbx and r12–r15);
+- correct parallel moves for block arguments;
+- coalescing hints (an argument takes its block parameter's register);
+- direct x86-64 encoding into `mmap`'d executable memory, then the code runs.
+
+Each kernel gets only a few cases' worth of instruction selection. Results
+correct on both kernels, one core [M]:
+
+| Kernel | Compile | Generated code | gcc -O2 | zc -O2 today |
+|---|---:|---:|---:|---:|
+| fib(38), 7 values | 8 µs (106 bytes) | 280 ms | 70–97 ms | ~102 ms (inlines 4 levels) |
+| Bounds-checked sum, 50 × 1 M, 16 values | 7 µs (222 bytes) | 55 ms without coalescing → **42 ms with coalescing** | 20–24 ms (scalar gcc also 20 ms) | — |
+
+**What this means:**
+
+- **The direct-emission path works end to end** and compiles in microseconds.
+  Most of those 7–8 µs is the `mmap` of a fresh code buffer (see M31 on page
+  faults).
+- **Backend mechanics alone don't make fast code.** The naive fib is 2.7×
+  slower than today's zc -O2, because zc inlines and this prototype doesn't.
+- In the loop, coalescing block arguments is worth −24%. The remaining 1.8–2×
+  against scalar gcc is two standard passes:
+  - loop rotation (one branch per iteration instead of two);
+  - bounds-check elimination against the loop bound.
+- This confirms the plan's order: the flat IR plus mid-end passes (inlining,
+  coalescing, rotation, bounds-check elimination) come before or with the new
+  encoder. A new backend without them would regress against today's -O2.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2466,3 +2500,9 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 72.**
   - Consistency pass on the current-best section: same-session values (M53),
     per-thread regions, the M52 rejection, and the fuzzing evidence in layer 6.
+- **2026-10-01, cycle 73.**
+  - Built an end-to-end flat-IR → x86 prototype that compiles in µs and runs
+    correctly (M55).
+  - Without mid-end passes, code is 1.8–2.8× gcc. Coalescing gives −24%;
+    inlining, rotation and bounds-check elimination are required before the
+    new backend can replace -O2.
