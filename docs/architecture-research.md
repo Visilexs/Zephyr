@@ -90,7 +90,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
      1.56× [M14].
    - **In-place append when the string is uniquely owned**, plus slices.
-     strbuild: 2.2× → 1.45× [M23].
+     strbuild: 2.2× → 1.45× [M23]. wordfreq's whole 1.9× gap is
+     concatenation [M44].
    - **No cycle collection when the type graph is acyclic**, and tracing
      restricted to cycle-capable types otherwise. lexer −12.5%, shapes −6%,
      wordfreq −5% [M36].
@@ -1577,6 +1578,30 @@ Part of strbuild's "escaped" share is the same artifact.
   allocation-heavy class. A real escape analysis in the compiler will capture
   some fraction of this upper bound [E].
 
+### M44. wordfreq: the gap is string building, not the map (cycle 51)
+
+`research/oracle/wordfreq_alloc.c` is the C reference with exactly one change:
+each word is built by repeated concatenation into newly allocated heap strings
+(32-byte header + bytes, the previous one freed), as Zephyr does. Same
+checksum [M]:
+
+| Version | Time |
+|---|---:|
+| C reference (word in a stack buffer) | 0.59 s |
+| **C with Zephyr-style concatenation** | **1.135 s** |
+| Zephyr -O2 | 1.097 s |
+
+**The whole 1.9× gap is word construction.** The map is as good as C's, and
+M50 showed 1.06 probes per lookup.
+
+The profile blamed `runtimeFindMapEntry` (62%) because allocation churn
+evicts the table and keys from cache, so the cost shows up on the map's loads.
+That's the M22 lesson again: profiles locate stalls, oracles find causes.
+
+**Fix:** in-place append when the string is uniquely owned (M23), or lowering
+`word = word + piece` in a loop to a builder. Expected to bring wordfreq to
+about C's 0.59 s [E, from this oracle]. **Q6 is closed.**
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1665,8 +1690,8 @@ Part of strbuild's "escaped" share is the same artifact.
   66–100% of freed objects die before their allocating frame returns. Still
   open: the compiler itself, and how much of that a static escape analysis
   proves.
-- **Q6.** What is wordfreq's 1.95× gap? M24 was inconclusive. Profile the C
-  reference against `research/proto/mapmodels.c` at instruction level.
+- **Q6. Answered (cycle 51, M44):** wordfreq's gap is entirely
+  string building by repeated concatenation. The fix is in-place append.
 - **Q7.** dispatch's remaining loop cost (~1.4× C, M28) is attributed to the
   interface cell and to density, but no oracle has isolated it.
 - **Q8.** How good is copy-and-patch code compared with today's baseline? This
@@ -1920,3 +1945,8 @@ Part of strbuild's "escaped" share is the same artifact.
   - wordfreq probes: 1.06 per lookup, which rejects probing as the cause.
   - The candidates left are memory latency and per-lookup overheads (string
     building, comparison call, hashing).
+- **2026-10-01, cycle 51.**
+  - wordfreq solved (M44): C with Zephyr-style concatenation takes 1.135 s
+    against Zephyr's 1.097 s, so the gap is string building and the map is
+    fine.
+  - Q6 closed.
