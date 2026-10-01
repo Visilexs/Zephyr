@@ -1,0 +1,5 @@
+// runtimeAppendStringBuilderInteger: digit-count boundaries, both signs, i64 extremes
+let values = [0, 7, 9, 10, 99, 100, 101, 1234567890, 9223372036854775807, -1, -10, -99, -100, -9223372036854775807 - 1]
+var text = ""
+for value in values { text += "{value} " }
+print(text)

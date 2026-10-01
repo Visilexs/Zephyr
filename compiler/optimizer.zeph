@@ -1323,6 +1323,26 @@ fn keepsHeapIntact(name: str) -> bool {
     return name == "runtimeSubstringValue" or name == "runtimeSubstringFromCheckedBounds" or name == "runtimeConcatenateStrings" or name == "runtimeAllocateDescribedObject" or name == "runtimeAllocateObject" or name == "runtimeNewDescribedList"
 }
 
+// a call that may free objects (dropping counts) but never resizes a list
+fn callOnlyReleases(instruction: int) -> bool {
+    let functionIndex = irImmediates[instruction]
+    if functionIndex < 0 or functionIndex == indirectStackCall { return false }
+    let name = functionDefinitions[functionIndex].name
+    return name == "runtimeAssignReference" or name == "runtimeReleaseReference"
+}
+
+// a list a release in the loop cannot free: a global the loop never
+// reassigns, or a parameter (the caller holds it)
+fn listOutlivesLoop(list: int, loopStoredGlobals: [int]) -> bool {
+    let source = resolveValue(list)
+    if irOpcodes[source] == irParameter { return true }
+    if irOpcodes[source] != irLoadGlobal { return false }
+    for stored in loopStoredGlobals {
+        if stored == irImmediates[source] { return false }
+    }
+    return true
+}
+
 fn callKeepsHeapIntact(instruction: int) -> bool {
     let functionIndex = irImmediates[instruction]
     return functionIndex >= 0 and functionIndex != indirectStackCall and keepsHeapIntact(functionDefinitions[functionIndex].name)
@@ -4071,6 +4091,7 @@ fn addressAvoidsGlobal(value: int, globalSlot: int, depth: int) -> bool {
 }
 
 fn survivesCrossedCalls(value: int) -> bool {
+    if irOpcodes[value] == irListData and listDataSurvivesReleases(value) { return true }
     let elementGlobal = loadedElementGlobal(value)
     let root = borrowRoot(value)
     if root == 0 - 1 { return false }
@@ -4086,6 +4107,26 @@ fn survivesCrossedCalls(value: int) -> bool {
             // runtimeAppendString frees at most its left operand, as a release would
             if not isRuntimeCallTo(instruction, "runtimeReleaseReference") and not isRuntimeCallTo(instruction, "runtimeAppendString") { return false }
             if root >= 0 and resolveValue(irOperands[instruction][0]) == root { return false }
+        }
+    }
+    return true
+}
+
+// A list's data pointer moves only when the list grows or is freed. Assigns
+// and releases never grow a list, and a list held by a global the region
+// never stores to keeps that count through them.
+fn listDataSurvivesReleases(data: int) -> bool {
+    let list = resolveValue(irOperands[data][0])
+    if irOpcodes[list] != irLoadGlobal { return false }
+    for block in 0..blockInstructions.len() {
+        for instruction in blockInstructions[block] {
+            if valueDead[instruction] { continue }
+            let opcode = irOpcodes[instruction]
+            if (opcode == irStoreGlobal or opcode == irFloatStoreGlobal) and irImmediates[instruction] == irImmediates[list] { return false }
+            if opcode != irCall or not irCallMayFree(instruction) { continue }
+            let single: [int] = [instructionPositions[instruction]]
+            if not crossesAnyPosition(data, single) { continue }
+            if not isRuntimeCallTo(instruction, "runtimeAssignReference") and not isRuntimeCallTo(instruction, "runtimeReleaseReference") { return false }
         }
     }
     return true
@@ -6675,13 +6716,19 @@ fn hoistLoopInvariants() {
         let members = loopBlockSets[loopIndex]
         // what the loop itself may change: a load it cannot change is invariant in it
         var loopFreesOrResizes = false
+        var loopResizesLists = false             // a release can free objects but never resizes a live list
+        var loopStoredGlobals: [int] = []
         var loopStoresElements = false
         var loopFieldOffsets: [int] = []
         for block in blockOrder {
             if not members[block] { continue }
             for instruction in blockInstructions[block] {
                 let opcode = irOpcodes[instruction]
-                if (opcode == irCall and not callKeepsHeapIntact(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { loopFreesOrResizes = true }
+                if (opcode == irCall and not callKeepsHeapIntact(instruction)) or opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 {
+                    loopFreesOrResizes = true
+                    if not (opcode == irCall and callOnlyReleases(instruction)) { loopResizesLists = true }
+                }
+                if opcode == irStoreGlobal or opcode == irFloatStoreGlobal { loopStoredGlobals.push(irImmediates[instruction]) }
                 if opcode == irStoreIndexed or opcode == irFloatStoreIndexed { loopStoresElements = true }
                 if opcode == irStore or opcode == irFloatStore { loopFieldOffsets.push(irImmediates[instruction]) }
             }
@@ -6696,8 +6743,10 @@ fn hoistLoopInvariants() {
                 for instruction in candidates {
                     var movable = isMovable(instruction)
                     let opcode = irOpcodes[instruction]
+                    if not movable and not loopResizesLists and (opcode == irListLength or opcode == irListData) {
+                        movable = not loopFreesOrResizes or listOutlivesLoop(irOperands[instruction][0], loopStoredGlobals)
+                    }
                     if not movable and not loopFreesOrResizes {
-                        if opcode == irListLength or opcode == irListData { movable = true }
                         if (opcode == irLoad or opcode == irFloatLoad) and not loopStoresElements {
                             movable = true
                             for offset in loopFieldOffsets {
@@ -7599,6 +7648,7 @@ fn outlineLoops(statements: [Node], slotCount: int, parameterCount: int, registe
             startTrialRegion()
             var compiled = compileTrialRegion() and runInlineTrials("loop at {functionName}:{statement.line}", functionName)
             if not compiled and inlinedCallCount > 0 {
+                optimizerNote("loop at {functionName}:{statement.line}: retrying without inlining ({optimizerBailReason})")
                 inliningEnabled = false
                 compiled = lowerLoopRegion(statement, slotCount, parameterCount, registerCall) and compileRegion(regionLabel, 0, false)
                 inliningEnabled = true

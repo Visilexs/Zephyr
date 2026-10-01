@@ -32,6 +32,7 @@ $expected = @{
     "hello"   = "Hello, Zephyr!"
     "convert" = "10.5`n6.28`n13`ncount is 13`n3.5`n-7"
     "shapes"  = "5`n5`nPoint{x: 6, y: 8}`n3`n(0, 0)`n(3, 4)`n(6, 8)"
+    "integer_formatting" = "0 7 9 10 99 100 101 1234567890 9223372036854775807 -1 -10 -99 -100 -9223372036854775808"
 }
 foreach ($name in $expected.Keys) {
     $exe = Join-Path $tmp "$name.exe"
