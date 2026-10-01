@@ -1,0 +1,111 @@
+// Oracle rewrite of bench/wordfreq.zeph (revision 398aadd): what a redesigned
+// runtime string map plus in-place string building would execute.
+//   - The word is built in place in one reused byte buffer (uniquely owned
+//     string appended in place, M23) instead of one allocation per concatenation.
+//   - The table is open addressing with the hash stored in each slot, so a probe
+//     compares hashes before touching key bytes. Keys are copied once, on first
+//     insertion, into a byte arena (offset, length).
+// Same word stream, same order-independent checksum.
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+let syllables = ["ka", "lo", "mi", "ne", "ru", "sa", "to", "vi", "ze", "po", "an", "el", "or", "ust", "ing", "ble"]
+
+var word: [u8] = []
+var arena: [u8] = []
+var capacity = 1024
+var slotHash = zeros(capacity)
+var slotOffset = zeros(capacity)
+var slotLength = zeros(capacity)
+var slotCount = zeros(capacity)
+var used = 0
+
+fn tableHash() -> int {
+    var hash = -3750763034362895579
+    for i in 0..word.len() { hash = (hash ^ word[i]) * 1099511628211 }
+    return hash
+}
+
+fn sameKey(slot: int) -> bool {
+    let length = word.len()
+    if slotLength[slot] != length { return false }
+    let offset = slotOffset[slot]
+    for i in 0..length {
+        if arena[offset + i] != word[i] { return false }
+    }
+    return true
+}
+
+fn grow() {
+    let oldCapacity = capacity
+    let oldHash = slotHash
+    let oldOffset = slotOffset
+    let oldLength = slotLength
+    let oldCount = slotCount
+    capacity = capacity * 2
+    slotHash = zeros(capacity)
+    slotOffset = zeros(capacity)
+    slotLength = zeros(capacity)
+    slotCount = zeros(capacity)
+    for i in 0..oldCapacity {
+        if oldCount[i] == 0 { continue }
+        var slot = oldHash[i] & (capacity - 1)
+        while slotCount[slot] != 0 { slot = (slot + 1) & (capacity - 1) }
+        slotHash[slot] = oldHash[i]
+        slotOffset[slot] = oldOffset[i]
+        slotLength[slot] = oldLength[i]
+        slotCount[slot] = oldCount[i]
+    }
+}
+
+fn increment() {
+    let hash = tableHash()
+    var slot = hash & (capacity - 1)
+    while slotCount[slot] != 0 {
+        if slotHash[slot] == hash and sameKey(slot) {
+            slotCount[slot] += 1
+            return
+        }
+        slot = (slot + 1) & (capacity - 1)
+    }
+    slotHash[slot] = hash
+    slotOffset[slot] = arena.len()
+    slotLength[slot] = word.len()
+    for i in 0..word.len() { arena.push(word[i]) }
+    slotCount[slot] = 1
+    used += 1
+    if used * 2 > capacity { grow() }
+}
+
+fn wordHashAt(offset: int, length: int) -> int {
+    var hash = 7
+    for i in 0..length { hash = hash * 31 + arena[offset + i] }
+    return hash
+}
+
+var wordCount = 3000000
+if args().len() > 1 { wordCount = args()[1] as int }
+
+for i in 0..wordCount {
+    let syllableCount = nextRandom() % 4 + 1
+    let noBytes: [u8] = []
+    word = noBytes
+    let first = syllables[nextRandom() % 16]
+    for c in first { word.push(c) }
+    for j in 1..syllableCount {
+        let next = syllables[nextRandom() % 16]
+        for c in next { word.push(c) }
+    }
+    increment()
+}
+
+var checksum = 0
+for slot in 0..capacity {
+    if slotCount[slot] != 0 { checksum += slotCount[slot] * wordHashAt(slotOffset[slot], slotLength[slot]) }
+}
+print(used, checksum)

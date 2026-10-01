@@ -786,6 +786,35 @@ Oracles with identical output (md5 of stdout), `hyperfine -N`, 6–10 runs [M]:
 - The rest is byte-at-a-time `[u8]` pushes and interpolation-builder overhead.
   A bulk append (`memcpy` of a whole string) is the next lever [E].
 
+### M24. wordfreq: inconclusive (cycle 18)
+
+Two attempts to bound a string-map redesign. Neither is trustworthy, and they
+are recorded so they aren't repeated:
+
+1. **Zephyr oracle** (`research/oracle/wordfreq_table.zeph`): open addressing
+   with stored hashes, a key arena, and a word built in a reused `[u8]` buffer.
+   - It ran in **2.23 s against 1.09 s for today's -O2**. Same checksum.
+   - Byte-at-a-time Zephyr code (a `push` per byte, indexed reads for hashing
+     and comparison) is far slower than the runtime's word-at-a-time
+     primitives, so a Zephyr-source oracle can't bound runtime data-structure
+     changes.
+   - **Lesson:** use C models for runtime-representation questions, and Zephyr
+     oracles for compiler-transformation questions.
+2. **C model** (`research/proto/mapmodels.c`):
+   - Today's representation: a counted string per concatenation, slots
+     without stored hashes, word-at-a-time hash. **1.35 s**, close to real
+     Zephyr's 1.09 s.
+   - Redesign: in-place word building and stored hashes. **1.05 s (−22%)**.
+   - But the C reference with the same design runs in **0.54–0.57 s**, so the
+     model is missing something, probably its hash function or table
+     parameters.
+   - A follow-up that switched hashes was invalid (it called `getenv` per
+     lookup).
+
+**Status:** the wordfreq gap (1.95× C) is unexplained beyond "string
+construction and map representation". Proposed next step: profile the C
+reference against the model at instruction level before drawing conclusions.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -966,3 +995,8 @@ Oracles with identical output (md5 of stdout), `hyperfine -N`, 6–10 runs [M]:
 - **2026-10-01, cycle 17.**
   - strbuild oracles (M23): slices −12%; slices + in-place append of a uniquely
     owned line −37% (2.2× → 1.45× C).
+- **2026-10-01, cycle 18.**
+  - wordfreq attempts (M24) were inconclusive. The Zephyr oracle was slower
+    than today's runtime, and the C model didn't reproduce the C reference.
+  - Recorded the method lesson: C models for runtime representation, Zephyr
+    oracles for compiler transformations.
