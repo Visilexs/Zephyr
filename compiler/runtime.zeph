@@ -2815,9 +2815,13 @@ fn runtimeEndStringInterpolation(mark: int) -> int {
     return text
 }
 
-// ---- command-line args ----
+// Parse the OS command line using one scratch buffer large enough for any argument.
 fn runtimeArguments() -> int {
     let commandLine = win("GetCommandLineA")       // LPSTR
+    if commandLine == 0 { runtimeFail("cannot read command line") }
+    var commandLength = 0
+    while load8(commandLine + commandLength) != 0 { commandLength += 1 }
+    let buffer = runtimeAllocateObject(commandLength + 1)
     let argumentList = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)
     var index = 0
     var going = true
@@ -2826,9 +2830,7 @@ fn runtimeArguments() -> int {
         if load8(commandLine + index) == 0 {
             going = false
         } else {
-            let start = index
             var quoted = false
-            let buffer = runtimeAllocateObject(2048)
             var argumentLength = 0
             var scanning = true
             while scanning {

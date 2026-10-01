@@ -1,0 +1,239 @@
+// Mutable reads must be captured before later operands change their storage.
+var globalInt = 10
+var globalFloat = 1.5
+var globalList = [7]
+var globalBool = true
+struct Box { value: int, flag: bool }
+struct Triple { first: int, second: int, third: int }
+let globalBox = Box{value: 10, flag: true}
+var trace = 0
+var packedBytes: [u8] = [0]
+var packedFloats: [f32] = [0.0]
+var globalSource = ""
+struct TextBox { value: str }
+let textBox = TextBox{value: ""}
+let textList = [""]
+
+// Small enough to exercise the frontend inliner's side-effect ordering.
+fn bump() -> int {
+    globalInt += 1
+    return 2
+}
+
+// Forty observable stores exceed the frontend's 128-node inline threshold.
+fn bumpLarge() -> int {
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    globalInt += 1
+    return 2
+}
+
+fn bumpFloat() -> float {
+    globalFloat = 9.0
+    return 0.5
+}
+
+fn replaceList() -> int {
+    globalList = [99]
+    return 0
+}
+
+fn mutateBox() -> int {
+    globalBox.value = 30
+    return 2
+}
+
+fn flip() -> bool {
+    globalBool = false
+    return false
+}
+
+fn flipMember() -> bool {
+    globalBox.flag = false
+    return false
+}
+
+fn combine(first: int, second: int, third: int) -> int {
+    return first * 100 + second * 10 + third
+}
+
+// Record assignment evaluation without relying on the assigned value.
+fn assignmentValue() -> int {
+    trace = trace * 10 + 1
+    return 9
+}
+
+fn assignmentBox() -> Box {
+    trace = trace * 10 + 2
+    return globalBox
+}
+
+fn assignmentList() -> [int] {
+    trace = trace * 10 + 2
+    return globalList
+}
+
+fn assignmentIndex() -> int {
+    trace = trace * 10 + 3
+    return 0
+}
+
+fn assignmentBytes() -> [u8] {
+    trace = trace * 10 + 2
+    return packedBytes
+}
+
+fn assignmentFloats() -> [f32] {
+    trace = trace * 10 + 2
+    return packedFloats
+}
+
+fn assignmentFloatValue() -> float {
+    trace = trace * 10 + 1
+    return 2.5
+}
+
+// Replacing the source drops its owning reference during target evaluation.
+fn referenceBox() -> TextBox {
+    globalSource = "replaced"
+    return textBox
+}
+
+fn referenceList() -> [str] {
+    globalSource = "replaced"
+    return textList
+}
+
+fn checkAlias() {
+    let localAlias = globalBox
+    print("alias", localAlias.value + mutateBox(), localAlias.value)
+}
+
+// This body exceeds the inline threshold, preserving SSA and bool parameters.
+fn checkAssignmentOrdering(prefix: bool) {
+    print("short-global", (prefix and globalBool) == flip())
+    print("short-member", (prefix and globalBox.flag) == flipMember())
+
+    globalBox.value = 0
+    globalList = [0]
+    trace = 0
+    assignmentBox().value = assignmentValue()
+    print("function-field", trace, globalBox.value)
+    trace = 0
+    assignmentList()[assignmentIndex()] = assignmentValue()
+    print("function-index", trace, globalList[0])
+
+    packedBytes = [0] as [u8]
+    packedFloats = [0.0] as [f32]
+    trace = 0
+    assignmentBytes()[assignmentIndex()] = assignmentValue()
+    print("function-byte", trace, packedBytes[0])
+    trace = 0
+    assignmentFloats()[assignmentIndex()] = assignmentFloatValue()
+    print("function-float", trace, packedFloats[0])
+
+    textBox.value = ""
+    textList[0] = ""
+    globalSource = "field-original".sub(0, 14)
+    referenceBox().value = globalSource
+    print("function-ref-field", textBox.value, globalSource)
+    globalSource = "list-original".sub(0, 13)
+    referenceList()[0] = globalSource
+    print("function-ref-list", textList[0], globalSource)
+
+    globalList = [7]
+    let keptList = globalList
+    globalList[replaceList()] = 42
+    print("function-captured-list", keptList[0], globalList[0])
+}
+
+print("inline", globalInt + bump(), globalInt)
+globalInt = 10
+print("call", globalInt + bumpLarge(), globalInt)
+globalInt = 10
+globalInt = globalInt + bump()
+print("assign", globalInt)
+globalInt = 10
+globalInt += bump()
+print("compound", globalInt)
+print("float", globalFloat + bumpFloat(), globalFloat)
+print("index", globalList[replaceList()], globalList[0])
+checkAlias()
+
+globalInt = 10
+print("arguments", combine(globalInt, bump(), globalInt), globalInt)
+globalInt = 10
+print("list", [globalInt, bump(), globalInt])
+globalInt = 10
+print("tuple", (globalInt, bump(), globalInt))
+globalInt = 10
+let triple = Triple{first: globalInt, second: bump(), third: globalInt}
+print("struct", triple.first, triple.second, triple.third)
+globalInt = 10
+let mapping = [globalInt: bump(), globalInt: globalInt]
+print("map", mapping[10], mapping[11])
+
+// Assignment evaluates its RHS before the target container and index.
+assignmentBox().value = assignmentValue()
+print("field-assignment", trace, globalBox.value)
+trace = 0
+assignmentList()[assignmentIndex()] = assignmentValue()
+print("index-assignment", trace, globalList[0])
+
+// Exercise the packed and reference store paths outside SSA as well.
+trace = 0
+assignmentBytes()[assignmentIndex()] = assignmentValue()
+print("byte-assignment", trace, packedBytes[0])
+trace = 0
+assignmentFloats()[assignmentIndex()] = assignmentFloatValue()
+print("float-assignment", trace, packedFloats[0])
+
+globalSource = "field-original".sub(0, 14)
+referenceBox().value = globalSource
+print("ref-field", textBox.value, globalSource)
+globalSource = "list-original".sub(0, 13)
+referenceList()[0] = globalSource
+print("ref-list", textList[0], globalSource)
+
+globalList = [7]
+let keptList = globalList
+globalList[replaceList()] = 42
+print("captured-list", keptList[0], globalList[0])
+checkAssignmentOrdering(true)

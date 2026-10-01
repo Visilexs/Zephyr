@@ -1,0 +1,194 @@
+// Inlining benchmark (large function, tiny hot path): process() has a 5-line
+// fast path taken for ~99.9% of records (value & 1023 != 0) and ~150 lines of
+// rare validation, fallback and error accounting. A size-based inliner never
+// inlines it; partial inlining (hot path inline, cold rest outlined) wins.
+// Usage: inl_bigcold [rounds]   (default 1000)
+
+struct Record { value: int, weight: int, tag: int }
+struct Stats { slowCount: int, errorCount: int, repairCount: int, history: [int], historyPosition: int }
+
+const valueMask = 16777215
+
+fn digitSum(value: int) -> int {
+    var remaining = value
+    var sum = 0
+    while remaining > 0 {
+        sum += remaining % 10
+        remaining = remaining / 10
+    }
+    return sum
+}
+
+fn bitCount(value: int) -> int {
+    var remaining = value
+    var count = 0
+    while remaining > 0 {
+        count += remaining & 1
+        remaining = remaining >> 1
+    }
+    return count
+}
+
+fn recordError(stats: Stats, code: int) {
+    stats.errorCount += 1
+    stats.history[stats.historyPosition] = code
+    stats.historyPosition = (stats.historyPosition + 1) & 15
+}
+
+fn process(record: Record, mode: int, stats: Stats) -> int {
+    let value = record.value
+    if (value & 1023) != 0 {
+        let mixed = (value ^ (value >> 7)) * mode
+        return (mixed + record.weight) & valueMask
+    }
+
+    // Slow path: validate the record, repair what can be repaired, account errors.
+    stats.slowCount += 1
+    var weight = record.weight
+    var result = value >> 10
+
+    // Stage 1: weight range.
+    if weight < 0 {
+        recordError(stats, 1)
+        weight = 0
+    } else if weight > 1000000 {
+        recordError(stats, 2)
+        weight = 1000000
+    }
+
+    // Stage 2: digit and bit structure of the value.
+    let digits = digitSum(value)
+    let setBitCount = bitCount(value)
+    if digits % 7 == 3 {
+        recordError(stats, 3)
+        result = result + digits
+    }
+    if setBitCount > 20 {
+        recordError(stats, 4)
+        result = result ^ (setBitCount << 8)
+    } else if setBitCount < 4 {
+        recordError(stats, 5)
+        result = result + 4096
+    }
+
+    // Stage 3: mix the error history into a repair key.
+    var repairKey = 0
+    for i in 0..16 {
+        repairKey = (repairKey * 33 + stats.history[i] + i) & valueMask
+    }
+    if repairKey % 3 == 0 {
+        stats.repairCount += 1
+        result = (result + repairKey) & valueMask
+    }
+
+    // Stage 4: slow fallback computation, a few rounds per mode.
+    var accumulator = result + weight
+    for round in 0..mode + 4 {
+        if (accumulator & 1) == 0 {
+            accumulator = accumulator / 2 + round
+        } else {
+            accumulator = (accumulator * 3 + 1) & valueMask
+        }
+        if accumulator > 8000000 {
+            accumulator = accumulator - 8000000
+            stats.repairCount += 1
+        }
+    }
+
+    // Stage 5: tag-specific handling.
+    let tagKind = record.tag % 5
+    if tagKind == 0 {
+        result = accumulator + digits
+    } else if tagKind == 1 {
+        result = accumulator ^ (weight << 3)
+        if result < 0 {
+            recordError(stats, 6)
+            result = -result
+        }
+    } else if tagKind == 2 {
+        var folded = accumulator
+        for shift in 0..4 {
+            folded = folded ^ (folded >> (shift + 3))
+        }
+        result = folded
+    } else if tagKind == 3 {
+        result = (accumulator + setBitCount * 1000) % 999983
+        if result == 0 {
+            recordError(stats, 7)
+            result = 1
+        }
+    } else {
+        var scaled = accumulator
+        var steps = 0
+        while scaled > 1000 and steps < 12 {
+            scaled = scaled / 3
+            steps += 1
+        }
+        result = scaled * 1000 + steps
+    }
+
+    // Stage 6: cross-check against the mode and the weight.
+    if mode > 3 and weight > 500000 {
+        recordError(stats, 8)
+        result = result / 2
+    }
+    if (result & 255) == 255 {
+        recordError(stats, 9)
+        result = result - 1
+    }
+    var checkDigits = digitSum(result)
+    while checkDigits >= 10 {
+        checkDigits = digitSum(checkDigits)
+    }
+    if checkDigits == 9 {
+        stats.repairCount += 1
+        result = result + 7
+    }
+
+    // Stage 7: final accounting.
+    if stats.errorCount > 1000000 {
+        stats.errorCount = 0
+        for i in 0..16 {
+            stats.history[i] = 0
+        }
+        stats.historyPosition = 0
+    }
+    return (result + weight) & valueMask
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const recordCount = 4096
+
+fn run(records: [Record], stats: Stats, rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        let mode = (round & 3) + 1
+        for record in records {
+            total = total * 31 + process(record, mode, stats)
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var records: [Record] = []
+for i in 0..recordCount {
+    let value = nextRandom()
+    let weight = nextRandom() % 1000
+    let tag = nextRandom() % 64
+    records.push(Record{value: value, weight: weight, tag: tag})
+}
+let stats = Stats{slowCount: 0, errorCount: 0, repairCount: 0, history: zeros(16), historyPosition: 0}
+
+var checksum = run(records, stats, rounds)
+checksum = checksum * 31 + stats.slowCount
+checksum = checksum * 31 + stats.errorCount
+checksum = checksum * 31 + stats.repairCount
+print(checksum)

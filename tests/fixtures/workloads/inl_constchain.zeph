@@ -1,0 +1,58 @@
+// Inlining benchmark (constants through a call chain): level0 .. level9 pass
+// config parameters (square flag, wrap mode, power-of-two size, scale, pass
+// count) down to leafCompute; they are literals only at the top call site.
+// Inlining the chain lets the leaf fold its branches, divisions and loop bound.
+// Usage: inl_constchain [rounds]   (default 1000)
+
+fn leafCompute(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int {
+    var result = value
+    if squareFlag != 0 {
+        result = (result & 65535) * (result & 65535)
+    }
+    for pass in 0..passes {
+        if wrapMode == 1 {
+            result = result % size + result / size + pass
+        } else if wrapMode == 2 {
+            result = result / size * scale + pass
+        } else {
+            result = result + size
+        }
+    }
+    return result * scale + result / size
+}
+
+fn level9(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return leafCompute(value ^ 333, squareFlag, wrapMode, size, scale, passes) }
+fn level8(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level9(value + 8, squareFlag, wrapMode, size, scale, passes) }
+fn level7(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level8(value ^ 259, squareFlag, wrapMode, size, scale, passes) }
+fn level6(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level7(value + 6, squareFlag, wrapMode, size, scale, passes) }
+fn level5(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level6(value ^ 185, squareFlag, wrapMode, size, scale, passes) }
+fn level4(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level5(value + 4, squareFlag, wrapMode, size, scale, passes) }
+fn level3(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level4(value ^ 111, squareFlag, wrapMode, size, scale, passes) }
+fn level2(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level3(value + 2, squareFlag, wrapMode, size, scale, passes) }
+fn level1(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level2(value ^ 37, squareFlag, wrapMode, size, scale, passes) }
+fn level0(value: int, squareFlag: int, wrapMode: int, size: int, scale: int, passes: int) -> int { return level1(value + 1, squareFlag, wrapMode, size, scale, passes) }
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const dataSize = 4096
+
+fn run(data: [int], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            total = total * 31 + level0(data[i] + round, 1, 1, 256, 3, 4)
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(data, rounds))

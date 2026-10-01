@@ -1,0 +1,123 @@
+var trace = 0
+
+// Each comparison uses incoming argument registers on both fast and slow paths.
+fn entryLt(a: int, b: int, c: int, d: int) -> int {
+    if a < b { return c }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryLe(a: int, b: int, c: int, d: int) -> int {
+    if b <= c { return d }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryGt(a: int, b: int, c: int, d: int) -> int {
+    if c > d { return b }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryGe(a: int, b: int, c: int, d: int) -> int {
+    if d >= a { return a }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryEq(a: int, b: int, c: int, d: int) -> int {
+    if b == d { return c }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryNe(a: int, b: int, c: int, d: int) -> int {
+    if c != a { return b }
+    return a + b * 10 + c * 100 + d * 1000
+}
+fn entryMax(n: int) -> int {
+    if n < 9223372036854775807 { return 9223372036854775806 }
+    return n
+}
+fn entryMin(n: int) -> int {
+    if n <= -9223372036854775807 - 1 { return -9223372036854775807 - 1 }
+    return n + 1
+}
+fn entryLiteralLeft(a: int, b: int) -> int {
+    if 9223372036854775807 > a { return b }
+    return a - b
+}
+fn entryThree(a: int, b: int, c: int) -> int {
+    if c <= b { return a }
+    return a + b * 10 + c * 100
+}
+fn entryFib(n: int) -> int {
+    if n < 2 { return n }
+    return entryFib(n - 1) + entryFib(n - 2)
+}
+fn entryEffect(n: int) -> int {
+    if n < 0 { return n }
+    trace = trace + 1
+    return n + 10
+}
+
+// Unsupported guard/base forms and stack calling conventions must stay ordinary.
+var limit = 0
+fn rejectedGlobal(n: int) -> int {
+    if n < limit { return n }
+    return n + 1
+}
+fn rejectedBase(n: int) -> int {
+    if n < 0 { return limit }
+    return n + 1
+}
+fn touch(n: int) -> int { trace = trace + 1
+    return n }
+fn rejectedGuardCall(n: int) -> int {
+    if touch(n) < 0 { return n }
+    return n + 1
+}
+fn rejectedBaseCall(n: int) -> int {
+    if n < 0 { return touch(n) }
+    return n + 1
+}
+fn rejectedArithmetic(n: int) -> int {
+    if n + 1 < 0 { return n }
+    return n + 1
+}
+fn rejectedBaseArithmetic(n: int) -> int {
+    if n < 0 { return n + 1 }
+    return n + 2
+}
+fn rejectedFloat(n: float) -> float {
+    if n < 0.0 { return n }
+    return n + 1.0
+}
+fn rejectedReference(n: [int]) -> int {
+    if n[0] < 0 { return n[0] }
+    return n[0] + 1
+}
+fn rejectedFive(a: int, b: int, c: int, d: int, e: int) -> int {
+    if a < b { return e }
+    return a + b * 10 + c * 100 + d * 1000 + e * 10000
+}
+fn rejectedValue(n: int) -> int {
+    if n < 0 { return n }
+    return n + 1
+}
+fn capture(value: int) -> fn(int) -> int {
+    return fn(n: int) -> int { if n < 0 { return value }
+        return n + value }
+}
+let functionValue = rejectedValue
+let capturedFunction = capture(7)
+let minimum = -9223372036854775807 - 1
+let maximum = 9223372036854775807
+print("lt", entryLt(-9, 2, 3, 4), entryLt(9, 2, 3, 4))
+print("le", entryLe(-9, 2, 3, 4), entryLe(9, 5, 3, 4))
+print("gt", entryGt(-9, 2, 5, 4), entryGt(9, 2, 3, 4))
+print("ge", entryGe(-9, 2, 3, 4), entryGe(9, 2, 3, 4))
+print("eq", entryEq(-9, 4, 3, 4), entryEq(9, 2, 3, 4))
+print("ne", entryNe(-9, 2, 3, 4), entryNe(3, 2, 3, 4))
+print("extreme", entryLt(minimum, maximum, -3, 4), entryLt(maximum, minimum, 0, 0), entryGe(minimum, 0, 0, maximum))
+print("literals", entryMax(minimum), entryMax(maximum), entryMin(minimum), entryMin(-1))
+print("left", entryLiteralLeft(-1, 37), entryLiteralLeft(maximum, 37))
+print("three", entryThree(-3, 9, 2), entryThree(-3, 2, 9))
+print("fib", entryFib(-1), entryFib(0), entryFib(1), entryFib(10))
+print("effect", entryEffect(-3), entryEffect(2), trace)
+print("globals", rejectedGlobal(-2), rejectedGlobal(2), rejectedBase(-2), rejectedBase(2))
+print("calls", rejectedGuardCall(-2), rejectedGuardCall(2), rejectedBaseCall(-2), rejectedBaseCall(2), trace)
+print("arithmetic", rejectedArithmetic(-2), rejectedArithmetic(2), rejectedBaseArithmetic(-2), rejectedBaseArithmetic(2))
+print("types", rejectedFloat(-2.0), rejectedFloat(2.0), rejectedReference([-2]), rejectedReference([2]))
+print("five", rejectedFive(-3, 2, 3, 4, 5), rejectedFive(9, 2, 3, 4, 5))
+print("values", functionValue(-2), functionValue(2), capturedFunction(-2), capturedFunction(2))

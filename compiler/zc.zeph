@@ -390,6 +390,10 @@ fn optimizerSelectsFunction(label: str) -> bool {
 }
 var optimizerReport = false                // --opt-report: say what was optimized and why not
 var optimizerDump = false                  // --opt-dump: print the IR of a region that fails its borrow check
+var callGraphReport = false
+var profileGeneratePath = ""     // --profile-generate FILE: count branches, write FILE at exit
+var profileUsePath = ""          // --profile-use FILE
+var profileCounts: [int] = []     // the loaded counters, empty without --profile-use                // --callgraph-report: print the whole-program call graph (-O2)
 var pendingRegionLines: [str] = []         // outlined loop bodies, emitted after their parent
 var excludedLocalSlots: [bool] = []        // parent slots an outlined loop owns: never promoted
 var excludedParameterSlots: [bool] = []
@@ -4559,6 +4563,21 @@ fn checkStatement(statement: Node) {
             if target.nodeKind == nodeCall and target.auxiliary == callKindRuntimeCall { targetType = target.typeIndex }      // buf[i] += 1: lowered with the value
             else { targetType = checkExpression(target) }
             if target.nodeKind == nodeCall and target.auxiliary == callKindRuntimeCall and (target.name == "runtimeU8Get" or target.name == "runtimeF32Get") {
+                // Packed stores are calls after checking. Save the RHS first so
+                // they keep the same assignment order as ordinary list stores.
+                let value = coerce(statement.children[1], targetType, "assignment")
+                let valueSlot = localSlotCount
+                localSlotCount += 1
+                var declaration = makeNode(nodeDeclaration, statement.line)
+                declaration.name = "(packed store value)"
+                declaration.auxiliary = identifierKindLocal
+                declaration.slot = valueSlot
+                declaration.typeIndex = value.typeIndex
+                declaration.children.push(value)
+                var savedValue = makeNode(nodeIdentifier, statement.line)
+                savedValue.auxiliary = identifierKindLocal
+                savedValue.slot = valueSlot
+                savedValue.typeIndex = value.typeIndex
                 var setter = makeNode(nodeCall, statement.line)           // packed store; the getter may be shared
                 setter.auxiliary = callKindRuntimeCall
                 setter.name = "runtimeU8Set"
@@ -4566,11 +4585,15 @@ fn checkStatement(statement: Node) {
                 setter.typeIndex = typeIdVoid
                 setter.children.push(target.children[0])
                 setter.children.push(target.children[1])
-                setter.children.push(coerce(statement.children[1], targetType, "assignment"))
+                setter.children.push(savedValue)
                 setter.children.push(target.children[2])
+                var orderedStore = makeNode(nodeLetExpression, statement.line)
+                orderedStore.typeIndex = typeIdVoid
+                orderedStore.children.push(declaration)
+                orderedStore.children.push(setter)
                 statement.nodeKind = nodeExpressionStatement
                 var statementChildren: [Node] = []
-                statementChildren.push(setter)
+                statementChildren.push(orderedStore)
                 statement.children = statementChildren
                 return
             }
@@ -6235,11 +6258,12 @@ fn allocateInlineSlots(slotCount: int) -> int {
     return firstSlot
 }
 
-// no calls, no panics, no side effects anywhere in the tree
+// Safe to move across calls: no panics, effects, or mutable shared reads.
 fn strictPure(expression: Node) -> bool {
     let expressionKind = expression.nodeKind
-    if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean or expressionKind == nodeIdentifier { return true }
-    if expressionKind == nodeNegate or expressionKind == nodeNot or expressionKind == nodeMember { return strictPure(expression.children[0]) }
+    if expressionKind == nodeIdentifier { return expression.auxiliary != identifierKindGlobal }
+    if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean { return true }
+    if expressionKind == nodeNegate or expressionKind == nodeNot { return strictPure(expression.children[0]) }
     if expressionKind == nodeCast {
         if expression.auxiliary == castKindNoOperation or expression.auxiliary == castKindIntegerToFloat or expression.auxiliary == castKindTruncate { return strictPure(expression.children[0]) }
         return false
@@ -6296,6 +6320,28 @@ fn cloneInlineNode(node: Node, parameterBase: int, localBase: int, resultSlot: i
 }
 
 var inlineExpansionCount = 0          // expansions in the function being walked this round
+// --opt-report: every front-end expansion as (caller, callee), in order
+var frontEndInlineCallers: [str] = []
+var frontEndInlineCallees: [str] = []
+
+// one line per caller: "opt: front-end inlined into f: g, h x3"
+fn reportFrontEndInlines() {
+    var callers: [str] = []
+    for caller in frontEndInlineCallers {
+        var seen = false
+        for known in callers {
+            if known == caller { seen = true }
+        }
+        if not seen { callers.push(caller) }
+    }
+    for caller in callers {
+        var callees: [str] = []
+        for i in 0..frontEndInlineCallers.len() {
+            if frontEndInlineCallers[i] == caller { callees.push(frontEndInlineCallees[i]) }
+        }
+        print("opt: front-end inlined into {caller}: {describeNameCounts(callees)}")
+    }
+}
 
 fn inlinableCall(expression: Node) -> bool {
     if expression.nodeKind != nodeCall or expression.auxiliary != callKindUser or expression.integerValue >= 4 { return false }
@@ -6376,6 +6422,10 @@ fn expandCall(parent: Node, index: int) {
     inlineSubstitutions = emptyNodes()
     hoistedStatements.push(inline)
     inlineExpansionCount += 1
+    if optimizerReport {
+        frontEndInlineCallers.push(functionDefinitions[inlineFunctionIndex].name)
+        frontEndInlineCallees.push(functionDefinition.name)
+    }
     var resultIdentifier = makeNode(nodeIdentifier, call.line)
     resultIdentifier.auxiliary = identifierKindLocal
     resultIdentifier.slot = resultSlot
@@ -6388,8 +6438,9 @@ fn expandCall(parent: Node, index: int) {
 fn tryChild(parent: Node, index: int) -> bool {
     let expression = parent.children[index]
     let expressionKind = expression.nodeKind
-    if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean or expressionKind == nodeIdentifier { return true }
-    if expressionKind == nodeNegate or expressionKind == nodeNot or expressionKind == nodeMember { return tryChild(expression, 0) }
+    if expressionKind == nodeIdentifier { return expression.auxiliary != identifierKindGlobal }
+    if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean { return true }
+    if expressionKind == nodeNegate or expressionKind == nodeNot { return tryChild(expression, 0) }
     if expressionKind == nodeCast {
         if not tryChild(expression, 0) { return false }
         return expression.auxiliary == castKindNoOperation or expression.auxiliary == castKindIntegerToFloat or expression.auxiliary == castKindTruncate
@@ -6421,10 +6472,10 @@ fn hoistStatement(statement: Node) {
         return
     }
     if statementKind == nodeAssign {
-        // target parts are evaluated before the value; only touch the value
-        // when the target cannot observe the reorder
+        // Field/list assignments evaluate the value before the write target.
+        // Maps retain their container, key, value order.
         let target = statement.children[0]
-        if target.nodeKind == nodeIdentifier or (target.nodeKind == nodeMember and strictPure(target.children[0])) {
+        if target.nodeKind == nodeIdentifier or target.nodeKind == nodeMember or (target.nodeKind == nodeIndex and typeKinds[target.children[0].typeIndex] != kindMap) {
             let childIsPure = tryChild(statement, 1)
         }
         return
@@ -6722,6 +6773,724 @@ fn foldGlobals(program: Node) {
     constantFoldAll(program)
 }
 
+// Only parameter arithmetic and direct self calls are effect-free here. Reject
+// division/remainder (which can trap), globals, allocations and other callees.
+fn accumulatorPure(expression: Node, functionIndex: int, allowSelfCall: bool) -> bool {
+    if expression.typeIndex != typeIdInteger and expression.typeIndex != typeIdBoolean { return false }
+    let kind = expression.nodeKind
+    if kind == nodeInteger or kind == nodeBoolean { return true }
+    if kind == nodeIdentifier { return expression.auxiliary == identifierKindParameter and expression.slot == 0 }
+    if kind == nodeCall {
+        if not allowSelfCall or expression.auxiliary != callKindUser or expression.operator != 0 or expression.referenceIndex != functionIndex or expression.children.len() != 2 { return false }
+        return accumulatorPure(expression.children[1], functionIndex, false)
+    }
+    if kind == nodeNegate or kind == nodeNot {
+        return expression.children.len() == 1 and accumulatorPure(expression.children[0], functionIndex, allowSelfCall)
+    }
+    if kind != nodeBinary or expression.children.len() != 2 { return false }
+    let operator = expression.operator
+    if operator != tokenPlus and operator != tokenMinus and operator != tokenStar and operator != tokenAmpersand and operator != tokenPipe and operator != tokenCaret and operator != tokenShiftLeft and operator != tokenShiftRight and operator != tokenLessThan and operator != tokenGreaterThan and operator != tokenLessOrEqual and operator != tokenGreaterOrEqual and operator != tokenEquals and operator != tokenNotEquals and operator != tokenAnd and operator != tokenOr { return false }
+    return accumulatorPure(expression.children[0], functionIndex, allowSelfCall) and accumulatorPure(expression.children[1], functionIndex, allowSelfCall)
+}
+
+// Build a checked integer addition; wrapping addition permits reassociation.
+fn accumulatorAdd(left: Node, right: Node) -> Node {
+    let sum = makeNode(nodeBinary, right.line)
+    sum.file = right.file
+    sum.operator = tokenPlus
+    sum.typeIndex = typeIdInteger
+    sum.auxiliary = binaryCategoryInteger
+    sum.children.push(left)
+    sum.children.push(right)
+    return sum
+}
+
+// Turn `if guard { return base }; return term + self(next)` into a loop.
+// The signature stays unchanged, and term still runs before next. Restricting
+// every read to the single parameter makes moving additions across calls safe.
+// ---- interprocedural constant propagation (-O2) ----
+// A parameter that every direct call passes the same literal for, and that the
+// body never assigns, becomes that literal in the body. The signature stays,
+// so callers are untouched. Functions used as values, methods (interface
+// dispatch reaches them unseen) and runtime helpers (codegen calls them) are
+// left alone.
+let constantArgumentUnseen = 0
+let constantArgumentFixed = 1
+let constantArgumentVarying = 2
+var constantArgumentFirstSlot: [int] = []     // function -> its first entry in the two lists below
+var constantArgumentStates: [int] = []
+var constantArgumentValues: [Node] = []
+var constantArgumentCallCounts: [int] = []
+var constantArgumentTaken: [bool] = []
+var constantParameterDone: [str: bool] = [:]     // "function/parameter" already substituted
+
+// a substituted literal becomes the next callee's constant argument, so repeat
+// until a round substitutes nothing (a chain of n levels takes n rounds)
+fn propagateConstantArguments(program: Node) {
+    if not optimizerEnabled or debugEnabled or wasmTargetEnabled or macosTargetEnabled or linuxTargetEnabled { return }
+    var substituted = false
+    while propagateConstantArgumentsOnce(program) { substituted = true }
+    if specializeConstantArguments(program) { substituted = true }
+    if substituted { constantFoldAll(program) }
+}
+
+// ---- constant-argument specialization (-O2) ----
+// A call passing literals for parameters that steer the callee (a branch or
+// loop condition, a loop bound, a divisor or shift amount) calls a clone with
+// those literals substituted, when the callee will not inline anyway: it calls
+// itself or is big. Clones are keyed by the literal vector and capped per
+// function. A recursive call that passes the parameter through carries the
+// same literal after substitution, so it finds the clone's own key.
+let specializationCloneLimit = 4
+let specializationMinimumNodes = 60
+var specializationKeys: [str: int] = [:]          // "function|parameter=literal|..." -> clone
+var specializationCloneCounts: [int: int] = [:]   // function -> clones made
+var parameterSteersCache: [str: bool] = [:]       // "function/parameter" -> steers code
+var specializedCallCount = 0
+
+fn specializeConstantArguments(program: Node) -> bool {
+    specializedCallCount = 0
+    for statement in program.children {
+        if statement.nodeKind != nodeFunction { specializeCallsIn(statement, program) }
+    }
+    var functionIndex = 0
+    while functionIndex < functionDefinitions.len() {      // clones appended here are walked too
+        let definition = functionDefinitions[functionIndex]
+        if definition.typeParameters.len() == 0 and definition.body.nodeKind != nodeNone { specializeCallsIn(definition.body, program) }
+        functionIndex += 1
+    }
+    return specializedCallCount > 0
+}
+
+fn specializableCallee(functionIndex: int) -> bool {
+    if functionIndex >= constantArgumentTaken.len() or constantArgumentTaken[functionIndex] { return false }
+    let definition = functionDefinitions[functionIndex]
+    if definition.hasEnvironment or definition.typeParameters.len() != 0 or textStartsWith(definition.name, "runtime") or nameHasDot(definition.name) { return false }
+    return callsFunction(definition.body, functionIndex) or countNodes(definition.body) > specializationMinimumNodes
+}
+
+fn specializeCallsIn(expression: Node, program: Node) {
+    for child in expression.children { specializeCallsIn(child, program) }
+    if expression.nodeKind != nodeCall or expression.auxiliary != callKindUser or not specializableCallee(expression.referenceIndex) { return }
+    let callee = expression.referenceIndex
+    let definition = functionDefinitions[callee]
+    var arguments: [Node] = []
+    if expression.operator == 1 { arguments.push(expression.children[0].children[0]) }
+    for argumentIndex in 1..expression.children.len() { arguments.push(expression.children[argumentIndex]) }
+    if arguments.len() != definition.parameterTypes.len() { return }
+    var key = definition.name
+    var steeringParameters: [int] = []
+    for j in 0..arguments.len() {
+        if isConstantArgument(arguments[j]) and parameterSteers(callee, j) {
+            key = key + "|{j}=" + describeConstantArgument(arguments[j])
+            steeringParameters.push(j)
+        }
+    }
+    if steeringParameters.len() == 0 { return }
+    var clone = 0 - 1
+    if specializationKeys.has(key) {
+        clone = specializationKeys[key]
+    } else {
+        var cloneCount = 0
+        if specializationCloneCounts.has(callee) { cloneCount = specializationCloneCounts[callee] }
+        if cloneCount >= specializationCloneLimit { return }
+        specializationCloneCounts[callee] = cloneCount + 1
+        clone = cloneFunctionDefinition(callee, "{definition.name}__special{cloneCount}", program)
+        for j in steeringParameters { substituteConstantParameter(functionDefinitions[clone].body, j, arguments[j]) }
+        specializationKeys[key] = clone
+        if optimizerReport { print("opt: specialized {functionDefinitions[clone].name}: {key}") }
+    }
+    expression.referenceIndex = clone
+    if expression.operator == 0 { expression.children[0].name = functionDefinitions[clone].name }
+    specializedCallCount += 1
+}
+
+fn callsFunction(expression: Node, functionIndex: int) -> bool {
+    if expression.nodeKind == nodeCall and expression.auxiliary == callKindUser and expression.referenceIndex == functionIndex { return true }
+    for child in expression.children {
+        if callsFunction(child, functionIndex) { return true }
+    }
+    return false
+}
+
+fn parameterSteers(functionIndex: int, slot: int) -> bool {
+    let cacheKey = "{functionIndex}/{slot}"
+    if not parameterSteersCache.has(cacheKey) {
+        let body = functionDefinitions[functionIndex].body
+        parameterSteersCache[cacheKey] = not divideAssignedIn(body, identifierKindParameter, slot) and passesParameterThrough(body, functionIndex, slot) and parameterSteersCode(body, slot)
+    }
+    return parameterSteersCache[cacheKey]
+}
+
+// every self-call hands the parameter on unchanged: a recursion counter
+// (depth - 1) would key a clone only its first call uses
+fn passesParameterThrough(expression: Node, functionIndex: int, slot: int) -> bool {
+    if expression.nodeKind == nodeCall and expression.auxiliary == callKindUser and expression.referenceIndex == functionIndex {
+        var argument = makeNode(nodeNone, 0)
+        if expression.operator == 1 and slot == 0 { argument = expression.children[0].children[0] }
+        else if expression.operator == 1 { argument = expression.children[slot] }
+        else { argument = expression.children[slot + 1] }
+        if argument.nodeKind != nodeIdentifier or argument.auxiliary != identifierKindParameter or argument.slot != slot { return false }
+    }
+    for child in expression.children {
+        if not passesParameterThrough(child, functionIndex, slot) { return false }
+    }
+    return true
+}
+
+fn parameterSteersCode(expression: Node, slot: int) -> bool {
+    let kind = expression.nodeKind
+    if kind == nodeFunctionLiteral { return false }
+    if (kind == nodeIf or kind == nodeWhile or kind == nodeIfExpression) and mentionsParameter(expression.children[0], slot) { return true }
+    if kind == nodeRangeLoop {
+        for i in 0..expression.children.len() {
+            if i != 2 and mentionsParameter(expression.children[i], slot) { return true }
+        }
+    }
+    if kind == nodeBinary and (expression.operator == tokenSlash or expression.operator == tokenPercent or expression.operator == tokenShiftLeft or expression.operator == tokenShiftRight) and mentionsParameter(expression.children[1], slot) { return true }
+    for child in expression.children {
+        if parameterSteersCode(child, slot) { return true }
+    }
+    return false
+}
+
+fn mentionsParameter(expression: Node, slot: int) -> bool {
+    if expression.nodeKind == nodeFunctionLiteral { return false }
+    if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindParameter and expression.slot == slot { return true }
+    for child in expression.children {
+        if mentionsParameter(child, slot) { return true }
+    }
+    return false
+}
+
+fn propagateConstantArgumentsOnce(program: Node) -> bool {
+    clearIntegers(constantArgumentFirstSlot)
+    clearIntegers(constantArgumentStates)
+    clearNodes(constantArgumentValues)
+    clearIntegers(constantArgumentCallCounts)
+    clearBooleans(constantArgumentTaken)
+    for functionIndex in 0..functionDefinitions.len() {
+        constantArgumentFirstSlot.push(constantArgumentStates.len())
+        for j in 0..functionDefinitions[functionIndex].parameterTypes.len() {
+            constantArgumentStates.push(constantArgumentUnseen)
+            constantArgumentValues.push(makeNode(nodeNone, 0))
+        }
+        constantArgumentCallCounts.push(0)
+        constantArgumentTaken.push(false)
+    }
+    for statement in program.children {
+        if statement.nodeKind != nodeFunction { collectConstantArguments(statement) }
+    }
+    for definition in functionDefinitions {
+        if definition.typeParameters.len() == 0 and definition.body.nodeKind != nodeNone { collectConstantArguments(definition.body) }
+    }
+    var substituted = false
+    for functionIndex in 0..functionDefinitions.len() {
+        let definition = functionDefinitions[functionIndex]
+        if constantArgumentTaken[functionIndex] or constantArgumentCallCounts[functionIndex] == 0 or definition.hasEnvironment or definition.typeParameters.len() != 0 { continue }
+        if textStartsWith(definition.name, "runtime") or nameHasDot(definition.name) { continue }
+        for j in 0..definition.parameterTypes.len() {
+            let entry = constantArgumentFirstSlot[functionIndex] + j
+            let doneKey = "{functionIndex}/{j}"
+            if constantArgumentStates[entry] != constantArgumentFixed or constantParameterDone.has(doneKey) or divideAssignedIn(definition.body, identifierKindParameter, j) { continue }
+            constantParameterDone[doneKey] = true
+            substituteConstantParameter(definition.body, j, constantArgumentValues[entry])
+            substituted = true
+            if optimizerReport { print("opt: constant parameter: {definition.name}.{definition.parameterNames[j]} is always {describeConstantArgument(constantArgumentValues[entry])}") }
+        }
+    }
+    return substituted
+}
+
+fn collectConstantArguments(expression: Node) {
+    if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindFunction and expression.referenceIndex < constantArgumentTaken.len() {
+        constantArgumentTaken[expression.referenceIndex] = true
+    }
+    if expression.nodeKind == nodeCall and expression.auxiliary == callKindUser and expression.referenceIndex < constantArgumentTaken.len() {
+        let callee = expression.referenceIndex
+        var arguments: [Node] = []
+        if expression.operator == 1 { arguments.push(expression.children[0].children[0]) }
+        for argumentIndex in 1..expression.children.len() { arguments.push(expression.children[argumentIndex]) }
+        if arguments.len() != functionDefinitions[callee].parameterTypes.len() {
+            constantArgumentTaken[callee] = true
+        } else {
+            constantArgumentCallCounts[callee] += 1
+            for j in 0..arguments.len() { noteConstantArgument(callee, j, arguments[j]) }
+        }
+    }
+    for child in expression.children { collectConstantArguments(child) }
+}
+
+fn noteConstantArgument(callee: int, parameterIndex: int, argument: Node) {
+    let entry = constantArgumentFirstSlot[callee] + parameterIndex
+    let state = constantArgumentStates[entry]
+    if state == constantArgumentVarying { return }
+    if not isConstantArgument(argument) {
+        constantArgumentStates[entry] = constantArgumentVarying
+        return
+    }
+    if state == constantArgumentUnseen {
+        constantArgumentStates[entry] = constantArgumentFixed
+        constantArgumentValues[entry] = argument
+        return
+    }
+    if not sameConstantArgument(constantArgumentValues[entry], argument) { constantArgumentStates[entry] = constantArgumentVarying }
+}
+
+fn nameHasDot(name: str) -> bool {
+    for i in 0..name.len() {
+        if name.byte(i) == 46 { return true }
+    }
+    return false
+}
+
+fn isConstantArgument(argument: Node) -> bool {
+    let kind = argument.nodeKind
+    if kind == nodeInteger or kind == nodeFloat or kind == nodeBoolean { return true }
+    return kind == nodeNegate and (argument.children[0].nodeKind == nodeInteger or argument.children[0].nodeKind == nodeFloat)
+}
+
+fn sameConstantArgument(first: Node, second: Node) -> bool {
+    if first.nodeKind != second.nodeKind or first.typeIndex != second.typeIndex { return false }
+    if first.nodeKind == nodeNegate { return sameConstantArgument(first.children[0], second.children[0]) }
+    return first.integerValue == second.integerValue and first.floatValue == second.floatValue
+}
+
+fn describeConstantArgument(argument: Node) -> str {
+    if argument.nodeKind == nodeNegate { return "-" + describeConstantArgument(argument.children[0]) }
+    if argument.nodeKind == nodeFloat { return "{argument.floatValue}" }
+    return "{argument.integerValue}"
+}
+
+fn substituteConstantParameter(expression: Node, slot: int, value: Node) {
+    if expression.nodeKind == nodeFunctionLiteral { return }        // its parameters are its own
+    if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindParameter and expression.slot == slot {
+        nodeBecome(expression, cloneNode(value))
+        return
+    }
+    for child in expression.children { substituteConstantParameter(child, slot, value) }
+}
+
+// ---- partial inlining by cold-tail outlining (-O2) ----
+// `prefix; if guard { fast; return }; slowTail`, where the prefix only declares
+// scalars and prefix and guard have no effects, becomes
+// `prefix; if guard { fast; return }; return f__coldTail(params)`. The clone
+// is the whole original function: it re-runs the prefix, finds the guard false
+// again and runs the tail, so no live-in analysis is needed. The trimmed
+// function is small enough for either inliner to take.
+// ponytail: early-exit guard shape only; `if rare { big }` arms need live-outs
+let coldTailHotNodeLimit = 60
+let coldTailMinimumNodes = 60
+
+fn splitColdTails(program: Node) {
+    if not optimizerEnabled or debugEnabled or wasmTargetEnabled or macosTargetEnabled or linuxTargetEnabled { return }
+    let functionCount = functionDefinitions.len()
+    for functionIndex in 0..functionCount {
+        let definition = functionDefinitions[functionIndex]
+        if definition.hasEnvironment or definition.typeParameters.len() != 0 or textStartsWith(definition.name, "runtime") { continue }
+        let guardPosition = coldTailGuardPosition(definition.body)
+        if guardPosition < 0 { continue }
+        var hotNodes = 1
+        for i in 0..guardPosition + 1 { hotNodes += countNodes(definition.body.children[i]) }
+        let tailNodes = countNodes(definition.body) - hotNodes
+        if hotNodes > coldTailHotNodeLimit or tailNodes < coldTailMinimumNodes or inlineHasClosure(definition.body) { continue }
+        let coldName = "{definition.name}__coldTail"
+        let coldIndex = cloneFunctionDefinition(functionIndex, coldName, program)
+        var coldCall = makeNode(nodeCall, definition.line)
+        coldCall.file = definition.body.file
+        var callee = makeNode(nodeIdentifier, definition.line)
+        callee.name = coldName
+        coldCall.children.push(callee)
+        for j in 0..definition.parameterNames.len() {
+            var parameter = makeNode(nodeIdentifier, definition.line)
+            parameter.name = definition.parameterNames[j]
+            parameter.auxiliary = identifierKindParameter
+            parameter.slot = j
+            parameter.typeIndex = definition.parameterTypes[j]
+            coldCall.children.push(parameter)
+        }
+        coldCall.auxiliary = callKindUser
+        coldCall.referenceIndex = coldIndex
+        coldCall.typeIndex = definition.returnType
+        var tailStatement = makeNode(nodeReturn, definition.line)
+        if definition.returnType == typeIdVoid { tailStatement.nodeKind = nodeExpressionStatement }
+        tailStatement.children.push(coldCall)
+        var hotStatements: [Node] = []
+        for i in 0..guardPosition + 1 { hotStatements.push(definition.body.children[i]) }
+        hotStatements.push(tailStatement)
+        definition.body.children = hotStatements
+        if optimizerReport { print("opt: partial inline: {definition.name} keeps {hotNodes} nodes, its {tailNodes}-node tail moves to {coldName}") }
+    }
+}
+
+// a new function with a copy of the body, emitted after every other top-level node
+fn cloneFunctionDefinition(functionIndex: int, cloneName: str, program: Node) -> int {
+    let definition = functionDefinitions[functionIndex]
+    let cloneIndex = functionDefinitions.len()
+    var cloneTopLevel = cloneNode(definition.node)
+    cloneTopLevel.name = cloneName
+    cloneTopLevel.referenceIndex = cloneIndex
+    let cloneBody = cloneNode(definition.body)
+    cloneTopLevel.children[2] = cloneBody
+    functionDefinitions.push(FunctionDefinition{name: cloneName, parameterNames: definition.parameterNames, parameterTypes: definition.parameterTypes, returnType: definition.returnType,
+                    body: cloneBody, slotCount: definition.slotCount, line: definition.line,
+                    typeParameters: definition.typeParameters, node: cloneTopLevel, label: functionAssemblyLabel(cloneName), hasEnvironment: false,
+                    pristine: cloneTopLevel, inlinable: false, pristineSlotCount: 0})
+    functionNameIndices[cloneName] = cloneIndex
+    program.children.push(cloneTopLevel)
+    return cloneIndex
+}
+
+// index of the early-exit guard, -1 if the body doesn't have the shape
+fn coldTailGuardPosition(body: Node) -> int {
+    let statements = body.children
+    for i in 0..statements.len() - 1 {
+        let statement = statements[i]
+        if statement.nodeKind == nodeDeclaration {
+            if not coldTailReexecutable(statement.children[0]) { return 0 - 1 }
+            continue
+        }
+        if statement.nodeKind != nodeIf or not coldTailReexecutable(statement.children[0]) { return 0 - 1 }
+        if statement.children.len() > 2 and statement.children[2].nodeKind != nodeNone { return 0 - 1 }
+        let fastStatements = statement.children[1].children
+        if fastStatements.len() == 0 or fastStatements[fastStatements.len() - 1].nodeKind != nodeReturn { return 0 - 1 }
+        return i
+    }
+    return 0 - 1
+}
+
+// a scalar computation with no effects: running it twice gives the same value
+fn coldTailReexecutable(expression: Node) -> bool {
+    let kind = expression.nodeKind
+    if kind == nodeIdentifier or kind == nodeInteger or kind == nodeFloat or kind == nodeBoolean { return true }
+    let typeKind = typeKinds[expression.typeIndex]
+    if typeKind != kindInteger and typeKind != kindFloat and typeKind != kindBoolean { return false }
+    if kind == nodeNegate or kind == nodeNot or kind == nodeMember { return coldTailReexecutable(expression.children[0]) }
+    if kind == nodeCast {
+        if expression.auxiliary != castKindNoOperation and expression.auxiliary != castKindIntegerToFloat and expression.auxiliary != castKindTruncate { return false }
+        return coldTailReexecutable(expression.children[0])
+    }
+    if kind == nodeBinary {
+        if expression.auxiliary == binaryCategoryString { return false }
+        return coldTailReexecutable(expression.children[0]) and coldTailReexecutable(expression.children[1])
+    }
+    if kind == nodeIndex {
+        if typeKinds[expression.children[0].typeIndex] != kindList { return false }
+        return coldTailReexecutable(expression.children[0]) and coldTailReexecutable(expression.children[1])
+    }
+    return false
+}
+
+fn accumulatorRecursionPass() {
+    if not optimizerEnabled or debugEnabled or wasmTargetEnabled or macosTargetEnabled or linuxTargetEnabled { return }
+    for functionIndex in 0..functionDefinitions.len() {
+        let definition = functionDefinitions[functionIndex]
+        if definition.hasEnvironment or definition.typeParameters.len() != 0 or definition.parameterTypes.len() != 1 or definition.returnType != typeIdInteger { continue }
+        if definition.parameterTypes[0] != typeIdInteger or definition.body.children.len() != 2 { continue }
+        let guard = definition.body.children[0]
+        let recursiveReturn = definition.body.children[1]
+        if guard.nodeKind != nodeIf or guard.children.len() != 3 or recursiveReturn.nodeKind != nodeReturn or recursiveReturn.children.len() != 1 { continue }
+        if guard.children[2].nodeKind != nodeNone or guard.children[1].children.len() != 1 { continue }
+        let baseReturn = guard.children[1].children[0]
+        if baseReturn.nodeKind != nodeReturn or baseReturn.children.len() != 1 { continue }
+        let sum = recursiveReturn.children[0]
+        if sum.nodeKind != nodeBinary or sum.operator != tokenPlus or sum.typeIndex != typeIdInteger or sum.children.len() != 2 { continue }
+        let tail = sum.children[1]
+        if tail.nodeKind != nodeCall or not accumulatorPure(tail, functionIndex, true) { continue }
+        if not accumulatorPure(guard.children[0], functionIndex, false) or not accumulatorPure(baseReturn.children[0], functionIndex, false) or not accumulatorPure(sum.children[0], functionIndex, true) { continue }
+
+        let accumulator = makeNode(nodeIdentifier, recursiveReturn.line)
+        accumulator.file = recursiveReturn.file
+        accumulator.name = "(recursion accumulator)"
+        accumulator.auxiliary = identifierKindLocal
+        accumulator.typeIndex = typeIdInteger
+        accumulator.slot = definition.slotCount
+        accumulator.isMutable = true
+        definition.slotCount += 1
+        let zero = makeNode(nodeInteger, recursiveReturn.line)
+        let declaration = makeNode(nodeDeclaration, recursiveReturn.line)
+        declaration.name = accumulator.name
+        declaration.slot = accumulator.slot
+        declaration.auxiliary = identifierKindLocal
+        declaration.typeIndex = typeIdInteger
+        declaration.isMutable = true
+        declaration.children.push(zero)
+
+        baseReturn.children[0] = accumulatorAdd(cloneNode(accumulator), baseReturn.children[0])
+        let accumulate = makeNode(nodeAssign, recursiveReturn.line)
+        accumulate.children.push(accumulator)
+        accumulate.children.push(accumulatorAdd(cloneNode(accumulator), sum.children[0]))
+        let parameter = makeNode(nodeIdentifier, tail.line)
+        parameter.name = definition.parameterNames[0]
+        parameter.auxiliary = identifierKindParameter
+        parameter.typeIndex = typeIdInteger
+        parameter.slot = 0
+        let advance = makeNode(nodeAssign, tail.line)
+        advance.children.push(parameter)
+        advance.children.push(tail.children[1])
+
+        let loopBody = makeNode(nodeProgram, guard.line)
+        loopBody.children.push(guard)
+        loopBody.children.push(accumulate)
+        loopBody.children.push(advance)
+        let condition = makeNode(nodeBoolean, guard.line)
+        condition.typeIndex = typeIdBoolean
+        condition.integerValue = 1
+        let loop = makeNode(nodeWhile, guard.line)
+        loop.children.push(condition)
+        loop.children.push(loopBody)
+        // Preserve the shared body object referenced by the program AST.
+        clearNodes(definition.body.children)
+        definition.body.children.push(declaration)
+        definition.body.children.push(loop)
+        if optimizerReport { print("opt: accumulator recursion " + definition.name) }
+    }
+}
+
+// ---- self tail recursion (-O2) ----
+// `return f(args)` becomes parameter updates and a `continue` of a loop around
+// the body; `return E op f(args)` (integer + * & | ^) folds E into one
+// accumulator first, and every other return answers `acc op value`. Wrapping
+// arithmetic makes the reassociation exact. Returns inside an inner loop stay
+// recursive calls (a `continue` there would hit the inner loop), so do changed
+// parameters that are not scalars. When the call is E's left operand, E must
+// be strictly pure: it now runs before the call instead of after.
+var tailRecursionFunction = 0
+var tailRecursionOperator = 0            // 0 until an accumulating return fixes it
+var tailRecursionValid = true
+var tailRecursionSites = 0
+var tailRecursionAccumulator = makeNode(nodeNone, 0)
+
+fn tailRecursionPass() {
+    if not optimizerEnabled or debugEnabled or wasmTargetEnabled or macosTargetEnabled or linuxTargetEnabled { return }
+    for functionIndex in 0..functionDefinitions.len() {
+        let definition = functionDefinitions[functionIndex]
+        if definition.hasEnvironment or definition.typeParameters.len() != 0 or textStartsWith(definition.name, "runtime") { continue }
+        if not callsFunction(definition.body, functionIndex) or inlineHasClosure(definition.body) { continue }
+        tailRecursionFunction = functionIndex
+        tailRecursionOperator = 0
+        tailRecursionValid = true
+        tailRecursionSites = 0
+        scanTailReturns(definition.body, false)
+        if not tailRecursionValid or tailRecursionSites == 0 { continue }
+        let line = definition.body.line
+        var statements: [Node] = []
+        if tailRecursionOperator != 0 {
+            tailRecursionAccumulator = newTailLocal(definition, "(tail accumulator)", typeIdInteger, line)
+            let identity = makeNode(nodeInteger, line)
+            identity.typeIndex = typeIdInteger
+            if tailRecursionOperator == tokenStar { identity.integerValue = 1 }
+            if tailRecursionOperator == tokenAmpersand { identity.integerValue = 0 - 1 }
+            statements.push(tailLocalDeclaration(tailRecursionAccumulator, identity))
+        }
+        let loopBody = makeNode(nodeProgram, line)
+        loopBody.children = rewriteTailReturns(definition, definition.body.children)
+        loopBody.children.push(makeNode(nodeBreak, line))      // falling off the end leaves the function, as before
+        let condition = makeNode(nodeBoolean, line)
+        condition.typeIndex = typeIdBoolean
+        condition.integerValue = 1
+        let loop = makeNode(nodeWhile, line)
+        loop.children.push(condition)
+        loop.children.push(loopBody)
+        statements.push(loop)
+        definition.body.children = statements
+        if optimizerReport { print("opt: tail recursion {definition.name}: {tailRecursionSites} site(s)") }
+    }
+}
+
+fn isTailSelfCall(expression: Node) -> bool {
+    return expression.nodeKind == nodeCall and expression.auxiliary == callKindUser and expression.referenceIndex == tailRecursionFunction
+}
+
+fn tailAccumulatingOperator(operator: int) -> bool {
+    return operator == tokenPlus or operator == tokenStar or operator == tokenAmpersand or operator == tokenPipe or operator == tokenCaret
+}
+
+// the self call a return hands back, directly or as one operand; nodeNone if none
+fn tailCallOf(value: Node) -> Node {
+    if isTailSelfCall(value) { return value }
+    if value.nodeKind != nodeBinary or value.typeIndex != typeIdInteger or not tailAccumulatingOperator(value.operator) { return makeNode(nodeNone, 0) }
+    if isTailSelfCall(value.children[1]) { return value.children[1] }
+    if isTailSelfCall(value.children[0]) and strictPure(value.children[1]) { return value.children[0] }
+    return makeNode(nodeNone, 0)
+}
+
+fn tailCallArguments(call: Node) -> [Node] {
+    var arguments: [Node] = []
+    if call.operator == 1 { arguments.push(call.children[0].children[0]) }
+    for argumentIndex in 1..call.children.len() { arguments.push(call.children[argumentIndex]) }
+    return arguments
+}
+
+fn passesOwnParameter(argument: Node, slot: int) -> bool {
+    return argument.nodeKind == nodeIdentifier and argument.auxiliary == identifierKindParameter and argument.slot == slot
+}
+
+fn scanTailReturns(block: Node, insideLoop: bool) {
+    for statement in block.children {
+        let kind = statement.nodeKind
+        if kind == nodeReturn and statement.children.len() == 1 {
+            let value = statement.children[0]
+            let call = tailCallOf(value)
+            if call.nodeKind == nodeNone { continue }        // a base case, or a recursion left as a call
+            if insideLoop { continue }
+            let definition = functionDefinitions[tailRecursionFunction]
+            let arguments = tailCallArguments(call)
+            if arguments.len() != definition.parameterTypes.len() {
+                tailRecursionValid = false
+                return
+            }
+            for j in 0..arguments.len() {
+                let typeKind = typeKinds[definition.parameterTypes[j]]
+                if not passesOwnParameter(arguments[j], j) and typeKind != kindInteger and typeKind != kindFloat and typeKind != kindBoolean { tailRecursionValid = false }
+            }
+            if value.nodeKind == nodeBinary {
+                if tailRecursionOperator != 0 and tailRecursionOperator != value.operator { tailRecursionValid = false }
+                tailRecursionOperator = value.operator
+            }
+            tailRecursionSites += 1
+        } else if kind == nodeIf {
+            scanTailReturns(statement.children[1], insideLoop)
+            if statement.children.len() > 2 { scanTailElse(statement.children[2], insideLoop) }
+        } else if kind == nodeProgram {
+            scanTailReturns(statement, insideLoop)
+        }
+    }
+}
+
+fn scanTailElse(elseBranch: Node, insideLoop: bool) {
+    if elseBranch.nodeKind == nodeProgram { scanTailReturns(elseBranch, insideLoop) }
+    else if elseBranch.nodeKind == nodeIf {
+        let wrapper = makeNode(nodeProgram, elseBranch.line)
+        wrapper.children.push(elseBranch)
+        scanTailReturns(wrapper, insideLoop)
+    }
+}
+
+// the statements with every tail site replaced; nested blocks are rewritten in place
+// (scanTailReturns only counted sites outside loops, and so does this)
+fn rewriteTailReturns(definition: FunctionDefinition, statements: [Node]) -> [Node] {
+    var rewritten: [Node] = []
+    for statement in statements {
+        let kind = statement.nodeKind
+        if kind == nodeReturn and statement.children.len() == 1 {
+            let value = statement.children[0]
+            let call = tailCallOf(value)
+            if call.nodeKind != nodeNone {
+                for replacement in tailCallStatements(definition, value, call) { rewritten.push(replacement) }
+                continue
+            }
+            if tailRecursionOperator != 0 { statement.children[0] = tailAccumulate(value) }
+        } else if kind == nodeIf {
+            statement.children[1].children = rewriteTailReturns(definition, statement.children[1].children)
+            if statement.children.len() > 2 { rewriteTailElse(definition, statement.children[2]) }
+        } else if kind == nodeWhile or kind == nodeRangeLoop or kind == nodeIterableLoop {
+            if tailRecursionOperator != 0 { rewriteLoopReturns(statement) }   // sites in here stayed calls
+        } else if kind == nodeProgram {
+            statement.children = rewriteTailReturns(definition, statement.children)
+        }
+        rewritten.push(statement)
+    }
+    return rewritten
+}
+
+fn rewriteTailElse(definition: FunctionDefinition, elseBranch: Node) {
+    if elseBranch.nodeKind == nodeProgram { elseBranch.children = rewriteTailReturns(definition, elseBranch.children) }
+    else if elseBranch.nodeKind == nodeIf {
+        var single: [Node] = []
+        single.push(elseBranch)
+        let rewritten = rewriteTailReturns(definition, single)       // an if rewrites in place: still one node
+    }
+}
+
+// inside an inner loop every return answers through the accumulator, call or not
+fn rewriteLoopReturns(node: Node) {
+    if node.nodeKind == nodeFunctionLiteral { return }
+    if node.nodeKind == nodeReturn and node.children.len() == 1 {
+        node.children[0] = tailAccumulate(node.children[0])
+        return
+    }
+    for child in node.children { rewriteLoopReturns(child) }
+}
+
+fn tailAccumulate(value: Node) -> Node {
+    let combined = makeNode(nodeBinary, value.line)
+    combined.file = value.file
+    combined.operator = tailRecursionOperator
+    combined.typeIndex = typeIdInteger
+    combined.auxiliary = binaryCategoryInteger
+    combined.children.push(cloneNode(tailRecursionAccumulator))
+    combined.children.push(value)
+    return combined
+}
+
+fn tailCallStatements(definition: FunctionDefinition, value: Node, call: Node) -> [Node] {
+    var statements: [Node] = []
+    let line = call.line
+    if value.nodeKind == nodeBinary {
+        var operand = value.children[0]                 // the side tailCallOf did not pick
+        if not isTailSelfCall(value.children[1]) { operand = value.children[1] }
+        statements.push(tailAssign(cloneNode(tailRecursionAccumulator), tailAccumulate(operand)))
+    }
+    let arguments = tailCallArguments(call)
+    var changedSlots: [int] = []
+    for j in 0..arguments.len() {
+        if not passesOwnParameter(arguments[j], j) { changedSlots.push(j) }
+    }
+    if changedSlots.len() == 1 {
+        let j = changedSlots[0]
+        statements.push(tailAssign(tailParameter(definition, j, line), arguments[j]))
+    } else {
+        var temporaries: [Node] = []
+        for j in changedSlots {
+            let temporary = newTailLocal(definition, "(tail argument)", definition.parameterTypes[j], line)
+            statements.push(tailLocalDeclaration(temporary, arguments[j]))
+            temporaries.push(temporary)
+        }
+        for i in 0..changedSlots.len() { statements.push(tailAssign(tailParameter(definition, changedSlots[i], line), cloneNode(temporaries[i]))) }
+    }
+    statements.push(makeNode(nodeContinue, line))
+    return statements
+}
+
+fn tailParameter(definition: FunctionDefinition, slot: int, line: int) -> Node {
+    let parameter = makeNode(nodeIdentifier, line)
+    parameter.name = definition.parameterNames[slot]
+    parameter.auxiliary = identifierKindParameter
+    parameter.typeIndex = definition.parameterTypes[slot]
+    parameter.slot = slot
+    return parameter
+}
+
+fn newTailLocal(definition: FunctionDefinition, name: str, typeIndex: int, line: int) -> Node {
+    let local = makeNode(nodeIdentifier, line)
+    local.name = name
+    local.auxiliary = identifierKindLocal
+    local.typeIndex = typeIndex
+    local.slot = definition.slotCount
+    local.isMutable = true
+    definition.slotCount += 1
+    return local
+}
+
+fn tailLocalDeclaration(local: Node, value: Node) -> Node {
+    let declaration = makeNode(nodeDeclaration, local.line)
+    declaration.name = local.name
+    declaration.slot = local.slot
+    declaration.auxiliary = identifierKindLocal
+    declaration.typeIndex = local.typeIndex
+    declaration.isMutable = true
+    declaration.children.push(value)
+    return declaration
+}
+
+fn tailAssign(target: Node, value: Node) -> Node {
+    let assignment = makeNode(nodeAssign, target.line)
+    assignment.children.push(target)
+    assignment.children.push(value)
+    return assignment
+}
+
 fn inlinePass(program: Node) {
     // Borrow pristine bodies until their first expansion would mutate them.
     // Functions that never expand need no copy, even when used as callees.
@@ -6770,6 +7539,7 @@ fn inlinePass(program: Node) {
             }
         }
     }
+    if optimizerReport { reportFrontEndInlines() }
 }
 
 // ---- runtime-reciprocal division pass ----
@@ -7334,7 +8104,7 @@ fn generateFloatOperands(leftNode: Node, rightNode: Node) {
     } else if isLeaf(rightNode) {
         generateFloatExpression(leftNode)               // left -> xmm0
         generateFloatLeaf("xmm1", rightNode)
-    } else if isLeaf(leftNode) {
+    } else if isLeafAfter(leftNode, rightNode) {
         generateFloatExpression(rightNode)               // right -> xmm0
         emitInstruction("movapd xmm1, xmm0")
         generateFloatLeaf("xmm0", leftNode)
@@ -7647,7 +8417,7 @@ fn generateBinaryOperator(expression: Node) {
     // commutative op with a leaf LEFT operand and a complex right one:
     // evaluate the complex side into rax, then apply the leaf directly --
     // no push/pop round-trip.
-    if category != binaryCategoryString and category != binaryCategoryFloat and isLeaf(expression.children[0]) and not isLeaf(expression.children[1]) {
+    if category != binaryCategoryString and category != binaryCategoryFloat and isLeafAfter(expression.children[0], expression.children[1]) and not isLeaf(expression.children[1]) {
         if operator == tokenPlus or operator == tokenStar or operator == tokenAmpersand or operator == tokenPipe or operator == tokenCaret {
             generateExpression(expression.children[1])
             generateLeaf("rcx", expression.children[0])
@@ -7787,6 +8557,12 @@ fn generateBinaryOperator(expression: Node) {
 fn isLeaf(expression: Node) -> bool {
     if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindFunction { return false }   // allocates a closure cell
     return expression.nodeKind == nodeInteger or expression.nodeKind == nodeFloat or expression.nodeKind == nodeBoolean or expression.nodeKind == nodeIdentifier
+}
+
+// Locals are captured by value; only global leaves can change during a call.
+fn isLeafAfter(leaf: Node, other: Node) -> bool {
+    if not isLeaf(leaf) { return false }
+    return leaf.nodeKind != nodeIdentifier or leaf.auxiliary != identifierKindGlobal or not hasCall(other)
 }
 
 // right operand is a non-negative literal fitting in a sign-extended imm32,
@@ -8186,7 +8962,7 @@ fn generateIndexAddress(expression: Node) -> str {
         indexAddressOwnership = 0                   // nothing parked: every caller ends with finishIndexKeepResult
         return indexRegister
     }
-    if isLeaf(expression.children[0]) {            // list is a simple var: no stack shuffle
+    if isLeafAfter(expression.children[0], expression.children[1]) { // stable list: no stack shuffle
         if indexInRegister { indexRegister = indexOperand } else { generateExpression(expression.children[1]) }
         generateLeaf("rcx", expression.children[0])     // list ptr -> rcx
         indexAddressOwnership = 0
@@ -9676,7 +10452,7 @@ fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
 
     let targetList = target.children[0]
     let sourceList = sourceElement.children[0]
-    if macosTargetEnabled and not nativeAxpyInputsSafe(targetList, sourceList, scalarFactor, outputBaseExpression, inputBaseExpression, statement.children[0], statement.children[1]) { return false }
+    if not nativeAxpyInputsSafe(targetList, sourceList, scalarFactor, outputBaseExpression, inputBaseExpression, statement.children[0], statement.children[1]) { return false }
     if targetList.auxiliary == sourceList.auxiliary and targetList.slot == sourceList.slot { return false }   // same array: avoid aliasing
     let scalarLabel = allocateLabel()
     let doneLabel = allocateLabel()
@@ -9724,41 +10500,39 @@ fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
     emitInstruction("mov [rsp + 120], rax")                                 // vend = lo+bulk
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("mov {loopVariableAddress}, rax")                                        // j = lo (scalar default)
-    if macosTargetEnabled {
-        // A range may wrap in int arithmetic. Only use the bulk kernel when
-        // base and index are nonnegative and the *entire* range fits each list.
-        // Check by subtraction, avoiding base+hi overflow. Otherwise retain
-        // scalar evaluation order, partial writes, and the original panic site.
-        emitInstruction("mov rax, [rsp + 80]")
-        emitInstruction("cmp rax, 0")
-        emitInstruction("jl {labelText(vectorSkipLabel)}")
-        emitInstruction("mov rax, [rsp + 88]")
-        emitInstruction("cmp rax, [rsp + 80]")
-        emitInstruction("jle {labelText(vectorSkipLabel)}")
-        emitInstruction("mov rax, [rsp + 64]")
-        emitInstruction("cmp rax, 0")
-        emitInstruction("jl {labelText(vectorSkipLabel)}")
-        emitInstruction("cmp rax, [rsp + 40]")
-        emitInstruction("jg {labelText(vectorSkipLabel)}")
-        emitInstruction("mov rcx, [rsp + 40]")
-        emitInstruction("sub rcx, rax")
-        emitInstruction("cmp rcx, [rsp + 88]")
-        emitInstruction("jl {labelText(vectorSkipLabel)}")
-        emitInstruction("mov rax, [rsp + 72]")
-        emitInstruction("cmp rax, 0")
-        emitInstruction("jl {labelText(vectorSkipLabel)}")
-        emitInstruction("cmp rax, [rsp + 56]")
-        emitInstruction("jg {labelText(vectorSkipLabel)}")
-        emitInstruction("mov rcx, [rsp + 56]")
-        emitInstruction("sub rcx, rax")
-        emitInstruction("cmp rcx, [rsp + 88]")
-        emitInstruction("jl {labelText(vectorSkipLabel)}")
-        // Distinct variable names can still refer to the same list. A shifted
-        // overlapping source must observe each preceding scalar write.
-        emitInstruction("mov rax, [rsp + 32]")
-        emitInstruction("cmp rax, [rsp + 48]")
-        emitInstruction("je {labelText(vectorSkipLabel)}")
-    }
+    // A range may wrap in int arithmetic. Only use the bulk kernel when
+    // base and index are nonnegative and the *entire* range fits each list.
+    // Check by subtraction, avoiding base+hi overflow. Otherwise retain
+    // scalar evaluation order, partial writes, and the original panic site.
+    emitInstruction("mov rax, [rsp + 80]")
+    emitInstruction("cmp rax, 0")
+    emitInstruction("jl {labelText(vectorSkipLabel)}")
+    emitInstruction("mov rax, [rsp + 88]")
+    emitInstruction("cmp rax, [rsp + 80]")
+    emitInstruction("jle {labelText(vectorSkipLabel)}")
+    emitInstruction("mov rax, [rsp + 64]")
+    emitInstruction("cmp rax, 0")
+    emitInstruction("jl {labelText(vectorSkipLabel)}")
+    emitInstruction("cmp rax, [rsp + 40]")
+    emitInstruction("jg {labelText(vectorSkipLabel)}")
+    emitInstruction("mov rcx, [rsp + 40]")
+    emitInstruction("sub rcx, rax")
+    emitInstruction("cmp rcx, [rsp + 88]")
+    emitInstruction("jl {labelText(vectorSkipLabel)}")
+    emitInstruction("mov rax, [rsp + 72]")
+    emitInstruction("cmp rax, 0")
+    emitInstruction("jl {labelText(vectorSkipLabel)}")
+    emitInstruction("cmp rax, [rsp + 56]")
+    emitInstruction("jg {labelText(vectorSkipLabel)}")
+    emitInstruction("mov rcx, [rsp + 56]")
+    emitInstruction("sub rcx, rax")
+    emitInstruction("cmp rcx, [rsp + 88]")
+    emitInstruction("jl {labelText(vectorSkipLabel)}")
+    // Distinct variable names can still refer to the same list. A shifted
+    // overlapping source must observe each preceding scalar write.
+    emitInstruction("mov rax, [rsp + 32]")
+    emitInstruction("cmp rax, [rsp + 48]")
+    emitInstruction("je {labelText(vectorSkipLabel)}")
     // bounds pre-check; any failure -> scalar loop (which checks per element)
     emitInstruction("mov rax, [rsp + 112]")
     emitInstruction("cmp rax, 0")
@@ -9863,19 +10637,22 @@ fn generateStatement(statement: Node, returnLabel: int) {
                 emitInstruction("mov " + slotAddress(target.auxiliary, target.slot) + ", rax")
             }
         } else if target.nodeKind == nodeMember {
-            let ownsBase = generateTemporary(target.children[0], not hasCall(statement.children[1]))
-            emitInstruction("push rax")
             generateExpression(statement.children[1])
+            emitInstruction("push rax")                  // owned value survives target evaluation
+            let ownsBase = generateTemporary(target.children[0], true)
+            emitInstruction("push rax")
             if isReferenceType(target.typeIndex) {
-                emitInstruction("mov rdx, rax")
+                emitInstruction("mov rdx, [rsp + 8]")
                 emitInstruction("mov rcx, [rsp]")
                 emitInstruction("add rcx, {8 * target.slot}")
                 emitRuntimeCall(functionCodeLabel("runtimeAssignReference"))
             } else {
                 emitInstruction("mov rcx, [rsp]")
+                emitInstruction("mov rax, [rsp + 8]")
                 emitInstruction("mov [rcx + {8 * target.slot}], rax")
             }
             popTemporary(ownsBase)
+            emitInstruction("add rsp, 8")
         } else if typeKinds[target.children[0].typeIndex] == kindMap {
             let ownsMap = generateTemporaryRuntime(target.children[0], not hasCall(target.children[1]) and not hasCall(statement.children[1]))
             emitInstruction("push rax")                    // map
@@ -9897,7 +10674,8 @@ fn generateStatement(statement: Node, returnLabel: int) {
             if indexOperand != "" and not textStartsWith(indexOperand, "[") { indexRegister = indexOperand }
             var ownsBase = false
             var pushed = false
-            if isLeaf(target.children[0]) or target.operator > 0 {   // list is a var (or hoisted): load it last, skip its push/pop
+            var savedValue = false
+            if (isLeaf(target.children[0]) or target.operator > 0) and strictPure(target.children[1]) { // stable index may be loaded early
                 if indexRegister != "rdx" {
                     generateExpression(statement.children[1])      // value -> rax
                 } else {
@@ -9913,13 +10691,15 @@ fn generateStatement(statement: Node, returnLabel: int) {
                 }
                 if target.operator == 0 { generateLeaf("rcx", target.children[0]) }   // list -> rcx
             } else {
-                ownsBase = generateTemporary(target.children[0], not hasCall(target.children[1]) and not hasCall(statement.children[1]))
+                generateExpression(statement.children[1])
+                emitInstruction("push rax")                // value, then container, then index
+                savedValue = true
+                ownsBase = generateTemporary(target.children[0], not hasCall(target.children[1]))
                 pushed = true
                 emitInstruction("push rax")                // base stays at [rsp] until the store is done
                 generateExpression(target.children[1])
-                emitInstruction("push rax")
-                generateExpression(statement.children[1])
-                emitInstruction("pop rdx")
+                emitInstruction("mov rdx, rax")
+                emitInstruction("mov rax, [rsp + 8]")
                 emitInstruction("mov rcx, [rsp]")
                 indexRegister = "rdx"
             }
@@ -9939,6 +10719,7 @@ fn generateStatement(statement: Node, returnLabel: int) {
                 emitInstruction("mov [r8 + " + indexRegister + "*8], rax")
             }
             if pushed { popTemporary(ownsBase) }
+            if savedValue { emitInstruction("add rsp, 8") }
         }
         return
     }
@@ -10406,6 +11187,7 @@ fn generateProgram(program: Node) {
     let optimizingTierRequested = optimizerEnabled
     if optimizerEnabled { computeUnaliasedGlobals(program) }
     computeRegisterCall(program)
+    if optimizerEnabled { buildCallGraph(program) }        // inline trials price calls with it
     emitAssemblyLine(".intel_syntax noprefix")
     emitAssemblyLine(".text")
     emitAssemblyLine(".globl zephyrMain")
@@ -10460,6 +11242,7 @@ fn generateProgram(program: Node) {
     generateFunctionBody("zephyrMain", topLevelSlotCount, 0, topLevelStatements)
     streamAssembledLines()
     optimizerEnabled = optimizingTierRequested
+    if callGraphReport and optimizerEnabled { reportCallGraph() }
 
     emitAssemblyLine(".section .rdata")
     for i in 0..floatConstants.len() {
@@ -14334,9 +15117,13 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    return text\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
-    sourceLines.push("// ---- command-line args ----\n")
+    sourceLines.push("// Parse the OS command line using one scratch buffer large enough for any argument.\n")
     sourceLines.push("fn runtimeArguments() -> int \{\n")
     sourceLines.push("    let commandLine = win(\"GetCommandLineA\")       // LPSTR\n")
+    sourceLines.push("    if commandLine == 0 \{ runtimeFail(\"cannot read command line\") \}\n")
+    sourceLines.push("    var commandLength = 0\n")
+    sourceLines.push("    while load8(commandLine + commandLength) != 0 \{ commandLength += 1 \}\n")
+    sourceLines.push("    let buffer = runtimeAllocateObject(commandLength + 1)\n")
     sourceLines.push("    let argumentList = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)\n")
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    var going = true\n")
@@ -14345,9 +15132,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        if load8(commandLine + index) == 0 \{\n")
     sourceLines.push("            going = false\n")
     sourceLines.push("        \} else \{\n")
-    sourceLines.push("            let start = index\n")
     sourceLines.push("            var quoted = false\n")
-    sourceLines.push("            let buffer = runtimeAllocateObject(2048)\n")
     sourceLines.push("            var argumentLength = 0\n")
     sourceLines.push("            var scanning = true\n")
     sourceLines.push("            while scanning \{\n")
@@ -16557,6 +17342,77 @@ fn collectTests(program: Node) -> [Node] {
 
 // A main file that declares fn main() and never calls it at the top level
 // gets the call appended, after every other top-level statement.
+// ---- profile-guided optimization ----
+// Counters are numbered in source order once imports expand, so a rebuild of
+// the same source finds them again: one per function entry, two per `if`
+// (then, else). --profile-generate inserts `zephyrProfileCounters[k] += 1`
+// before checking and writes the counts when the program ends normally;
+// --profile-use reads them into profileCounts. Either way each `if` carries
+// referenceIndex = its then-counter + 1, which clones and inlined copies keep.
+var profileCounterCount = 0
+var profileFunctionCounters: [str: int] = [:]
+
+fn setUpProfile(program: Node) {
+    numberProfileCounters(program)
+    if profileGeneratePath != "" {
+        let path = profileGeneratePath.replace("\\", "/")
+        let declaration = parse(tokenizeSource("var zephyrProfileCounters: [int] = zeros({profileCounterCount})\n", 1))
+        var statements: [Node] = []
+        for statement in declaration.children { statements.push(statement) }
+        for statement in program.children { statements.push(statement) }
+        let writer = parse(tokenizeSource("var zephyrProfileLines: [str] = [\"zprof {profileCounterCount}\\n\"]\nfor zephyrProfileCount in zephyrProfileCounters \{ zephyrProfileLines.push(\"\{zephyrProfileCount}\\n\") }\nwriteFile(\"{path}\", zephyrProfileLines.join())\n", 1))
+        for statement in writer.children { statements.push(statement) }
+        program.children = statements
+    }
+    if profileUsePath != "" {
+        let lines = readFile(profileUsePath).split("\n")
+        if lines.len() < 1 or lines[0] != "zprof {profileCounterCount}" {
+            print("zc: warning: {profileUsePath} was not recorded from this source (expected {profileCounterCount} counters); ignored")
+            return
+        }
+        for i in 1..profileCounterCount + 1 { profileCounts.push(lines[i] as int) }
+    }
+}
+
+fn numberProfileCounters(node: Node) {
+    if node.nodeKind == nodeFunction and node.children.len() > 2 and node.children[2].nodeKind == nodeProgram {
+        profileFunctionCounters[node.name] = profileCounterCount
+        if profileGeneratePath != "" { prependStatement(node.children[2], profileCounterStatement(profileCounterCount, node.line)) }
+        profileCounterCount += 1
+    } else if node.nodeKind == nodeIf {
+        let thenCounter = profileCounterCount
+        profileCounterCount += 2
+        node.referenceIndex = thenCounter + 1
+        if profileGeneratePath != "" {
+            prependStatement(node.children[1], profileCounterStatement(thenCounter, node.line))
+            var elseBlock = makeNode(nodeProgram, node.line)
+            let hasElse = node.children.len() > 2 and node.children[2].nodeKind != nodeNone
+            if hasElse and node.children[2].nodeKind == nodeProgram { elseBlock = node.children[2] }
+            else if hasElse { elseBlock.children.push(node.children[2]) }        // else if: the nested if is the block
+            prependStatement(elseBlock, profileCounterStatement(thenCounter + 1, node.line))
+            if node.children.len() > 2 { node.children[2] = elseBlock } else { node.children.push(elseBlock) }
+        }
+    }
+    for child in node.children { numberProfileCounters(child) }
+}
+
+fn profileCounterStatement(counter: int, line: int) -> Node {
+    return parse(tokenizeSource("zephyrProfileCounters[{counter}] += 1\n", line)).children[0]
+}
+
+fn prependStatement(block: Node, statement: Node) {
+    var statements: [Node] = []
+    statements.push(statement)
+    for existing in block.children { statements.push(existing) }
+    block.children = statements
+}
+
+// --profile-use: how often a function was entered, -1 when unknown
+fn profiledEntryCount(name: str) -> int {
+    if profileCounts.len() == 0 or not profileFunctionCounters.has(name) { return 0 - 1 }
+    return profileCounts[profileFunctionCounters[name]]
+}
+
 fn callMain(program: Node) {
     var mainNode = makeNode(nodeNone, 0)
     for topLevelNode in program.children {
@@ -19190,6 +20046,13 @@ while argumentIndex < commandLineArguments.len() {
     }
     else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--opt-dump" { optimizerDump = true }
+    else if argument == "--callgraph-report" { callGraphReport = true }
+    else if argument == "--profile-generate" or argument == "--profile-use" {
+        argumentIndex += 1
+        if argumentIndex >= commandLineArguments.len() { panic(argument + " requires a profile file path") }
+        if argument == "--profile-generate" { profileGeneratePath = commandLineArguments[argumentIndex] }
+        else { profileUsePath = commandLineArguments[argumentIndex] }
+    }
     else if argument == "--map" { symbolMapEnabled = true }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true
@@ -19221,6 +20084,7 @@ if inputPath == "" and showVersion {
     if runTests { addTestRunner(program, tests) }
     else { callMain(program) }
     program = expandImports(program, directoryName(inputPath))
+    if profileGeneratePath != "" or profileUsePath != "" { setUpProfile(program) }
     var firstUserNode = 0
     currentSourceFile = baseName(inputPath)
     if includeRuntime {
@@ -19290,6 +20154,11 @@ if inputPath == "" and showVersion {
     check(program)
     currentSourceFile = baseName(inputPath)
     foldGlobals(program)
+    preserveEntryReturns()
+    accumulatorRecursionPass()
+    tailRecursionPass()
+    propagateConstantArguments(program)  // before the split, so it sees the folded body
+    splitColdTails(program)              // partial inlining: before the inliners size anything
     inlinePass(program)
     constantFoldAll(program)                       // fold what inlined literal args exposed
     let isAssemblyOutput = outputPath.len() > 2 and outputPath.sub(outputPath.len() - 2, outputPath.len()) == ".s"

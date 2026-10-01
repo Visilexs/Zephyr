@@ -1,0 +1,135 @@
+// Inlining benchmark (dominant call path): stageA calls stageB (99.8%) or
+// stageC (0.2%), stageB calls stageD (99.8%) or stageE (0.2%), decided by LCG
+// data; every stage is 15-30 lines of arithmetic. Inlining the hot path
+// A->B->D and leaving C and E as calls is the profitable choice.
+// Usage: inl_superpath [rounds]   (default 1000)
+
+const valueMask = 1073741823
+const dataSize = 4096
+
+fn stageD(value: int, state: int) -> int {
+    var mixed = state ^ (value & 65535)
+    mixed = (mixed * 2654435 + 12345) & valueMask
+    let low = mixed & 65535
+    let high = mixed >> 16
+    var result = low * 31 + high * 17
+    result = result ^ (result >> 5)
+    result = (result + (low ^ high)) & valueMask
+    let spread = (result & 1023) * (value & 1023)
+    result = (result + spread) & valueMask
+    if (result & 3) == 0 {
+        result = result + 7
+    }
+    result = ((result << 3) ^ (result >> 7)) & valueMask
+    result = (result + mixed) & valueMask
+    return result
+}
+
+fn stageE(value: int, state: int) -> int {
+    var result = (state + value) & valueMask
+    for round in 0..8 {
+        result = (result * 33 + round) & valueMask
+        if (result & 1) != 0 {
+            result = result ^ (result >> 3)
+        } else {
+            result = result + (result >> 9)
+        }
+    }
+    let low = result & 65535
+    let high = (result >> 16) & 16383
+    result = (low * high + 99991) & valueMask
+    result = result ^ (value & 255)
+    result = (result + (result >> 11)) & valueMask
+    if result > 500000000 {
+        result = result - 500000000
+    }
+    result = (result * 5 + 1) & valueMask
+    return result
+}
+
+fn stageB(value: int, state: int) -> int {
+    var mixed = (state + (value >> 7)) & valueMask
+    mixed = mixed ^ (mixed >> 13)
+    let weight = (mixed & 255) + 1
+    var result = 0
+    if (value >> 13) % 1000 < 998 {
+        result = stageD(value, mixed)
+    } else {
+        result = stageE(value, mixed)
+    }
+    result = (result + weight * 3) & valueMask
+    let folded = (result >> 10) ^ (result & 1023)
+    result = (result + folded) & valueMask
+    if (result & 7) == 5 {
+        result = (result ^ mixed) & valueMask
+    }
+    result = (result * 9 + weight) & valueMask
+    result = result ^ (result >> 17)
+    return result
+}
+
+fn stageC(value: int, state: int) -> int {
+    var result = state
+    for round in 0..6 {
+        let low = result & 65535
+        result = (low * 40503 + round * 7 + (value & 4095)) & valueMask
+        result = result ^ (result >> 6)
+    }
+    let checkValue = result % 9973
+    if checkValue < 100 {
+        result = result + checkValue * 1000
+    } else {
+        result = result - checkValue
+    }
+    result = (result + 1000000007) & valueMask
+    result = ((result << 4) | (result >> 26)) & valueMask
+    result = (result ^ state) & valueMask
+    return result
+}
+
+fn stageA(value: int, state: int) -> int {
+    var mixed = (state * 31 + value) & valueMask
+    mixed = mixed ^ (mixed >> 11)
+    let bias = (value & 63) + 1
+    mixed = (mixed + bias * bias) & valueMask
+    var result = 0
+    if (value >> 3) % 1000 < 998 {
+        result = stageB(value, mixed)
+    } else {
+        result = stageC(value, mixed)
+    }
+    result = (result + (mixed & 4095)) & valueMask
+    result = result ^ (result >> 9)
+    if (result & 15) == 0 {
+        result = result + bias
+    }
+    result = (result * 3 + 1) & valueMask
+    let tail = (result & 255) * bias
+    result = (result + tail) & valueMask
+    return result
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn run(data: [int], rounds: int) -> int {
+    var total = 0
+    var state = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            state = stageA(data[i], (state + round) & valueMask)
+            total = total * 31 + state
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(data, rounds))

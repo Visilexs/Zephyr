@@ -1,0 +1,124 @@
+// Inlining benchmark (mutually recursive SCC): a recursive-descent evaluator,
+// parseExpression -> parseTerm -> parseFactor -> parseExpression (for
+// parentheses), over pre-generated random integer token streams, plus a small
+// isEven/isOdd mutual recursion. Tests inlining inside a call cycle.
+// Usage: inl_mutual [rounds]   (default 20)
+
+const valueMask = 2147483647
+const plusToken = -1
+const minusToken = -2
+const timesToken = -3
+const openToken = -4
+const closeToken = -5
+const endToken = -6
+const expressionCount = 20000
+const maxDepth = 6
+
+struct Parser { tokens: [int], position: int }
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn generateExpression(tokens: [int], depth: int) {
+    generateTerm(tokens, depth)
+    let extraTerms = nextRandom() % 3
+    for i in 0..extraTerms {
+        tokens.push(if nextRandom() % 2 == 0 { plusToken } else { minusToken })
+        generateTerm(tokens, depth)
+    }
+}
+
+fn generateTerm(tokens: [int], depth: int) {
+    generateFactor(tokens, depth)
+    let extraFactors = nextRandom() % 2
+    for i in 0..extraFactors {
+        tokens.push(timesToken)
+        generateFactor(tokens, depth)
+    }
+}
+
+fn generateFactor(tokens: [int], depth: int) {
+    if depth > 0 and nextRandom() % 3 == 0 {
+        tokens.push(openToken)
+        generateExpression(tokens, depth - 1)
+        tokens.push(closeToken)
+    } else {
+        tokens.push(nextRandom() % 1000)
+    }
+}
+
+fn parseExpression(parser: Parser, round: int) -> int {
+    var value = parseTerm(parser, round)
+    while true {
+        let token = parser.tokens[parser.position]
+        if token == plusToken {
+            parser.position += 1
+            value = (value + parseTerm(parser, round)) & valueMask
+        } else if token == minusToken {
+            parser.position += 1
+            value = (value - parseTerm(parser, round)) & valueMask
+        } else {
+            break
+        }
+    }
+    return value
+}
+
+fn parseTerm(parser: Parser, round: int) -> int {
+    var value = parseFactor(parser, round)
+    while parser.tokens[parser.position] == timesToken {
+        parser.position += 1
+        value = (value * parseFactor(parser, round)) & valueMask
+    }
+    return value
+}
+
+fn parseFactor(parser: Parser, round: int) -> int {
+    let token = parser.tokens[parser.position]
+    parser.position += 1
+    if token == openToken {
+        let value = parseExpression(parser, round)
+        parser.position += 1
+        return value
+    }
+    return (token + round) & valueMask
+}
+
+fn isEven(value: int) -> bool {
+    if value == 0 { return true }
+    return isOdd(value - 1)
+}
+
+fn isOdd(value: int) -> bool {
+    if value == 0 { return false }
+    return isEven(value - 1)
+}
+
+fn run(parser: Parser, rounds: int) -> int {
+    var checksum = 0
+    var evenCount = 0
+    for round in 0..rounds {
+        parser.position = 0
+        for expression in 0..expressionCount {
+            let result = parseExpression(parser, round)
+            parser.position += 1
+            checksum = checksum * 31 + result
+            if isEven(result & 63) { evenCount += 1 }
+        }
+    }
+    return checksum * 31 + evenCount
+}
+
+var rounds = 20
+if args().len() > 1 { rounds = args()[1] as int }
+var tokens: [int] = []
+for expression in 0..expressionCount {
+    generateExpression(tokens, maxDepth)
+    tokens.push(endToken)
+}
+let parser = Parser{tokens: tokens, position: 0}
+print(run(parser, rounds))

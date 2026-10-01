@@ -147,6 +147,8 @@ var blockSuccessors: [[int]] = []
 var blockSealed: [bool] = []
 var blockTerminated: [bool] = []
 var blockLoopDepth: [int] = []
+var blockProfileScales: [float] = []   // --profile-use: how often a block runs per region entry, as far as its ifs say
+var currentProfileScale = 1.0
 var loopHeaders: [int] = []                 // findLoops: one header per natural loop
 var loopBlockSets: [[bool]] = []
 var loopPreheaders: [int] = []
@@ -191,6 +193,23 @@ var regionReturnScopeDepth = 0              // ownedScopes a return leaves: the 
 var regionReturnTemporaryMark = 0           // pendingTemporaries a return releases
 var inliningEnabled = true
 var inlinedCallCount = 0                    // calls this lowering inlined: a failed region retries without
+var regionInlinedFunctions: [int] = []      // --opt-report: the function of every body this lowering inlined
+var regionHotInstructionCount = 0           // --opt-report: emitted instructions in line, and in the cold area
+var regionColdInstructionCount = 0
+// Inlining limits of the SSA tier. The defaults hold unless an inline trial
+// (runInlineTrials) measures a cheaper region with larger ones.
+let defaultInlineNodeLimit = 60
+let defaultInlineDepthLimit = 3
+var inlineNodeLimit = defaultInlineNodeLimit
+var inlineDepthLimit = defaultInlineDepthLimit
+var inlineRefusedByLimit = false            // this lowering left a call that a larger limit would inline
+var regionEstimatedCost = 0                 // static cost of one entry into the region (emitRegionCode)
+var functionEntryCosts: [int: int] = [:]    // function index -> regionEstimatedCost of its optimized code
+var callGraphStaticCosts: [int] = []        // call-graph node -> one entry's estimated cost, callees included
+var callGraphNodeSizes: [int] = []          // call-graph node -> AST nodes of the body as written
+var callGraphSccs: [int] = []               // call-graph node -> SCC number; an SCC is numbered after every SCC it calls
+var callGraphSccRecursive: [bool] = []
+var lowerPreInlineBody = false             // lowerFunctionRegion: lower the body from before front-end inlining
 var inlineStack: [int] = []                 // functions being inlined, innermost last
 var inlineKeyPrefix = ""                    // variable-key namespace of the body being inlined
 var inlineInstanceCount = 0
@@ -263,6 +282,9 @@ fn resetIr() {
     blockTerminated = noTerminated
     var noDepths: [int] = []
     blockLoopDepth = noDepths
+    var noScales: [float] = []
+    blockProfileScales = noScales
+    currentProfileScale = 1.0
     var noKeys: [str: int] = [:]
     variableKeys = noKeys
     var noClasses: [int] = []
@@ -306,6 +328,9 @@ fn resetIr() {
     regionReturnScopeDepth = 0
     regionReturnTemporaryMark = 0
     inlinedCallCount = 0
+    inlineRefusedByLimit = false
+    var noInlinedFunctions: [int] = []
+    regionInlinedFunctions = noInlinedFunctions
     var noInlines: [int] = []
     inlineStack = noInlines
     var noFrames: [InlineFrame] = []
@@ -355,6 +380,7 @@ fn newBlock() -> int {
     blockSealed.push(false)
     blockTerminated.push(false)
     blockLoopDepth.push(currentLoopDepth)
+    blockProfileScales.push(currentProfileScale)
     var definitions: [int] = []
     for i in 0..variableClasses.len() { definitions.push(0 - 1) }
     currentDefinitions.push(definitions)
@@ -1034,7 +1060,7 @@ fn lowerIndirectCall(expression: Node) -> int {
     var pinned: [int] = []
     let knownClosure = knownClosureOfNode(cellNode)
     if optimizerBailed { return 0 }
-    if not isDispatch and knownClosure >= 0 and canInlineWithin(knownClosureFunctions[knownClosure], 60) {
+    if not isDispatch and knownClosure >= 0 and canInlineWithin(knownClosureFunctions[knownClosure], inlineNodeLimit) {
         let inlineArguments = lowerInlineArguments(arguments, pinned)
         if optimizerBailed { return 0 }
         let inlinedResult = lowerInlinedBody(knownClosureFunctions[knownClosure], inlineArguments, knownClosureCaptures[knownClosure])
@@ -1999,8 +2025,8 @@ fn lowerReferenceStore(target: Node, source: Node) {
             optimizerBail("member store to a non-struct")
             return
         }
-        let base = lowerContainer(target.children[0], [source])
         let value = takeOwnership(lowerExpression(source))
+        let base = lowerContainer(target.children[0], [])
         if optimizerBailed { return }
         address = emitIr2(irAdd, classInteger, base, integerConstant(8 * target.slot), 0)
         let assigned = lowerRuntimeCall("runtimeAssignReference", [address, value])
@@ -2012,9 +2038,9 @@ fn lowerReferenceStore(target: Node, source: Node) {
     }
     let elementType = plainListElement(target.children[0].typeIndex)
     if optimizerBailed { return }
-    let list = lowerContainer(target.children[0], [target.children[1], source])
-    let index = lowerExpression(target.children[1])
     let value = takeOwnership(lowerExpression(source))
+    let list = lowerContainer(target.children[0], [target.children[1]])
+    let index = lowerExpression(target.children[1])
     if optimizerBailed { return }
     releaseEarly(releasing)
     let data = lowerElementAddress(list, index, target)
@@ -2384,7 +2410,7 @@ fn lowerCall(expression: Node) -> int {
     var operands: [int] = []
     var pinned: [int] = []
     var referenceMask = 0
-    if canInline(expression.referenceIndex) or (hasClosureArgument(callArguments) and canInlineWithin(expression.referenceIndex, 300)) {
+    if canInline(expression.referenceIndex) or (hasClosureArgument(callArguments) and canInlineWithin(expression.referenceIndex, max(300, inlineNodeLimit))) {
         let argumentValues = lowerInlineArguments(callArguments, pinned)
         if optimizerBailed { return 0 }
         let inlinedResult = lowerInlinedCall(expression.referenceIndex, argumentValues)
@@ -2439,31 +2465,51 @@ var preInlineNodeCounts: [int: int] = [:]     // the same, of the body before fr
 
 fn canInline(functionIndex: int) -> bool {
     if functionDefinitions[functionIndex].hasEnvironment { return false }
-    return canInlineWithin(functionIndex, 60)
+    return canInlineWithin(functionIndex, inlineNodeLimit)
 }
 
 // what an inlined call lowers: the expanded body, unless only its
 // pre-expansion one fit (see canInlineWithin)
 fn inlinedBody(functionIndex: int) -> Node {
-    if functionNodeCounts.has(functionIndex) and functionNodeCounts[functionIndex] > 60 { return preInlineBody(functionIndex) }
+    if functionNodeCounts.has(functionIndex) and functionNodeCounts[functionIndex] > inlineNodeLimit { return preInlineBody(functionIndex) }
     return functionDefinitions[functionIndex].body
 }
 
 fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
-    if not inliningEnabled or inlineStack.len() >= 3 or functionIndex == regionFunctionIndex { return false }
+    if not inliningEnabled or functionIndex == regionFunctionIndex { return false }
+    if inlineStack.len() >= inlineDepthLimit {
+        inlineRefusedByLimit = true
+        return false
+    }
     let functionDefinition = functionDefinitions[functionIndex]
     if functionDefinition.name == "runtimeCollectGarbage" { return false }
     for active in inlineStack {
         if active == functionIndex { return false }
     }
     if irOpcodes.len() > inlineRegionValueBudget { return false }      // a huge region costs more to allocate than calls cost to run
-    // sized as the front end expanded it, except a runtime helper in a user
-    // loop: its fast path is what matters there (runtimeU8Push, say)
+    // sized as the front end expanded it, or else as written when the region
+    // is user code: a runtime helper only in a user loop, where its fast path
+    // is what matters (runtimeU8Push, say)
     if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(functionDefinition.body) }
     if functionNodeCounts[functionIndex] <= nodeLimit { return true }
-    if currentLoopDepth == 0 or not textStartsWith(functionDefinition.name, "runtime") or (regionFunctionIndex >= 0 and textStartsWith(functionDefinitions[regionFunctionIndex].name, "runtime")) { return false }
+    let regionIsRuntime = regionFunctionIndex >= 0 and textStartsWith(functionDefinitions[regionFunctionIndex].name, "runtime")
+    let calleeIsRuntime = textStartsWith(functionDefinition.name, "runtime")
+    if regionIsRuntime or (calleeIsRuntime and currentLoopDepth == 0) {
+        inlineRefusedByLimit = true
+        return false
+    }
+    // One more level of a recursive callee at each leaf the front end unrolled
+    // it into: inside its SCC that pays (mixTree__coldTail, inl_mutual's
+    // generators), from an outside caller it only adds spills (inl_recursive's
+    // run). The cost estimate can't tell: it prices a recursive call as one call.
+    if inRecursiveScc(functionIndex) and not lowerPreInlineBody and not inSameScc(regionFunctionIndex, functionIndex) and regionExpandsFunction(functionIndex) {
+        inlineRefusedByLimit = true
+        return false
+    }
     if not preInlineNodeCounts.has(functionIndex) { preInlineNodeCounts[functionIndex] = countNodes(preInlineBody(functionIndex)) }
-    return preInlineNodeCounts[functionIndex] <= nodeLimit
+    if preInlineNodeCounts[functionIndex] <= nodeLimit { return true }
+    inlineRefusedByLimit = true
+    return false
 }
 
 // a closure literal argument: inlining the callee lets its calls through it inline too
@@ -2480,6 +2526,7 @@ fn enterInlinedBody(functionIndex: int, argumentValues: [int], captureValues: [i
     let functionDefinition = functionDefinitions[functionIndex]
     inlinedCallCount += 1
     inlineInstanceCount += 1
+    regionInlinedFunctions.push(functionIndex)
     inlineFrames.push(InlineFrame{prefix: inlineKeyPrefix, ownedSlots: ownedLocalSlots, sourceMakesCalls: regionSourceMakesCalls,
         returnBlock: regionReturnBlock, returnVariable: regionReturnVariable, returnType: regionReturnType,
         returnScopeDepth: regionReturnScopeDepth, returnTemporaryMark: regionReturnTemporaryMark, captureValues: inlineCaptureValues})
@@ -2861,8 +2908,8 @@ fn lowerStatementKind(statement: Node) {
                 optimizerBail("member store to a non-struct")
                 return
             }
-            let base = lowerExpression(target.children[0])
             let value = lowerExpression(statement.children[1])
+            let base = lowerExpression(target.children[0])
             if optimizerBailed { return }
             if irClasses[value] == classFloat { let stored = emitIr2(irFloatStore, classFloat, base, value, 8 * target.slot) }
             else { let stored = emitIr2(irStore, classInteger, base, value, 8 * target.slot) }
@@ -2871,9 +2918,9 @@ fn lowerStatementKind(statement: Node) {
         if target.nodeKind == nodeIndex {
             let elementType = plainListElement(target.children[0].typeIndex)
             if optimizerBailed { return }
-            let list = lowerExpression(target.children[0])
-            let index = lowerExpression(target.children[1])
             let value = lowerExpression(statement.children[1])
+            let list = lowerContainer(target.children[0], [target.children[1]])
+            let index = lowerExpression(target.children[1])
             if optimizerBailed { return }
             let data = lowerElementAddress(list, index, target)
             if irClasses[value] == classFloat { let stored = emitIr(irFloatStoreIndexed, classFloat, [data, index, value], 0) }
@@ -2884,22 +2931,40 @@ fn lowerStatementKind(statement: Node) {
         return
     }
     if kind == nodeIf {
+        let outerScale = currentProfileScale
+        var thenScale = outerScale
+        var elseScale = outerScale
+        if profileCounts.len() > 0 and statement.referenceIndex > 0 {
+            let thenCount = profileCounts[statement.referenceIndex - 1]
+            let elseCount = profileCounts[statement.referenceIndex]
+            if thenCount + elseCount > 0 {
+                thenScale = outerScale * (thenCount as float) / ((thenCount + elseCount) as float)
+                elseScale = outerScale * (elseCount as float) / ((thenCount + elseCount) as float)
+            }
+        }
         let thenBlock = newBlock()
+        blockProfileScales[thenBlock] = thenScale
         let joinBlock = newBlock()
         var elseBlock = joinBlock
         let hasElse = statement.children[2].nodeKind != nodeNone
-        if hasElse { elseBlock = newBlock() }
+        if hasElse {
+            elseBlock = newBlock()
+            blockProfileScales[elseBlock] = elseScale
+        }
         lowerCondition(statement.children[0], thenBlock, elseBlock)
         sealBlock(thenBlock)
         currentIrBlock = thenBlock
+        currentProfileScale = thenScale
         lowerBlock(statement.children[1])
         jumpTo(joinBlock)
         if hasElse {
             sealBlock(elseBlock)
             currentIrBlock = elseBlock
+            currentProfileScale = elseScale
             lowerBlock(statement.children[2])
             jumpTo(joinBlock)
         }
+        currentProfileScale = outerScale
         sealBlock(joinBlock)
         currentIrBlock = joinBlock
         return
@@ -3231,7 +3296,6 @@ fn lowerLoopRegion(loopStatement: Node, parentSlotCount: int, parentParameterCou
 }
 
 // lower a whole function body into a region
-var lowerPreInlineBody = false             // lowerFunctionRegion: lower preInlineBodies[] instead of the body
 
 fn lowerFunctionRegion(functionIndex: int) -> bool {
     resetIr()
@@ -3240,7 +3304,7 @@ fn lowerFunctionRegion(functionIndex: int) -> bool {
     regionFunctionIndex = functionIndex
     regionReturnType = functionDefinition.returnType
     var body = functionDefinition.body
-    if lowerPreInlineBody { body = preInlineBodies[functionIndex] }
+    if lowerPreInlineBody { body = preInlineBody(functionIndex) }
     regionGlobalsInMemory = subtreeHasUserCall(body) or assignsReferenceGlobal(body)
     findOwnedLocals(body)
     let entryBlock = newBlock()
@@ -4129,18 +4193,27 @@ fn loopWeight(block: int) -> int {
     return 1 << (3 * depth)
 }
 
+// loopWeight scaled by the profile's branch probabilities (x64 keeps rare
+// blocks distinguishable); plain loopWeight without --profile-use
+fn profiledWeight(block: int) -> int {
+    if profileCounts.len() == 0 or block >= blockProfileScales.len() { return loopWeight(block) }
+    let weight = ((loopWeight(block) as float) * blockProfileScales[block] * 64.0) as int
+    if weight < 1 { return 1 }
+    return weight
+}
+
 fn computeSpillCosts() {
     var costs: [int] = []
     for value in 0..irOpcodes.len() { costs.push(0) }
     for block in blockOrder {
-        let weight = loopWeight(block)
+        let weight = profiledWeight(block)
         for instruction in blockInstructions[block] {
             if isAllocatable(instruction) { costs[groupOf(instruction)] += weight }
             if irOpcodes[instruction] == irPhi {
                 let predecessors = blockPredecessors[block]
                 for i in 0..predecessors.len() {
                     let operand = irOperands[instruction][i]
-                    if isAllocatable(operand) { costs[groupOf(operand)] += loopWeight(predecessors[i]) }
+                    if isAllocatable(operand) { costs[groupOf(operand)] += profiledWeight(predecessors[i]) }
                 }
             } else {
                 for operand in irOperands[instruction] {
@@ -4691,15 +4764,37 @@ fn emitColdPanic(stringIndex: int) -> int {
     return label
 }
 
-// cmp, or test when the right side is zero (same flags for every condition we use)
-fn compareWith(left: str, right: int) {
-    if isImmediateConstant(right) and irImmediates[right] == 0 { emitOptimized("test {left}, {left}") }
-    else { emitOptimized("cmp {left}, {locationOf(right)}") }
+// Windows spill operands must still live on the stack in this block: loop
+// promotion can give a spilled value a temporary register home.
+fn canUseIntegerSpill(value: int, location: str) -> bool {
+    return not linuxTargetEnabled and not wasmTargetEnabled and not macosTargetEnabled and irClasses[value] == classInteger and valueSpillSlots[value] >= 0 and not isRegisterLocation(location) and not isImmediateConstant(value)
 }
 
+// Compare directly from a spill when x86 permits the other operand. Memory
+// compared with zero needs cmp; our assembler's test accepts only registers.
+fn compareWith(leftValue: int, right: int) {
+    let leftLocation = locationOf(leftValue)
+    let rightLocation = locationOf(right)
+    if canUseIntegerSpill(leftValue, leftLocation) and (isRegisterLocation(rightLocation) or isImmediateConstant(right)) {
+        emitOptimized("cmp {leftLocation}, {rightLocation}")
+        return
+    }
+    let left = integerIn(leftValue, "rax")
+    if isImmediateConstant(right) and irImmediates[right] == 0 { emitOptimized("test {left}, {left}") }
+    else { emitOptimized("cmp {left}, {rightLocation}") }
+}
+
+// Reuse a matching spill home for destructive integer operations. Other
+// destinations, memory sources and imul still go through a scratch register.
 fn emitIntegerBinary(value: int, mnemonic: str, commutative: bool) {
     let first = locationOf(irOperands[value][0])
     let second = locationOf(irOperands[value][1])
+    let destination = locationOf(value)
+    let memoryOperation = mnemonic == "add" or mnemonic == "sub" or mnemonic == "and" or mnemonic == "or" or mnemonic == "xor"
+    if memoryOperation and canUseIntegerSpill(value, destination) and destination == first and (isRegisterLocation(second) or isImmediateConstant(irOperands[value][1])) {
+        emitOptimized("{mnemonic} {destination}, {second}")
+        return
+    }
     let target = resultRegister(value, "rax")
     // into another register: lea does the copy and the add in one
     if (mnemonic == "add" or mnemonic == "sub") and target != first and target != second and isRegisterLocation(first) {
@@ -5037,8 +5132,7 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode == irCompare {
-        let left = integerIn(operands[0], "rax")
-        compareWith(left, operands[1])
+        compareWith(operands[0], operands[1])
         emitSetFromFlags(value, conditionSuffix(immediate))
         return
     }
@@ -5458,8 +5552,7 @@ fn emitTerminator(block: int, value: int) {
             let index = integerIn(irOperands[load][1], "rdx")
             emitOptimized("cmp byte ptr [{base} + {index} + 8], {irImmediates[constant]}")
         } else {
-            let left = integerIn(operands[0], "rax")
-            compareWith(left, operands[1])
+            compareWith(operands[0], operands[1])
         }
         conditionalJump(conditionSuffix(condition), conditionSuffix(invertCondition(condition)), successors[0], successors[1])
         return
@@ -5544,6 +5637,70 @@ fn canRepeatBranch(block: int, header: int) -> bool {
     return true
 }
 
+// Statically cold blocks, without a profile: a block that ends in a panic,
+// and an if arm whose work is a call to a user function returning nothing
+// (`if bad { reportError(...) }`), plus straight-line code reached only
+// from cold blocks. A wrong guess costs a jump, never correctness.
+// ponytail: two structural rules; a profile (design 4.9) replaces them
+fn findColdBlocks() -> [bool] {
+    let blockCount = blockInstructions.len()
+    var cold: [bool] = []
+    for block in 0..blockCount {
+        let instructions = blockInstructions[block]
+        var isCold = false
+        if instructions.len() > 0 {
+            let terminator = irOpcodes[instructions[instructions.len() - 1]]
+            isCold = terminator == irPanicAt or terminator == irUnreachable
+        }
+        if not isCold and blockPredecessors[block].len() > 0 and blockIsConditionalArm(block) {
+            for instruction in instructions {
+                if irOpcodes[instruction] == irCall and callsVoidUserFunction(irImmediates[instruction]) { isCold = true }
+            }
+        }
+        if profileCounts.len() > 0 and block > 0 and blockProfileScales[block] < 0.001 { isCold = true }    // the profile never (or almost never) saw it
+        cold.push(isCold)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for block in 0..blockCount {
+            if cold[block] or block == 0 or blockPredecessors[block].len() == 0 { continue }
+            var allColdPredecessors = true
+            for predecessor in blockPredecessors[block] {
+                if not cold[predecessor] { allColdPredecessors = false }
+            }
+            if allColdPredecessors {
+                cold[block] = true
+                changed = true
+            }
+        }
+    }
+    return cold
+}
+
+// every predecessor ends in a two-way branch, looking through split-edge
+// jump blocks (`a or b` reaches its arm through two of them)
+fn blockIsConditionalArm(block: int) -> bool {
+    for predecessor in blockPredecessors[block] {
+        var branchBlock = predecessor
+        let edgeInstructions = blockInstructions[predecessor]
+        if edgeInstructions.len() == 1 and irOpcodes[edgeInstructions[0]] == irJump and blockPredecessors[predecessor].len() == 1 {
+            branchBlock = blockPredecessors[predecessor][0]
+        }
+        let instructions = blockInstructions[branchBlock]
+        if instructions.len() == 0 or blockSuccessors[branchBlock].len() != 2 { return false }
+        let terminator = irOpcodes[instructions[instructions.len() - 1]]
+        if terminator != irBranch and terminator != irBranchCompare { return false }
+    }
+    return true
+}
+
+fn callsVoidUserFunction(callee: int) -> bool {
+    if callee < 0 or callee == indirectStackCall { return false }
+    let functionDefinition = functionDefinitions[callee]
+    return typeKinds[functionDefinition.returnType] == kindVoid and not textStartsWith(functionDefinition.name, "runtime")
+}
+
 fn saveAreaOffset(index: int) -> int { return outgoingAreaSize + 8 * spillSlotCount + 8 * index }
 
 fn emitEpilogue() {
@@ -5559,6 +5716,74 @@ fn emitEpilogue() {
     emitOptimized("mov rsp, rbp")
     emitOptimized("pop rbp")
     emitOptimized("ret")
+}
+
+// Preserve entry guards before accumulator lowering and inlining rewrite them.
+var entryReturnGuards: [Node] = []
+var entryReturnEmitted = false
+
+// ponytail: leaf operands only; extend expression lowering if profiles justify it.
+fn entryReturnLeaf(expression: Node, parameterCount: int) -> bool {
+    if expression.typeIndex != typeIdInteger { return false }
+    if expression.nodeKind == nodeInteger { return true }
+    return expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindParameter and expression.slot >= 0 and expression.slot < parameterCount
+}
+
+// Snapshot only guards whose fast path cannot touch memory, call, or trap.
+// The register/stack calling convention is decided later and checked at emission.
+fn preserveEntryReturns() {
+    clearNodes(entryReturnGuards)
+    if not optimizerEnabled or debugEnabled or wasmTargetEnabled or macosTargetEnabled or linuxTargetEnabled { return }
+    for definition in functionDefinitions {
+        entryReturnGuards.push(makeNode(nodeNone, 0))
+        let parameterCount = definition.parameterTypes.len()
+        if definition.hasEnvironment or definition.typeParameters.len() != 0 or definition.returnType != typeIdInteger or parameterCount < 1 or parameterCount > 4 { continue }
+        var integerParameters = true
+        for parameterType in definition.parameterTypes {
+            if parameterType != typeIdInteger { integerParameters = false }
+        }
+        if not integerParameters or definition.body.children.len() == 0 { continue }
+        let guard = definition.body.children[0]
+        if guard.nodeKind != nodeIf or guard.children.len() != 3 { continue }
+        if guard.children[2].nodeKind != nodeNone or guard.children[1].children.len() != 1 { continue }
+        let condition = guard.children[0]
+        let result = guard.children[1].children[0]
+        if condition.nodeKind != nodeBinary or not compareOperator(condition.operator) or condition.children.len() != 2 { continue }
+        if result.nodeKind != nodeReturn or result.children.len() != 1 { continue }
+        if not entryReturnLeaf(condition.children[0], parameterCount) or not entryReturnLeaf(condition.children[1], parameterCount) or not entryReturnLeaf(result.children[0], parameterCount) { continue }
+        entryReturnGuards[entryReturnGuards.len() - 1] = cloneNode(guard)
+    }
+}
+
+// Read the incoming ABI location without disturbing any argument registers.
+fn entryReturnOperand(expression: Node, scratch: str, allowImmediate: bool) -> str {
+    if expression.nodeKind == nodeIdentifier {
+        let registers = ["rcx", "rdx", "r8", "r9"]
+        return registers[expression.slot]
+    }
+    if allowImmediate and fitsImmediate(expression.integerValue) { return "{expression.integerValue}" }
+    moveImmediate(scratch, expression.integerValue)
+    return scratch
+}
+
+// A failed guard falls through to the ordinary frame with all arguments intact.
+fn emitEntryReturn(registerCall: bool) {
+    entryReturnEmitted = false
+    if not regionIsFunction or not registerCall or regionFunctionIndex < 0 or regionFunctionIndex >= entryReturnGuards.len() { return }
+    let guard = entryReturnGuards[regionFunctionIndex]
+    if guard.nodeKind == nodeNone { return }
+    let condition = guard.children[0]
+    let left = entryReturnOperand(condition.children[0], "rax", false)
+    let right = entryReturnOperand(condition.children[1], "r10", true)
+    let slowLabel = allocateLabel()
+    emitOptimized("cmp {left}, {right}")
+    let suffix = invertConditionCode(conditionCodeFor(condition.operator))
+    emitOptimized("j{suffix} .L{slowLabel}")
+    let result = entryReturnOperand(guard.children[1].children[0].children[0], "rax", false)
+    if result != "rax" { emitOptimized("mov rax, {result}") }
+    emitOptimized("ret")
+    optimizerLines.push(".L{slowLabel}:\n")
+    entryReturnEmitted = true
 }
 
 // frame: [rsp] outgoing stack arguments | spill slots | callee-saved registers
@@ -5591,6 +5816,7 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     blockLabels = noLabels
     for block in 0..blockInstructions.len() { blockLabels.push(allocateLabel()) }
     optimizerLines.push(label + ":\n")
+    emitEntryReturn(registerCall)
     emitOptimized("push rbp")
     emitOptimized("mov rbp, rsp")
     emitOptimized("and rsp, -16")
@@ -5623,17 +5849,25 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
     var noFolds: [bool] = []
     foldedMemoryLoads = noFolds
     for value in 0..irOpcodes.len() { foldedMemoryLoads.push(false) }
-    // blocks that only jump on are never entered: every jump goes past them
+    // blocks that only jump on are never entered: every jump goes past them;
+    // cold blocks go after the hot ones, so the hot path falls through
+    let coldBlocks = findColdBlocks()
     var emittedOrder: [int] = []
+    var coldOrder: [int] = []
     for orderPosition in 0..blockOrder.len() {
         let block = blockOrder[orderPosition]
-        if orderPosition == 0 or jumpDestination(block) == block { emittedOrder.push(block) }
+        if orderPosition == 0 or jumpDestination(block) == block {
+            if orderPosition > 0 and coldBlocks[block] { coldOrder.push(block) } else { emittedOrder.push(block) }
+        }
     }
+    for block in coldOrder { emittedOrder.push(block) }
     blockOrder = emittedOrder
+    regionEstimatedCost = instructionLineCount(optimizerLines)       // the prologue, once per entry
     for orderPosition in 0..blockOrder.len() {
         currentOrderPosition = orderPosition
         let block = blockOrder[orderPosition]
         emittingBlock = block
+        let blockFirstLine = optimizerLines.len()
         for header in loopHeaders {
             if header == block { optimizerLines.push(".balign 16\n") }     // a loop's back edges land on a fetch-block boundary
         }
@@ -5648,8 +5882,11 @@ fn emitRegionCode(label: str, parameterCount: int, registerCall: bool) {
             if isTerminatorOpcode(irOpcodes[instruction]) { emitTerminator(block, instruction) }
             else { emitInstructionFor(instruction) }
         }
+        regionEstimatedCost += profiledWeight(block) * estimatedBlockCost(block, blockFirstLine)
     }
     emittingBlock = 0 - 1
+    regionHotInstructionCount = instructionLineCount(optimizerLines)
+    regionColdInstructionCount = instructionLineCount(optimizerColdLines)
     for line in optimizerColdLines { optimizerLines.push(line) }
     optimizerLines.push("\n")
 }
@@ -6285,14 +6522,10 @@ fn numberValues() {
             }
             let storeOpcode = irOpcodes[instruction]
             if storeOpcode == irStoreGlobal or storeOpcode == irFloatStoreGlobal {
-                // a later load of this global in the epoch reads what was stored
-                var loadOpcode = irLoadGlobal
-                var loadClass = classInteger
-                if storeOpcode == irFloatStoreGlobal {
-                    loadOpcode = irFloatLoadGlobal
-                    loadClass = classFloat
-                }
-                known["m{globalEpoch}:{loadOpcode}:{loadClass}:{irImmediates[instruction]}"] = resolveValue(irOperands[instruction][0])
+                // A value dominating a load does not prove that its store does,
+                // especially at a rotated loop exit. Invalidate without forwarding.
+                epochCount += 1
+                globalEpoch = epochCount
                 continue
             }
             // Raw word reads may reuse an earlier typed slot, preserving its
@@ -7017,6 +7250,198 @@ fn optimizerNote(text: str) {
     if optimizerReport { print("opt: " + text) }
 }
 
+// emitted lines are "  instruction", ".Llabel:" or a directive
+fn instructionLineCount(lines: [str]) -> int {
+    var count = 0
+    for line in lines {
+        if textStartsWith(line, "  ") { count += 1 }
+    }
+    return count
+}
+
+// "name, other x3": each name once, in first-seen order, with its count
+fn describeNameCounts(allNames: [str]) -> str {
+    var names: [str] = []
+    var counts: [int] = []
+    for name in allNames {
+        var found = 0 - 1
+        for i in 0..names.len() {
+            if names[i] == name { found = i }
+        }
+        if found < 0 {
+            names.push(name)
+            counts.push(1)
+        } else { counts[found] += 1 }
+    }
+    var text = ""
+    for i in 0..names.len() {
+        if i > 0 { text = text + ", " }
+        text = text + names[i]
+        if counts[i] > 1 { text = text + " x{counts[i]}" }
+    }
+    return text
+}
+
+// what one run of a block costs: its instructions, again for each stack
+// access (spills, locals in memory), and every call it still makes
+// ponytail: uniform instruction weights; fit per-opcode weights to battle results when they mislead
+fn estimatedBlockCost(block: int, firstLine: int) -> int {
+    var cost = 0
+    for i in firstLine..optimizerLines.len() {
+        let line = optimizerLines[i]
+        if not textStartsWith(line, "  ") { continue }
+        cost += 1
+        if lineTouchesStack(line) { cost += 1 }
+    }
+    for instruction in blockInstructions[block] {
+        if irOpcodes[instruction] == irCall { cost += estimatedCallCost(irImmediates[instruction]) }
+    }
+    return cost
+}
+
+// "[rsp" in an emitted line (a byte scan, as lineUsesR12)
+fn lineTouchesStack(text: str) -> bool {
+    var index = 0
+    while index + 3 < text.len() {
+        if text.byte(index) == 91 and text.byte(index + 1) == 114 and text.byte(index + 2) == 115 and text.byte(index + 3) == 112 { return true }
+        index += 1
+    }
+    return false
+}
+
+// a call's own overhead plus one run of its callee: measured once the callee
+// is optimized, guessed from its size before that
+let callOverheadCost = 8
+let unknownCalleeCost = 40
+// A callee in the region's own recursive SCC counts its body only: its
+// measured cost already includes the calls that lead back here.
+let maximumCalleeCost = 1000000000
+fn estimatedCallCost(callee: int) -> int {
+    if callee < 0 or callee == indirectStackCall { return callOverheadCost + unknownCalleeCost }
+    if regionFunctionIndex >= 0 and callee < callGraphSccs.len() and callGraphSccs[callee] == callGraphSccs[regionFunctionIndex] { return callOverheadCost + callGraphNodeSizes[callee] }
+    if functionEntryCosts.has(callee) { return callOverheadCost + min(functionEntryCosts[callee], maximumCalleeCost) }
+    if callee < callGraphStaticCosts.len() { return callOverheadCost + min(callGraphStaticCosts[callee], maximumCalleeCost) }
+    return callOverheadCost + unknownCalleeCost
+}
+
+// The compile an inline trial repeats: a whole function or one outlined loop.
+var trialIsLoop = false
+var trialFunctionIndex = 0
+var trialLoopStatement = makeNode(nodeNone, 0)
+var trialSlotCount = 0
+var trialParameterCount = 0
+var trialRegisterCall = false
+var trialLabel = ""
+var trialUsesPreInlineBody = false
+var trialDataStringMark = 0             // dataStringLiterals before the region's first compile
+
+// Each compile registers its own panic messages; one that is thrown away
+// must not leave them behind.
+fn startTrialRegion() { trialDataStringMark = dataStringLiterals.len() }
+
+fn recompileTrialRegion() -> bool {
+    while dataStringLiterals.len() > trialDataStringMark { let dropped = dataStringLiterals.pop() }
+    return compileTrialRegion()
+}
+
+fn compileTrialRegion() -> bool {
+    lowerPreInlineBody = trialUsesPreInlineBody
+    var compiled = false
+    if trialIsLoop { compiled = lowerLoopRegion(trialLoopStatement, trialSlotCount, trialParameterCount, trialRegisterCall) and compileRegion(trialLabel, 0, false) }
+    else { compiled = lowerFunctionRegion(trialFunctionIndex) and compileRegion(trialLabel, functionDefinitions[trialFunctionIndex].parameterNames.len(), functionIsRegisterCall(trialFunctionIndex)) }
+    lowerPreInlineBody = false
+    return compiled
+}
+
+// Larger limits, step by step, while a limit still refuses some call.
+// ponytail: whole-region limits, not per-site decisions (design 4.1); a step
+// is kept only if it cuts the estimated cost by 3% within the growth budget
+let inlineTrialNodeLimits = [120, 250, 500, 1000, 2000]
+let inlineTrialDepthLimits = [4, 6, 10, 16, 32]
+let inlineTrialMaximumInstructions = 6000
+
+// Called right after the region compiled with the default limits. Returns
+// whether the region compiled again, as the chosen attempt: every region
+// global (optimizerLines, spills, values) then describes that attempt.
+fn inSameScc(first: int, second: int) -> bool {
+    return first >= 0 and first < callGraphSccs.len() and second < callGraphSccs.len() and callGraphSccs[first] >= 0 and callGraphSccs[first] == callGraphSccs[second]
+}
+
+fn inRecursiveScc(functionIndex: int) -> bool {
+    return functionIndex < callGraphSccs.len() and callGraphSccs[functionIndex] >= 0 and callGraphSccRecursive[callGraphSccs[functionIndex]]
+}
+
+var regionExpansionCache: [str: bool] = [:]    // "region function/callee" -> the front end inlined callee there
+
+fn regionExpandsFunction(functionIndex: int) -> bool {
+    if regionFunctionIndex < 0 { return false }
+    let key = "{regionFunctionIndex}/{functionIndex}"
+    if not regionExpansionCache.has(key) { regionExpansionCache[key] = expandsFunctionNamed(functionDefinitions[regionFunctionIndex].body, functionDefinitions[functionIndex].name) }
+    return regionExpansionCache[key]
+}
+
+fn expandsFunctionNamed(node: Node, name: str) -> bool {
+    if node.nodeKind == nodeInline and node.name == name { return true }
+    for child in node.children {
+        if expandsFunctionNamed(child, name) { return true }
+    }
+    return false
+}
+
+// the front end left an inlined copy of a recursive function in here
+fn expandsRecursiveFunction(node: Node) -> bool {
+    if node.nodeKind == nodeInline and functionNameIndices.has(node.name) and inRecursiveScc(functionNameIndices[node.name]) { return true }
+    for child in node.children {
+        if expandsRecursiveFunction(child) { return true }
+    }
+    return false
+}
+
+fn runInlineTrials(regionName: str, ownerName: str) -> bool {
+    // ponytail: not the runtime, which is the same in every program; tune its limits offline
+    if not inlineRefusedByLimit or textStartsWith(ownerName, "runtime") { return true }
+    if profiledEntryCount(ownerName) == 0 { return true }       // the profile never entered it: keep the default inlining
+    let defaultHotInstructions = regionHotInstructionCount
+    var bestCost = regionEstimatedCost
+    var bestStep = 0 - 1
+    var trialLog = "{defaultInlineNodeLimit}/{defaultInlineDepthLimit} cost {regionEstimatedCost}"
+    for step in 0..inlineTrialNodeLimits.len() {
+        inlineNodeLimit = inlineTrialNodeLimits[step]
+        inlineDepthLimit = inlineTrialDepthLimits[step]
+        if not recompileTrialRegion() {
+            trialLog = trialLog + ", {inlineNodeLimit}/{inlineDepthLimit} failed"
+            break
+        }
+        trialLog = trialLog + ", {inlineNodeLimit}/{inlineDepthLimit} cost {regionEstimatedCost}"
+        let withinBudget = regionHotInstructionCount <= min(8 * defaultHotInstructions + 200, inlineTrialMaximumInstructions)
+        if withinBudget and regionEstimatedCost * 100 < bestCost * 97 {
+            bestCost = regionEstimatedCost
+            bestStep = step
+        }
+        if not inlineRefusedByLimit { break }
+    }
+    if bestStep >= 0 {
+        inlineNodeLimit = inlineTrialNodeLimits[bestStep]
+        inlineDepthLimit = inlineTrialDepthLimits[bestStep]
+        optimizerNote("inline trials for {regionName}: {trialLog}; kept {inlineNodeLimit}/{inlineDepthLimit}")
+    } else {
+        inlineNodeLimit = defaultInlineNodeLimit
+        inlineDepthLimit = defaultInlineDepthLimit
+        optimizerNote("inline trials for {regionName}: {trialLog}; kept the defaults")
+    }
+    let compiled = recompileTrialRegion()
+    inlineNodeLimit = defaultInlineNodeLimit
+    inlineDepthLimit = defaultInlineDepthLimit
+    return compiled
+}
+
+// the bodies the region inlined
+fn describeRegionInlines() -> str {
+    var names: [str] = []
+    for functionIndex in regionInlinedFunctions { names.push(functionDefinitions[functionIndex].name) }
+    return describeNameCounts(names)
+}
+
 // whole function: replaces generateFunctionBody when every statement lowers
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
@@ -7029,12 +7454,26 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
     inliningEnabled = true
     var compiled = false
     let hasBigPreInlineBody = functionIndex < preInlineBodies.len() and preInlineBodies[functionIndex].nodeKind != nodeNone
-    if hasBigPreInlineBody {                  // the optimizer's own inliner first: it budgets what it expands
-        lowerPreInlineBody = true
-        compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex))
-        lowerPreInlineBody = false
+    trialIsLoop = false
+    trialFunctionIndex = functionIndex
+    trialLabel = label
+    startTrialRegion()
+    // The optimizer's own inliner first: it budgets what it expands, and for
+    // code outside the runtime it measures larger budgets (runInlineTrials)
+    // instead of keeping what the front end expanded unmeasured.
+    // Recursion keeps the front end's expansion: in a recursive function (fib
+    // unrolls through it; the SSA inliner never inlines a region into itself)
+    // and in a caller the front end unrolled one into (run in inl_recursive
+    // takes treeWalk 15 deep, where the SSA inliner stops after one level).
+    let isRecursive = inRecursiveScc(functionIndex) or expandsRecursiveFunction(functionDefinition.body)
+    if hasBigPreInlineBody or (hasPreInlineBody(functionIndex) and not textStartsWith(functionDefinition.name, "runtime") and not isRecursive) {
+        trialUsesPreInlineBody = true
+        compiled = compileTrialRegion() and runInlineTrials("function {functionDefinition.name}", functionDefinition.name)
     }
-    if not compiled { compiled = lowerFunctionRegion(functionIndex) and compileRegion(label, functionDefinition.parameterNames.len(), functionIsRegisterCall(functionIndex)) }
+    if not compiled {
+        trialUsesPreInlineBody = false
+        compiled = compileTrialRegion() and runInlineTrials("function {functionDefinition.name}", functionDefinition.name)
+    }
     if not compiled and inlinedCallCount > 0 {
         optimizerNote("function {functionDefinition.name}: retry without inlining ({optimizerBailReason})")
         inliningEnabled = false
@@ -7058,7 +7497,11 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
         optimizerNote("function {functionDefinition.name}: baseline ({optimizerBailReason})")
         return false
     }
-    optimizerNote("function {functionDefinition.name}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values")
+    if entryReturnEmitted { optimizerNote("entry return " + functionDefinition.name) }
+    if callGraphReport { recordCompiledFunction(functionIndex) }
+    functionEntryCosts[functionIndex] = regionEstimatedCost
+    optimizerNote("function {functionDefinition.name}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values, {regionHotInstructionCount}+{regionColdInstructionCount} instructions")
+    if optimizerReport and regionInlinedFunctions.len() > 0 { optimizerNote("inlined into {functionDefinition.name}: {describeRegionInlines()}") }
     for line in optimizerLines { assemblyLines.push(line) }
     return true
 }
@@ -7146,14 +7589,23 @@ fn outlineLoops(statements: [Node], slotCount: int, parameterCount: int, registe
         if isLoopStatement(statement) and not containsBaselineVectorCandidate(statement) {
             let regionLabel = "zopt_region{optimizedRegionCount}"
             inliningEnabled = true
-            var compiled = lowerLoopRegion(statement, slotCount, parameterCount, registerCall) and compileRegion(regionLabel, 0, false)
+            trialIsLoop = true
+            trialLoopStatement = statement
+            trialSlotCount = slotCount
+            trialParameterCount = parameterCount
+            trialRegisterCall = registerCall
+            trialLabel = regionLabel
+            trialUsesPreInlineBody = false
+            startTrialRegion()
+            var compiled = compileTrialRegion() and runInlineTrials("loop at {functionName}:{statement.line}", functionName)
             if not compiled and inlinedCallCount > 0 {
                 inliningEnabled = false
                 compiled = lowerLoopRegion(statement, slotCount, parameterCount, registerCall) and compileRegion(regionLabel, 0, false)
                 inliningEnabled = true
             }
             if compiled {
-                optimizerNote("loop at {functionName}:{statement.line}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values")
+                optimizerNote("loop at {functionName}:{statement.line}: optimized, {spillSlotCount} spills, {irOpcodes.len()} values, {regionHotInstructionCount}+{regionColdInstructionCount} instructions")
+                if optimizerReport and regionInlinedFunctions.len() > 0 { optimizerNote("inlined into loop at {functionName}:{statement.line}: {describeRegionInlines()}") }
                 for line in optimizerLines { pendingRegionLines.push(line) }
                 var original = makeNode(statement.nodeKind, statement.line)
                 original.operator = statement.operator
@@ -7199,4 +7651,337 @@ fn prepareOptimizedLoops(label: str, statements: [Node], slotCount: int, paramet
     for i in 0..slotCount { excludedLocalSlots.push(false) }
     for i in 0..parameterCount { excludedParameterSlots.push(false) }
     outlineLoops(statements, slotCount, parameterCount, registerCall, label)
+}
+
+// ================= whole-program call graph =================
+// --callgraph-report (-O2): phase P1 of docs/inlining-design.md, a report
+// only; nothing here changes code generation. One node per function plus a
+// last one for the top-level statements (zephyrMain). Sites come from the
+// bodies as written, before front-end inlining. Calls the lowering adds on
+// its own (allocation, reference counting) are not in the graph.
+let callSiteDirect = 0
+let callSiteRuntime = 1        // a method the runtime implements, called by name
+let callSiteInterface = 2      // one implementor an interface dispatch may reach
+let callSiteClosure = 3        // a closure literal made here: its body may run here
+let callSiteIndirect = 4       // through a function value, target unknown
+let callSiteKindNames = ["direct", "runtime", "interface", "closure", "indirect"]
+// static frequency estimate: runs per entry of the enclosing function
+let loopFrequencyFactor = 8.0          // a loop body, as loopWeight
+let branchFrequencyFactor = 0.5        // either arm of an if, the right side of and/or
+let coldFrequencyFactor = 0.001        // an arm that panics
+let recursionFrequencyFactor = 16.0    // every member of a recursive SCC, per entry into it
+let maximumFrequency = 1000000000000000.0
+
+var callSiteCallers: [int] = []
+var callSiteCallees: [int] = []            // -1: unknown target
+var callSiteKinds: [int] = []
+var callSiteWeights: [float] = []          // runs per entry of the caller
+var callSiteLiteralArguments: [int] = []   // bit i set: argument i is a literal
+var callGraphNodeSites: [[int]] = []       // node -> the call sites in its body
+var callGraphFrequencies: [float] = []     // node -> estimated entries per program run
+var callGraphCompiledValues: [int] = []    // node -> optimized IR values, -1 = not optimized
+var callGraphCompiledSpills: [int] = []
+var callGraphHotInstructions: [int] = []
+var callGraphColdInstructions: [int] = []
+var tarjanIndices: [int] = []
+var tarjanLowLinks: [int] = []
+var tarjanOnStack: [bool] = []
+var tarjanStack: [int] = []
+var tarjanCounter = 0
+
+fn cappedFrequency(frequency: float) -> float {
+    if frequency > maximumFrequency { return maximumFrequency }
+    return frequency
+}
+
+fn callGraphNodeName(node: int) -> str {
+    if node == functionDefinitions.len() { return "zephyrMain" }
+    return functionDefinitions[node].name
+}
+
+fn addCallSite(caller: int, callee: int, kind: int, weight: float, literalArguments: int) {
+    callSiteCallers.push(caller)
+    callSiteCallees.push(callee)
+    callSiteKinds.push(kind)
+    callSiteWeights.push(cappedFrequency(weight))
+    callSiteLiteralArguments.push(literalArguments)
+    callGraphNodeSites[caller].push(callSiteCallers.len() - 1)
+}
+
+fn isLiteralArgument(argument: Node) -> bool {
+    let kind = argument.nodeKind
+    return kind == nodeInteger or kind == nodeFloat or kind == nodeBoolean or kind == nodeStringLiteral
+}
+
+// arguments are children 1.., after the callee; a UFCS receiver is argument 0
+fn literalArgumentMask(call: Node) -> int {
+    var mask = 0
+    var position = 0
+    if call.operator == 1 {
+        if isLiteralArgument(call.children[0].children[0]) { mask = 1 }
+        position = 1
+    }
+    for i in 1..call.children.len() {
+        if position < 62 and isLiteralArgument(call.children[i]) { mask = mask | (1 << position) }
+        position += 1
+    }
+    return mask
+}
+
+// a block that panics or fails on its own straight-line path is cold
+fn blockPanics(block: Node) -> bool {
+    for statement in block.children {
+        var expression = statement
+        if statement.nodeKind == nodeExpressionStatement and statement.children.len() > 0 { expression = statement.children[0] }
+        if expression.nodeKind != nodeCall { continue }
+        if expression.auxiliary == callKindPanic { return true }
+        if expression.auxiliary == callKindUser and functionDefinitions[expression.referenceIndex].name == "runtimeFail" { return true }
+    }
+    return false
+}
+
+fn addCallSitesOf(call: Node, caller: int, weight: float) {
+    let callKind = call.auxiliary
+    if callKind == callKindUser {
+        addCallSite(caller, call.referenceIndex, callSiteDirect, weight, literalArgumentMask(call))
+    } else if callKind == callKindRuntimeCall {
+        let callee = findFunction(call.name)
+        if callee >= 0 { addCallSite(caller, callee, callSiteRuntime, weight, 0) }
+    } else if callKind == callKindIndirect {
+        addCallSite(caller, 0 - 1, callSiteIndirect, weight, literalArgumentMask(call))
+    } else if callKind == callKindInterfaceDispatch {
+        // the implementors guarded devirtualization would test (lowerGuardedDispatch)
+        let interfaceIndex = typeDefinitionIds[call.children[0].children[0].typeIndex]
+        let methodName = interfaceDefinitions[interfaceIndex].methodNames[call.slot]
+        var implementors: [int] = []
+        for table in 0..dispatchStructIndices.len() {
+            if dispatchInterfaceIndices[table] != interfaceIndex { continue }
+            let method = findFunction(structDefinitions[dispatchStructIndices[table]].name + "." + methodName)
+            if method >= 0 { implementors.push(method) }
+        }
+        if implementors.len() == 0 { addCallSite(caller, 0 - 1, callSiteIndirect, weight, literalArgumentMask(call)) }
+        for method in implementors { addCallSite(caller, method, callSiteInterface, weight / (implementors.len() as float), literalArgumentMask(call)) }
+    }
+}
+
+fn collectCallSites(node: Node, caller: int, weight: float) {
+    let kind = node.nodeKind
+    if kind == nodeFunctionLiteral {
+        addCallSite(caller, node.referenceIndex, callSiteClosure, weight, 0)
+        for i in 3..node.children.len() { collectCallSites(node.children[i], caller, weight) }     // only the captures run here
+        return
+    }
+    if (kind == nodeIf or kind == nodeIfExpression) and node.children.len() == 3 {
+        collectCallSites(node.children[0], caller, weight)
+        for i in 1..3 {
+            var armWeight = weight * branchFrequencyFactor
+            if blockPanics(node.children[i]) { armWeight = weight * coldFrequencyFactor }
+            collectCallSites(node.children[i], caller, armWeight)
+        }
+        return
+    }
+    if kind == nodeBinary and (node.operator == tokenAnd or node.operator == tokenOr) {
+        collectCallSites(node.children[0], caller, weight)
+        collectCallSites(node.children[1], caller, weight * branchFrequencyFactor)
+        return
+    }
+    if kind == nodeCall { addCallSitesOf(node, caller, weight) }
+    var childWeight = weight
+    if kind == nodeWhile or kind == nodeRangeLoop or kind == nodeIterableLoop { childWeight = cappedFrequency(weight * loopFrequencyFactor) }
+    for child in node.children { collectCallSites(child, caller, childWeight) }
+}
+
+// Tarjan: an SCC is numbered once everything it calls is numbered
+fn visitCallGraphNode(node: int) {
+    tarjanIndices[node] = tarjanCounter
+    tarjanLowLinks[node] = tarjanCounter
+    tarjanCounter += 1
+    tarjanStack.push(node)
+    tarjanOnStack[node] = true
+    for site in callGraphNodeSites[node] {
+        let callee = callSiteCallees[site]
+        if callee < 0 { continue }
+        if tarjanIndices[callee] < 0 {
+            visitCallGraphNode(callee)
+            tarjanLowLinks[node] = min(tarjanLowLinks[node], tarjanLowLinks[callee])
+        } else if tarjanOnStack[callee] { tarjanLowLinks[node] = min(tarjanLowLinks[node], tarjanIndices[callee]) }
+    }
+    if tarjanLowLinks[node] != tarjanIndices[node] { return }
+    let sccNumber = callGraphSccRecursive.len()
+    var memberCount = 0
+    while true {
+        let member = tarjanStack.pop()
+        tarjanOnStack[member] = false
+        callGraphSccs[member] = sccNumber
+        memberCount += 1
+        if member == node { break }
+    }
+    var callsItself = false
+    for site in callGraphNodeSites[node] {
+        if callSiteCallees[site] == node { callsItself = true }
+    }
+    callGraphSccRecursive.push(memberCount > 1 or callsItself)
+}
+
+// callers' SCCs before callees': the highest SCC number first
+fn propagateCallGraphFrequencies(root: int) {
+    var members: [[int]] = []
+    for scc in 0..callGraphSccRecursive.len() {
+        var noMembers: [int] = []
+        members.push(noMembers)
+    }
+    for node in 0..callGraphSccs.len() { members[callGraphSccs[node]].push(node) }
+    callGraphFrequencies[root] = 1.0
+    var scc = callGraphSccRecursive.len()
+    while scc > 0 {
+        scc -= 1
+        if callGraphSccRecursive[scc] {
+            var entries = 0.0
+            for member in members[scc] { entries += callGraphFrequencies[member] }
+            for member in members[scc] { callGraphFrequencies[member] = cappedFrequency(entries * recursionFrequencyFactor) }
+        }
+        for member in members[scc] {
+            for site in callGraphNodeSites[member] {
+                let callee = callSiteCallees[site]
+                if callee < 0 or callGraphSccs[callee] == scc { continue }
+                callGraphFrequencies[callee] = cappedFrequency(callGraphFrequencies[callee] + callGraphFrequencies[member] * callSiteWeights[site])
+            }
+        }
+    }
+}
+
+fn buildCallGraph(program: Node) {
+    let nodeCount = functionDefinitions.len() + 1
+    for node in 0..nodeCount {
+        var noSites: [int] = []
+        callGraphNodeSites.push(noSites)
+        callGraphNodeSizes.push(0)
+        callGraphSccs.push(0 - 1)
+        callGraphFrequencies.push(0.0)
+        callGraphCompiledValues.push(0 - 1)
+        callGraphCompiledSpills.push(0)
+        callGraphHotInstructions.push(0)
+        callGraphColdInstructions.push(0)
+        tarjanIndices.push(0 - 1)
+        tarjanLowLinks.push(0)
+        tarjanOnStack.push(false)
+    }
+    for functionIndex in 0..functionDefinitions.len() {
+        if functionDefinitions[functionIndex].typeParameters.len() > 0 { continue }     // a template: its instantiations are the nodes
+        let body = preInlineBody(functionIndex)
+        callGraphNodeSizes[functionIndex] = countNodes(body)
+        collectCallSites(body, functionIndex, 1.0)
+    }
+    let mainNode = nodeCount - 1
+    for topLevelNode in program.children {
+        let kind = topLevelNode.nodeKind
+        if kind == nodeFunction or kind == nodeStructDefinition or kind == nodeEnumDefinition or kind == nodeInterface { continue }
+        callGraphNodeSizes[mainNode] += countNodes(topLevelNode)
+        collectCallSites(topLevelNode, mainNode, 1.0)
+    }
+    for node in 0..nodeCount {
+        if tarjanIndices[node] < 0 { visitCallGraphNode(node) }
+    }
+    propagateCallGraphFrequencies(mainNode)
+    computeCallGraphStaticCosts()
+}
+
+// Bottom-up over SCCs: one AST node is about one instruction (measured on the
+// battle workloads), and every site adds its weight times a call of its callee.
+// Inside an SCC a callee counts its own body only.
+fn computeCallGraphStaticCosts() {
+    for node in 0..callGraphNodeSites.len() { callGraphStaticCosts.push(callGraphNodeSizes[node]) }
+    for scc in 0..callGraphSccRecursive.len() {
+        for node in 0..callGraphNodeSites.len() {
+            if callGraphSccs[node] != scc { continue }
+            var cost = callGraphNodeSizes[node] as float
+            for site in callGraphNodeSites[node] {
+                let callee = callSiteCallees[site]
+                var calleeCost = unknownCalleeCost
+                if callee >= 0 and callGraphSccs[callee] == scc { calleeCost = callGraphNodeSizes[callee] }
+                else if callee >= 0 { calleeCost = callGraphStaticCosts[callee] }
+                cost = cappedFrequency(cost + callSiteWeights[site] * ((callOverheadCost + calleeCost) as float))
+            }
+            if cost > 1000000000.0 { cost = 1000000000.0 }
+            callGraphStaticCosts[node] = cost as int
+        }
+    }
+}
+
+fn recordCompiledFunction(functionIndex: int) {
+    callGraphCompiledValues[functionIndex] = irOpcodes.len()
+    callGraphCompiledSpills[functionIndex] = spillSlotCount
+    callGraphHotInstructions[functionIndex] = regionHotInstructionCount
+    callGraphColdInstructions[functionIndex] = regionColdInstructionCount
+}
+
+// whole numbers from 100 up, three decimals below
+fn formatFrequency(frequency: float) -> str {
+    if frequency >= 100.0 { return "{frequency as int}" }
+    let thousandths = (frequency * 1000.0) as int
+    let fraction = thousandths % 1000
+    var padding = ""
+    if fraction < 100 { padding = "0" }
+    if fraction < 10 { padding = "00" }
+    return "{thousandths / 1000}.{padding}{fraction}"
+}
+
+fn literalArgumentList(mask: int) -> str {
+    var text = ""
+    for position in 0..62 {
+        if (mask >> position) & 1 == 0 { continue }
+        if text != "" { text = text + "," }
+        text = text + "{position}"
+    }
+    return text
+}
+
+// hottest first; a function nothing reaches is counted, not listed
+fn reportCallGraph() {
+    let nodeCount = callGraphNodeSites.len()
+    var kindCounts = [0, 0, 0, 0, 0]
+    for kind in callSiteKinds { kindCounts[kind] += 1 }
+    var recursiveCount = 0
+    for recursive in callGraphSccRecursive {
+        if recursive { recursiveCount += 1 }
+    }
+    print("callgraph: {nodeCount} nodes, {callSiteKinds.len()} call sites ({kindCounts[0]} direct, {kindCounts[1]} runtime, {kindCounts[2]} interface, {kindCounts[3]} closure, {kindCounts[4]} indirect), {recursiveCount} recursive SCCs")
+    for scc in 0..callGraphSccRecursive.len() {
+        if not callGraphSccRecursive[scc] { continue }
+        var names: [str] = []
+        for node in 0..nodeCount {
+            if callGraphSccs[node] == scc { names.push(callGraphNodeName(node)) }
+        }
+        print("callgraph: recursive SCC: {describeNameCounts(names)}")
+    }
+    var listed: [bool] = []
+    var unreachedCount = 0
+    for node in 0..nodeCount {
+        let unreached = callGraphFrequencies[node] <= 0.0
+        listed.push(unreached)
+        if unreached and (node == nodeCount - 1 or functionDefinitions[node].typeParameters.len() == 0) { unreachedCount += 1 }
+    }
+    while true {
+        var hottest = 0 - 1
+        for node in 0..nodeCount {
+            if not listed[node] and (hottest < 0 or callGraphFrequencies[node] > callGraphFrequencies[hottest]) { hottest = node }
+        }
+        if hottest < 0 { break }
+        listed[hottest] = true
+        var compiled = "not optimized"
+        if callGraphCompiledValues[hottest] >= 0 {
+            compiled = "optimized: {callGraphCompiledValues[hottest]} values, {callGraphCompiledSpills[hottest]} spills, {callGraphHotInstructions[hottest]}+{callGraphColdInstructions[hottest]} instructions"
+        }
+        var recursion = ""
+        if callGraphSccRecursive[callGraphSccs[hottest]] { recursion = ", recursive" }
+        print("callgraph: {callGraphNodeName(hottest)}: frequency {formatFrequency(callGraphFrequencies[hottest])}, {callGraphNodeSizes[hottest]} nodes{recursion}, {compiled}")
+        for site in callGraphNodeSites[hottest] {
+            var callee = "?"
+            if callSiteCallees[site] >= 0 { callee = callGraphNodeName(callSiteCallees[site]) }
+            var literals = ""
+            if callSiteLiteralArguments[site] != 0 { literals = ", literal arguments {literalArgumentList(callSiteLiteralArguments[site])}" }
+            print("callgraph:   -> {callee} ({callSiteKindNames[callSiteKinds[site]]}) x{formatFrequency(callSiteWeights[site])}{literals}")
+        }
+    }
+    print("callgraph: {unreachedCount} functions never reached from zephyrMain (dead, or called only by code the lowering adds)")
 }

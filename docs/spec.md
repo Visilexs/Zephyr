@@ -546,6 +546,19 @@ panic (§6) on any other malformed input.
 
 ### 3.3 Operators
 
+Expressions evaluate left to right: binary operands, call arguments, literal
+elements and fields (including map keys before their values), and the container
+before the index in `xs[i]`. Each read happens at its position in that order;
+`g + f()` reads `g` before calling `f`, even if `f` changes `g`.
+
+Assignment to a variable evaluates the right-hand side before storing it.
+Field and list assignments are an exception to container-first evaluation:
+`p.f = e` evaluates `e`, then `p`; `xs[i] = e` evaluates `e`, then `xs`, then
+`i`. This also applies to packed lists. Map assignment evaluates the map, key,
+then value. Compound assignment follows its desugaring `x = x op e`, so the
+read of `x` precedes `e`; a field or indexed target is evaluated again for the
+subsequent store.
+
 - `+ - * / %`: numeric. Two ints yield int (`/` truncates toward zero; `/`
   and `%` by zero panic). Any float operand yields float (`%` is not defined
   for floats). `+` on two strs concatenates.

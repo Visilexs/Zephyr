@@ -1,0 +1,80 @@
+// Inlining benchmark (repeated call sites): mix(value, salt) is a ~40-line
+// hash with a 4-round inner loop and salt-dependent branches, called from 12
+// sites in the hot loop with different literal salts. Inlining all 12 grows
+// the code 12x but lets each copy fold its salt; the trade-off is the test.
+// Usage: inl_repeat [rounds]   (default 1000)
+
+const hashMask = 4294967295
+
+fn mix(value: int, salt: int) -> int {
+    var state = (value ^ (salt * 2654435761)) & hashMask
+    let rotation = (salt & 15) + 1
+    let multiplier = (salt * 2 + 1) & 65535
+    for round in 0..4 {
+        state = (state * multiplier + round) & hashMask
+        state = ((state << rotation) | (state >> (32 - rotation))) & hashMask
+        if (salt & 1) != 0 {
+            state = state ^ (state >> 15)
+        } else {
+            state = (state + (state >> 11)) & hashMask
+        }
+        if (salt & 2) != 0 {
+            state = (state + salt) & hashMask
+        }
+    }
+    let kind = salt % 3
+    if kind == 0 {
+        state = state ^ (state >> 16)
+    } else if kind == 1 {
+        state = (state * 31 + 7) & hashMask
+    } else {
+        state = (state + (state << 3)) & hashMask
+    }
+    if salt > 100 {
+        state = state ^ (salt << 4)
+    } else {
+        state = state + salt
+    }
+    if (state & 1) != 0 {
+        state = state >> 1
+    }
+    return state & hashMask
+}
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const dataSize = 4096
+
+fn run(data: [int], rounds: int) -> int {
+    var total = 0
+    for round in 0..rounds {
+        for i in 0..dataSize {
+            let value = data[i] + round
+            var hash = mix(value, 1)
+            hash += mix(value, 2)
+            hash += mix(value, 7)
+            hash += mix(value, 12)
+            hash ^= mix(value, 33)
+            hash += mix(value, 64)
+            hash += mix(value, 101)
+            hash ^= mix(value, 150)
+            hash += mix(value, 255)
+            hash += mix(value, 1000)
+            hash ^= mix(value, 4097)
+            hash += mix(value, 65537)
+            total = total * 31 + hash
+        }
+    }
+    return total
+}
+
+var rounds = 1000
+if args().len() > 1 { rounds = args()[1] as int }
+var data: [int] = []
+for i in 0..dataSize { data.push(nextRandom()) }
+print(run(data, rounds))

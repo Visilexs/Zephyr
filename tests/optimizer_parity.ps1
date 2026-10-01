@@ -16,8 +16,16 @@ foreach ($file in Get-ChildItem tests\fixtures\basics, tests\fixtures\threads, t
 $programs += , @((Resolve-Path "tests\regression\byteComparisonBranches.zeph").Path, "")
 $programs += , @((Resolve-Path "tests\regression\typedRawSlotReuse.zeph").Path, "")
 $programs += , @((Resolve-Path "tests\regression\scaledAddressValues.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\evaluation_order.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\global_store_exit.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\accumulator_recursion.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\tail_recursion.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\entry_return.zeph").Path, "")
 $workloadArguments = @{ fib = "27"; matmul = "120"; mandel = "120"; sort = "20000"; strings = "20000"; hashmap = "20000"; cube = "200"; pi = "500"; liquid = "40";
-                     shapes = "3000"; closures = "2000"; wordfreq = "30000"; nbody = "10"; lexer = "10000"; vectors = "20" }
+                     shapes = "3000"; closures = "2000"; wordfreq = "30000"; nbody = "10"; lexer = "10000"; vectors = "20";
+                     dispatch = "1000"; records = "1000"; strbuild = "1000"; bintrees = "8";
+                     inl_chain = "180"; inl_tiny = "350"; inl_bigcold = "1300"; inl_branchy = "520"; inl_repeat = "52"; inl_recursive = "30";
+                     inl_mutual = "2"; inl_indirect = "220"; inl_constchain = "480"; inl_loopcalls = "180"; inl_hotcold = "870"; inl_superpath = "75"; inl_specialize = "40" }
 foreach ($name in $workloadArguments.Keys) { $programs += , @((Resolve-Path "tests\fixtures\workloads\$name.zeph").Path, $workloadArguments[$name]) }
 
 $passed = 0; $failed = 0; $skipped = 0

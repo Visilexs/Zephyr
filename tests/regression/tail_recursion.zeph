@@ -1,0 +1,79 @@
+// -O2 turns self tail calls into loops (tailRecursionPass); every shape here
+// must print what the baseline prints.
+
+struct Counter { hits: int }
+
+// swapped parameters need temporaries: b gets the old a
+fn gcd(a: int, b: int) -> int {
+    if b == 0 { return a }
+    return gcd(b, a % b)
+}
+
+// a reference parameter passed through, a scalar one changed, effects in order
+fn countDown(counter: Counter, steps: int) -> int {
+    if steps == 0 { return counter.hits }
+    counter.hits += steps
+    return countDown(counter, steps - 1)
+}
+
+// float parameters, else-if chain with a site in each arm
+fn approach(value: float, target: float, rounds: int) -> float {
+    if rounds == 0 { return value }
+    else if value < target { return approach(value + (target - value) / 2.0, target, rounds - 1) }
+    else { return approach(value - 1.0, target, rounds - 1) }
+}
+
+// a multiplying accumulator, call on the left with a pure right operand
+fn power(base: int, exponent: int) -> int {
+    if exponent == 0 { return 1 }
+    return power(base, exponent - 1) * base
+}
+
+// accumulator with a return inside an inner loop: it must answer acc + value
+fn sumUntilNegative(values: [int], index: int) -> int {
+    if index >= values.len() { return 0 }
+    for i in index..values.len() {
+        if values[i] < 0 { return 1000 + i }
+        if values[i] == 7 { return sumUntilNegative(values, i + 1) + 70 }
+    }
+    return values[index] + sumUntilNegative(values, index + 1)
+}
+
+// xor accumulator, the call on the right after a call that has effects
+fn mixAll(counter: Counter, value: int) -> int {
+    if value <= 0 { return counter.hits }
+    return bump(counter, value) ^ mixAll(counter, value - 3)
+}
+
+fn bump(counter: Counter, value: int) -> int {
+    counter.hits += value
+    return counter.hits * 31
+}
+
+// a void function falling off the end: the loop must not run again
+fn note(counter: Counter, value: int) {
+    if value > 100 { return }
+    counter.hits += value
+}
+
+fn walk(counter: Counter, depth: int) -> int {
+    note(counter, depth)
+    if depth == 0 { return counter.hits }
+    return walk(counter, depth - 1)
+}
+
+print(gcd(1071, 462))
+print(gcd(17, 5))
+let counter = Counter{hits: 0}
+print(countDown(counter, 1000))
+print(approach(0.0, 10.0, 30))
+print(power(3, 13))
+print(sumUntilNegative([1, 2, 3, 4, 5], 0))
+print(sumUntilNegative([1, 2, 7, 4, -5, 6], 0))
+print(sumUntilNegative([3, 7, 7, 1], 0))
+let mixer = Counter{hits: 5}
+print(mixAll(mixer, 40))
+print(mixer.hits)
+let walker = Counter{hits: 0}
+print(walk(walker, 50))
+print(gcd(1000000007, 998244353))

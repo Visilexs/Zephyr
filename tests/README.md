@@ -34,6 +34,44 @@ are `crosscheck-linux.ps1` (x86-64 WSL) and `crosscheck-wasm.ps1` (Node.js).
 The historical C-bootstrap checks are `bootstrap.ps1` and `nocc.ps1`; they
 require rebuilding the C seed with `bootstrap/build.ps1` first.
 
+Windows correctness checks after `scripts/selfbuild.ps1`:
+
+```powershell
+python scripts/embed-gen.py --check
+python tests/argument_tests.py --compiler .\zc.exe
+python tests/accumulator_recursion.py --compiler .\zc.exe
+python tests/entry_return.py --compiler .\zc.exe
+python tests/spill_codegen.py --compiler .\zc.exe
+python tests/differential.py --cases 100 --seed 20261001
+python tests/differential.py --pure --cases 100 --seed 20261001
+```
+
+The accumulator check verifies integer recursion results, wrapping overflow,
+side-effect exclusions, and exact optimization reports at baseline, `-O2`, and
+`-O2 -g`. The experimental pass applies only to the Windows target.
+
+The entry-return check verifies all six signed comparisons, extreme integers,
+argument preservation, and excluded guard/calling-convention forms. It inspects
+assembly and forces real calls to check fast returns before frame setup.
+
+The spill-codegen check generates a bounded register-pressure program and checks
+baseline/optimized results against a wrapping-integer model. Assembly assertions
+cover spill updates, value/branch comparisons, and encodable operand fallbacks.
+
+The argument checks include empty arguments, whitespace, and arguments beyond
+the old 2,048-byte limit. The seeded fuzzer compares baseline and `-O2` with an
+independent model for bounded integer expressions and known results for floats,
+ownership, closures, interfaces, maps, generics, and string building. Pure mode
+excludes calls that mutate shared state. Failures are reduced by removing
+independent source units and saved with expected output under `repro/`; the
+printed seed reproduces the original program. This is bounded coverage, not
+an interpreter for the full language.
+
+`regression/evaluation_order.zeph` and `regression/global_store_exit.zeph` run
+in both the core and optimizer parity suites. Parity includes all 19 workloads
+at small test sizes; it does not measure their performance. Self-build compares
+generations 2 and 3, allowing the checked-in seed to predate its source.
+
 `fixtures/basics/`, `fixtures/threads/`, and `fixtures/wasm/` hold the source
 programs used by those suites. `fixtures/workloads/` contains the Zephyr-only
 workloads used by the parity tests. The native performance harness lives under

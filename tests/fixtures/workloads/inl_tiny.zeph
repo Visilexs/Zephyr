@@ -1,0 +1,98 @@
+// Inlining benchmark (tiny helpers): particles bouncing in a box, every field
+// read and write going through one-line getters and setters, plus minInt,
+// maxInt, clampInt, absInt, isInside and lerpInt. Inlined, the helpers vanish
+// into plain field accesses; called, each costs more than its body.
+// Usage: inl_tiny [steps]   (default 1000)
+
+struct Particle { x: int, y: int, velocityX: int, velocityY: int }
+
+fn getX(particle: Particle) -> int { return particle.x }
+fn getY(particle: Particle) -> int { return particle.y }
+fn getVelocityX(particle: Particle) -> int { return particle.velocityX }
+fn getVelocityY(particle: Particle) -> int { return particle.velocityY }
+fn setX(particle: Particle, value: int) -> int {
+    particle.x = value
+    return value
+}
+fn setY(particle: Particle, value: int) -> int {
+    particle.y = value
+    return value
+}
+fn setVelocityX(particle: Particle, value: int) -> int {
+    particle.velocityX = value
+    return value
+}
+fn setVelocityY(particle: Particle, value: int) -> int {
+    particle.velocityY = value
+    return value
+}
+fn minInt(a: int, b: int) -> int { return if a < b { a } else { b } }
+fn maxInt(a: int, b: int) -> int { return if a > b { a } else { b } }
+fn clampInt(value: int, low: int, high: int) -> int { return minInt(maxInt(value, low), high) }
+fn absInt(value: int) -> int { return if value < 0 { -value } else { value } }
+fn isInside(x: int, y: int, size: int) -> bool { return x >= 0 and x < size and y >= 0 and y < size }
+fn lerpInt(from: int, to: int, weight: int) -> int { return from + (to - from) * weight / 256 }
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const particleCount = 4096
+const worldSize = 1048576
+const maxSpeed = 4000
+
+fn run(particles: [Particle], targets: [int], steps: int) -> int {
+    var spread = 0
+    for step in 0..steps {
+        let targetX = targets[step & 1023]
+        let targetY = targets[(step + 512) & 1023]
+        var lowest = worldSize
+        var highest = 0
+        for particle in particles {
+            var nextX = getX(particle) + getVelocityX(particle)
+            var nextY = getY(particle) + getVelocityY(particle)
+            if not isInside(nextX, nextY, worldSize) {
+                setVelocityX(particle, -getVelocityX(particle))
+                setVelocityY(particle, -getVelocityY(particle))
+                nextX = clampInt(nextX, 0, worldSize - 1)
+                nextY = clampInt(nextY, 0, worldSize - 1)
+            }
+            setX(particle, nextX)
+            setY(particle, nextY)
+            let pullX = clampInt(lerpInt(getVelocityX(particle), (targetX - getX(particle)) / 64, 24), -maxSpeed, maxSpeed)
+            let pullY = clampInt(lerpInt(getVelocityY(particle), (targetY - getY(particle)) / 64, 24), -maxSpeed, maxSpeed)
+            setVelocityX(particle, pullX)
+            setVelocityY(particle, pullY)
+            lowest = minInt(lowest, minInt(getX(particle), getY(particle)))
+            highest = maxInt(highest, maxInt(getX(particle), getY(particle)))
+            spread += absInt(pullX) + absInt(pullY)
+        }
+        spread += highest - lowest
+    }
+    return spread
+}
+
+var steps = 1000
+if args().len() > 1 { steps = args()[1] as int }
+var particles: [Particle] = []
+for i in 0..particleCount {
+    let x = nextRandom() % worldSize
+    let y = nextRandom() % worldSize
+    let velocityX = nextRandom() % (2 * maxSpeed) - maxSpeed
+    let velocityY = nextRandom() % (2 * maxSpeed) - maxSpeed
+    particles.push(Particle{x: x, y: y, velocityX: velocityX, velocityY: velocityY})
+}
+var targets: [int] = []
+for i in 0..1024 { targets.push(nextRandom() % worldSize) }
+
+var checksum = run(particles, targets, steps)
+for particle in particles {
+    checksum = checksum * 31 + particle.x
+    checksum = checksum * 31 + particle.y
+    checksum = checksum * 31 + particle.velocityX
+    checksum = checksum * 31 + particle.velocityY
+}
+print(checksum)
