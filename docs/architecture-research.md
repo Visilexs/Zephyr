@@ -330,6 +330,19 @@ The worst x86 gaps are allocation and string workloads: bintrees 3.00,
 strbuild 2.19, lexer 2.19, wordfreq 1.95, shapes 1.69, vectors 1.69. Baseline
 vectors is 66× C, because every `Vec3` temporary is a heap object.
 
+**Re-run on a quiet machine (cycle 64,** `research/results/x86-linux-rerun.json`**):**
+
+- Geometric mean **1.255**, against 1.253 in the first run, so the headline is
+  robust.
+- Single workloads moved by up to ~±10% between runs:
+  - dispatch 1.47 → 1.70;
+  - vectors 1.69 → 1.52;
+  - shapes 1.69 → 1.81;
+  - strings 1.49 → 1.57.
+- That is the noise band for this VM: single-workload differences under ~10%
+  are only trusted from same-session A/B comparisons. All oracle comparisons in
+  this document use same-session A/B runs.
+
 x86 looks very different from the M5:
 
 - matmul, hashmap and pi already beat C on x86, but mandel is at parity.
@@ -2241,3 +2254,8 @@ evaluation order. Does an interpreted design prevent that by construction?
   - Added the Apple Silicon section: macOS builds take 4.8 s / 2.6 s today
     (repo results), against a projected 5–15 ms.
   - Listed the macOS-specific requirements: ad-hoc code signing and MAP_JIT.
+- **2026-10-01, cycle 64.**
+  - Quiet re-run of the full suite: geometric mean 1.255 (the original was
+    1.253).
+  - Per-workload noise is up to ±10%, which is why same-session A/B
+    comparisons are required.
