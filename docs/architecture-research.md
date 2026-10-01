@@ -72,6 +72,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    traffic on SoA data).
    - 3.17× on 4 cores, bit-identical [M8].
    - Only for loops with ≥ 5–10 µs of work per invocation.
+   - Counts stay non-atomic. Atomic counts are 12× slower and biased ones 1.4×
+     [M26], so parallel bodies must provably do no count updates on shared
+     objects.
 6. **The IR interpreter as the executable specification.**
    - A differential-testing oracle for every pass.
    - The compile-time evaluator and the debugger.
@@ -841,6 +844,32 @@ of 3 runs on one core [M]:
 - **That strengthens C1 (cached AOT, no JIT tier).** Persisted profiles should
   be an opt-in, measured optimization applied per function, never a default.
 
+### M26. Sharing across threads: what atomic counts would cost (cycle 20)
+
+`research/proto/rccost.c` does one retain and one release per object over 4,096
+objects in shuffled order, single-threaded and uncontended. A compiler barrier
+stops gcc from cancelling the plain pairs [M]:
+
+| Scheme | ns per count update | vs plain |
+|---|---:|---:|
+| Plain non-atomic (today) | 0.48–0.50 | 1.0× |
+| Biased (owner check, then plain; other threads atomic) | 0.68–0.73 | ~1.4× |
+| Always atomic | 5.9–6.2 | ~12× |
+
+**What this means:**
+
+- Atomic counts everywhere are out: 12× per update, on code where count
+  updates are a large share of the time (M3, M13).
+- Biased counting would allow sharing at +40% per update. That is still a tax
+  on all code, to benefit only code that shares.
+- **Adopted instead:**
+  1. Parallel loops only where the compiler proves the body does no count
+     updates on shared objects (layer 5; SoA values make this the common case).
+  2. Parallel compilation through share-nothing workers that exchange the flat
+     `[int]`-array IR by copy, or through processes. The flat IR from layer 2
+     makes the copy cheap.
+- This keeps today's 0.5 ns plain counts for all single-threaded code.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1030,3 +1059,8 @@ of 3 runs on one core [M]:
   - gcc PGO on the C references (M25): geometric mean 1.042 (slower), best
     −13%, worst +67%. Profile feedback is a weak lever here, which supports C1
     further.
+- **2026-10-01, cycle 20.**
+  - Count-update costs (M26): plain 0.5 ns, biased 0.7 ns, atomic 6 ns.
+  - Kept non-atomic counts. Parallelism requires bodies proven free of count
+    updates, and parallel compilation uses share-nothing workers.
+  - Saved `research/pgo_c.py` for M25.
