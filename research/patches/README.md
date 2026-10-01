@@ -13,3 +13,6 @@ next to its own binary.
 | `runtime-no-cycle-collection.patch` | M36 | skip the cycle collector (valid only for acyclic programs) |
 | `optimizer-no-kernel-bail.patch` | M34 | optimize functions that hold a baseline native-kernel loop |
 | `runtime-lifetimes.patch` | M43 | record the stack pointer at allocation and free (object lifetime vs frame) |
+| `runtime-probe-count.patch` | M24 (cycle 50) | count string-map probes per lookup |
+| `zc-print-lifetimes.patch` | M50 | print the M43 lifetime counters at the end of the driver |
+| `optimizer-no-global-store-forwarding.patch` | M39 (cycle 81) | a global store starts a new memory epoch instead of being forwarded; confirms the loop-exit miscompile diagnosis |

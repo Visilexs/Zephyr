@@ -1,0 +1,14 @@
+--- compiler/optimizer.zeph
++++ compiler/optimizer.zeph
+@@ -6292,7 +6292,10 @@
+                     loadOpcode = irFloatLoadGlobal
+                     loadClass = classFloat
+                 }
+-                known["m{globalEpoch}:{loadOpcode}:{loadClass}:{irImmediates[instruction]}"] = resolveValue(irOperands[instruction][0])
++                // research experiment (cycle 81): no forwarding from global stores;
++                // a store still invalidates earlier loads of globals (new epoch)
++                epochCount += 1
++                globalEpoch = epochCount
+                 continue
+             }
+             // Raw word reads may reuse an earlier typed slot, preserving its

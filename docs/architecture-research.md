@@ -1554,6 +1554,34 @@ read-only, not yet confirmed by instrumentation):**
 Either should make `research/fuzz/repro/loop-exit-global-1009.zeph` and
 `pure-1292.zeph` print baseline's result.
 
+**Confirmation (cycle 81, scratch compiler, shipping code untouched):** a copy
+of `compiler/` in `/tmp/zr/fix` with one change in `numberValues`. A global
+store no longer records its value for forwarding; it starts a new memory
+epoch, so earlier loads of globals are still invalidated
+(`research/patches/optimizer-no-global-store-forwarding.patch`). The first
+try dropped the record without bumping the epoch, and that broke
+invalidation: seed 1009 printed 8. Results [M]:
+
+| Repro | Baseline | -O2 today | -O2 with patch |
+|---|---:|---:|---:|
+| `pure-1292` | 10 | 11 | **10** |
+| `loop-exit-global-1009` | 13 | 12 | 11 |
+| `min1162` | 1 | 485 | 485 |
+| `min1260` | 11 | 10 | 10 |
+| `min1404` | 4 | 1 | 1 |
+| `all3-230` | 4 | 3 | 3 |
+
+- `pure-1292` is order-independent, and the patch fixes it. The diagnosis
+  holds: the miscompile is global-store forwarding in `numberValues`.
+- Seed 1009 now prints 11, the left-to-right value (genpair's reference).
+  Baseline's 13 comes from baseline reading `acc` after the call. The
+  remaining gap is evaluation order, not the miscompile.
+- The other four repros are order-dependent and don't change.
+- `PURE=1` seeds 1000–1599 with the patch: run pending (cycle 82).
+- The patch is a diagnosis tool, not the fix to ship. It gives up all
+  store-to-load forwarding for globals. Fix (a) keeps that forwarding where
+  it is safe. Its cost was not measured.
+
 **Classification of the 18 (cycle 39):**
 
 - `PURE=1 genprog.py` makes called functions never assign globals or push to
@@ -2639,3 +2667,7 @@ All rows are bintrees unless noted, same checksum, one core.
     instead of the store's (lines 6295/6344). This becomes a lost-copy register
     conflict.
   - Two candidate fixes recorded in M39.
+- **2026-10-01, cycle 81.**
+  - Confirmed the diagnosis with a scratch compiler. Disabling global-store
+    forwarding (and keeping invalidation) fixes `pure-1292`. The other repros
+    differ only by evaluation order. Patch saved in `research/patches/`.
