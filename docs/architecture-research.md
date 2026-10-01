@@ -600,6 +600,28 @@ in that program with a field of that name [M].
   mutated in place through an alias. This is future work [E]; nbody is already
   at 1.23× C.
 
+### M17. Fixed costs of a cache-backed `zc run` (cycle 11)
+
+Measured with `hyperfine -N` and a C loader microbenchmark [M]:
+
+| Step | Time |
+|---|---:|
+| Start the 7.5 MB static zc and exit (`zc --version`) | 1.7 ± 0.3 ms |
+| Map a 480 KB cached code image, patch 5,000 relocations, make it executable | 0.3–0.4 ms |
+| Run an empty compiled program, process start to exit | 0.23 ms |
+
+**Time to first instruction for `zc run fib.zeph` with a warm cache:**
+
+- start zc: 1.7 ms;
+- split and hash the source, then parse, check and compile two small
+  functions: under 1 ms [E from M4b/M10];
+- load the image: 0.4 ms.
+
+That is **≈ 3 ms in total** [M components, E sum]. Today it is 280 ms of
+compile, and 4 s on macOS. An interpreter tier could save at most the ~0.1 ms
+of code generation inside that 3 ms. Scenario S1 of the cycle 2 evaluation is
+now confirmed with measured components.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -753,3 +775,6 @@ in that program with a field of that name [M].
 - **2026-10-01, cycle 10.**
   - Immutability scan (M16): 74% of struct types in the repo's programs are
     never mutated, but only 3 of 14 in the compiler.
+- **2026-10-01, cycle 11.**
+  - Fixed costs of a cached `zc run` (M17): ~3 ms to the first instruction,
+    which confirms S1.
