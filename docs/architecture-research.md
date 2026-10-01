@@ -1501,6 +1501,44 @@ Outputs identical [M]:
   a function/parameter variant, and its numbers should count in the
   scoreboard alongside the originals.
 
+### M43. How often objects die before their allocating frame returns (cycle 48)
+
+**Method.** A scratch runtime (a `/tmp` copy) records `stackPointer()` at every
+allocation, in a side table indexed by object address, and compares it at every
+free. With 512 bytes of slack for runtime frames, a free counts as **in frame**
+if the stack hasn't unwound past the allocating frame, and as **escaped**
+otherwise. Objects never freed are live until exit. All at -O2 [M]:
+
+| Workload | Allocations | Freed in frame | Escaped | Never freed |
+|---|---:|---:|---:|---:|
+| bintrees | 29.9 M | 29.6 M (99%) | 0.0 M | 0.3 M |
+| lexer | 12.97 M | 12.97 M (100%) | ~0 | ~0 |
+| wordfreq | 10.5 M | 10.37 M (98.8%) | 0.06 M | 0.07 M |
+| strbuild | 16.0 M | 10.5 M (65.7%) | 5.5 M | ~0 |
+| strings | 4.0 M | ~0 | 4.0 M (*) | ~0 |
+| pi | 13.4 k | 8.9 k (67%) | 4.4 k | — |
+| shapes | 4.5 M | 0.3 M | ~0 | 4.2 M (live data) |
+| dispatch | 2.0 M | ~0 | ~0 | 2.0 M (live data) |
+| records | 1.0 M | ~0 | ~0 | 1.0 M (live data) |
+| vectors, nbody, closures, small kernels | ≤ 8 k | — | — | — |
+
+(*) strings' strings are allocated inside runtime interpolation helpers. The
+helper's frame returns before the user code frees them, so the metric counts
+them as escaped. This is a measurement artifact: they die in the user's frame.
+Part of strbuild's "escaped" share is the same artifact.
+
+**What this means:**
+
+- For allocation-heavy workloads whose objects die, **two-thirds to all of
+  them die before the allocating user frame returns.** That is the upper bound
+  for function-scope regions. Statement-scope regions need the stricter proof
+  M7 used.
+- Long-lived data (shapes, dispatch, records) is not a region candidate. Those
+  workloads need the density fixes (M11, M27, M13).
+- Region inference (layer 4, step 10) has broad potential on the
+  allocation-heavy class. A real escape analysis in the compiler will capture
+  some fraction of this upper bound [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1585,10 +1623,10 @@ Outputs identical [M]:
   there is only a hand-allocated oracle (−27% on one loop, M20). Next step:
   add splitting to `research/proto/flatopt.c`, then reassemble real hot loops
   with its allocation.
-- **Q5.** How widely does region inference apply in real programs, beyond
-  bintrees? Which allocations in the compiler and the workloads die at
-  statement or call end? Needs allocation-lifetime instrumentation in a scratch
-  runtime.
+- **Q5. Partly answered (cycle 48, M43):** in allocation-heavy workloads,
+  66–100% of freed objects die before their allocating frame returns. Still
+  open: the compiler itself, and how much of that a static escape analysis
+  proves.
 - **Q6.** What is wordfreq's 1.95× gap? M24 was inconclusive. Profile the C
   reference against `research/proto/mapmodels.c` at instruction level.
 - **Q7.** dispatch's remaining loop cost (~1.4× C, M28) is attributed to the
@@ -1831,3 +1869,7 @@ Outputs identical [M]:
 - **2026-10-01, cycle 47.**
   - Float/closure/interface fuzzing (`genext.py`, 500 programs): 0 mismatches.
   - Added the fuzzing totals table.
+- **2026-10-01, cycle 48.**
+  - Lifetime instrumentation in a scratch runtime (M43): 66–100% of freed
+    objects in the allocation-heavy workloads die before their allocating
+    frame returns. That is the upper bound for function-scope regions.
