@@ -5,60 +5,78 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 
 ## Current best architecture
 
-*(Revised every cycle. Cycle 2 state.)*
+*(Revised every cycle. Cycle 7 state. Each claim cites a measurement.)*
 
-**In one paragraph:** semantics are defined once, by an interpreter for a flat,
-typed IR. That interpreter is the executable specification. It serves as the
-correctness oracle for compiled code and as the compile-time evaluator. Code
-that runs is native: one optimizing compiler over the same IR, made cheap by
-caching every compiled function under a hash of its content. There is no
-interpreter tier and no JIT tier, because with caching neither wins any
-measured scenario by more than tens of milliseconds, and then only on an empty
-cache (see the cycle 2 candidate evaluation). Copy-and-patch, with stencils
-generated from the interpreter's handlers, is kept in reserve. It is adopted
-only if the rewritten optimizer costs more than ~2 µs per SSA value.
+**Summary:**
 
-1. **Content-addressed caching** of the compiled runtime and std first, then of
-   every function. On x86, 0.26 s of the 0.28 s build of `fib.zeph` is the
-   runtime [M], so this one step takes small-program builds from ~280 ms to an
-   estimated 10–30 ms [E].
-2. **Direct machine-code emission.** The text assembler (`assembleLine`) is 28%
-   of a baseline self-compile [M], and emitting the text adds string-building
-   costs on top.
-3. **A compiler whose data does not touch the reference-counted heap on hot
-   paths.** About 43% of baseline self-compile time is retain/release,
-   allocation and GC [M]. In -O2 builds, `runtimeListPush` alone is 12% [M].
-   This argues for flat IR in preallocated `[int]` arrays rather than structs
-   and growable lists of objects.
-4. **The optimizer as the only code generator.**
-   - Today -O2 costs ~7.3 µs per SSA value on top of baseline [M: (7.67 s − 3.14 s) / 622,155 values in `--opt-report`].
-     That is in the range commonly reported for LLVM -O2, with much less
-     optimization.
-   - A flat-array pipeline written in Zephyr runs at 0.23–0.27 µs per value [M4b]
-     (CFG, fold/copy-propagation/GVN, DCE, bitset liveness, linear scan, x86
-     encoding). A production pipeline does more: inlining, loop optimizations,
-     RC elimination, bounds-check elimination. Allowing 3–5× more work gives
-     0.7–1.4 µs per value [E].
-   - Whole-zc optimization would then take 0.4–0.9 s cold, and edits are cached
-     at function granularity.
-   - The copy-and-patch gate (2 µs) is very likely met, so C3 stays in reserve.
-5. **Priorities by measured payoff (cycle 4, M6/M7):**
-   1. **Backend quality** decides 11 of 19 workloads: calling convention,
-      register allocation over all GPRs and XMMs, vectorization with SoA.
-   2. **Runtime library co-designed with the optimizer** decides 5: signed
-      magic division, small strings, hashes stored in map slots.
-   3. **Regions plus immutable-type flattening:** fewer workloads, but the
-      largest single gain (bintrees 3.00× → 0.29× C).
-   4. **Memory density:** an 8-byte object header instead of 24, and immutable
-      values flattened into containers (M11: shapes 1.83× → 1.40× from
-      flattening alone).
-   5. **Automatic loop parallelism** once SoA values exist: 3.17× on 4 cores
-      [M8], bit-identical output, with a minimum grain of ~5–10 µs per loop
-      invocation.
-6. **An IR interpreter as the executable specification**, not as a tier. It is
-   used for differential testing of every optimization, compile-time
-   evaluation, and debugging. That is the role in which an interpreter is
-   worth having for Zephyr.
+- An IR interpreter is the executable specification, not a tier.
+- All code that runs is native, from a single optimizing compiler over one flat
+  IR.
+- Caching every compiled declaration under a hash of its content is what makes
+  "always optimized" affordable.
+- The runtime's speed comes mostly from representation: small object headers,
+  values flattened into containers, regions, and runtime data structures
+  designed together with the optimizer.
+- Parallelism comes after that.
+
+### The layers, in build order
+
+1. **Cache layer.**
+   - Content-addressed caching keyed per top-level declaration: a hash of its
+     source plus the hashes of everything it depends on or inlines.
+   - Change detection costs 7 ms on the 1 MB `zc.zeph` [M10].
+   - The compiled runtime and std are cached first: they are 93% of a
+     small-program build today [M3].
+   - Projections: small-program cold build ~10–30 ms [E] (from 280 ms [M]);
+     zc incremental rebuild ~10–15 ms [E].
+2. **One flat IR.**
+   - Typed SSA with block parameters, stored in preallocated `[int]` arrays.
+   - The compiler's own hot data never touches the reference-counted heap.
+     Today 43% of compile time is reference counting, allocation and GC [M3].
+   - The flat pipeline runs at 0.23–0.27 µs per value in Zephyr [M4b], against
+     7.3 µs for today's -O2 [M5].
+3. **One optimizing native backend, emitting machine code directly.**
+   - No text assembler, which is 28% of a self-compile today [M3].
+   - Instruction selection, register allocation over all 16 GPRs and 16 XMMs,
+     and an internal calling convention.
+   - It decides 11 of the 19 workloads [M6].
+   - Missing passes, measured or identified:
+     - accumulator recursion elimination (fib) [M9];
+     - signed magic-number division [M7];
+     - SoA vectorization with alias versioning [M7];
+     - profile-guided inlining of hot loop bodies [M11].
+   - Debug builds are this backend with passes off.
+4. **Representation layer**, using closed-world, whole-program facts:
+   - **Immutability inference:** never-mutated struct types become values,
+     flattened into their containers (SoA). shapes: 1.83× → 1.40× [M11];
+     vectors: bound 0.40× C with AVX2 [M7].
+   - **Region inference** for structures that die at the end of a statement or
+     call. bintrees: 3.00× → 0.29× C [M7].
+   - **8-byte object header** instead of 24 [E, M11].
+   - **Runtime data structures co-designed with the optimizer:** small strings,
+     hashes stored in map slots, a formatter in the fast division domain.
+     strings: 1.49× → 1.22× [M7].
+5. **Automatic loop parallelism**, enabled by layer 4 (no reference-count
+   traffic on SoA data).
+   - 3.17× on 4 cores, bit-identical [M8].
+   - Only for loops with ≥ 5–10 µs of work per invocation.
+6. **The IR interpreter as the executable specification.**
+   - A differential-testing oracle for every pass.
+   - The compile-time evaluator and the debugger.
+   - It is not an execution tier. Interpreters run 5–16× slower than native
+     [M4], and with caching there is no latency left for a tier to hide [M10].
+   - Copy-and-patch from the interpreter's handlers stays in reserve, in case
+     the optimizer ever exceeds ~2 µs per value.
+
+**Projected single-core geometric mean vs gcc -O2:**
+
+| Basis | Geometric mean |
+|---|---:|
+| Today [M] | 1.253 |
+| Measured oracle results only, other workloads unchanged | ≈ 1.02 |
+| Including the estimated fixes listed above | ≈ 0.88 [E] |
+
+Parallel workloads go well below 1.0 on multicore machines.
 
 ## Scoreboard
 
