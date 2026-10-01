@@ -87,6 +87,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      [M13] and 4.1× in Zephyr (739 → 180 ms, 0.69× C) [M33].
    - **Nullable-pointer optionals** for reference types, no cells (−30% [M13]).
    - **8-byte object header** instead of 24 (−28% [M13]).
+   - **Interface values as plain object pointers**, with the vtable found
+     through the object's descriptor and no `{vtable, data}` cell. That
+     representation explains ~90% of dispatch's gap [M45].
    - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
      1.56× [M14].
    - **In-place append when the string is uniquely owned**, plus slices.
@@ -1602,6 +1605,34 @@ That's the M22 lesson again: profiles locate stalls, oracles find causes.
 `word = word + piece` in a loop to a builder. Expected to bring wordfreq to
 about C's 0.59 s [E, from this oracle]. **Q6 is closed.**
 
+### M45. dispatch: the gap is the interface representation (cycle 52)
+
+`research/oracle/dispatch_cells.c` is the C reference with Zephyr's
+representation:
+
+- each list element points to a counted `{vtable, data}` cell (24-byte header);
+- the cell points to the object, which also has a 24-byte header;
+- calls go `cell->vtable->apply(cell->data, …)`.
+
+Same checksum [M]:
+
+| Version | Time |
+|---|---:|
+| C reference (object with an inline vtable pointer, malloc) | 329 ms |
+| **C with Zephyr's cell + header representation** | **464 ms** |
+| Zephyr -O2 | 480 ms |
+
+**What this means:**
+
+- Representation explains about 90% of dispatch's gap. **Q7 is closed.**
+- The fix: an interface value is the object pointer itself, with the vtable
+  found through the object's descriptor (one load from the header), and no
+  cell allocation. Plus the 8-byte header (M13).
+- This refines M11. In shapes, removing only the cell, while keeping 24-byte
+  headers and growing every object to six fields, gained nothing. In
+  dispatch's small objects the cell is a large share of the bytes. Both
+  results point to the same lever, bytes per element.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1692,8 +1723,9 @@ about C's 0.59 s [E, from this oracle]. **Q6 is closed.**
   proves.
 - **Q6. Answered (cycle 51, M44):** wordfreq's gap is entirely
   string building by repeated concatenation. The fix is in-place append.
-- **Q7.** dispatch's remaining loop cost (~1.4× C, M28) is attributed to the
-  interface cell and to density, but no oracle has isolated it.
+- **Q7. Answered (cycle 52, M45):** dispatch's gap is the `{vtable, data}`
+  cell and 24-byte headers. The fix is interface value = object pointer, with
+  the vtable through the header.
 - **Q8.** How good is copy-and-patch code compared with today's baseline? This
   decides whether C3 could replace debug builds.
 - **Q9.** Do x86-64 Linux numbers transfer to Windows (A2), and do the
@@ -1950,3 +1982,7 @@ about C's 0.59 s [E, from this oracle]. **Q6 is closed.**
     against Zephyr's 1.097 s, so the gap is string building and the map is
     fine.
   - Q6 closed.
+- **2026-10-01, cycle 52.**
+  - dispatch solved (M45): C with Zephyr's cell + header representation takes
+    464 ms against Zephyr's 480 ms and plain C's 329 ms.
+  - Q7 closed. Interface value = object pointer joins layer 4.
