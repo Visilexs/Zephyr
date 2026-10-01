@@ -1354,6 +1354,9 @@ $optimizerRegressions = [ordered]@{
     "sort_merge" = "sizes 0 0 100537 347208`nstable 33 0 9848`ntrace 62 -4764252242437029482"
     "substring_ranges" = "ranges 0 abcdef 0 def`ntemporary oken`nbounds bcd abcdef changed-end 2`nretained 256 1024 oken oken"
     "evaluation_order" = "operands [1, 100, 1000, 1, 1, 1, 1]`nassignments [1, 1, 1, 1]`nindex 1 1`nloop-exit 10"
+    "cycle_collection" = "acyclic 0 bounded true"
+    "acyclic_collection" = "acyclic 1 total 44852587 handler 30 bounded true"
+    "integer_format" = "0 1 -1 9 10 -10 99 100 -100 1234567890 -1234567890 9223372036854775807 -9223372036854775808 1000000000000000000 -1000000000000000000"
 }
 foreach ($regressionName in $optimizerRegressions.Keys) {
     $regressionExecutable = Join-Path $tmp "$regressionName.exe"

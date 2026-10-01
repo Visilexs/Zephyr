@@ -6693,6 +6693,151 @@ fn constantFoldAll(program: Node) {
     }
 }
 
+// ---- accumulator recursion ----
+// fn f(p...) -> int { if C { return B }  return X + f(Y...) }, with scalar
+// parameters, becomes a loop that keeps X in an accumulator:
+//     var q... = p...; var acc = 0
+//     while true { if C' { return acc + B' }  acc = acc + X'; t... = Y'...; q... = t... }
+// (' = parameters read through q). The evaluation order is unchanged: X runs
+// before Y, then the next round's C. Integer + wraps, so regrouping the sums
+// gives the same result. fib's second call becomes the loop (gcc does the same).
+fn accumulateRecursion() {
+    for functionIndex in 0..functionDefinitions.len() {
+        let definition = functionDefinitions[functionIndex]
+        if accumulatorShape(definition, functionIndex) { rewriteAccumulator(definition) }
+    }
+}
+
+fn accumulatorShape(definition: FunctionDefinition, functionIndex: int) -> bool {
+    if definition.typeParameters.len() > 0 or definition.hasEnvironment or definition.returnType != typeIdInteger { return false }
+    for parameterType in definition.parameterTypes {
+        let kind = typeKinds[parameterType]
+        if kind != kindInteger and kind != kindFloat and kind != kindBoolean { return false }
+    }
+    let statements = definition.body.children
+    if statements.len() != 2 or statements[0].nodeKind != nodeIf or statements[0].children.len() != 3 or statements[0].children[2].nodeKind != nodeNone { return false }
+    let thenBlock = statements[0].children[1]
+    if thenBlock.children.len() != 1 or thenBlock.children[0].nodeKind != nodeReturn or thenBlock.children[0].children.len() != 1 { return false }
+    let last = statements[1]
+    if last.nodeKind != nodeReturn or last.children.len() != 1 { return false }
+    let sum = last.children[0]
+    if sum.nodeKind != nodeBinary or sum.operator != tokenPlus or sum.auxiliary != binaryCategoryInteger { return false }
+    let call = sum.children[1]
+    if call.nodeKind != nodeCall or call.auxiliary != callKindUser or call.referenceIndex != functionIndex { return false }
+    if call.children.len() != definition.parameterTypes.len() { return false }
+    return not accumulatorBlocks(definition.body)
+}
+
+// constructs the rewrite does not model: closures (they would capture the
+// changing parameter copies) and anything already lowered by an earlier pass
+fn accumulatorBlocks(node: Node) -> bool {
+    if node.nodeKind == nodeFunctionLiteral or node.nodeKind == nodeInline or node.nodeKind == nodeInlineReturn or node.nodeKind == nodeLetExpression { return true }
+    for child in node.children {
+        if accumulatorBlocks(child) { return true }
+    }
+    return false
+}
+
+fn accumulatorLocal(slot: int, typeIndex: int, line: int) -> Node {
+    var identifier = makeNode(nodeIdentifier, line)
+    identifier.auxiliary = identifierKindLocal
+    identifier.slot = slot
+    identifier.typeIndex = typeIndex
+    return identifier
+}
+
+fn accumulatorDeclaration(slot: int, typeIndex: int, value: Node, line: int) -> Node {
+    var declaration = makeNode(nodeDeclaration, line)
+    declaration.name = "(accumulator)"
+    declaration.auxiliary = identifierKindLocal
+    declaration.slot = slot
+    declaration.typeIndex = typeIndex
+    declaration.isMutable = true
+    declaration.children.push(value)
+    return declaration
+}
+
+fn accumulatorAssign(slot: int, typeIndex: int, value: Node, line: int) -> Node {
+    var assignment = makeNode(nodeAssign, line)
+    assignment.children.push(accumulatorLocal(slot, typeIndex, line))
+    assignment.children.push(value)
+    return assignment
+}
+
+fn accumulatorSum(left: Node, right: Node, line: int) -> Node {
+    var sum = binaryNode(tokenPlus, left, right, line)
+    sum.auxiliary = binaryCategoryInteger
+    sum.typeIndex = typeIdInteger
+    return sum
+}
+
+// a copy of node that reads parameter j from local slot base + j
+fn accumulatorRemap(node: Node, base: int) -> Node {
+    var copy = cloneNode(node)
+    accumulatorRemapInPlace(copy, base)
+    return copy
+}
+
+fn accumulatorRemapInPlace(node: Node, base: int) {
+    if node.nodeKind == nodeIdentifier and node.auxiliary == identifierKindParameter {
+        node.auxiliary = identifierKindLocal
+        node.slot = base + node.slot
+    }
+    for child in node.children { accumulatorRemapInPlace(child, base) }
+}
+
+fn rewriteAccumulator(definition: FunctionDefinition) {
+    let line = definition.body.line
+    let parameterCount = definition.parameterTypes.len()
+    let base = definition.slotCount                     // parameter copies, then acc, then temporaries
+    let accumulatorSlot = base + parameterCount
+    let temporaryBase = accumulatorSlot + 1
+    definition.slotCount = temporaryBase + parameterCount
+    let statements = definition.body.children
+    let guard = statements[0]
+    let baseValue = guard.children[1].children[0].children[0]
+    let sum = statements[1].children[0]
+    let call = sum.children[1]
+    var body = makeNode(nodeProgram, line)
+    for j in 0..parameterCount {
+        var parameter = makeNode(nodeIdentifier, line)
+        parameter.auxiliary = identifierKindParameter
+        parameter.slot = j
+        parameter.typeIndex = definition.parameterTypes[j]
+        body.children.push(accumulatorDeclaration(base + j, definition.parameterTypes[j], parameter, line))
+    }
+    var zero = makeNode(nodeInteger, line)
+    zero.typeIndex = typeIdInteger
+    body.children.push(accumulatorDeclaration(accumulatorSlot, typeIdInteger, zero, line))
+    var loopBody = makeNode(nodeProgram, line)
+    var exitReturn = makeNode(nodeReturn, line)
+    exitReturn.children.push(accumulatorSum(accumulatorLocal(accumulatorSlot, typeIdInteger, line), accumulatorRemap(baseValue, base), line))
+    var exitBlock = makeNode(nodeProgram, line)
+    exitBlock.children.push(exitReturn)
+    var exitIf = makeNode(nodeIf, guard.line)
+    exitIf.children.push(accumulatorRemap(guard.children[0], base))
+    exitIf.children.push(exitBlock)
+    exitIf.children.push(makeNode(nodeNone, guard.line))     // no else
+    loopBody.children.push(exitIf)
+    loopBody.children.push(accumulatorAssign(accumulatorSlot, typeIdInteger, accumulatorSum(accumulatorLocal(accumulatorSlot, typeIdInteger, line), accumulatorRemap(sum.children[0], base), line), line))
+    for j in 0..parameterCount {
+        loopBody.children.push(accumulatorDeclaration(temporaryBase + j, definition.parameterTypes[j], accumulatorRemap(call.children[j], base), line))
+    }
+    for j in 0..parameterCount {
+        loopBody.children.push(accumulatorAssign(base + j, definition.parameterTypes[j], accumulatorLocal(temporaryBase + j, definition.parameterTypes[j], line), line))
+    }
+    var always = makeNode(nodeBoolean, line)
+    always.integerValue = 1
+    always.typeIndex = typeIdBoolean
+    var loop = makeNode(nodeWhile, line)
+    loop.children.push(always)
+    loop.children.push(loopBody)
+    body.children.push(loop)
+    // in place: the program's nodeFunction holds the same body node, and later
+    // passes (foldGlobals, constantFoldAll) walk the program
+    definition.body.children = body.children
+}
+
 // ---- cycle-capable types ----
 // Reference counting reclaims everything except cycles, and a cycle of
 // objects needs a cycle in the type graph. Edges: struct fields (and the
@@ -11940,11 +12085,21 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    \}\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
+    sourceLines.push("// Set to 1 by the compiler when no type in the program can reach itself\n")
+    sourceLines.push("// (typeGraphMayCycle in zc.zeph). Then reference counting frees every object,\n")
+    sourceLines.push("// so the collector skips marking and its sweep only coalesces the blocks\n")
+    sourceLines.push("// counting already freed.\n")
+    sourceLines.push("let runtimeTypeGraphAcyclic = 0\n")
+    sourceLines.push("\n")
     sourceLines.push("fn runtimeCollectGarbage() \{\n")
     sourceLines.push("    // ponytail: Linux cannot suspend stacks yet, including the unregistered\n")
     sourceLines.push("    // main thread. Defer cyclic garbage until all workers are joined; add signal\n")
     sourceLines.push("    // safepoints if long-lived workers need bounded cyclic-heap growth.\n")
     sourceLines.push("    if runtimeUnsuspendableThreadCount != 0 \{ return \}\n")
+    sourceLines.push("    if runtimeTypeGraphAcyclic != 0 \{\n")
+    sourceLines.push("        runtimeSweepHeap()\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    // clear marks\n")
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    while index < runtimeBitmapCommittedBytes \{\n")
@@ -11970,7 +12125,12 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        let size = load64(object - 8) & (0 - 8)\n")
     sourceLines.push("        runtimeScanRootRange(object, object + size)\n")
     sourceLines.push("    \}\n")
-    sourceLines.push("    // sweep: rebuild the free lists from unmarked objects\n")
+    sourceLines.push("    runtimeSweepHeap()\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// Rebuild the free lists from dead objects: unmarked ones after a mark phase,\n")
+    sourceLines.push("// or, with runtimeTypeGraphAcyclic, the ones reference counting already freed.\n")
+    sourceLines.push("fn runtimeSweepHeap() \{\n")
     sourceLines.push("    var sizeClass = 0\n")
     sourceLines.push("    while sizeClass <= runtimeSmallAllocationClassCount \{\n")
     sourceLines.push("        store64(runtimeFreeListHeads + sizeClass * 8, 0)\n")
@@ -12010,7 +12170,10 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        let objectHeader = load64(object - 8)\n")
     sourceLines.push("        let size = objectHeader & (0 - 8)\n")
     sourceLines.push("        let bitIndex = (object - runtimeHeapBaseAddress) >> 3\n")
-    sourceLines.push("        if runtimeGetBitmapBit(runtimeObjectMarkBitmap, bitIndex) == 0 \{\n")
+    sourceLines.push("        var dead = false\n")
+    sourceLines.push("        if runtimeTypeGraphAcyclic != 0 \{ dead = (objectHeader & runtimeHeapFlagFree) != 0 \}\n")
+    sourceLines.push("        else \{ dead = runtimeGetBitmapBit(runtimeObjectMarkBitmap, bitIndex) == 0 \}\n")
+    sourceLines.push("        if dead \{\n")
     sourceLines.push("            // Unreachable but not yet freed: under reference counting that is\n")
     sourceLines.push("            // either a cycle or a missed drop. Counted so it can be reported.\n")
     sourceLines.push("            if (objectHeader & runtimeHeapFlagFree) == 0 \{ runtimeUnreleasedObjectCount += 1 \}\n")
@@ -14065,24 +14228,35 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        return\n")
     sourceLines.push("    \}\n")
     sourceLines.push("    let isNegative = value < 0\n")
-    sourceLines.push("    // work in the non-positive domain so i64 MIN never overflows a negate\n")
+    sourceLines.push("    // Peel the lowest digit in the non-positive domain once, so that i64 MIN\n")
+    sourceLines.push("    // never overflows a negate; the rest runs on a positive value, where\n")
+    sourceLines.push("    // division by 10 compiles to a multiply.\n")
+    sourceLines.push("    var lowDigit = -1\n")
     sourceLines.push("    var remainingValue = value\n")
-    sourceLines.push("    if remainingValue > 0 \{ remainingValue = 0 - remainingValue \}\n")
+    sourceLines.push("    if isNegative \{\n")
+    sourceLines.push("        lowDigit = 0 - remainingValue % 10\n")
+    sourceLines.push("        remainingValue = 0 - remainingValue / 10\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    var digitCount = 0\n")
     sourceLines.push("    var remainingDigits = remainingValue\n")
-    sourceLines.push("    while remainingDigits < 0 \{\n")
+    sourceLines.push("    while remainingDigits > 0 \{\n")
     sourceLines.push("        digitCount += 1\n")
     sourceLines.push("        remainingDigits = remainingDigits / 10\n")
     sourceLines.push("    \}\n")
     sourceLines.push("    var total = digitCount\n")
+    sourceLines.push("    if lowDigit >= 0 \{ total += 1 \}\n")
     sourceLines.push("    if isNegative \{ total += 1 \}\n")
     sourceLines.push("    let builderAddress = runtimeGetStringBuilder()\n")
     sourceLines.push("    runtimeEnsureStringBuilderCapacity(builderAddress, total)\n")
     sourceLines.push("    let buffer = load64(builderAddress)\n")
     sourceLines.push("    let usedLength = load64(builderAddress + 8)\n")
     sourceLines.push("    var position = usedLength + total - 1\n")
-    sourceLines.push("    while remainingValue < 0 \{\n")
-    sourceLines.push("        store8(buffer + position, 48 - remainingValue % 10)      // x%10 is <= 0, so -(x%10) is the digit\n")
+    sourceLines.push("    if lowDigit >= 0 \{\n")
+    sourceLines.push("        store8(buffer + position, 48 + lowDigit)\n")
+    sourceLines.push("        position -= 1\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    while remainingValue > 0 \{\n")
+    sourceLines.push("        store8(buffer + position, 48 + remainingValue % 10)\n")
     sourceLines.push("        position -= 1\n")
     sourceLines.push("        remainingValue = remainingValue / 10\n")
     sourceLines.push("    \}\n")
@@ -14417,6 +14591,11 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("fn runtimeArguments() -> int \{\n")
     sourceLines.push("    let commandLine = win(\"GetCommandLineA\")       // LPSTR\n")
     sourceLines.push("    let argumentList = runtimeNewDescribedList(0, runtimeReferenceListDescriptor)\n")
+    sourceLines.push("    // one scratch buffer as long as the whole command line, so no argument can\n")
+    sourceLines.push("    // overrun it\n")
+    sourceLines.push("    var commandLineLength = 0\n")
+    sourceLines.push("    while load8(commandLine + commandLineLength) != 0 \{ commandLineLength += 1 \}\n")
+    sourceLines.push("    let buffer = runtimeAllocateObject(commandLineLength + 1)\n")
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    var going = true\n")
     sourceLines.push("    while going \{\n")
@@ -14426,7 +14605,6 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        \} else \{\n")
     sourceLines.push("            let start = index\n")
     sourceLines.push("            var quoted = false\n")
-    sourceLines.push("            let buffer = runtimeAllocateObject(2048)\n")
     sourceLines.push("            var argumentLength = 0\n")
     sourceLines.push("            var scanning = true\n")
     sourceLines.push("            while scanning \{\n")
@@ -19369,6 +19547,7 @@ if inputPath == "" and showVersion {
     check(program)
     currentSourceFile = baseName(inputPath)
     markTypeGraphAcyclic(program)
+    accumulateRecursion()
     foldGlobals(program)
     inlinePass(program)
     constantFoldAll(program)                       // fold what inlined literal args exposed

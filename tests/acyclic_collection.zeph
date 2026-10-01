@@ -1,0 +1,16 @@
+// No type here can reach itself (closures capture only ints), so the compiler
+// sets runtimeTypeGraphAcyclic and the collector only sweeps. Reference
+// counting must still free everything dropped, and kept objects must survive.
+struct Leaf { values: [int], name: str }
+
+var kept: [Leaf] = []
+for i in 0..300000 {
+    let leaf = Leaf{values: [i, i + 1, i + 2], name: "n{i}"}
+    if i % 1000 == 0 { kept.push(leaf) }
+}
+var total = 0
+for leaf in kept { total += leaf.values[2] + leaf.name.len() }
+
+var handlers: [fn() -> int] = []
+for i in 0..10 { handlers.push(fn() -> int { return i * 10 }) }
+print("acyclic {runtimeTypeGraphAcyclic} total {total} handler {handlers[3]()} bounded {runtimeLiveHeapBytes < 16 * 1024 * 1024}")

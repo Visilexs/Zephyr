@@ -1,0 +1,14 @@
+// Garbage collection of reference cycles, and the acyclic fast path.
+// Ring can reach itself, so the collector must mark and sweep: 300,000
+// dropped two-object cycles must not stay live. A program whose types cannot
+// form a cycle sets runtimeTypeGraphAcyclic and skips marking.
+struct Ring { next: Ring?, payload: [int] }
+
+fn makeRing() {
+    let first = Ring{next: none, payload: [1, 2, 3, 4, 5, 6, 7, 8]}
+    let second = Ring{next: first, payload: [1, 2, 3, 4, 5, 6, 7, 8]}
+    first.next = second
+}
+
+for i in 0..300000 { makeRing() }
+print("acyclic {runtimeTypeGraphAcyclic} bounded {runtimeLiveHeapBytes < 16 * 1024 * 1024}")

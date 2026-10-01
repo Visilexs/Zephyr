@@ -1,0 +1,5 @@
+// Integer formatting at the edges: zero, signs, powers of ten, i64 extremes.
+let values = [0, 1, -1, 9, 10, -10, 99, 100, -100, 1234567890, -1234567890, 9223372036854775807, -9223372036854775807 - 1, 1000000000000000000, -1000000000000000000]
+var line = ""
+for v in values { line = line + "{v} " }
+print(line)
