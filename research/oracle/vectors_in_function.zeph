@@ -1,0 +1,64 @@
+// Placement variant (M41): bench/vectors.zeph with its time-step loop moved into a function.
+// Small-value-struct benchmark: particles pulled toward an anchor, every bit
+// of arithmetic going through a Vec3 struct and small helpers (add, subtract,
+// scale, dot). Most Vec3s are temporaries: C and Rust keep them in
+// registers, a naive Zephyr allocates each one. Same LCG, same checksum.
+// Usage: vectors [steps]   (default 1000)
+
+struct Vec3 { x: float, y: float, z: float }
+
+fn add(a: Vec3, b: Vec3) -> Vec3 { return Vec3{x: a.x + b.x, y: a.y + b.y, z: a.z + b.z} }
+fn subtract(a: Vec3, b: Vec3) -> Vec3 { return Vec3{x: a.x - b.x, y: a.y - b.y, z: a.z - b.z} }
+fn scale(a: Vec3, factor: float) -> Vec3 { return Vec3{x: a.x * factor, y: a.y * factor, z: a.z * factor} }
+fn dot(a: Vec3, b: Vec3) -> float { return a.x * b.x + a.y * b.y + a.z * b.z }
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn randomUnit() -> float { return (nextRandom() % 20001 - 10000) as float / 10000.0 }
+
+const particleCount = 4000
+
+var steps = 1000
+if args().len() > 1 { steps = args()[1] as int }
+
+var positions: [Vec3] = []
+var velocities: [Vec3] = []
+for i in 0..particleCount {
+    let x = randomUnit()
+    let y = randomUnit()
+    let z = randomUnit()
+    positions.push(Vec3{x: x, y: y, z: z})
+    velocities.push(Vec3{x: 0.0, y: 0.0, z: 0.0})
+}
+let anchor = Vec3{x: 0.25, y: -0.5, z: 0.125}
+
+fn simulate(stepCount: int) {
+    for step in 0..stepCount {
+        for i in 0..particleCount {
+            let position = positions[i]
+            let offset = subtract(anchor, position)
+            let distanceSquared = dot(offset, offset) + 0.01
+            let pull = scale(offset, 0.001 / distanceSquared)
+            let drag = scale(velocities[i], 0.002)
+            let velocity = subtract(add(velocities[i], pull), drag)
+            velocities[i] = velocity
+            positions[i] = add(position, scale(velocity, 0.01))
+        }
+    }
+
+
+}
+
+simulate(steps)
+
+var total = 0.0
+for i in 0..particleCount {
+    total += positions[i].x + 2.0 * positions[i].y + 3.0 * positions[i].z
+    total += velocities[i].x - velocities[i].y + velocities[i].z
+}
+print((total * 1000000.0) as int)

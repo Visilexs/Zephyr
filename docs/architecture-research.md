@@ -166,6 +166,7 @@ the oracle or prototype that justified the step.
 | 9 | Vectorizer (straight-line + SoA loops), accumulator recursion | nbody ≤ 1.1× C; vectors ≤ 0.6× C; fib ≤ 0.95× C; matmul stays ≤ 0.55× C without the pattern kernel; cube ≤ 1.0× C | M18–M21, M29, M34, M38 |
 | 10 | Region inference | bintrees ≤ 100 ms | M7 |
 | 11 | Automatic loop parallelism | vectors ≥ 3× on 4 cores, bit-identical | M8 |
+| 3b | Every function compiled whole: no baseline fallback, no outlined regions | Placement gate: top-level vs in-function kernels within 10% (vectors today: 0.72 vs 4.51 s; oracle 0.80 vs 0.55 s) | M41 |
 | 12 | ARM64 instruction selection over the same IR | macOS: no clang, no `arm64.py`; `zc run fib` ≤ 10 ms to first instruction | M17, macOS results |
 
 The IR interpreter (oracle/sanitizer) is built alongside step 3. Every later
@@ -1394,6 +1395,44 @@ The 2 "all three differ" seeds are candidates for further miscompiles, such as
 the M39 loop-exit class. Their sources are in
 `research/fuzz/failures/pair-seed*.zeph`, with `.py` references.
 
+### M41. Placement cliffs: the same loop at top level and in a function (cycle 43)
+
+Hot loops written at top level, or in a function that falls back to baseline,
+are compiled as outlined `zopt_region`s. Their source variables are loaded from
+the frame on entry and written back on exit. The test moves the same loop into
+an ordinary function that -O2 compiles whole. Outputs identical,
+`hyperfine -N` [M]:
+
+| Program | Top level (region) | In a function | Change |
+|---|---:|---:|---:|
+| vectors oracle (SoA values, M7) | 804 ms, 17 spills | **551 ms, 5 spills** | **−32%** |
+| `bench/records.zeph` | 1.246 s | 1.174 s | −6% |
+| `bench/closures.zeph` | 0.684 s | 0.646 s | −5.5% |
+| shapes, dispatch, lexer, wordfreq, strings, mandel, matmul, strbuild | — | — | within ±5% |
+| **`bench/vectors.zeph` (original, `Vec3` structs)** | **720 ms** | **4.51 s** | **+526%** |
+
+**What this means:**
+
+1. **Correction to M20/M30.** Most of the vectors-oracle spilling came from
+   region outlining, not from the allocator lacking interval splitting. As a
+   whole function the same loop reaches 551 ms, faster than the hand
+   allocation (0.61 s) and level with non-vectorized C (0.56 s). Interval
+   splitting stays on the list, with lower priority.
+2. **Today's optimizations are context-dependent heuristics.** In the original
+   vectors, moving the loop into a function loses the in-place reuse of list
+   elements. 36% of the time then goes to allocating and releasing `Vec3`
+   (profile), and the program is 6.3× slower. That is exactly the kind of
+   performance cliff the earlier conversation warned about.
+3. **Architecture requirements that follow:**
+   - one code path for every function: no baseline fallback with outlined
+     regions;
+   - the same analyses wherever code is placed;
+   - `--opt-report` must state allocation and reuse decisions per site;
+   - a new **placement gate**: each workload's hot kernel, at top level and in a
+     function, must run within 10% of each other.
+     `research/oracle/vectors_in_function.zeph` and
+     `vectors_values_in_function.zeph` are the first two test cases.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1706,3 +1745,9 @@ the M39 loop-exit class. Their sources are in
   - Reduced the "all three differ" seed 230: it's order-dependent (a loop where
     `acc = acc * 1 + f0(…)` and `f0` modifies `acc`), not a new miscompile.
   - Rewrote the open-questions list (Q4–Q10).
+- **2026-10-01, cycle 43.**
+  - Placement experiments (M41). Most of the vectors-oracle spilling is region
+    outlining (−32% as a whole function), which corrects M20/M30.
+  - The original vectors is 6.3× slower in a function, because in-place
+    element reuse is lost.
+  - Added the placement gate and step 3b.
