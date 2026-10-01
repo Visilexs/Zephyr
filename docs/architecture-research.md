@@ -2029,6 +2029,24 @@ evaluation order. Does an interpreted design prevent that by construction?
 | C5 meta-tracing | Rejected | Recursion and branchy code trace poorly; same warm-up problem as C2 |
 | C6 IR interpreter as executable spec and oracle | **Adopted** in that role | Removes the parity-bug class; required for compile-time evaluation anyway |
 
+### Backend candidates (consolidated in cycle 69)
+
+| Candidate | Result | Verdict | Evidence |
+|---|---|---|---|
+| Text assembly + zc assembler (today) | 28% of a self-compile is the assembler | Replace with direct encoding | M3 |
+| Outlined loop regions inside baseline functions (today) | vectors oracle 804 → 551 ms when compiled whole; a 6× cliff in the other direction for rebuilt structs | Replace: every function compiled whole | M41, M42 |
+| Linear scan without splitting (today) | 17 spills in a region; 5 when the loop is compiled whole | Keep linear scan; add two-address hints. Splitting is low priority (Q4) | M30, M41 |
+| Hand-quality register allocation | −27% on the vectors loop | Target quality; whole-function compilation gets most of it | M20, M41 |
+| Lean internal calling convention | −15% on fib; 0% on shapes; −3% for register-passed interface arguments | **Adopted** | M21, M28, M30 |
+| Accumulator recursion elimination | fib 1.43 → 0.96× C; 0.95× with the lean frame | **Adopted** | M21, M29 |
+| Signed magic division | strings −22% via a formatter patch | **Adopted**, as an optimizer pass | M7, M22 |
+| Invariant-divisor magic (exists today) | pi 0.54–0.58× C | **Keep** | M38 |
+| Straight-line vectorization (pair x/y/z ops) | explains ~60% of nbody's gap and ~22% of vectors' | **Adopted**, after allocation | M18, M19 |
+| SoA loop vectorization + alias versioning | vectors bound 0.40× C (AVX2) | **Adopted**; it replaces the pattern kernels | M7, M34, M38 |
+| Pattern-specific native kernels (today) | cube: worth more than optimizing the rest of the function | Subsume into the vectorizer | M34 |
+| Branch-tree devirtualization at megamorphic sites | slower than an indirect call | Rejected; keep indirect calls | M28 |
+| Profile-guided optimization (gcc as proxy) | geometric mean 1.042 (worse); best −13% | Opt-in only | M25 |
+
 ### Memory management candidates (consolidated in cycle 67)
 
 All rows are bintrees unless noted, same checksum, one core.
@@ -2057,10 +2075,10 @@ All rows are bintrees unless noted, same checksum, one core.
 
 **Open, in priority order:**
 
-- **Q4.** What does a linear scan **with splitting** actually gain? Today
-  there is only a hand-allocated oracle (−27% on one loop, M20). Next step:
-  add splitting to `research/proto/flatopt.c`, then reassemble real hot loops
-  with its allocation.
+- **Q4. Deprioritized (cycle 69):** most of the spilling M20 attributed to
+  missing interval splitting was region outlining (M41). Compiled whole, the
+  same loop has 5 spills and reaches non-vectorized C. Revisit only if
+  whole-function compilation leaves hot spills.
 - **Q5. Mostly answered (cycles 48 and 61, M43, M50):** 66–100% of freed
   objects in allocation-heavy workloads, and 50–66% of all allocations in the
   compiler, die before their allocating frame returns. Still open: how much of
@@ -2391,3 +2409,6 @@ All rows are bintrees unless noted, same checksum, one core.
   - Re-timed all oracles in one session (M53); results are consistent.
   - Projection updated with the same-session values: measured-only ≈ 0.98,
     with C models ≈ 0.93.
+- **2026-10-01, cycle 69.**
+  - Consolidated the backend candidates into one table.
+  - Deprioritized Q4 (interval splitting) on the strength of M41.
