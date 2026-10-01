@@ -1,0 +1,105 @@
+// Oracle rewrite of bench/strbuild.zeph (revision 398aadd): str.sub as a slice
+// (start, end) of its parent instead of a copy (as in lexer_slices.zeph), and
+// in-place appends to the uniquely owned line. Same checksum.
+// String building and slicing benchmark: build comma-separated lines of
+// "name=number" fields by appending and interpolating pieces, then split each
+// line by scanning for delimiters, take substrings for every name and value,
+// compare names against a small key set and parse the values by hand.
+// C and Rust build an owned string per line but view substrings in place
+// (pointer + length / &str); Zephyr's .sub allocates a new string each time.
+// Usage: strbuild [lines]   (default 1000000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+let names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+let keys = ["alpha", "beta", "gamma", "delta"]
+
+// In-place append: `line` is uniquely owned, so `line += ...` can append into
+// its buffer instead of copying it (reuse when the count is 1). Written here
+// with an explicit byte buffer and the same decimal formatting.
+fn appendNumber(buffer: [u8], value: int) {
+    if value == 0 {
+        buffer.push('0')
+        return
+    }
+    var digits = 0
+    var rest = value
+    while rest > 0 {
+        digits += 1
+        rest = rest / 10
+    }
+    let at = buffer.len()
+    for d in 0..digits { buffer.push('0') }
+    var position = at + digits - 1
+    rest = value
+    while rest > 0 {
+        buffer[position] = '0' + rest % 10
+        position -= 1
+        rest = rest / 10
+    }
+}
+
+fn buildLine() -> str {
+    let fieldCount = nextRandom() % 4 + 3
+    var buffer: [u8] = []
+    for j in 0..fieldCount {
+        if j > 0 { buffer.push(',') }
+        let name = names[nextRandom() % 6]
+        for character in name { buffer.push(character) }
+        buffer.push('=')
+        appendNumber(buffer, nextRandom() % 100000)
+    }
+    return buffer as str
+}
+
+fn keyIndex(line: str, start: int, end: int) -> int {
+    for i in 0..keys.len() {
+        let key = keys[i]
+        if end - start == key.len() {
+            var same = true
+            for k in 0..key.len() {
+                if line.byte(start + k) != key.byte(k) {
+                    same = false
+                    break
+                }
+            }
+            if same { return i + 1 }
+        }
+    }
+    return 0
+}
+
+fn parseDigits(line: str, start: int, end: int) -> int {
+    var number = 0
+    for i in start..end { number = number * 10 + line.byte(i) - '0' }
+    return number
+}
+
+var lineCount = 1000000
+if args().len() > 1 { lineCount = args()[1] as int }
+
+var checksum = 0
+var totalLength = 0
+for lineIndex in 0..lineCount {
+    let line = buildLine()
+    let length = line.len()
+    totalLength += length
+    var fieldStart = 0
+    while fieldStart < length {
+        var fieldEnd = fieldStart
+        var separator = -1
+        while fieldEnd < length and line.byte(fieldEnd) != ',' {
+            if line.byte(fieldEnd) == '=' { separator = fieldEnd }
+            fieldEnd += 1
+        }
+        let value = parseDigits(line, separator + 1, fieldEnd)
+        checksum = checksum * 31 + keyIndex(line, fieldStart, separator) * value + (separator - fieldStart) + line.byte(separator + 1)
+        fieldStart = fieldEnd + 1
+    }
+}
+print(checksum + totalLength)

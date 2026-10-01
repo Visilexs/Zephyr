@@ -63,6 +63,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - **8-byte object header** instead of 24 (−28% [M13]).
    - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
      1.56× [M14].
+   - **In-place append when the string is uniquely owned**, plus slices.
+     strbuild: 2.2× → 1.45× [M23].
    - **Runtime data structures co-designed with the optimizer:** small strings,
      hashes stored in map slots, a formatter in the fast division domain.
      strings: 1.49× → 1.22× [M7].
@@ -764,6 +766,26 @@ strbuild's remaining 2.1× gap: its C version views substrings in place
 (pointer + length), while Zephyr's `.sub` copies. That is the same lever as
 lexer's slices (M14, −30%) [E for strbuild].
 
+### M23. strbuild: slices and in-place append (cycle 17)
+
+Oracles with identical output (md5 of stdout), `hyperfine -N`, 6–10 runs [M]:
+
+| Version | Time | vs C |
+|---|---:|---:|
+| `bench/strbuild.zeph`, -O2 | ~0.99 s | 2.2 |
+| `.sub` as slices (`research/oracle/strbuild_slices.zeph`) | 0.86–0.87 s | 1.95 |
+| Line-building only, with slices (diagnostic) | 0.72 s | — |
+| Slices + in-place append to the uniquely owned line (`strbuild_inplace.zeph`) | **0.62 s** | **1.45** |
+| C (`snprintf` into a malloc'd buffer) | 0.43 s | 1.00 |
+
+**What this means:**
+
+- `line += "{name}={n}"` copies the whole line on every field. When `line`'s
+  count is 1, the compiler can append into its buffer instead: reuse-when-unique,
+  as in Perceus. Together with slices that is −37%.
+- The rest is byte-at-a-time `[u8]` pushes and interpolation-builder overhead.
+  A bulk append (`memcpy` of a whole string) is the next lever [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -941,3 +963,6 @@ lexer's slices (M14, −30%) [E for strbuild].
   - The formatter fix gives strings −22% but strbuild only −3%, although
     strbuild's profile share fell 14 points (M22).
   - Adopted the rule that profiles are hypotheses and oracles are evidence.
+- **2026-10-01, cycle 17.**
+  - strbuild oracles (M23): slices −12%; slices + in-place append of a uniquely
+    owned line −37% (2.2× → 1.45× C).
