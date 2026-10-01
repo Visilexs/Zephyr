@@ -1,0 +1,153 @@
+// Can a rebuild find which top-level declarations changed without lexing or
+// parsing the whole file? This splits a Zephyr source file into top-level
+// declarations, aware of strings (including interpolation, raw and triple-quoted
+// strings), char literals, and line and nested block comments, and hashes each
+// one. A rebuild compares the hashes with the previous build's and re-parses
+// only the declarations that changed (research question on incremental rebuilds).
+// Build: zc --linux --rt -O2 research/proto/declsplit.zeph declsplit
+// Usage: declsplit file.zeph [repetitions]
+import "std/io.zeph"
+
+var starts = zeros(200000)
+var hashes = zeros(200000)
+var declarationCount = 0
+
+// Skips a string starting at the opening quote; returns the index after it.
+fn skipString(text: str, start: int) -> int {
+    let n = text.len()
+    if start + 2 < n and text.byte(start + 1) == 34 and text.byte(start + 2) == 34 {
+        var i = start + 3                                  // """ ... """
+        while i + 2 < n {
+            if text.byte(i) == 34 and text.byte(i + 1) == 34 and text.byte(i + 2) == 34 { return i + 3 }
+            i += 1
+        }
+        return n
+    }
+    var i = start + 1
+    while i < n {
+        let c = text.byte(i)
+        if c == 92 { i += 2 }                              // backslash escape
+        else if c == 34 { return i + 1 }
+        else if c == 123 { i = skipCode(text, i + 1, 1) }  // {interpolation}
+        else { i += 1 }
+    }
+    return n
+}
+
+// Skips code until brace depth returns to zero from `depth`; returns the index
+// after the closing brace (used for interpolations).
+fn skipCode(text: str, start: int, depth: int) -> int {
+    let n = text.len()
+    var d = depth
+    var i = start
+    while i < n {
+        let c = text.byte(i)
+        if c == 34 { i = skipString(text, i) }
+        else if c == 123 {
+            d += 1
+            i += 1
+        } else if c == 125 {
+            d -= 1
+            i += 1
+            if d == 0 { return i }
+        } else { i += 1 }
+    }
+    return n
+}
+
+fn split(text: str) {
+    declarationCount = 0
+    let n = text.len()
+    var i = 0
+    var depth = 0
+    var atLineStart = true
+    while i < n {
+        let c = text.byte(i)
+        if atLineStart and depth == 0 and c != 10 and c != 32 and c != 9 and c != 13 {
+            if not (c == 47 and i + 1 < n and (text.byte(i + 1) == 47 or text.byte(i + 1) == 42)) and c != 125 {
+                starts[declarationCount] = i
+                declarationCount += 1
+            }
+        }
+        atLineStart = false
+        if c == 10 {
+            atLineStart = true
+            i += 1
+        } else if c == 34 {
+            i = skipString(text, i)
+        } else if c == 114 and i + 1 < n and text.byte(i + 1) == 34 and (i == 0 or not isWordByte(text.byte(i - 1))) {
+            var j = i + 2                                   // r"raw": no escapes
+            while j < n and text.byte(j) != 34 { j += 1 }
+            i = j + 1
+        } else if c == 39 {
+            if i + 2 < n and text.byte(i + 1) == 92 { i += 4 } else { i += 3 }   // 'a' or '\n'
+        } else if c == 47 and i + 1 < n and text.byte(i + 1) == 47 {
+            while i < n and text.byte(i) != 10 { i += 1 }
+        } else if c == 47 and i + 1 < n and text.byte(i + 1) == 42 {
+            var nest = 1                                    // nesting /* */
+            i += 2
+            while i < n and nest > 0 {
+                if text.byte(i) == 47 and i + 1 < n and text.byte(i + 1) == 42 {
+                    nest += 1
+                    i += 2
+                } else if text.byte(i) == 42 and i + 1 < n and text.byte(i + 1) == 47 {
+                    nest -= 1
+                    i += 2
+                } else { i += 1 }
+            }
+        } else if c == 123 {
+            depth += 1
+            i += 1
+        } else if c == 125 {
+            depth -= 1
+            i += 1
+        } else if c == 40 or c == 91 {
+            depth += 1                                      // ( and [ also continue a declaration
+            i += 1
+        } else if c == 41 or c == 93 {
+            depth -= 1
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+    starts[declarationCount] = n
+}
+
+fn isWordByte(c: int) -> bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95
+}
+
+fn hashAll(text: str) {
+    for d in 0..declarationCount {
+        var h = -3750763034362895579                        // FNV-1a offset basis
+        for i in starts[d]..starts[d + 1] { h = (h ^ text.byte(i)) * 1099511628211 }
+        hashes[d] = h
+    }
+}
+
+fn main() {
+    let path = args()[1]
+    var repetitions = 20
+    if args().len() > 2 { repetitions = args()[2] as int }
+    let text = readFile(path)
+    var splitTime = 0
+    var hashTime = 0
+    for r in 0..repetitions {
+        let t0 = nowNanoseconds()
+        split(text)
+        let t1 = nowNanoseconds()
+        hashAll(text)
+        let t2 = nowNanoseconds()
+        splitTime += t1 - t0
+        hashTime += t2 - t1
+    }
+    let bytes = text.len()
+    var functions = 0
+    for d in 0..declarationCount {
+        if text.sub(starts[d], min(starts[d] + 3, bytes)) == "fn " { functions += 1 }
+    }
+    print("{path}: {bytes} bytes, {declarationCount} top-level declarations ({functions} start with fn)")
+    print("  split: {splitTime / repetitions / 1000} us  ({bytes * 1000 * repetitions / max(splitTime, 1)} MB/s)")
+    print("  hash:  {hashTime / repetitions / 1000} us  ({bytes * 1000 * repetitions / max(hashTime, 1)} MB/s)")
+}

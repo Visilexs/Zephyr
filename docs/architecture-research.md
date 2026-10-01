@@ -64,7 +64,7 @@ only if the rewritten optimizer costs more than ~2 µs per SSA value.
 | Small-program cold build (`fib.zeph`) | < 100 ms | 280 ms baseline, 530 ms -O2 | [M] `/usr/bin/time`, Xeon 2.1 GHz |
 | Empty program cold build | < 100 ms | 260 ms (runtime only) | [M] |
 | Self-compile (`zc.zeph`, 19k lines + runtime) | — | 3.14 s baseline, 7.67 s -O2; 256 MB / 471 MB peak RSS | [M] |
-| Incremental rebuild | < 20 ms | same as a cold build (no caching) | [M] |
+| Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
 | Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads | [M] `research/x86bench.py` |
 | Bit-identical output across modes | required | checksums match on every workload so far | [M] |
 
@@ -379,6 +379,42 @@ That's legal because integer `+` is associative under wraparound.
   elimination, not from the convention. It applies to every recursive function
   of the shape `f(x) = g(f(a), f(b))` with `g` associative.
 
+### M10. Incremental rebuild: finding what changed (cycle 6)
+
+`research/proto/declsplit.zeph` splits a source file into top-level
+declarations and hashes each one. It handles strings with interpolation, raw and
+triple-quoted strings, char literals, and nesting comments. It works without
+lexing or parsing the whole file [M]:
+
+| File | Size | Declarations | Split | Hash (FNV-1a) |
+|---|---:|---:|---:|---:|
+| `compiler/zc.zeph` | 1.05 MB | 992 (504 `fn`, matching `grep -c '^fn '`) | 5.3 ms (196 MB/s) | 1.5 ms (697 MB/s) |
+| `compiler/optimizer.zeph` | 0.33 MB | 549 (309 `fn`) | 3.0 ms (111 MB/s) | 0.5 ms |
+
+**An edit-one-function rebuild of zc, estimated:**
+
+| Step | Cost |
+|---|---|
+| Split and hash, to find the changed declaration | ~7 ms [M] |
+| Re-lex, parse and check that declaration | < 1 ms [E] |
+| Optimize it (~530 values at ~1 µs each, M4b) | ~0.5 ms [E] |
+| Re-link cached machine code (~5 MB) | ~2–5 ms [E] |
+| **Total** | **~10–15 ms [E]** |
+
+That meets the < 20 ms target, as long as the cache tracks dependencies:
+
+- a changed signature re-checks its callers;
+- a changed struct or global re-checks its users;
+- every function that inlined the changed one is recompiled.
+
+**What this means for the interpreted-compiler question:**
+
+- An interpreter tier saves only code generation. It still needs the frontend.
+- With declaration-level caching, the frontend work per edit is one declaration
+  and code generation is under a millisecond.
+- So the time an interpreter tier could save is tiny, which strengthens the C1
+  verdict.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -504,3 +540,9 @@ That's legal because integer `+` is associative under wraparound.
   - Parallel-loop prototype (M8): 3.17× on 4 vCPUs, bit-identical; 0.6 µs fork-join.
   - fib's gap comes from one missing pass, accumulator recursion elimination
     (M9), not from the calling convention.
+- **2026-10-01, cycle 6.**
+  - Attacked the "no interpreter tier" verdict from the frontend side.
+  - Declaration splitting and hashing of zc.zeph takes 7 ms (M10), so
+    incremental rebuilds can hit < 20 ms without an interpreter.
+  - An interpreter tier would only skip code generation, which is now the
+    cheap part.
