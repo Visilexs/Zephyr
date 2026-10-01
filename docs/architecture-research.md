@@ -5,7 +5,7 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 
 ## Current best architecture
 
-*(Revised every cycle. Cycle 23 state. Each claim cites a measurement.)*
+*(Revised every cycle. Cycle 30 state. Each claim cites a measurement.)*
 
 **Summary:**
 
@@ -29,27 +29,42 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      small-program build today [M3].
    - Projections: small-program cold build ~10–30 ms [E] (from 280 ms [M]);
      zc incremental rebuild ~10–15 ms [E].
+   - A warm `zc run` reaches its first instruction in ≈ 3 ms (zc start
+     1.7 ms + image load 0.4 ms) [M17].
+   - Builds stay deterministic, because the cache only skips work. Parallel
+     compilation must emit in a fixed order, so selfbuild fixpoints still hold.
 2. **One flat IR.**
    - Typed SSA with block parameters, stored in preallocated `[int]` arrays.
    - The compiler's own hot data never touches the reference-counted heap.
      Today 43% of compile time is reference counting, allocation and GC [M3].
    - The flat pipeline runs at 0.23–0.27 µs per value in Zephyr [M4b], against
      7.3 µs for today's -O2 [M5].
+   - Cold compile target ≈ 5–10 µs per small function [E]. Today zc takes
+     165 µs, about gcc -O2's speed; tcc takes 1.6 µs [M32].
+   - A flat lexer in Zephyr scans ~55 MB/s including token storage [M14:
+     38.7 MB in ~0.7 s], so lexing zc.zeph costs ~20 ms.
 3. **One optimizing native backend, emitting machine code directly.**
    - No text assembler, which is 28% of a self-compile today [M3].
    - Instruction selection, register allocation over all 16 GPRs and 16 XMMs.
      Hand allocation of one hot loop gave −27% (M20).
+   - Linear scan **with interval splitting**, two-address hints, and a smaller
+     scratch reservation. Today's allocator has no splitting and reserves 2
+     XMMs [M30].
    - An internal calling convention: no frame pointer, no stack realignment,
      shrink-wrapped saves. Calls cost 1.47× C's today [M12]; a lean prologue
      alone is −15% on fib [M21].
    - It decides 11 of the 19 workloads [M6].
    - Missing passes, measured or identified:
-     - accumulator recursion elimination (fib 1.46× → 0.96× C) [M9, M21];
+     - accumulator recursion elimination; with the lean frame, fib goes from
+       1.46× to 0.95× C [M9, M21, M29];
      - signed magic-number division [M7];
      - SoA loop vectorization with alias versioning [M7], and straight-line
        vectorization of paired x/y/z arithmetic, which gcc uses in both vectors
        and nbody [M7, M18];
-     - profile-guided inlining of hot loop bodies [M11].
+     - inlining of hot loop bodies [M11].
+   - Megamorphic sites stay indirect calls, since branch trees are slower
+     [M28]. Interface methods pass arguments in registers, not on the stack
+     (−3%) [M28].
    - Debug builds are this backend with passes off.
 4. **Representation layer**, using closed-world, whole-program facts:
    - **Immutability inference:** never-mutated struct types become values,
@@ -84,8 +99,10 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      [M4], and with caching there is no latency left for a tier to hide [M10].
    - Runtime profiles, a JIT's other advantage, are worth ≤ 5–13% at best and
      −4% on average here [M25]. So profiles stay opt-in.
-   - Copy-and-patch from the interpreter's handlers stays in reserve, in case
-     the optimizer ever exceeds ~2 µs per value.
+   - Copy-and-patch from the interpreter's handlers stays in reserve (18–20 ns
+     per op in C [M31]). It is triggered if the optimizer ever exceeds ~2 µs
+     per value, or for cold builds of programs above ~100 k lines without a
+     shared cache (scenario S7).
 
 **Projected single-core geometric mean vs gcc -O2** (cycle 23 update):
 
