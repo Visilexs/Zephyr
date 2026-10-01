@@ -1,0 +1,93 @@
+// Oracle rewrite of bench/records.zeph (revision 398aadd): mutable records
+// flattened into their list, as SoA. Same checksum.
+// Record-table benchmark: a list of structs with eight mixed int/float fields,
+// walked by hot loops every round: a filtered scan (one category), a
+// multi-predicate filter, a per-category aggregation into small arrays, and an
+// in-place update of several fields. C and Rust store the records inline in a
+// contiguous array; Zephyr's [Record] holds references to boxed structs.
+// Usage: records [count]   (default 1000000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+var count = 1000000
+if args().len() > 1 { count = args()[1] as int }
+let rounds = 40
+
+// [Record] flattened into one list per field (SoA). Element aliases in the
+// original (`for record in records`, then record.f = ...) become index-based
+// accesses, which is what (list, index) element references compile to.
+var id: [int] = []
+var category: [int] = []
+var quantity: [int] = []
+var flags: [int] = []
+var price: [float] = []
+var weight: [float] = []
+var score: [float] = []
+var discount: [float] = []
+for i in 0..count {
+    let c = nextRandom() % 8
+    let q = nextRandom() % 1000
+    let f = nextRandom() % 16
+    let p = (nextRandom() % 100000) as float / 100.0
+    let w = (nextRandom() % 10000) as float / 100.0
+    let s = (nextRandom() % 1000) as float / 10.0
+    let d = (nextRandom() % 500) as float / 1000.0
+    id.push(i)
+    category.push(c)
+    quantity.push(q)
+    flags.push(f)
+    price.push(p)
+    weight.push(w)
+    score.push(s)
+    discount.push(d)
+}
+
+var checksum = 0
+for round in 0..rounds {
+    let targetCategory = round % 8
+    var revenue = 0.0
+    var matchedCount = 0
+    for r in 0..count {
+        if category[r] == targetCategory {
+            revenue += price[r] * (quantity[r] as float)
+            matchedCount += 1
+        }
+    }
+
+    let flagBit = 1 << (round % 4)
+    var heavyCount = 0
+    var heavyScore = 0.0
+    for r in 0..count {
+        if weight[r] > 50.0 and (flags[r] & flagBit) != 0 and quantity[r] < 500 {
+            heavyCount += 1
+            heavyScore += score[r]
+        }
+    }
+
+    var categoryTotals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var categoryQuantities = [0, 0, 0, 0, 0, 0, 0, 0]
+    for r in 0..count {
+        categoryTotals[category[r]] += weight[r] * discount[r]
+        categoryQuantities[category[r]] += quantity[r]
+    }
+
+    for r in 0..count {
+        quantity[r] = (quantity[r] * 7 + round + id[r]) % 1000
+        score[r] = score[r] * 0.5 + price[r] * 0.25
+        if (flags[r] & 1) != 0 { price[r] = price[r] + discount[r] }
+        flags[r] = (flags[r] * 5 + 1) & 15
+        discount[r] = discount[r] * 0.75
+    }
+
+    checksum = checksum * 31 + (revenue * 100.0) as int + matchedCount
+    checksum = checksum * 31 + (heavyScore * 100.0) as int + heavyCount
+    for i in 0..8 {
+        checksum = checksum * 31 + (categoryTotals[i] * 1000.0) as int + categoryQuantities[i]
+    }
+}
+print(checksum)

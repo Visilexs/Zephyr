@@ -55,6 +55,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - **Immutability inference:** never-mutated struct types become values,
      flattened into their containers (SoA). shapes: 1.83× → 1.40× [M11];
      vectors: bound 0.40× C with AVX2 [M7].
+   - **Mutable records flattened too**, with element references as (list,
+     index) pairs. records: 1.25× → 1.01× C [M27].
    - **Region inference** for structures that die at the end of a statement or
      call. bintrees: 3.00× → 0.29× C [M7].
    - **Allocation and release specialized per type** instead of the generic
@@ -870,6 +872,32 @@ stops gcc from cancelling the plain pairs [M]:
      makes the copy cheap.
 - This keeps today's 0.5 ns plain counts for all single-threaded code.
 
+### M27. records: flattening mutable records (cycle 21)
+
+`bench/records.zeph` updates struct fields in place through list elements.
+Today each element is a pointer to a separate object (24-byte header + 64-byte
+payload), against C's inline 64-byte structs. The oracle
+`research/oracle/records_soa.zeph` stores one list per field. The original's
+element aliases (`for record in records { record.f = … }`) become index
+accesses, which is what (list, index) element references would compile to.
+Same checksum, `hyperfine -N`, 5 runs [M]:
+
+| Version | Time | vs C |
+|---|---:|---:|
+| `bench/records.zeph`, -O2 | 1.27 s | 1.25 |
+| SoA oracle | **1.03 s** | **1.01** |
+| C (inline array of structs) | 1.02 s | 1.00 |
+
+**What this means:** mutable records need flattening too, not only immutable
+ones (M16). The mechanism is element references as (list, index) pairs.
+
+- They are safe because a list's storage is reachable only through the list.
+- They need care at growth: a `push` that reallocates must leave existing
+  (list, index) references valid. It does, since the reference names the list,
+  not the storage address.
+
+This moves the M16 "future work" item into the plan.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1064,3 +1092,6 @@ stops gcc from cancelling the plain pairs [M]:
   - Kept non-atomic counts. Parallelism requires bodies proven free of count
     updates, and parallel compilation uses share-nothing workers.
   - Saved `research/pgo_c.py` for M25.
+- **2026-10-01, cycle 21.**
+  - records SoA oracle (M27): 1.25× → 1.01× C. Mutable records flattened via
+    (list, index) element references joins the plan.
