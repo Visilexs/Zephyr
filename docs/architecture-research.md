@@ -5,7 +5,7 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 
 ## Current best architecture
 
-*(Revised every cycle. Cycle 7 state. Each claim cites a measurement.)*
+*(Revised every cycle. Cycle 23 state. Each claim cites a measurement.)*
 
 **Summary:**
 
@@ -87,15 +87,42 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - Copy-and-patch from the interpreter's handlers stays in reserve, in case
      the optimizer ever exceeds ~2 µs per value.
 
-**Projected single-core geometric mean vs gcc -O2:**
+**Projected single-core geometric mean vs gcc -O2** (cycle 23 update):
 
 | Basis | Geometric mean |
 |---|---:|
 | Today [M] | 1.253 |
-| Measured oracle results only, other workloads unchanged | ≈ 1.02 |
-| Including the estimated fixes listed above | ≈ 0.88 [E] |
+| Every workload at its best **measured** oracle (each one applies a single transformation; untested workloads at today's value) [M] | **0.99** |
+| The same, with vectors at its C-measured SoA + AVX2 bound (0.40) | 0.93 |
 
-Parallel workloads go well below 1.0 on multicore machines.
+Per-workload values used in the 0.99 row:
+
+| Workload | Value | Source |
+|---|---:|---|
+| fib | 0.96 | M21 |
+| matmul | 0.55 | today |
+| mandel | 0.98 | today |
+| sort | 0.53 | today |
+| strings | 1.22 | M7 |
+| hashmap | 0.71 | today |
+| cube | 1.15 | today |
+| pi | 0.58 | today |
+| liquid | 1.20 | today |
+| shapes | 1.40 | M11 |
+| closures | 1.10 | today |
+| wordfreq | 1.95 | today; M24 inconclusive |
+| nbody | 1.23 | today |
+| lexer | 1.56 | M14 |
+| vectors | 1.24 | M20, hand register allocation |
+| dispatch | 1.43 | M28 |
+| records | 1.01 | M27 |
+| strbuild | 1.45 | M23 |
+| bintrees | 0.29 | M7 |
+
+Combining transformations should compound: for example, register allocation
+plus the lean convention plus header shrinking on the same workload. Those
+combinations haven't been measured, so they aren't counted. Parallel workloads
+go well below 1.0 on multicore machines [M8].
 
 ## Scoreboard
 
@@ -105,7 +132,7 @@ Parallel workloads go well below 1.0 on multicore machines.
 | Empty program cold build | < 100 ms | 260 ms (runtime only) | [M] |
 | Self-compile (`zc.zeph`, 19k lines + runtime) | — | 3.14 s baseline, 7.67 s -O2; 256 MB / 471 MB peak RSS | [M] |
 | Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
-| Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads | [M] `research/x86bench.py` |
+| Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle | [M] `research/x86bench.py`; oracles M7–M28 |
 | Bit-identical output across modes | required | checksums match on every workload so far | [M] |
 
 ## Measurements
@@ -1131,3 +1158,6 @@ same checksum [M]:
   - Register arguments gain 3%. Construction is 2.1× C.
   - The rest is attributed to the extra load through the interface cell and to
     density.
+- **2026-10-01, cycle 23.**
+  - Recomputed the projection from measured oracles only: 0.99× C geometric
+    mean (0.93× with the vectors SoA bound).
