@@ -298,21 +298,41 @@ fn linuxReadWholeFile(path: int, buffer: int, capacity: int) -> int {
 // ---- command line ----
 
 // /proc/self/cmdline is argv joined by NULs; runtimeArguments wants the Windows
-// GetCommandLineA shape, so the NULs become spaces.
-// ponytail: no quoting, so an argument containing a space splits in two.
-// Capture argv at _start if that ever matters.
+// GetCommandLineA shape, so each argument is wrapped in double quotes and the
+// arguments are joined by spaces. Spaces and empty arguments survive. Like the
+// Windows parser, there is no escape for a literal double quote.
 var linuxCommandLine = 0
 
 fn kernel32GetCommandLineA() -> int {
     if linuxCommandLine != 0 { return linuxCommandLine }
-    let page = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
+    let rawCapacity = 131072
+    let page = linuxMapMemory(0, 3 * rawCapacity + 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
     if page == 0 { return 0 }
-    let path = linuxProcCommandLinePath(page + 4096)
-    let byteCount = linuxReadWholeFile(path, page, 4096)
-    for i in 0..byteCount {
-        if load8(page + i) == 0 { store8(page + i, 32) }
+    let raw = page + 2 * rawCapacity + 4096
+    let path = linuxProcCommandLinePath(raw + rawCapacity)
+    let byteCount = linuxReadWholeFile(path, raw, rawCapacity - 1)
+    var length = 0
+    var start = 0
+    for i in 0..byteCount + 1 {
+        if i == byteCount or load8(raw + i) == 0 {
+            if i > start or i < byteCount {
+                if length > 0 {
+                    store8(page + length, 32)
+                    length += 1
+                }
+                store8(page + length, 34)
+                length += 1
+                for j in start..i {
+                    store8(page + length, load8(raw + j))
+                    length += 1
+                }
+                store8(page + length, 34)
+                length += 1
+            }
+            start = i + 1
+        }
     }
-    store8(page + byteCount, 0)
+    store8(page + length, 0)
     linuxCommandLine = page
     return page
 }

@@ -359,6 +359,7 @@ var typeBindingTypes: [int] = []
 var lambdaScopeBases: [int] = []
 var lambdaCaptureNames: [[str]] = []
 var lambdaCaptureTypes: [[int]] = []
+var allClosureCaptureTypes: [int] = []   // every closure's capture types, for typeGraphMayCycle
 var lambdaCaptureNodes: [[Node]] = []
 var descriptors: [int] = []
 var scopes: [[VariableInformation]] = []
@@ -3558,6 +3559,7 @@ fn checkFunctionLiteral(expression: Node) -> int {
     let poppedScopeBase = lambdaScopeBases.pop()
     let captureNamesLocal = lambdaCaptureNames.pop()
     let captureTypesLocal = lambdaCaptureTypes.pop()
+    for captureType in captureTypesLocal { allClosureCaptureTypes.push(captureType) }
     let captureNodesLocal = lambdaCaptureNodes.pop()
     environmentPop()
 
@@ -6688,6 +6690,70 @@ fn constantFoldAll(program: Node) {
     for i in 0..functionDefinitions.len() {
         let functionDefinition = functionDefinitions[i]
         if functionDefinition.body.nodeKind != nodeNone { foldConstants(functionDefinition.body) }
+    }
+}
+
+// ---- cycle-capable types ----
+// Reference counting reclaims everything except cycles, and a cycle of
+// objects needs a cycle in the type graph. Edges: struct fields (and the
+// fields of an enum's variant structs), list, optional and map element and
+// key types, every captured type for a function value (any closure may be
+// behind it), and every struct for an interface value. If no type reaches
+// itself, the collector's mark phase can never find garbage that counting
+// missed, so the runtime skips it (runtimeTypeGraphAcyclic).
+fn typeGraphMayCycle() -> bool {
+    let typeCount = typeKinds.len()
+    var states: [int] = []                       // 0 unvisited, 1 on the stack, 2 done
+    for i in 0..typeCount { states.push(0) }
+    for root in 0..typeCount {
+        if states[root] == 0 and typeReachesItself(root, states) { return true }
+    }
+    return false
+}
+
+fn typeGraphSuccessors(typeIndex: int) -> [int] {
+    var successors: [int] = []
+    let kind = typeKinds[typeIndex]
+    if kind == kindList or kind == kindOptional { successors.push(typeElementIds[typeIndex]) }
+    else if kind == kindMap {
+        successors.push(typeElementIds[typeIndex])
+        successors.push(typeDefinitionIds[typeIndex])
+    } else if kind == kindStruct {
+        let definition = structDefinitions[typeDefinitionIds[typeIndex]]
+        for fieldType in definition.fieldTypes { successors.push(fieldType) }
+        for variant in definition.variants {
+            for fieldType in structDefinitions[variant].fieldTypes { successors.push(fieldType) }
+        }
+    } else if kind == kindFunction {
+        for captureType in allClosureCaptureTypes { successors.push(captureType) }
+    } else if kind == kindInterface {
+        for other in 0..typeKinds.len() {
+            if typeKinds[other] == kindStruct { successors.push(other) }
+        }
+    }
+    return successors
+}
+
+fn typeReachesItself(typeIndex: int, states: [int]) -> bool {
+    states[typeIndex] = 1
+    for successor in typeGraphSuccessors(typeIndex) {
+        if successor >= 0 and successor < states.len() {
+            if states[successor] == 1 { return true }
+            if states[successor] == 0 and typeReachesItself(successor, states) { return true }
+        }
+    }
+    states[typeIndex] = 2
+    return false
+}
+
+// sets the runtime's `let runtimeTypeGraphAcyclic = 0` to 1 when no type can
+// form a cycle; must run before foldGlobals substitutes the constant
+fn markTypeGraphAcyclic(program: Node) {
+    if typeGraphMayCycle() { return }
+    for statement in program.children {
+        if statement.nodeKind == nodeDeclaration and statement.name == "runtimeTypeGraphAcyclic" and statement.children.len() > 0 and statement.children[0].nodeKind == nodeInteger {
+            statement.children[0].integerValue = 1
+        }
     }
 }
 
@@ -19302,6 +19368,7 @@ if inputPath == "" and showVersion {
     lowerDefers(program)
     check(program)
     currentSourceFile = baseName(inputPath)
+    markTypeGraphAcyclic(program)
     foldGlobals(program)
     inlinePass(program)
     constantFoldAll(program)                       // fold what inlined literal args exposed
