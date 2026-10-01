@@ -99,7 +99,7 @@ Per-workload values used in the 0.99 row:
 
 | Workload | Value | Source |
 |---|---:|---|
-| fib | 0.96 | M21 |
+| fib | 0.95 | M29 |
 | matmul | 0.55 | today |
 | mandel | 0.98 | today |
 | sort | 0.53 | today |
@@ -955,6 +955,22 @@ same checksum [M]:
     the extra dependent load through the `{vtable, data}` cell and to object
     size (~80 bytes per element against ~32) [E; not isolated by an oracle].
 
+### M29. Combining two transformations on fib (cycle 24)
+
+`research/leanframe.py` rewrites chosen functions in reassembled zc output to
+the lean internal frame. It keeps `rsp`-relative spill slots and refuses
+functions it cannot rewrite safely. Applied to the accumulator oracle (M21),
+`hyperfine -N`, 8 runs [M]:
+
+| Version | fib(43) | vs C |
+|---|---:|---:|
+| Accumulator oracle, zc frame | 836 ms | 1.02 |
+| Accumulator oracle + lean frame | **777 ms** | **0.95** |
+| C -O2 | 817 ms | 1.00 |
+
+The two transformations compound, as expected, and fib ends up faster than C.
+This is the first measured combination. The projection now uses 0.95 for fib.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1161,3 +1177,7 @@ same checksum [M]:
 - **2026-10-01, cycle 23.**
   - Recomputed the projection from measured oracles only: 0.99× C geometric
     mean (0.93× with the vectors SoA bound).
+- **2026-10-01, cycle 24.**
+  - Built `research/leanframe.py`.
+  - The accumulator oracle + lean frame gives fib 0.95× C (M29), the first
+    measured combination of two transformations.
