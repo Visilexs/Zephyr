@@ -1,0 +1,94 @@
+// Oracle rewrite of bench/dispatch.zeph (revision 398aadd).
+// Megamorphic dispatch benchmark: one interface with two methods and eight
+// implementing structs (more receiver types than a small inline cache or a
+// 4-way devirtualization guard can cover). A list of randomly mixed objects is
+// walked for many rounds; each object transforms a running 20-bit value and
+// reports a weight, both through the interface.
+// C uses vtables of function pointers, Rust uses Vec<Box<dyn Transform>>.
+// Usage: dispatch [count]   (default 1000000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+const valueMask = 1048575
+
+// Closed-world conversion of `interface Transform` (eight known impls): one
+// struct with a kind tag and two fields; apply/weight are inlined bodies behind
+// a balanced branch tree on the kind (3 branches per call instead of an
+// indirect call). Same arithmetic, same checksum.
+struct Transform { kind: int, a: int, b: int }
+
+fn apply(t: Transform, value: int) -> int {
+    let kind = t.kind
+    if kind < 4 {
+        if kind < 2 {
+            if kind == 0 { return (value + t.a) & valueMask }
+            return (value * t.a) & valueMask
+        }
+        if kind == 2 { return value ^ t.a }
+        return ((value << t.a) | (value >> (20 - t.a))) & valueMask
+    }
+    if kind < 6 {
+        if kind == 4 {
+            if value < t.a { return t.a }
+            if value > t.b { return t.b }
+            return value
+        }
+        return (value * t.a + t.b) & valueMask
+    }
+    if kind == 6 { return value / t.a + t.a * 1000 }
+    return (valueMask - value + t.a) & valueMask
+}
+
+fn weight(t: Transform) -> int {
+    let kind = t.kind
+    if kind == 0 { return t.a & 7 }
+    if kind == 1 { return 1 }
+    if kind == 2 { return 2 }
+    if kind == 3 { return t.a }
+    if kind == 4 { return 3 }
+    if kind == 5 { return 4 }
+    if kind == 6 { return t.a }
+    return 5
+}
+
+fn makeTransform() -> Transform {
+    let kind = nextRandom() % 8
+    if kind == 0 { return Transform{kind: 0, a: nextRandom() % 1000, b: 0} }
+    if kind == 1 { return Transform{kind: 1, a: nextRandom() % 64 + 1, b: 0} }
+    if kind == 2 { return Transform{kind: 2, a: nextRandom() & valueMask, b: 0} }
+    if kind == 3 { return Transform{kind: 3, a: nextRandom() % 19 + 1, b: 0} }
+    if kind == 4 {
+        let low = nextRandom() % 100000
+        let high = low + nextRandom() % 900000
+        return Transform{kind: 4, a: low, b: high}
+    }
+    if kind == 5 {
+        let scale = nextRandom() % 32 + 1
+        let offset = nextRandom() % 1000
+        return Transform{kind: 5, a: scale, b: offset}
+    }
+    if kind == 6 { return Transform{kind: 6, a: nextRandom() % 16 + 1, b: 0} }
+    return Transform{kind: 7, a: nextRandom() % 1000, b: 0}
+}
+var count = 1000000
+if args().len() > 1 { count = args()[1] as int }
+let rounds = 20
+var transforms: [Transform] = []
+for i in 0..count { transforms.push(makeTransform()) }
+var checksum = 0
+for round in 0..rounds {
+    var value = round
+    var weightTotal = 0
+    for transform in transforms {
+        value = apply(transform, value)
+        weightTotal += weight(transform)
+    }
+    checksum = checksum * 31 + value
+    checksum = checksum * 31 + weightTotal
+}
+print(checksum)

@@ -898,6 +898,36 @@ ones (M16). The mechanism is element references as (list, index) pairs.
 
 This moves the M16 "future work" item into the plan.
 
+### M28. dispatch: megamorphic calls (cycle 22)
+
+Measured with `hyperfine -N` on one core, 6–8 runs. Every variant produces the
+same checksum [M]:
+
+| Version | Time |
+|---|---:|
+| `bench/dispatch.zeph`, -O2 | 0.45–0.49 s |
+| Closed-world tagged struct with inlined bodies behind a 3-level branch tree (`research/oracle/dispatch_tagged.zeph`) | 0.50 s (**slower**) |
+| Tagged struct + per-kind function table, one indirect call (`dispatch_table.zeph`) | 0.49 s (no change) |
+| Reassembled: arguments in registers, no frames on the 16 method bodies | 0.47 s (−3%) |
+| C, vtables + malloc | 0.29–0.32 s |
+| Construction only (`rounds = 0`): Zephyr vs C | 95 ms vs 45 ms |
+
+**Findings:**
+
+- With 8 implementations in random order, a branch tree on the tag costs more
+  than one mispredicted indirect call. Closed-world dispatch should keep
+  indirect calls at megamorphic sites, and use guards only where a profile or
+  static count shows ≤ 2–4 targets.
+- Interface methods take their arguments on the stack (`[rbp + 16]`,
+  `[rbp + 24]`), which puts the serial value chain through memory. Fixing that
+  is worth only 3% here: store-to-load forwarding is cheap next to the
+  mispredicted indirect call.
+- Of the ~170 ms gap:
+  - ~50 ms is construction, the generic allocation path (M13);
+  - the dispatch loop is ~1.4× C. The remaining loop cost is attributed to
+    the extra dependent load through the `{vtable, data}` cell and to object
+    size (~80 bytes per element against ~32) [E; not isolated by an oracle].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1095,3 +1125,9 @@ This moves the M16 "future work" item into the plan.
 - **2026-10-01, cycle 21.**
   - records SoA oracle (M27): 1.25× → 1.01× C. Mutable records flattened via
     (list, index) element references joins the plan.
+- **2026-10-01, cycle 22.**
+  - dispatch (M28): branch-tree devirtualization is slower than indirect
+    calls, and table dispatch is unchanged.
+  - Register arguments gain 3%. Construction is 2.1× C.
+  - The rest is attributed to the extra load through the interface cell and to
+    density.
