@@ -16,7 +16,7 @@ $new   = Join-Path $root "zc.new.exe"
 $chk   = Join-Path $root "zc.chk.exe"
 
 if (-not (Test-Path $zc)) {
-    Write-Host "no zc.exe --- seed once: .\build.ps1; .\zephyr.exe build compiler\zc.zeph -o zc.exe --rt" -ForegroundColor Yellow
+    Write-Host "no zc.exe --- seed once: .\bootstrap\build.ps1" -ForegroundColor Yellow
     exit 1
 }
 if (-not (Test-Path (Join-Path (Join-Path $root "compiler") "runtime.zeph"))) {

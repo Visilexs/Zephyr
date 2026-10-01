@@ -7022,7 +7022,7 @@ fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
     if functionDefinition.name == "runtimeCollectGarbage" { return false }
     if containsBaselineVectorCandidate(functionDefinition.body) {
-        optimizerNote("function {functionDefinition.name}: baseline (holds an AVX2 kernel loop)")
+        optimizerNote("function {functionDefinition.name}: baseline (holds a target-native kernel loop)")
         return false
     }
     let label = functionCodeLabel(functionDefinition.label)
@@ -7067,8 +7067,8 @@ fn isLoopStatement(statement: Node) -> bool {
     return statement.nodeKind == nodeWhile or statement.nodeKind == nodeRangeLoop or statement.nodeKind == nodeIterableLoop
 }
 
-// A range loop the baseline may turn into an AVX2 kernel (tryFill, tryReduce,
-// tryScaledVectorAddition all want a one-assignment body): leave it to them.
+// Reserve loops only for a kernel available on the selected target. Darwin
+// has native AXPY and weighted-reduction kernels.
 // The same shape checks tryReduce and tryScaledVectorAddition make before
 // they commit to emitting their kernel.
 fn baselineVectorCandidate(statement: Node) -> bool {
@@ -7094,6 +7094,7 @@ fn baselineVectorCandidate(statement: Node) -> bool {
         if element.nodeKind != nodeIndex or factor.nodeKind != nodeIdentifier { return false }
         if factor.auxiliary != identifierKindLocal or factor.slot != loopSlot { return false }
         if element.children[0].nodeKind != nodeIdentifier or typeKinds[element.typeIndex] != kindInteger { return false }
+        if macosTargetEnabled and not nativeReduceInputsSafe(element.children[0], statement.children[0], statement.children[1]) { return false }
         let elementIndex = element.children[1]
         return elementIndex.nodeKind == nodeIdentifier and elementIndex.auxiliary == identifierKindLocal and elementIndex.slot == loopSlot
     }
@@ -7110,6 +7111,11 @@ fn baselineVectorCandidate(statement: Node) -> bool {
     if scaledVectorInvariantIndex(sourceElement.children[1], loopSlot) < 0 or usesLocal(scalarFactor, loopSlot) { return false }
     let targetList = target.children[0]
     let sourceList = sourceElement.children[0]
+    if macosTargetEnabled {
+        let outputBase = target.children[1].children[scaledVectorInvariantIndex(target.children[1], loopSlot)]
+        let inputBase = sourceElement.children[1].children[scaledVectorInvariantIndex(sourceElement.children[1], loopSlot)]
+        if not nativeAxpyInputsSafe(targetList, sourceList, scalarFactor, outputBase, inputBase, statement.children[0], statement.children[1]) { return false }
+    }
     return not (targetList.auxiliary == sourceList.auxiliary and targetList.slot == sourceList.slot)
 }
 

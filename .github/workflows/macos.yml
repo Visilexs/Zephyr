@@ -1,0 +1,31 @@
+name: Native Apple Silicon
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Verify native host and seed
+        run: |
+          test "$(uname -m)" = arm64
+          ./zc --version
+      - name: Native self-hosting fixpoint
+        run: ./zc selfbuild
+      - name: Native language and runtime regressions
+        run: python3 tests/macos_tests.py
+      - name: Native JIT transitions and runtime parity
+        run: python3 tests/macos_jit.py

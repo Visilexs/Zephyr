@@ -1,29 +1,15 @@
-# bootstrap/ — the historical C seed (not the live toolchain)
+# Compiler bootstrap and native runtime
 
-Zephyr is self-hosted: the compiler (`../zc.exe`, built from
-`../compiler/zc.zeph`) and its runtime (`../runtime.zeph`) are written in
-Zephyr, and `../selfbuild.ps1` rebuilds the compiler using only itself — no gcc,
-no C.
+The normal self-hosting loop starts from the root compiler seeds: `zc.exe` on
+Windows and `zc-macos` on Apple Silicon. Rebuild them with
+`scripts/selfbuild.ps1` and `./zc selfbuild`, respectively.
 
-But a self-hosting compiler is a binary that builds itself, so it needs a
-*first* binary to exist — the same chicken-and-egg every self-hosted language
-has (rustc is built by rustc; Go by Go). This folder is that seed, kept only so
-the whole toolchain can be reconstructed from source if `zc.exe` is ever
-lost. Nothing here runs in day-to-day use.
+`zephyr.c` and `runtime.c` preserve the historical Windows C bootstrap sources.
+On Windows with GCC, `bootstrap/build.ps1` rebuilds the C seed and attempts to
+seed the current compiler. The historical seed has fewer language features than
+the live compiler; this recovery path has not been validated by the native Mac
+checks. Generated C binaries, objects, and the copied runtime are build products.
 
-| file | what it is |
-|------|------------|
-| `zephyr.c` | the original Zephyr compiler, written in C |
-| `runtime.c` | the C runtime (`zephyr_rt.dll`) — optimized GC, full float support |
-| `build.ps1` | gcc builds the C seed, then emits the first `../zc.exe` |
-| `bootstrap.ps1` | verifies the self-host fixpoint (gcc path + native path) |
-| `nocc.ps1` | proves the loop is self-sustaining with zero gcc and zero C |
-| `zephyr.exe`, `zephyr_rt.dll`, `runtime.o` | the built C artifacts |
-
-## Re-seeding from scratch (needs gcc)
-
-```powershell
-.\bootstrap\build.ps1     # rebuilds the C seed and re-emits zc.exe
-```
-
-After that, forget this folder exists and use `.\selfbuild.ps1`.
+`macos/darwin.c`, `main.c`, `native.h`, and `entry.s` are required native Darwin
+runtime and entry-point sources. The Apple Silicon driver links them into every
+generated executable. They are part of the active toolchain.

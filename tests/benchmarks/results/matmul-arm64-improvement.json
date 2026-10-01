@@ -1,0 +1,118 @@
+{
+  "startedUtc": "2026-09-30T23:16:04.927334+00:00",
+  "machine": "Apple M5",
+  "macos": "27.0",
+  "architecture": "arm64",
+  "workload": "matmul",
+  "matrixSize": 1100,
+  "checksum": "26952750000",
+  "sourceRevision": "398aaddb0e1d15af42e8fc4756d36dbf561acd81",
+  "cFlags": "-arch arm64 -O2 -fwrapv -ffp-contract=off",
+  "clang": "Apple clang version 21.0.0 (clang-2100.3.20.102)",
+  "runsRequested": 10,
+  "perBuildBudgetMs": 30000,
+  "minimumBudgetSamples": 3,
+  "scheduling": "normal",
+  "cpuAffinity": "not fixed",
+  "memoryMetric": "process peak resident set in bytes",
+  "previousSeedSha256": "e01ca9334513678be1026e4a09f1462165b3df2276995688d4e876aaa3dae735",
+  "newSeedSha256": "5a6c53536489ff4bba9a78044910c2d9e0184d76f07059ee1aa459906dcb0af1",
+  "sourceSha256": "5bfd3eacb66fe74386951c73e02c07087f8203b08ec5e41f9908649fec793f4c",
+  "status": "complete",
+  "measurements": {
+    "previous-O2": {
+      "executableSha256": "6961392d35e396dde6974b285e124f6939f264b2b8327ac5373165d783bc32ca",
+      "warmupMs": 4504.591999997501,
+      "warmupRssBytes": 31719424,
+      "medianMs": 4220.657812002173,
+      "madMs": 18.174645003455225,
+      "minMs": 4198.500541999238,
+      "timesMs": [
+        4217.909083003178,
+        4216.145250000409,
+        4223.406541001168,
+        4288.815040999907,
+        4258.632583005237,
+        4198.500541999238,
+        4263.210832999903,
+        4206.465791998198
+      ],
+      "samples": 8,
+      "peakRssBytes": 31752192
+    },
+    "native-baseline": {
+      "executableSha256": "ac22d653e6c1705dd043fb794abc2ac554ed85d0f2c2038b36ac0d6984ddf34b",
+      "warmupMs": 376.90212500456255,
+      "warmupRssBytes": 31932416,
+      "medianMs": 374.7953545025666,
+      "madMs": 1.8993135054188315,
+      "minMs": 372.02804099797504,
+      "timesMs": [
+        372.02804099797504,
+        374.36595799954375,
+        374.7950840042904,
+        383.22395800059894,
+        401.4575410037651,
+        373.76404099632055,
+        378.3116670019808,
+        374.79562500084285,
+        383.4271660016384,
+        374.1566250027972
+      ],
+      "samples": 10,
+      "peakRssBytes": 31932416
+    },
+    "native-O2": {
+      "executableSha256": "66e9bc1a5af50cdf5f9ad0a036edb54432c749e244ecc5b0c6842a9ee222f482",
+      "warmupMs": 375.4907090042252,
+      "warmupRssBytes": 31850496,
+      "medianMs": 375.0149999978021,
+      "madMs": 2.6546044973656535,
+      "minMs": 371.7021249976824,
+      "timesMs": [
+        371.7021249976824,
+        372.66345800162526,
+        373.10962499759626,
+        380.0278749986319,
+        379.00045800051885,
+        373.78062499919906,
+        377.97266699635657,
+        378.7122499998077,
+        376.2493749964051,
+        372.8552500033402
+      ],
+      "samples": 10,
+      "peakRssBytes": 31850496
+    },
+    "C": {
+      "executableSha256": "f9347631d5bf399ca1d68a32cb26cdcc52c819c42ad0279cf0bc225e8c417f63",
+      "warmupMs": 481.20008400292136,
+      "warmupRssBytes": 30752768,
+      "medianMs": 442.31416700131376,
+      "madMs": 2.316271002200665,
+      "minMs": 438.3647499998915,
+      "timesMs": [
+        439.78933399921516,
+        442.11870900471695,
+        438.3647499998915,
+        464.2135829999461,
+        442.5096249979106,
+        440.20645799901104,
+        446.19820899970364,
+        459.5256669999799,
+        443.332292001287,
+        440.69816599949263
+      ],
+      "samples": 10,
+      "peakRssBytes": 30752768
+    }
+  },
+  "finishedUtc": "2026-09-30T23:16:56.608142+00:00",
+  "summary": {
+    "speedupOverPreviousO2": 11.254637313245897,
+    "previousO2TimeRelativeToC": 9.542217109201562,
+    "newO2TimeRelativeToC": 0.8478475888308777,
+    "timedExecutions": 38,
+    "checksumOk": true
+  }
+}
