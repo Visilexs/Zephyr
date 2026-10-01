@@ -1441,6 +1441,30 @@ an ordinary function that -O2 compiles whole. Outputs identical,
      `research/oracle/vectors_in_function.zeph` and
      `vectors_values_in_function.zeph` are the first two test cases.
 
+### M42. Placement cliffs with data passed as parameters (cycle 45)
+
+Idiomatic code passes its data to functions instead of reading globals.
+Outputs identical [M]:
+
+| Program | Top level (globals) | Function, data as parameters |
+|---|---:|---:|
+| vectors (`research/oracle/vectors_params.zeph`) | 0.71 s | **4.26 s (6×)** |
+| records (`research/oracle/records_params.zeph`) | 1.30 s | 1.23 s |
+
+**What this means:**
+
+- The vectors cliff (M41) isn't about globals specifically. It is about the
+  pattern that stores freshly built struct values back into list elements
+  (`velocities[i] = velocity`). The in-place reuse that makes that cheap fires
+  only for top-level code on list globals.
+- records, which updates fields in place and never rebuilds structs, has no
+  cliff.
+- **Implication for measurement:** the benchmark suite is written in
+  top-level style, so its geometric mean (1.253× C) can flatter -O2 on
+  idiomatic code. Wherever a workload's style allows it, the suite should gain
+  a function/parameter variant, and its numbers should count in the
+  scoreboard alongside the originals.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1759,3 +1783,8 @@ an ordinary function that -O2 compiles whole. Outputs identical,
   - The original vectors is 6.3× slower in a function, because in-place
     element reuse is lost.
   - Added the placement gate and step 3b.
+- **2026-10-01, cycle 45.**
+  - With the lists passed as parameters, vectors is still 6× slower (M42);
+    records has no cliff.
+  - The cliff is in rebuilding a struct and storing it into a list element.
+  - Recommended function-style variants for the benchmark suite.
