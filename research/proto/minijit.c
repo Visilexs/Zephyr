@@ -20,8 +20,8 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 
 enum { PARAM, CONST, ADD, SUB, ADDI, LOAD, CALL, LOADNC };   // LOADNC: element load after bounds-check elimination
 enum { T_JMP, T_BR_LT, T_BR_GE, T_RET };
-#define MV 256
-#define MB 32
+#define MV 4096
+#define MB 512
 static int op[MV], a0[MV], a1[MV], blk[MV], nv; static i64 imm[MV];
 static int bfirst[MB], bend[MB], bparams[MB][4], nbp[MB], term[MB], tx[MB], ty[MB], tgt[MB][2], targs[MB][2][4], ntargs[MB][2], nb;
 static int newv(int o, int x, int y, i64 k, int b) { op[nv] = o; a0[nv] = x; a1[nv] = y; imm[nv] = k; blk[nv] = b; return nv++; }
@@ -33,30 +33,34 @@ static const int calleeSaved[] = { 1, 1, 1, 1, 1, 0, 0, 0, 0 };   // rdi/rsi car
 static int crossesCall[MV];
 static void allocate(void) {
     int p = 0;
-    for (int b = 0; b < nb; b++) { for (int v = bfirst[b]; v < bend[b]; v++) pos[v] = p++; p++; }
+    static int bpos[MB], tpos[MB];          // explicit block start and terminator positions (blocks may be empty)
+    for (int b = 0; b < nb; b++) { bpos[b] = p; for (int v = bfirst[b]; v < bend[b]; v++) pos[v] = p++; tpos[b] = p++; }
     for (int v = 0; v < nv; v++) { start[v] = pos[v]; endp[v] = pos[v]; crossesCall[v] = 0; }
     for (int v = 0; v < nv; v++) {
         if (a0[v] >= 0 && pos[v] > endp[a0[v]]) endp[a0[v]] = pos[v];
         if (a1[v] >= 0 && pos[v] > endp[a1[v]]) endp[a1[v]] = pos[v];
     }
     for (int b = 0; b < nb; b++) {          // uses by terminators, and loop-carried extension
-        int tp = pos[bend[b] - 1] + 1;
+        int tp = tpos[b];
         int us[2] = { tx[b], ty[b] };
         for (int k = 0; k < 2; k++) if (us[k] >= 0 && tp > endp[us[k]]) endp[us[k]] = tp;
         for (int s = 0; s < 2; s++) for (int k = 0; k < ntargs[b][s]; k++) { int v = targs[b][s][k]; if (tp > endp[v]) endp[v] = tp; }
         for (int s = 0; s < 2; s++) { int t = tgt[b][s]; if (t >= 0 && t <= b)      // back edge: values live into the loop stay live to its end
-            for (int v = 0; v < nv; v++) if (start[v] < pos[bfirst[t]] && endp[v] >= pos[bfirst[t]] && endp[v] < tp) endp[v] = tp; }
+            for (int v = 0; v < nv; v++) if (start[v] < bpos[t] && endp[v] >= bpos[t] && endp[v] < tp) endp[v] = tp; }
     }
     for (int v = 0; v < nv; v++) if (op[v] == CALL) for (int w = 0; w < nv; w++) if (w != v && start[w] < pos[v] && endp[w] > pos[v]) crossesCall[w] = 1;
     int owner[16]; for (int i = 0; i < 16; i++) owner[i] = -1;
-    for (int v = 0; v < nv; v++) {          // values in position order = index order here
+    static int order[MV]; int no = 0;       // values in layout (position) order
+    for (int b = 0; b < nb; b++) for (int v = bfirst[b]; v < bend[b]; v++) order[no++] = v;
+    for (int oi = 0; oi < no; oi++) {
+        int v = order[oi];
         for (int r = 0; r < 16; r++) if (owner[r] >= 0 && endp[owner[r]] < start[v]) owner[r] = -1;   // expire only the current owner
         reg[v] = -1;
         // Coalescing hint: a value passed as a block argument prefers the
         // register of the block parameter it flows into, so the move vanishes.
         int hint = -1;
         for (int b = 0; b < nb && hint < 0; b++) for (int sx = 0; sx < 2 && hint < 0; sx++) for (int k = 0; k < ntargs[b][sx]; k++)
-            if (targs[b][sx][k] == v && tgt[b][sx] >= 0) { int param = bparams[tgt[b][sx]][k]; if (param < v && reg[param] >= 0) { hint = reg[param]; break; } }
+            if (targs[b][sx][k] == v && tgt[b][sx] >= 0) { int param = bparams[tgt[b][sx]][k]; if (pos[param] < pos[v] && reg[param] >= 0) { hint = reg[param]; break; } }
         if (hint >= 0) {
             int ok = owner[hint] < 0 || endp[owner[hint]] <= start[v];
             for (int i = 0; i < (int)(sizeof pool / sizeof *pool); i++) if (pool[i] == hint && crossesCall[v] && !calleeSaved[i]) ok = 0;
@@ -159,6 +163,70 @@ static void *compile(int listPtrReg /* the list base is the 2nd param */) {
     return code;
 }
 
+
+// ---- bounded recursive inlining on the flat IR (cycle 76) ----
+// Snapshot of the function before inlining: its body is what gets copied.
+static int S_op[MV], S_a0[MV], S_a1[MV], S_nv, S_bfirst[MB], S_bend[MB], S_bparams[MB][4], S_nbp[MB], S_term[MB], S_tx[MB], S_ty[MB], S_tgt[MB][2], S_targs[MB][2][4], S_ntargs[MB][2], S_nb;
+static i64 S_imm[MV];
+static void snapshot(void) {
+    memcpy(S_op, op, sizeof op); memcpy(S_a0, a0, sizeof a0); memcpy(S_a1, a1, sizeof a1); memcpy(S_imm, imm, sizeof imm); S_nv = nv;
+    memcpy(S_bfirst, bfirst, sizeof bfirst); memcpy(S_bend, bend, sizeof bend); memcpy(S_bparams, bparams, sizeof bparams); memcpy(S_nbp, nbp, sizeof nbp);
+    memcpy(S_term, term, sizeof term); memcpy(S_tx, tx, sizeof tx); memcpy(S_ty, ty, sizeof ty); memcpy(S_tgt, tgt, sizeof tgt);
+    memcpy(S_targs, targs, sizeof targs); memcpy(S_ntargs, ntargs, sizeof ntargs); S_nb = nb;
+}
+// Replace the call `v` in block `b` by a copy of the snapshot body. The call's
+// block is split: v becomes the parameter of a continuation block that holds
+// the rest of b, and every copied `ret x` becomes `jmp continuation(x)`.
+// Returns the first new block index (copied calls can be inlined further).
+static int inlineCall(int b, int v) {
+    int cont = nb++;
+    bfirst[cont] = v; bend[cont] = bend[b]; bend[b] = v;
+    term[cont] = term[b]; tx[cont] = tx[b]; ty[cont] = ty[b];
+    for (int s2 = 0; s2 < 2; s2++) { tgt[cont][s2] = tgt[b][s2]; ntargs[cont][s2] = ntargs[b][s2]; memcpy(targs[cont][s2], targs[b][s2], sizeof targs[b][s2]); }
+    nbp[cont] = 1; bparams[cont][0] = v;
+    int arg = a0[v];
+    op[v] = PARAM; imm[v] = 99; a0[v] = a1[v] = -1;
+    // copy blocks; value ids are remapped, the function parameter maps to the call argument
+    static int vmap[MV]; int first = nb;
+    for (int ob = 0; ob < S_nb; ob++) {
+        int nbk = nb++; bfirst[nbk] = nv;
+        for (int ov = S_bfirst[ob]; ov < S_bend[ob]; ov++) {
+            if (S_op[ov] == PARAM && S_imm[ov] == 0) { vmap[ov] = arg; continue; }
+            int x = S_a0[ov] >= 0 ? vmap[S_a0[ov]] : -1, y = S_a1[ov] >= 0 ? vmap[S_a1[ov]] : -1;
+            vmap[ov] = newv(S_op[ov], -1, -1, S_imm[ov], nbk); a0[vmap[ov]] = x; a1[vmap[ov]] = y;
+        }
+        bend[nbk] = nv;
+    }
+    for (int ob = 0; ob < S_nb; ob++) {
+        int nbk = first + ob;
+        nbp[nbk] = S_nbp[ob]; for (int k = 0; k < S_nbp[ob]; k++) bparams[nbk][k] = vmap[S_bparams[ob][k]];
+        if (S_term[ob] == T_RET) { term[nbk] = T_JMP; tgt[nbk][0] = cont; ntargs[nbk][0] = 1; targs[nbk][0][0] = vmap[S_tx[ob]]; tgt[nbk][1] = -1; ntargs[nbk][1] = 0; }
+        else {
+            term[nbk] = S_term[ob]; tx[nbk] = S_tx[ob] >= 0 ? vmap[S_tx[ob]] : -1; ty[nbk] = S_ty[ob] >= 0 ? vmap[S_ty[ob]] : -1;
+            for (int s2 = 0; s2 < 2; s2++) { tgt[nbk][s2] = S_tgt[ob][s2] >= 0 ? first + S_tgt[ob][s2] : -1; ntargs[nbk][s2] = S_ntargs[ob][s2];
+                for (int k = 0; k < S_ntargs[ob][s2]; k++) targs[nbk][s2][k] = vmap[S_targs[ob][s2][k]]; }
+        }
+    }
+    term[b] = T_JMP; tgt[b][0] = first; ntargs[b][0] = 0; tgt[b][1] = -1; ntargs[b][1] = 0;
+    return first;
+}
+// Inline every self-call `levels` deep.
+static void inlineRecursion(int levels) {
+    snapshot();
+    for (int level = 0; level < levels; level++) {
+        int calls[MV], where[MV], nc = 0;
+        for (int b = 0; b < nb; b++) for (int v = bfirst[b]; v < bend[b]; v++) if (op[v] == CALL) { calls[nc] = v; where[nc++] = b; }
+        for (int i = 0; i < nc; i++) {
+            int b = -1;   // the call may have moved into a continuation block
+            for (int k = 0; k < nb; k++) if (calls[i] >= bfirst[k] && calls[i] < bend[k]) { b = k; break; }
+            if (b < 0 || op[calls[i]] != CALL) continue;
+            if (nv + S_nv >= MV - 8 || nb + S_nb + 1 >= MB - 2) return;
+            inlineCall(b, calls[i]);
+        }
+        (void)where;
+    }
+}
+
 static void reset(void) { nv = 0; nb = 0; memset(ntargs, 0, sizeof ntargs); memset(nbp, 0, sizeof nbp); }
 static int block(void) { bfirst[nb] = nv; tgt[nb][0] = tgt[nb][1] = -1; tx[nb] = ty[nb] = -1; return nb++; }
 static void endb(int b) { bend[b] = nv; }
@@ -255,8 +323,9 @@ int main(void) {
     bparams[b2][0] = accB; bparams[b2][1] = mB; nbp[b2] = 2; term[b2] = T_JMP; tgt[b2][0] = 1; ntargs[b2][0] = 2; targs[b2][0][0] = accN; targs[b2][0][1] = mN;
     b3 = block(); int accC = newv(PARAM, -1, -1, 99, b3); int mC = newv(PARAM, -1, -1, 99, b3); int resC = newv(ADD, accC, mC, 0, b3); endb(b3);
     bparams[b3][0] = accC; bparams[b3][1] = mC; nbp[b3] = 2; term[b3] = T_RET; tx[b3] = resC;
-    c0 = now(); allocate(); i64 (*fibAcc)(i64) = (i64 (*)(i64))compile(0); c1 = now();
-    printf("fib, accumulator form: %d values compiled in %.1f us (%d bytes)\n", nv, (c1 - c0) * 1e6, len);
+    int levels = getenv("INL") ? atoi(getenv("INL")) : 0;
+    c0 = now(); if (levels) inlineRecursion(levels); allocate(); i64 (*fibAcc)(i64) = (i64 (*)(i64))compile(0); c1 = now();
+    printf("fib, accumulator form, %d inline levels: %d values compiled in %.1f us (%d bytes)\n", levels, nv, (c1 - c0) * 1e6, len);
     t0 = now(); x = fibAcc(38); t1 = now(); y = nfib(38); t2 = now();
     printf("  fib(38): generated %.0f ms, gcc -O2 %.0f ms, ratio %.2f  %s\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) / (t2 - t1), x == y ? "ok" : "MISMATCH");
     return 0;

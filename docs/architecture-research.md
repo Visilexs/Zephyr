@@ -2047,6 +2047,27 @@ few levels (bounded unrolling) is what closes the gap, and the accumulator
 transform adds to it. Both are mid-end passes on the flat IR, which reinforces
 the M55 lesson.
 
+**Cycle 76: a bounded recursive inliner on the flat IR.** `inlineRecursion()`
+in `minijit.c`:
+
+- splits the calling block at the call, so the call becomes the parameter of a
+  continuation block;
+- copies a snapshot of the callee's blocks with remapped value ids;
+- turns each copied `ret x` into `jmp continuation(x)`.
+
+With 0 levels, fib(38) runs in 197 ms (2.9× gcc). At 1 level the prototype
+**runs out of registers**:
+
+- each inlined accumulator loop keeps its `acc` and `m` live across the inner
+  calls;
+- only the 5 callee-saved registers can hold values across calls;
+- the prototype has no spilling.
+
+So bounded inlining of recursion needs spilling or caller-save support in the
+register allocator. That's a reminder that the production allocator must
+spill well (zc's current one does, M30), even though splitting is low priority
+(Q4). The fib inlining gain itself is already measured in zc (M21, M29).
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2543,3 +2564,8 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 75.**
   - Prototype with accumulator-form fib: 2.4–3.3× gcc without inlining.
     Bounded recursive inlining is the essential pass for recursion.
+- **2026-10-01, cycle 76.**
+  - Added a bounded recursive inliner to the prototype. One level of inlining
+    exceeds 5 callee-saved registers without spilling.
+  - The production allocator must spill; zc's inlining gain on fib is already
+    measured.
