@@ -1,0 +1,10 @@
+// research/fuzz/repro: index into a global list the index expression replaces (M57). Left-to-right expects 1 1
+var xs: [int] = [1, 2, 3]
+fn swap() -> int { xs = [100, 200, 300]
+    return 0 }
+fn main() {
+    print(xs[swap()])       // left to right: old list, 1
+    xs = [1, 2, 3]
+    let y = xs[swap()] + 0
+    print(y)                // left to right: 1
+}

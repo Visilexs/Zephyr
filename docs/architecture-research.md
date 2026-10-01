@@ -2250,6 +2250,41 @@ left-to-right reference has one of these three causes. Two small changes
 remove all of them. The spec should then state left-to-right (operands,
 arguments, then the assignment), so the rule has something to enforce.
 
+**Cost of the blunt patch (cycle 84)** [M]. Making a global never a leaf
+changes 1,400–2,000 instructions per program, mostly in the runtime.
+`x86bench.py --kinds z,zO2 --runs 3`, patched / original: geomean
+**0.981** baseline, **0.986** -O2. Re-timed with hyperfine, every swing was
+within σ except one:
+
+| Workload | Original | Blunt patch | |
+|---|---:|---:|---|
+| baseline vectors | 28.35 ± 0.41 s | 30.99 ± 0.25 s | **1.09× slower** |
+| baseline dispatch | 644 ± 13 ms | 627 ± 9 ms | within 2σ |
+| -O2 strings | 520 ± 11 ms | 528 ± 15 ms | noise |
+| -O2 matmul | 575 ± 17 ms | 577 ± 11 ms | noise |
+
+vectors' hot loop runs at top level, so its lists are globals. Baseline used
+to index them with one load (`mov rcx, [globals+528]; cmp r13, [rcx]`). With
+the blunt patch it takes the generic path (retain, push, compare, release).
+The hazard needs a global leaf **and** a call on the other side, which this
+code never has.
+
+**Targeted patch** (`research/patches/zc-left-to-right-targeted.patch`):
+`isLeaf` is unchanged. A new `isLeafAfter(leaf, other)` rejects a global
+leaf only when `other` contains a call. It is used at the three sites that
+evaluate the leaf last: float operands, the commutative shortcut, and the
+list base of an index. The inliner fix is the same.
+
+- It passes every probe row above in both tiers.
+- It also fixes a third tier disagreement found while writing it:
+  `xs[swap()]`, where `swap` replaces the global list, gave **100 in
+  baseline and 1 at -O2** (`research/fuzz/repro/order-index.zeph`). It now
+  gives 1 in both.
+- The store `g[i] = f()` still loads the list after the value. That is the
+  memory-safe choice (loading first would need a retain, or would write into
+  a list `f` freed). The spec should state this as the one exception:
+  "the container of an assignment target is read after the value".
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2783,3 +2818,9 @@ All rows are bintrees unless noted, same checksum, one core.
   - A scratch patch makes every probe left-to-right in both tiers. Fuzzing
     with both patches: 0 mismatches across all five generators. The three-way
     test fully agrees (400/400).
+- **2026-10-01, cycle 84.**
+  - The blunt order patch costs 9% on baseline vectors: its global lists lose
+    the fast index path. Everything else is in noise.
+  - Wrote a targeted patch: a global stops being a leaf only when the other
+    operand makes a call. It also fixes `xs[swap()]` (baseline 100, -O2 1).
+    Fuzzing and benchmarking it now.
