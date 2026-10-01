@@ -181,6 +181,7 @@ step's parity tests run against it as well as against the old pipeline.
 | Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
 | Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle | [M] `research/x86bench.py`; oracles M7–M28 |
 | Bit-identical output across modes | required | checksums match on every workload so far | [M] |
+| Peak memory vs C | report it | geometric mean 0.66×. Small programs are 0.2–0.5× (static binary, no libc). Allocation-heavy: lexer 4.23×, dispatch 2.26×, shapes 2.20×, bintrees 1.97×, records 1.65×. Oracles: bintrees 19 → 5 MB (region, M7), shapes 205 → 168 MB (flattening, M11) | [M] M37 |
 | Compiler size | report it | 24.4 k hand-written Zephyr lines today: zc.zeph 14.3 k (excluding the 4,980-line generated EMBED), optimizer 7.2 k, runtime 2.9 k; plus ~1 k lines of Python/C for macOS. Proposed design: ~28–33 k lines with native x86 and ARM64 backends, an IR interpreter and the cache, after deleting the baseline generator, text assembler, `arm64.py` and `jit.py`; +15–30% overall | [M] today (section markers); [E] proposed |
 
 ## Measurements
@@ -1229,6 +1230,38 @@ immediately, which is valid only for acyclic programs. Outputs identical
 - The compiler itself (`Node.children: [Node]`) is cycle-capable, so it would
   use the restricted form.
 
+### M37. Peak memory, Zephyr -O2 against C (cycle 36)
+
+Measured as peak RSS from `/usr/bin/time -f %M`, at the benchmark sizes [M]:
+
+| Workload | Zephyr MB | C MB | Ratio |
+|---|---:|---:|---:|
+| fib, mandel, strings, strbuild | 0.3 | 1.5–1.6 | ~0.2 |
+| cube, nbody, pi, vectors, liquid | 0.4–1.2 | 1.7–2.5 | 0.24–0.47 |
+| matmul | 28.3 | 29.3 | 0.96 |
+| sort | 46.2 | 92.9 | 0.50 |
+| wordfreq | 16.9 | 15.4 | 1.10 |
+| hashmap | 48.8 | 35.6 | 1.37 |
+| closures | 25.4 | 18.3 | 1.39 |
+| records | 103.3 | 62.6 | 1.65 |
+| bintrees | 18.8 | 9.5 | 1.97 |
+| shapes | 200.6 | 91.2 | 2.20 |
+| dispatch | 90.1 | 39.8 | 2.26 |
+| lexer | 267.4 | 63.1 | 4.23 |
+| **Geometric mean** | | | **0.66** |
+
+**What this means:**
+
+- Zephyr's static, libc-free binaries win on small programs.
+- On allocation-heavy ones, Zephyr uses 1.4–4.2× more memory than C, for the
+  same reasons as the time gaps:
+  - 24-byte headers;
+  - interface cells and optional cells;
+  - a separate heap object per record;
+  - a copied substring per token.
+- The representation layer (layer 4) addresses memory and time together.
+  bintrees falls from 19 MB to 5 MB with a region (M7), below C's 9.5 MB.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1487,3 +1520,6 @@ immediately, which is valid only for acyclic programs. Outputs identical
 - **2026-10-01, cycle 35.**
   - Added the build order with measurable acceptance gates, each tied to the
     oracle or prototype that justified the step.
+- **2026-10-01, cycle 36.**
+  - Peak memory (M37): geometric mean 0.66× C, but 1.4–4.2× on the
+    allocation-heavy workloads. Same causes and fixes as the time gaps.
