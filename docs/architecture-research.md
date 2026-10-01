@@ -325,6 +325,7 @@ the oracle or prototype that justified the step.
 | 11 | Automatic loop parallelism | vectors ≥ 3× on 4 cores, bit-identical | M8 |
 | 3b | Every function compiled whole: no baseline fallback, no outlined regions | Placement gate: top-level vs in-function kernels within 10% (vectors today: 0.72 vs 4.51 s; oracle 0.80 vs 0.55 s) | M41 |
 | 12 | ARM64 instruction selection over the same IR | macOS: no clang, no `arm64.py`; `zc run fib` ≤ 10 ms to first instruction | M17, macOS results |
+| 13 | WebAssembly from the flat IR: a control-flow structuring pass (stackifier) turns level-3 blocks into `block`/`loop`/`br` nesting; wasm keeps today's AST backend (`writeWasm`, 1,917 lines, M35) until then | `crosscheck-wasm` parity on every fixture; no wasm-only code paths in layers 3–4 | M35 |
 
 The IR interpreter (oracle/sanitizer) is built alongside step 3. Every later
 step's parity tests run against it as well as against the old pipeline.
@@ -2596,3 +2597,6 @@ All rows are bintrees unless noted, same checksum, one core.
   - Added naive spilling to the prototype. Inlining 1–4 levels then runs but
     gains nothing (190–202 ms), because whole-lifetime spills cancel it.
   - Recursive inlining needs cost-based spills and splitting around calls.
+- **2026-10-01, cycle 78.**
+  - Added WebAssembly as build step 13: a structuring pass from flat IR to
+    wasm control flow. The current AST backend stays until then.
