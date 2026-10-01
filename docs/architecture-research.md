@@ -929,6 +929,25 @@ are recorded so they aren't repeated:
 construction and map representation". Proposed next step: profile the C
 reference against the model at instruction level before drawing conclusions.
 
+**Cycle 49 instruction-level profile [M]:**
+
+- In Zephyr, `runtimeFindMapEntry` takes 62% of samples. Two loads account for
+  42.5% of all samples:
+  - the probe's slot-state load (21.9%, at the `test` after it);
+  - the key string's length, loaded after a tag match (20.6%).
+- The C reference spends 35% in `tableIncrement` and ~38% in libc (`malloc`,
+  `memcmp`).
+- Zephyr's map already stores hash tags in slot state, rehashes at ≤ 50% load
+  (`runtime.zeph` line 1530) like C, and dereferences the key only on a tag
+  match, also like C.
+- **So the 2× is not from load factor or missing hash tags.** The remaining
+  hypotheses are:
+  - probes per lookup, from how the slot index is derived from the hash
+    (`hash >> shift` and the tag layout);
+  - cache behaviour of keys scattered across the heap.
+- Next test: count probes per lookup in a scratch runtime and compare with C's
+  table.
+
 ### M25. What profiles are worth: gcc PGO on the 19 C references (cycle 19)
 
 This is a proxy for the value of a JIT's runtime profiles, or of C1's
@@ -1873,3 +1892,8 @@ Part of strbuild's "escaped" share is the same artifact.
   - Lifetime instrumentation in a scratch runtime (M43): 66–100% of freed
     objects in the allocation-heavy workloads die before their allocating
     frame returns. That is the upper bound for function-scope regions.
+- **2026-10-01, cycle 49.**
+  - wordfreq instruction profile: Zephyr's map already matches C's design
+    (hash tags, 50% load).
+  - Two cache-missing loads take 42% of time. Q6 remains open; next is
+    counting probes per lookup.
