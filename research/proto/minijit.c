@@ -30,7 +30,7 @@ static int newv(int o, int x, int y, i64 k, int b) { op[nv] = o; a0[nv] = x; a1[
 static int reg[MV], start[MV], endp[MV], pos[MV];
 static const int pool[] = { 3, 12, 13, 14, 15, 8, 9, 10, 11 };   // rbx r12-r15 (saved by the callee), r8-r11 (not)
 static const int calleeSaved[] = { 1, 1, 1, 1, 1, 0, 0, 0, 0 };   // rdi/rsi carry arguments, so they're not allocated
-static int crossesCall[MV];
+static int crossesCall[MV]; static int spillSlots;
 static void allocate(void) {
     int p = 0;
     static int bpos[MB], tpos[MB];          // explicit block start and terminator positions (blocks may be empty)
@@ -50,6 +50,7 @@ static void allocate(void) {
     }
     for (int v = 0; v < nv; v++) if (op[v] == CALL) for (int w = 0; w < nv; w++) if (w != v && start[w] < pos[v] && endp[w] > pos[v]) crossesCall[w] = 1;
     int owner[16]; for (int i = 0; i < 16; i++) owner[i] = -1;
+    spillSlots = 0;
     static int order[MV]; int no = 0;       // values in layout (position) order
     for (int b = 0; b < nb; b++) for (int v = bfirst[b]; v < bend[b]; v++) order[no++] = v;
     for (int oi = 0; oi < no; oi++) {
@@ -70,7 +71,7 @@ static void allocate(void) {
             if (owner[pool[i]] >= 0 || (crossesCall[v] && !calleeSaved[i])) continue;
             reg[v] = pool[i]; owner[pool[i]] = v; break;
         }
-        if (reg[v] < 0) { fprintf(stderr, "out of registers (prototype has no spilling)\n"); exit(1); }
+        if (reg[v] < 0) reg[v] = -1 - spillSlots++;   // spilled: lives in a stack slot (cycle 77)
     }
 }
 
@@ -86,6 +87,12 @@ static void addimm(int d, int k) { rex(1, 0, d); b8(0x81); b8(0xC0 | (d & 7)); b
 static void cmprr(int a, int b) { alu(0x39, a, b); }
 static void push(int r) { if (r >= 8) b8(0x41); b8(0x50 | (r & 7)); }
 static void pop(int r) { if (r >= 8) b8(0x41); b8(0x58 | (r & 7)); }
+
+// ---- spill support (cycle 77): spilled values live at [rsp + 8*slot] ----
+static void loadSlot(int r, int slot) { rex(1, r, 0); b8(0x8B); b8(0x84 | (r & 7) << 3); b8(0x24); b32(8 * slot); }
+static void storeSlot(int slot, int r) { rex(1, r, 0); b8(0x89); b8(0x84 | (r & 7) << 3); b8(0x24); b32(8 * slot); }
+static int use(int v, int scratch) { if (reg[v] >= 0) return reg[v]; loadSlot(scratch, -1 - reg[v]); return scratch; }
+static void fin(int v, int r) { if (reg[v] >= 0) movrr(reg[v], r); else storeSlot(-1 - reg[v], r); }
 static int blockAt[MB]; static int fix[64], fixBlock[64], nfix;
 static void jcc(int cc, int target) { b8(0x0F); b8(0x80 | cc); fix[nfix] = len; fixBlock[nfix++] = target; b32(0); }
 static void jmp(int target) { b8(0xE9); fix[nfix] = len; fixBlock[nfix++] = target; b32(0); }
@@ -98,8 +105,8 @@ static void moveArgs(int b, int s) {
     int t = tgt[b][s]; static const int scratch[3] = { 0, 1, 2 };
     int moving[4], n = 0;
     for (int k = 0; k < ntargs[b][s]; k++) if (reg[targs[b][s][k]] != reg[bparams[t][k]]) moving[n++] = k;   // coalesced ones need no move
-    for (int j = 0; j < n; j++) movrr(scratch[j], reg[targs[b][s][moving[j]]]);
-    for (int j = 0; j < n; j++) movrr(reg[bparams[t][moving[j]]], scratch[j]);
+    for (int j = 0; j < n; j++) { int r = use(targs[b][s][moving[j]], scratch[j]); movrr(scratch[j], r); }
+    for (int j = 0; j < n; j++) fin(bparams[t][moving[j]], scratch[j]);
 }
 
 static void *compile(int listPtrReg /* the list base is the 2nd param */) {
@@ -111,22 +118,27 @@ static void *compile(int listPtrReg /* the list base is the 2nd param */) {
     for (int i = 0; i < 5; i++) { int r = pool[i]; for (int v = 0; v < nv; v++) if (reg[v] == r) { saved[ns++] = r; break; } }
     if (ns % 2 == 0) b8(0x50 | 0);        // keep 16-byte alignment across calls (push rax as padding)
     for (int i = 0; i < ns; i++) push(saved[i]);
+    int frameBytes = 16 * ((spillSlots + 1) / 2);
+    if (frameBytes) { rex(1, 0, 4); b8(0x81); b8(0xEC); b32(frameBytes); }   // sub rsp, frame
     // params: value ids 0.. map to rdi, rsi
     int argRegs[2] = { 7, 6 };
     int nparam = 0; for (int v = 0; v < nv; v++) if (op[v] == PARAM) nparam++;
     // move incoming args into their allocated registers through rax/rdx to avoid clobbering
     movrr(0, argRegs[0]); if (nparam > 1) movrr(2, argRegs[1]);
-    for (int v = 0; v < nv; v++) if (op[v] == PARAM && (imm[v] == 0 || imm[v] == 1)) movrr(reg[v], imm[v] == 0 ? 0 : 2);
+    for (int v = 0; v < nv; v++) if (op[v] == PARAM && (imm[v] == 0 || imm[v] == 1)) fin(v, imm[v] == 0 ? 0 : 2);
     for (int b = 0; b < nb; b++) {
         blockAt[b] = len;
         for (int v = bfirst[b]; v < bend[b]; v++) {
             int d = reg[v];
             switch (op[v]) {
             case PARAM: break;
-            case CONST: movimm(d, imm[v]); break;
-            case ADD: if (d == reg[a1[v]]) alu(0x01, d, reg[a0[v]]); else { movrr(d, reg[a0[v]]); alu(0x01, d, reg[a1[v]]); } break;
-            case SUB: movrr(0, reg[a0[v]]); alu(0x29, 0, reg[a1[v]]); movrr(d, 0); break;
-            case ADDI: movrr(d, reg[a0[v]]); addimm(d, (int)imm[v]); break;
+            case CONST: if (d >= 0) movimm(d, imm[v]); else { movimm(0, imm[v]); fin(v, 0); } break;
+            case ADD:
+                if (d >= 0 && reg[a0[v]] >= 0 && reg[a1[v]] >= 0) { if (d == reg[a1[v]]) alu(0x01, d, reg[a0[v]]); else { movrr(d, reg[a0[v]]); alu(0x01, d, reg[a1[v]]); } }
+                else { movrr(0, use(a0[v], 1)); alu(0x01, 0, use(a1[v], 1)); fin(v, 0); }
+                break;
+            case SUB: movrr(0, use(a0[v], 1)); alu(0x29, 0, use(a1[v], 1)); fin(v, 0); break;
+            case ADDI: if (d >= 0 && reg[a0[v]] >= 0) { movrr(d, reg[a0[v]]); addimm(d, (int)imm[v]); } else { movrr(0, use(a0[v], 1)); addimm(0, (int)imm[v]); fin(v, 0); } break;
             case LOAD: {   // d = list[index]; list = {len, data[]}; bounds-checked
                 int L = reg[a0[v]], I = reg[a1[v]];
                 rex(1, I, L); b8(0x3B); b8(0x00 | (I & 7) << 3 | (L & 7)); if ((L & 7) == 4) b8(0x24);   // cmp I, [L]
@@ -138,19 +150,20 @@ static void *compile(int listPtrReg /* the list base is the 2nd param */) {
                 rex(1, d, 0); code[len - 1] |= (I >> 3) << 1 | (L >> 3); b8(0x8B); b8(0x44 | (d & 7) << 3); b8((3 << 6) | (I & 7) << 3 | (L & 7)); b8(8);
                 break; }
             case CALL: {   // self call with one argument
-                movrr(7, reg[a0[v]]); if (a1[v] >= 0) movrr(6, reg[a1[v]]);
-                b8(0xE8); b32(-(len + 4)); movrr(d, 0); break; }
+                movrr(7, use(a0[v], 1)); if (a1[v] >= 0) movrr(6, use(a1[v], 1));
+                b8(0xE8); b32(-(len + 4)); fin(v, 0); break; }
             }
         }
         // terminator
         if (term[b] == T_RET) {
-            movrr(0, reg[tx[b]]);
+            movrr(0, use(tx[b], 0));
+            if (frameBytes) { rex(1, 0, 4); b8(0x81); b8(0xC4); b32(frameBytes); }   // add rsp, frame
             for (int i = ns - 1; i >= 0; i--) pop(saved[i]);
             if (ns % 2 == 0) b8(0x58 | 1);    // pop rcx (padding)
             b8(0xC3);
         } else if (term[b] == T_JMP) { moveArgs(b, 0); if (tgt[b][0] != b + 1) jmp(tgt[b][0]); }
         else {  // conditional: branch to tgt[1] when the condition holds, else fall through to tgt[0]
-            cmprr(reg[tx[b]], reg[ty[b]]);
+            { int x = use(tx[b], 1), y = use(ty[b], 2); cmprr(x, y); }
             int cc = term[b] == T_BR_LT ? 0xC : 0xD;      // jl / jge
             if (ntargs[b][1] == 0 && ntargs[b][0] == 0) { jcc(cc, tgt[b][1]); if (tgt[b][0] != b + 1) jmp(tgt[b][0]); }
             else { int skip = len; b8(0x0F); b8(0x80 | (cc ^ 1)); b32(0); moveArgs(b, 1); jmp(tgt[b][1]);

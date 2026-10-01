@@ -2068,6 +2068,27 @@ register allocator. That's a reminder that the production allocator must
 spill well (zc's current one does, M30), even though splitting is low priority
 (Q4). The fib inlining gain itself is already measured in zc (M21, M29).
 
+**Cycle 77: with naive spilling** (a value with no free register lives in a
+stack slot for its whole life), inlining runs. fib(38), accumulator form,
+results correct [M]:
+
+| Inline levels | 0 | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|---:|
+| Values | 14 | 27 | 40 | 53 | 66 |
+| Time (gcc 67–72 ms) | 198 ms | 191 ms | 202 ms | 191 ms | 190 ms |
+
+Inlining buys nothing here: spill traffic from whole-lifetime spilling cancels
+the call savings. zc's real allocator, with spill costs and eviction (M30),
+does get the gain: ~1.4× gcc with 4-level self-inlining, 0.95× with the
+accumulator (M29).
+
+**Lesson for the design:** bounded recursive inlining is only as good as the
+allocator's spill decisions. The production allocator needs cost-based
+eviction (as today) and should split around calls in recursion-heavy code,
+which revives a narrow form of Q4. The prototype has served its purpose:
+backend mechanics plus standard passes reach gcc on loops (cycle 74), and
+recursion depends on inlining combined with good spilling.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2205,7 +2226,9 @@ All rows are bintrees unless noted, same checksum, one core.
 - **Q4. Deprioritized (cycle 69):** most of the spilling M20 attributed to
   missing interval splitting was region outlining (M41). Compiled whole, the
   same loop has 5 spills and reaches non-vectorized C. Revisit only if
-  whole-function compilation leaves hot spills.
+  whole-function compilation leaves hot spills. Exception (cycle 77): splitting
+  around calls matters for bounded recursive inlining, since whole-lifetime
+  spills cancel its gain.
 - **Q5. Mostly answered (cycles 48 and 61, M43, M50):** 66–100% of freed
   objects in allocation-heavy workloads, and 50–66% of all allocations in the
   compiler, die before their allocating frame returns. Still open: how much of
@@ -2569,3 +2592,7 @@ All rows are bintrees unless noted, same checksum, one core.
     exceeds 5 callee-saved registers without spilling.
   - The production allocator must spill; zc's inlining gain on fib is already
     measured.
+- **2026-10-01, cycle 77.**
+  - Added naive spilling to the prototype. Inlining 1–4 levels then runs but
+    gains nothing (190–202 ms), because whole-lifetime spills cancel it.
+  - Recursive inlining needs cost-based spills and splitting around calls.
