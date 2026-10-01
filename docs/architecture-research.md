@@ -40,10 +40,11 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - Instruction selection, register allocation over all 16 GPRs and 16 XMMs.
      Hand allocation of one hot loop gave −27% (M20).
    - An internal calling convention: no frame pointer, no stack realignment,
-     shrink-wrapped saves. Calls cost 1.47× C's today [M12].
+     shrink-wrapped saves. Calls cost 1.47× C's today [M12]; a lean prologue
+     alone is −15% on fib [M21].
    - It decides 11 of the 19 workloads [M6].
    - Missing passes, measured or identified:
-     - accumulator recursion elimination (fib) [M9];
+     - accumulator recursion elimination (fib 1.46× → 0.96× C) [M9, M21];
      - signed magic-number division [M7];
      - SoA loop vectorization with alias versioning [M7], and straight-line
        vectorization of paired x/y/z arithmetic, which gcc uses in both vectors
@@ -722,6 +723,26 @@ Results [M]:
 - Bounds checks were kept, so they are not a significant cost here: predictable
   branches on registers.
 
+### M21. fib: calling convention and accumulator recursion (cycle 15)
+
+Both results use the reassembly path from M20 [M]:
+
+| Version | fib(43) |
+|---|---:|
+| zc -O2, reassembled | 1.23 s |
+| Lean internal prologue: 6 `push`/`pop`, no frame pointer, no `and rsp, -16` | **1.05 s (−15%)** |
+| Lean prologue + shrink-wrapped `n < 2` exit | 1.07 s (no further gain; the inlined leaves already avoid most entries) |
+| Source oracle with accumulator recursion elimination (`research/oracle/fib_accumulate.zeph`), today's prologue | **0.80 s** |
+| C -O2 | 0.83 s |
+
+**What this means:**
+
+- Two separable backend items close fib completely.
+- The internal convention is worth 15% on call-heavy code. It applies to every
+  workload with non-inlined calls.
+- Accumulator recursion elimination alone reaches C.
+- Together they should beat C [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -891,3 +912,7 @@ Results [M]:
   - Built a path to reassemble zc output with GNU as (`research/zc2gas.sh`).
   - Hand register allocation of the vectors loop: −27%, reaching
     non-vectorized C (M20). Register allocation explains the scalar gap.
+- **2026-10-01, cycle 15.**
+  - fib via reassembly (M21): the lean internal prologue is −15%;
+    shrink-wrapping adds nothing here.
+  - An accumulator-recursion oracle runs at 0.80 s against C's 0.83 s.

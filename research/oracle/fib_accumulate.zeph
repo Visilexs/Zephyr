@@ -1,0 +1,17 @@
+// Oracle rewrite of bench/fib.zeph (revision 398aadd): accumulator recursion
+// elimination, the transformation gcc -O2 applies (M9). The second recursive
+// call becomes a loop, legal because integer + is associative and commutative
+// under wraparound. Same result.
+fn fib(n: int) -> int {
+    var m = n
+    var total = 0
+    while m >= 2 {
+        total += fib(m - 1)
+        m -= 2
+    }
+    return total + m
+}
+
+var N = 35
+if args().len() > 1 { N = args()[1] as int }
+print(fib(N))
