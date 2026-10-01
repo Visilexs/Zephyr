@@ -5,7 +5,7 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 
 ## Current best architecture
 
-*(Revised every cycle. Cycle 30 state. Each claim cites a measurement.)*
+*(Revised every cycle. Cycle 44 state. Each claim cites a measurement.)*
 
 **Summary:**
 
@@ -46,10 +46,18 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 3. **One optimizing native backend, emitting machine code directly.**
    - No text assembler, which is 28% of a self-compile today [M3].
    - Instruction selection, register allocation over all 16 GPRs and 16 XMMs.
-     Hand allocation of one hot loop gave −27% (M20).
-   - Linear scan **with interval splitting**, two-address hints, and a smaller
-     scratch reservation. Today's allocator has no splitting and reserves 2
-     XMMs [M30].
+     Hand allocation of one hot loop gave −27% (M20); compiling it as a whole
+     function gave −32% (M41).
+   - **Every function compiled whole.** No baseline fallback with outlined loop
+     regions, because region outlining keeps every loop variable live across
+     the loop. The vectors oracle goes from 804 to 551 ms when its loop sits in
+     a whole-compiled function [M41].
+   - Linear scan with two-address hints and a smaller scratch reservation.
+     Interval splitting is lower priority than first thought [M30, corrected
+     by M41].
+   - Same analyses wherever code is placed. Today the original vectors is 6.3×
+     slower in a function than at top level [M41]. Placement gate: within
+     10%.
    - An internal calling convention: no frame pointer, no stack realignment,
      shrink-wrapped saves. Calls cost 1.47× C's today [M12]; a lean prologue
      alone is −15% on fib [M21].
