@@ -9,11 +9,11 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 
 # program, arguments (small workloads keep this gate quick)
 $programs = @()
-foreach ($file in Get-ChildItem examples\basics, examples\threads, tests -Filter *.zeph -File) {
+foreach ($file in Get-ChildItem tests\fixtures\basics, tests\fixtures\threads, tests -Filter *.zeph -File) {
     $programs += , @($file.FullName, "")
 }
-$benchArguments = @{ fib = "27"; matmul = "120"; mandel = "120"; sort = "20000"; strings = "20000"; hashmap = "20000"; cube = "200"; pi = "500"; liquid = "40" }
-foreach ($name in $benchArguments.Keys) { $programs += , @((Resolve-Path "bench\$name.zeph").Path, $benchArguments[$name]) }
+$workloadArguments = @{ fib = "27"; matmul = "120"; mandel = "120"; sort = "20000"; strings = "20000"; hashmap = "20000"; cube = "200"; pi = "500"; liquid = "40" }
+foreach ($name in $workloadArguments.Keys) { $programs += , @((Resolve-Path "tests\fixtures\workloads\$name.zeph").Path, $workloadArguments[$name]) }
 
 $passed = 0; $failed = 0; $skipped = 0
 foreach ($entry in $programs) {

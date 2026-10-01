@@ -1,6 +1,6 @@
 # Zephyr standard library
 
-Import only the modules you need. Compile native examples with `zc.exe --rt example.zeph example.exe`; add `--linux` for Linux output. Functions can also be called through UFCS (`values.sum()`, `generator.nextInt()`). Strings are byte strings, and integer values are signed 64-bit.
+Import only the modules you need. Compile with `./zc example.zeph /tmp/example` on Apple Silicon or `zc.exe --rt example.zeph example.exe` on Windows; add `--linux` to the Windows command for Linux output. Functions can also be called through UFCS (`values.sum()`, `generator.nextInt()`). Strings are byte strings, and integer values are signed 64-bit.
 
 ## string.zeph
 

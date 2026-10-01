@@ -5,8 +5,8 @@ as `zc.exe`), which is the canonical implementation. The C seed in
 `bootstrap/zephyr.c` implements the same language, minus generics, closures,
 and function-value types, and exists only to reconstruct the first `zc.exe`.
 
-The compiler emits three native targets from the same source: Windows x86-64
-(default), Linux x86-64 (`--linux`), and WebAssembly (`--wasm`) — see §7.
+The compiler supports Windows x86-64 (default), Linux x86-64 (`--linux`),
+WebAssembly (`--wasm`), and native Apple Silicon macOS through `./zc` — see §7.
 
 ## 1. Source text
 
@@ -849,28 +849,31 @@ exhaustion. Panics are not catchable.
 
 ## 7. Programs and linkage
 
-A compiled program is a standalone native module. The self-hosted compiler
+A compiled program is a standalone module. The x86-64 self-hosted compiler
 emits assembly, then assembles and links it with its own built-in assembler and
-linker — no external tools. Exit code is 0 on normal completion, 1 on panic.
+linker. The Apple Silicon driver uses Apple Clang to assemble and link native
+ARM64 output. Exit code is 0 on normal completion, 1 on panic.
 The generated code keeps every value in 64 bits: floats as IEEE bit patterns,
 references as pointers.
 
 ### 7.1 Targets
 
-The same source compiles to three targets, selected by a flag:
+The same source compiles to three built-in targets, selected by a flag.
+An additional native Apple Silicon macOS target uses the `zc` driver:
 
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
 | `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*` |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
+| `./zc` driver | Apple Silicon macOS | ARM64 Mach-O | experimental; ARM64 instruction selection, including guarded integer AXPY/weighted-sum NEON kernels and wide array fills, followed by Apple Clang assembly/linking and a native Darwin OS runtime. See [macOS support](../README.md#apple-silicon-macos) |
 
 Not every feature reaches every target. WebAssembly currently omits file I/O,
 closures, interfaces and threads; native interop (§3.6) via `extern fn … from`
 is Windows-only, and non-kernel32 `win()` prefixes are Windows-only.
 Threads and synchronization primitives are available on both Windows and Linux
 x86-64 with `--rt` (§8).
-`scripts/crosscheck-linux.ps1` and `crosscheck-wasm.ps1` compile the same
+`tests/crosscheck-linux.ps1` and `tests/crosscheck-wasm.ps1` compile the same
 sources for two targets and require byte-identical program output.
 
 ### 7.2 Command-line flags

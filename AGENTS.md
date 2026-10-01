@@ -1,48 +1,25 @@
-# Agent instructions
+# Project instructions
 
-Read `CLAUDE.md` first. It holds this repo's project rules, layout and build steps, and they apply to every agent. This file only adds what changed since then.
+Read `README.md` for build commands and layout. `docs/spec.md` is authoritative
+for Zephyr syntax, type rules, conversions, and runtime semantics; do not assume
+Rust or Swift behavior. `docs/std.md` describes the standard library.
 
-## Benchmarks (changed 2026-09-30, commit 3304401)
+The live compiler is `compiler/zc.zeph`, with `compiler/optimizer.zeph` and
+`compiler/runtime.zeph`. The `>>>EMBED` section is generated from the runtime
+and `lib/std/*.zeph`: never edit it by hand. Use `scripts/embed-gen.ps1` after
+changing those sources. Newly introduced syntax cannot be used in the compiler
+until the bootstrap seed understands it.
 
-`bench/run_suite.ps1` and `bench/time1.ps1` are gone. Use `bench/bench.py` for all benchmarking, from the repo root:
+Keep compiler seeds at the repository root. Use `./zc selfbuild` and
+`python3 tests/macos_tests.py` and `python3 tests/macos_jit.py` on native Apple Silicon; use
+`scripts/selfbuild.ps1` and the PowerShell test runners on Windows.
+Do not run Windows-only suites on macOS or silently route native builds through
+an instruction emulator or compatibility layer.
+`zc run` uses native in-memory JIT execution with function hotness feedback.
+Explicit output builds remain the AOT bootstrap and regression path. Keep their
+benchmark results distinct; the JIT currently has no value speculation or OSR.
 
-```
-python bench/bench.py run --compiler zc_new.exe       # full suite; saves bench/results/<commit>-<time>.json
-python bench/bench.py run --only vectors,lexer --languages c,zephyrO2 --compiler zc_new.exe
-python bench/bench.py compare                         # two newest results (or: compare OLD.json NEW.json)
-python bench/bench.py ab dirA/zc.exe dirB/zc.exe      # two compiler builds head to head
-python bench/bench.py compile --compiler zc_new.exe   # compile-time scaling + zc self-compile
-```
-
-- **run:**
-  - builds each workload in Zephyr, Zephyr -O2, C (gcc -O2) and Rust (rustc -O);
-  - checks that all builds print the same checksum;
-  - does one warm-up and then 10 timed runs, pinned to one CPU at high priority;
-  - reports the median ± the median absolute deviation, and peak committed memory of the whole process tree.
-  - Exit code 1 means a checksum mismatch. Treat that as a miscompile, not noise.
-- **Comparing numbers:**
-  - Don't compare against figures from the old runner. Workloads were resized to run at least ~250 ms each, so the old millisecond figures don't carry over.
-  - Use `compare` or `ab` to judge a change. Only rows marked `*` are beyond the noise band. Run-to-run spread is under 1%.
-- **ab:**
-  - zc reads `compiler/runtime.zeph` and `lib/` from next to its own exe. Each compiler must sit in its own directory with its own runtime.
-  - If both compilers share a directory, both builds use the same runtime.
-- **compile:**
-  - generates 200×200 call chains through `bench/compilegen.py`, for Zephyr, C, C++, Rust, Java and C#;
-  - reports µs per function.
-  - It is deliberately not pinned to one CPU, because pinning makes the multi-threaded compilers (javac, rustc, csc) look far slower. Keep it unpinned.
-- **Toolchains:** gcc is at `C:\msys64\ucrt64\bin` and is found automatically. rustc, java and dotnet are on PATH.
-- **Adding a workload:**
-  - Write the same algorithm as `bench/<name>.zeph`, `.c` and `.rs`.
-  - Read the size from argv[1] with a default, and use the shared LCG `nextRandom`.
-  - Print exactly one checksum line.
-  - Add a row to `suite` in `bench/bench.py`.
-- **JIT-targeted workloads:**
-
-  | workload | what it targets |
-  |---|---|
-  | `dispatch` | 8-way interface dispatch, past the optimizer's 4-vtable guard |
-  | `records` | a list of boxed structs |
-  | `strbuild` | per-substring allocation |
-  | `bintrees` | allocation and recursion |
-
-- Current measurements are in `docs/jit.md` under "Measurements".
+This checkout is scoped to the compiler, runtime, standard library, build tools,
+and tests. Test fixtures are in `tests/fixtures/`. Retain the archived ML tests
+under `tests/ml/`, but do not restore removed optional libraries or applications
+unless requested. The core suite skips their checks.

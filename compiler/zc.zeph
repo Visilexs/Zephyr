@@ -316,6 +316,7 @@ var privateCount = 0
 var debugEnabled = false
 var mainSourceFile = ""
 var wasmTargetEnabled = false    // --wasm: emit a WebAssembly module instead of a native executable
+var macosTargetEnabled = false   // --macos-ir: target IR for native ARM64 instruction selection
 var linuxTargetEnabled = false   // --linux: emit a static ELF64 that talks to the kernel by syscall
 var debugOffsets: [int] = []
 var debugLines: [int] = []
@@ -382,6 +383,11 @@ var currentUsesRegisterCall = false   // current fn is rt_*: params arrive in rc
 var functionRegisterCall: [bool] = []   // per-function: register convention (see computeRegisterCall)
 // -O2: the optimizing tier (optimizer.zeph)
 var optimizerEnabled = false
+var optimizerHotFunction = ""     // native JIT: optimize only this stable code label
+
+fn optimizerSelectsFunction(label: str) -> bool {
+    return optimizerHotFunction == "" or optimizerHotFunction == label
+}
 var optimizerReport = false                // --opt-report: say what was optimized and why not
 var optimizerDump = false                  // --opt-dump: print the IR of a region that fails its borrow check
 var pendingRegionLines: [str] = []         // outlined loop bodies, emitted after their parent
@@ -9421,6 +9427,10 @@ fn tryFill(statement: Node, returnLabel: int) -> bool {
     let value = assignment.children[1]
     if not isLeaf(value) or usesLocal(value, loopSlot) { return false }
     let targetList = target.children[0]
+    if macosTargetEnabled {
+        if typeKinds[targetList.typeIndex] != kindList or typeKinds[typeElementIds[targetList.typeIndex]] != kindInteger { return false }
+        if not nativeAxpyPure(statement.children[0]) or not nativeAxpyPure(statement.children[1]) { return false }
+    }
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
     let scalarLoopLabel = allocateLabel()
@@ -9473,9 +9483,8 @@ fn tryFill(statement: Node, returnLabel: int) -> bool {
     return true
 }
 
-// AVX2 index-weighted reduction: for i in lo..hi { acc += L[i] * i }.  gcc/LLVM
-// leave this scalar; we do 4-wide (full i64 product) and horizontal-sum at the
-// end. Bounds pre-check + scalar remainder.
+// Target-native index-weighted reduction: acc += L[i] * i. Use AVX2 or
+// two-lane NEON with wrapping i64 products, bounds guards and a scalar tail.
 fn tryReduce(statement: Node, returnLabel: int) -> bool {
     let loopSlot = statement.slot
     let body = statement.children[2]
@@ -9505,6 +9514,7 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     let innerIndexExpression = indexNode.children[1]
     if innerIndexExpression.nodeKind != nodeIdentifier or innerIndexExpression.auxiliary != identifierKindLocal or innerIndexExpression.slot != loopSlot { return false }  // L[i]
     let sourceList = indexNode.children[0]
+    if macosTargetEnabled and not nativeReduceInputsSafe(sourceList, statement.children[0], statement.children[1]) { return false }
     let accumulatorAddress = slotAddress(accumulator.auxiliary, accumulator.slot)
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
@@ -9523,13 +9533,22 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     emitInstruction("mov [rsp + 88], rax")             // hi
     emitInstruction("mov rax, [rsp + 88]")
     emitInstruction("sub rax, [rsp + 80]")
-    emitInstruction("and rax, -4")
+    if macosTargetEnabled { emitInstruction("and rax, -2") }
+    else { emitInstruction("and rax, -4") }
     emitInstruction("mov [rsp + 96], rax")             // bulk
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("add rax, [rsp + 96]")
     emitInstruction("mov [rsp + 104], rax")            // vend
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("mov {loopVariableAddress}, rax")                   // i = lo default
+    if macosTargetEnabled {
+        // Guard the entire range before moving any writes out of scalar order.
+        emitInstruction("mov rax, [rsp + 88]")
+        emitInstruction("cmp rax, [rsp + 80]")
+        emitInstruction("jle {labelText(vectorSkipLabel)}")
+        emitInstruction("cmp rax, [rsp + 72]")
+        emitInstruction("jg {labelText(vectorSkipLabel)}")
+    }
     emitInstruction("mov rax, [rsp + 96]")
     emitInstruction("cmp rax, 0")
     emitInstruction("jle {labelText(vectorSkipLabel)}")
@@ -9559,27 +9578,32 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("lea r10, [r10 + rax*8]")          // gridptr = dataptr + lo*8
     emitInstruction("mov rax, [rsp + 96]")
-    emitInstruction("sar rax, 2")                      // groups
-    clearVector(0)                            // accv = 0
-    loadVector(1, 4, 0)                      // idxv = [rsp+0]
-    emitLabel(vectorLoopLabel)
-    loadVector(2, 10, 0)                     // gridv = [r10]
-    multiplyVectorUnsignedWords(3, 2, 1)                    // grid_lo * idx   (idx fits in 32 bits)
-    shiftVectorQuadwordsRight(4, 2, 32)                     // grid_hi
-    multiplyVectorUnsignedWords(4, 4, 1)                    // grid_hi * idx
-    shiftVectorQuadwordsLeft(4, 4, 32)
-    addVectorQuadwords(3, 3, 4)                      // product = grid * idx (low 64)
-    addVectorQuadwords(0, 0, 3)                      // accv += product
-    addMemoryVectorQuadwords(1, 1, 4, 32)              // idxv += fourv ([rsp+32])
-    emitInstruction("add r10, 32")
-    emitInstruction("sub rax, 1")
-    emitInstruction("jne {labelText(vectorLoopLabel)}")
-    storeVector(4, 0, 0)                     // [rsp+0] = accv
-    clearUpperVectorRegisters()
-    emitInstruction("mov rax, [rsp + 0]")              // horizontal sum of 4 lanes
-    emitInstruction("add rax, [rsp + 8]")
-    emitInstruction("add rax, [rsp + 16]")
-    emitInstruction("add rax, [rsp + 24]")
+    if macosTargetEnabled {
+        emitInstruction("sar rax, 1")
+        emitInstruction("macos_reduce2")
+    } else {
+        emitInstruction("sar rax, 2")                      // groups
+        clearVector(0)                            // accv = 0
+        loadVector(1, 4, 0)                      // idxv = [rsp+0]
+        emitLabel(vectorLoopLabel)
+        loadVector(2, 10, 0)                     // gridv = [r10]
+        multiplyVectorUnsignedWords(3, 2, 1)                    // grid_lo * idx   (idx fits in 32 bits)
+        shiftVectorQuadwordsRight(4, 2, 32)                     // grid_hi
+        multiplyVectorUnsignedWords(4, 4, 1)                    // grid_hi * idx
+        shiftVectorQuadwordsLeft(4, 4, 32)
+        addVectorQuadwords(3, 3, 4)                      // product = grid * idx (low 64)
+        addVectorQuadwords(0, 0, 3)                      // accv += product
+        addMemoryVectorQuadwords(1, 1, 4, 32)              // idxv += fourv ([rsp+32])
+        emitInstruction("add r10, 32")
+        emitInstruction("sub rax, 1")
+        emitInstruction("jne {labelText(vectorLoopLabel)}")
+        storeVector(4, 0, 0)                     // [rsp+0] = accv
+        clearUpperVectorRegisters()
+        emitInstruction("mov rax, [rsp + 0]")              // horizontal sum of 4 lanes
+        emitInstruction("add rax, [rsp + 8]")
+        emitInstruction("add rax, [rsp + 16]")
+        emitInstruction("add rax, [rsp + 24]")
+    }
     emitInstruction("add {accumulatorAddress}, rax")
     emitInstruction("mov rax, [rsp + 104]")
     emitInstruction("mov {loopVariableAddress}, rax")                   // i = vend
@@ -9594,6 +9618,27 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     emitLabel(doneLabel)
     emitInstruction("add rsp, 128")
     return true
+}
+
+// Native bulk evaluation must not hoist a call, a trapping expression, or a
+// packed/map access out of the scalar loop. Arithmetic here wraps and is pure.
+fn nativeAxpyPure(expression: Node) -> bool {
+    if isLeaf(expression) { return true }
+    if expression.nodeKind != nodeBinary { return false }
+    if expression.operator != tokenPlus and expression.operator != tokenMinus and expression.operator != tokenStar { return false }
+    return nativeAxpyPure(expression.children[0]) and nativeAxpyPure(expression.children[1])
+}
+
+fn nativeReduceInputsSafe(sourceList: Node, low: Node, high: Node) -> bool {
+    if typeKinds[sourceList.typeIndex] != kindList { return false }
+    if typeKinds[typeElementIds[sourceList.typeIndex]] != kindInteger { return false }
+    return nativeAxpyPure(low) and nativeAxpyPure(high)
+}
+
+fn nativeAxpyInputsSafe(targetList: Node, sourceList: Node, factor: Node, outputBase: Node, inputBase: Node, low: Node, high: Node) -> bool {
+    if typeKinds[targetList.typeIndex] != kindList or typeKinds[sourceList.typeIndex] != kindList { return false }
+    if typeKinds[typeElementIds[targetList.typeIndex]] != kindInteger or typeKinds[typeElementIds[sourceList.typeIndex]] != kindInteger { return false }
+    return nativeAxpyPure(factor) and nativeAxpyPure(outputBase) and nativeAxpyPure(inputBase) and nativeAxpyPure(low) and nativeAxpyPure(high)
 }
 
 fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
@@ -9631,6 +9676,7 @@ fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
 
     let targetList = target.children[0]
     let sourceList = sourceElement.children[0]
+    if macosTargetEnabled and not nativeAxpyInputsSafe(targetList, sourceList, scalarFactor, outputBaseExpression, inputBaseExpression, statement.children[0], statement.children[1]) { return false }
     if targetList.auxiliary == sourceList.auxiliary and targetList.slot == sourceList.slot { return false }   // same array: avoid aliasing
     let scalarLabel = allocateLabel()
     let doneLabel = allocateLabel()
@@ -9670,13 +9716,49 @@ fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
     emitInstruction("mov [rsp + 104], rax")                                 // startB = iB+lo
     emitInstruction("mov rax, [rsp + 88]")
     emitInstruction("sub rax, [rsp + 80]")
-    emitInstruction("and rax, -4")
+    if macosTargetEnabled { emitInstruction("and rax, -2") }
+    else { emitInstruction("and rax, -4") }
     emitInstruction("mov [rsp + 112], rax")                                 // bulk
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("add rax, [rsp + 112]")
     emitInstruction("mov [rsp + 120], rax")                                 // vend = lo+bulk
     emitInstruction("mov rax, [rsp + 80]")
     emitInstruction("mov {loopVariableAddress}, rax")                                        // j = lo (scalar default)
+    if macosTargetEnabled {
+        // A range may wrap in int arithmetic. Only use the bulk kernel when
+        // base and index are nonnegative and the *entire* range fits each list.
+        // Check by subtraction, avoiding base+hi overflow. Otherwise retain
+        // scalar evaluation order, partial writes, and the original panic site.
+        emitInstruction("mov rax, [rsp + 80]")
+        emitInstruction("cmp rax, 0")
+        emitInstruction("jl {labelText(vectorSkipLabel)}")
+        emitInstruction("mov rax, [rsp + 88]")
+        emitInstruction("cmp rax, [rsp + 80]")
+        emitInstruction("jle {labelText(vectorSkipLabel)}")
+        emitInstruction("mov rax, [rsp + 64]")
+        emitInstruction("cmp rax, 0")
+        emitInstruction("jl {labelText(vectorSkipLabel)}")
+        emitInstruction("cmp rax, [rsp + 40]")
+        emitInstruction("jg {labelText(vectorSkipLabel)}")
+        emitInstruction("mov rcx, [rsp + 40]")
+        emitInstruction("sub rcx, rax")
+        emitInstruction("cmp rcx, [rsp + 88]")
+        emitInstruction("jl {labelText(vectorSkipLabel)}")
+        emitInstruction("mov rax, [rsp + 72]")
+        emitInstruction("cmp rax, 0")
+        emitInstruction("jl {labelText(vectorSkipLabel)}")
+        emitInstruction("cmp rax, [rsp + 56]")
+        emitInstruction("jg {labelText(vectorSkipLabel)}")
+        emitInstruction("mov rcx, [rsp + 56]")
+        emitInstruction("sub rcx, rax")
+        emitInstruction("cmp rcx, [rsp + 88]")
+        emitInstruction("jl {labelText(vectorSkipLabel)}")
+        // Distinct variable names can still refer to the same list. A shifted
+        // overlapping source must observe each preceding scalar write.
+        emitInstruction("mov rax, [rsp + 32]")
+        emitInstruction("cmp rax, [rsp + 48]")
+        emitInstruction("je {labelText(vectorSkipLabel)}")
+    }
     // bounds pre-check; any failure -> scalar loop (which checks per element)
     emitInstruction("mov rax, [rsp + 112]")
     emitInstruction("cmp rax, 0")
@@ -9703,26 +9785,31 @@ fn tryScaledVectorAddition(statement: Node, returnLabel: int) -> bool {
     emitInstruction("mov rax, [rsp + 104]")
     emitInstruction("lea r11, [r11 + rax*8]")
     emitInstruction("mov rax, [rsp + 112]")
-    emitInstruction("sar rax, 2")                                           // groups = bulk/4
-    loadVector(0, 4, 0)                                           // ymm0 = broadcast S ([rsp])
-    shiftVectorQuadwordsRight(5, 0, 32)                                          // ymm5 = S >> 32
-    emitLabel(vectorLoopLabel)
-    loadVector(1, 11, 0)                                          // ymm1 = B[4] ([r11])
-    shiftVectorQuadwordsRight(3, 1, 32)                                          // ymm3 = B >> 32
-    multiplyVectorUnsignedWords(2, 0, 1)                                         // Slo*Blo
-    multiplyVectorUnsignedWords(4, 0, 3)                                         // Slo*Bhi
-    multiplyVectorUnsignedWords(3, 5, 1)                                         // Shi*Blo
-    addVectorQuadwords(4, 4, 3)                                           // cross
-    shiftVectorQuadwordsLeft(4, 4, 32)
-    addVectorQuadwords(2, 2, 4)                                           // product
-    loadVector(1, 10, 0)                                          // ymm1 = C[4] ([r10])
-    addVectorQuadwords(1, 1, 2)
-    storeVector(10, 0, 1)                                         // C[4] = result
-    emitInstruction("add r11, 32")
-    emitInstruction("add r10, 32")
-    emitInstruction("sub rax, 1")
-    emitInstruction("jne {labelText(vectorLoopLabel)}")
-    clearUpperVectorRegisters()
+    if macosTargetEnabled {
+        emitInstruction("sar rax, 1")
+        emitInstruction("macos_axpy2")   // native two-lane wrapping int64 AXPY
+    } else {
+        emitInstruction("sar rax, 2")                                           // groups = bulk/4
+        loadVector(0, 4, 0)                                           // ymm0 = broadcast S ([rsp])
+        shiftVectorQuadwordsRight(5, 0, 32)                                          // ymm5 = S >> 32
+        emitLabel(vectorLoopLabel)
+        loadVector(1, 11, 0)                                          // ymm1 = B[4] ([r11])
+        shiftVectorQuadwordsRight(3, 1, 32)                                          // ymm3 = B >> 32
+        multiplyVectorUnsignedWords(2, 0, 1)                                         // Slo*Blo
+        multiplyVectorUnsignedWords(4, 0, 3)                                         // Slo*Bhi
+        multiplyVectorUnsignedWords(3, 5, 1)                                         // Shi*Blo
+        addVectorQuadwords(4, 4, 3)                                           // cross
+        shiftVectorQuadwordsLeft(4, 4, 32)
+        addVectorQuadwords(2, 2, 4)                                           // product
+        loadVector(1, 10, 0)                                          // ymm1 = C[4] ([r10])
+        addVectorQuadwords(1, 1, 2)
+        storeVector(10, 0, 1)                                         // C[4] = result
+        emitInstruction("add r11, 32")
+        emitInstruction("add r10, 32")
+        emitInstruction("sub rax, 1")
+        emitInstruction("jne {labelText(vectorLoopLabel)}")
+        clearUpperVectorRegisters()
+    }
     emitInstruction("mov rax, [rsp + 120]")
     emitInstruction("mov {loopVariableAddress}, rax")                                        // j = vend
     emitLabel(vectorSkipLabel)
@@ -9892,9 +9979,9 @@ fn generateStatement(statement: Node, returnLabel: int) {
         return
     }
     if statement.nodeKind == nodeRangeLoop {
-        if tryFill(statement, returnLabel) { return }    // AVX2 memset: L[i] = K
-        if tryReduce(statement, returnLabel) { return }  // AVX2 index-weighted reduction: acc += L[i]*i
-        if tryScaledVectorAddition(statement, returnLabel) { return }    // AVX2 fast path for the AXPY idiom
+        if tryFill(statement, returnLabel) { return }    // target-native fill: L[i] = K
+        if tryReduce(statement, returnLabel) { return }  // target-native weighted reduction: acc += L[i]*i
+        if tryScaledVectorAddition(statement, returnLabel) { return }    // target-native fast path for the AXPY idiom
         let loopLabel = allocateLabel()
         let continueLabel = allocateLabel()
         let doneLabel = allocateLabel()
@@ -10316,6 +10403,7 @@ fn functionIsRegisterCall(index: int) -> bool {
 }
 
 fn generateProgram(program: Node) {
+    let optimizingTierRequested = optimizerEnabled
     if optimizerEnabled { computeUnaliasedGlobals(program) }
     computeRegisterCall(program)
     emitAssemblyLine(".intel_syntax noprefix")
@@ -10335,6 +10423,7 @@ fn generateProgram(program: Node) {
         if topLevelNode.nodeKind == nodeFunction {
             let functionDefinition = functionDefinitions[topLevelNode.referenceIndex]
             if functionDefinition.typeParameters.len() > 0 { continue }        // a template emits no code
+            optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction(functionCodeLabel(functionDefinition.label))
             generatingUserFunction = functionDefinition.body.file == mainSourceFile
             nextUsesRegisterCall = functionIsRegisterCall(topLevelNode.referenceIndex)
             currentParameterTypes = functionDefinition.parameterTypes
@@ -10348,6 +10437,7 @@ fn generateProgram(program: Node) {
     }
     for i in 0..instantiatedFunctions.len() {                        // one body per monomorphisation
         let functionDefinition = functionDefinitions[instantiatedFunctions[i]]
+        optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction(functionCodeLabel(functionDefinition.label))
         generatingUserFunction = functionDefinition.body.file == mainSourceFile
         nextUsesRegisterCall = functionIsRegisterCall(instantiatedFunctions[i])
         currentParameterTypes = functionDefinition.parameterTypes
@@ -10363,11 +10453,13 @@ fn generateProgram(program: Node) {
         if topLevelNode.nodeKind != nodeFunction and topLevelNode.nodeKind != nodeStructDefinition and topLevelNode.nodeKind != nodeEnumDefinition and topLevelNode.nodeKind != nodeInterface { topLevelStatements.push(topLevelNode) }
     }
     generatingUserFunction = true    // main body: per-node file filter keeps only main-file top statements
+    optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction("zephyrMain")
     nextUsesRegisterCall = false
     var noParameterTypes: [int] = []
     currentParameterTypes = noParameterTypes
     generateFunctionBody("zephyrMain", topLevelSlotCount, 0, topLevelStatements)
     streamAssembledLines()
+    optimizerEnabled = optimizingTierRequested
 
     emitAssemblyLine(".section .rdata")
     for i in 0..floatConstants.len() {
@@ -11393,7 +11485,7 @@ fn isAbsolutePath(path: str) -> bool {
 
 // ---- embedded sources ----
 // The runtime and the std library are baked into the compiler binary so a lone
-// zc.exe is self-sufficient. tools/embed-gen.ps1 regenerates the section
+// zc.exe is self-sufficient. scripts/embed-gen.ps1 regenerates the section
 // between the EMBED markers from runtime.zeph and std/*.zeph; the disk files,
 // when present next to the exe or in the cwd, still take priority (dev override).
 
@@ -16444,9 +16536,13 @@ fn canonicalPathKey(path: str) -> str {
     let output = zeros(33)                        // 264 bytes for a 260-byte path
     let outputAddress = load64(addr(output) + 16)
     let fullPathLength = win("GetFullPathNameA", bufferAddress, 260, outputAddress, 0)
-    if fullPathLength == 0 or fullPathLength >= 260 { return path.lower() }   // too long: n is the size it needed
+    if fullPathLength == 0 or fullPathLength >= 260 {
+        if macosTargetEnabled { return path }
+        return path.lower()
+    }   // too long: n is the size it needed
     var key = ""
     for i in 0..fullPathLength { key = key + chr(load8(outputAddress + i)) }
+    if macosTargetEnabled { return key }
     return key.lower()
 }
 
@@ -16534,7 +16630,7 @@ fn expandImports(program: Node, baseDirectory: str) -> Node {
                 path = baseDirectory + topLevelNode.name
                 // Fall back to the compiler's own directory, then to lib/
                 // beneath it, so `import "std/list.zeph"` or `import
-                // "vk/gfx.zeph"` finds the shipped library from anywhere.
+                // "std/list.zeph"` finds the shipped library from anywhere.
                 if not pathExists(path) and cachedExecutableDirectory != "" {
                     if pathExists(cachedExecutableDirectory + topLevelNode.name) {
                         path = cachedExecutableDirectory + topLevelNode.name
@@ -19080,11 +19176,18 @@ while argumentIndex < commandLineArguments.len() {
         else { guestCommandLine += " " + argument }
     }
     else if argument == "--rt" { includeRuntime = true }
+    else if argument == "--macos-ir" { macosTargetEnabled = true }
     else if argument == "--linux" { linuxTargetEnabled = true }
     else if argument == "--wasm" { wasmTargetEnabled = true }
     else if argument == "--version" { showVersion = true }
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
     else if argument == "-O2" { optimizerEnabled = true }
+    else if argument == "--jit-hot" {
+        argumentIndex += 1
+        if argumentIndex >= commandLineArguments.len() { panic("--jit-hot requires a function code label") }
+        optimizerHotFunction = commandLineArguments[argumentIndex]
+        optimizerEnabled = true
+    }
     else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--opt-dump" { optimizerDump = true }
     else if argument == "--map" { symbolMapEnabled = true }
@@ -19105,6 +19208,10 @@ if inputPath == "" and showVersion {
     if inputPath == "" or (outputPath == "" and not runInProcess) {
         panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>\n       zc run [--test] <input.zeph> [program arguments...]")
     }
+    if macosTargetEnabled and (linuxTargetEnabled or wasmTargetEnabled or runInProcess) { panic("--macos-ir requires scalar assembly output; use scripts/macos.py to build or run native ARM64 programs") }
+    if macosTargetEnabled and not outputPath.endsWith(".s") { panic("--macos-ir output must end in .s") }
+    if macosTargetEnabled and not includeRuntime { panic("--macos-ir requires --rt") }
+    if optimizerHotFunction != "" and not macosTargetEnabled { panic("--jit-hot is an internal native macOS JIT option") }
     if runInProcess and (linuxTargetEnabled or wasmTargetEnabled) { panic("zc run: runs Windows x86-64 code in this process; --linux and --wasm do not apply") }
     currentSourceFile = baseName(inputPath)
     cachedExecutableDirectory = executableDirectory()
