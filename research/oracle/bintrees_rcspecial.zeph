@@ -1,0 +1,83 @@
+// Oracle rewrite of bench/bintrees.zeph (revision 398aadd): reference counting
+// kept, but specialized to Node at compile time instead of going through the
+// generic runtime. Nodes live in flat arrays (left, right, count), allocation
+// pops a per-type free list, release decrements and frees children
+// recursively, and optionals are nullable indices (-1 = none). No regions.
+// Same trees, same checksum (measures M13's "specialized" rows in Zephyr).
+
+const minimumDepth = 4
+var leftOf = zeros(1 << 21)
+var rightOf = zeros(1 << 21)
+var countOf = zeros(1 << 21)
+var freeHead = -1
+var bump = 0
+
+fn allocate() -> int {
+    if freeHead >= 0 {
+        let node = freeHead
+        freeHead = leftOf[node]
+        countOf[node] = 1
+        return node
+    }
+    let node = bump
+    bump += 1
+    countOf[node] = 1
+    return node
+}
+
+fn release(node: int) {
+    if node < 0 { return }
+    countOf[node] -= 1
+    if countOf[node] != 0 { return }
+    release(leftOf[node])
+    release(rightOf[node])
+    leftOf[node] = freeHead
+    freeHead = node
+}
+
+fn bottomUpTree(depth: int) -> int {
+    let node = allocate()
+    if depth > 0 {
+        let left = bottomUpTree(depth - 1)
+        let right = bottomUpTree(depth - 1)
+        leftOf[node] = left
+        rightOf[node] = right
+    } else {
+        leftOf[node] = -1
+        rightOf[node] = -1
+    }
+    return node
+}
+
+fn itemCheck(node: int) -> int {
+    var total = 1
+    let left = leftOf[node]
+    if left >= 0 { total += itemCheck(left) }
+    let right = rightOf[node]
+    if right >= 0 { total += itemCheck(right) }
+    return total
+}
+
+var maximumDepth = 16
+if args().len() > 1 { maximumDepth = args()[1] as int }
+if maximumDepth < minimumDepth + 2 { maximumDepth = minimumDepth + 2 }
+
+let stretch = bottomUpTree(maximumDepth + 1)
+var checksum = itemCheck(stretch)
+release(stretch)
+let longLivedTree = bottomUpTree(maximumDepth)
+
+var depth = minimumDepth
+while depth <= maximumDepth {
+    let iterations = 1 << (maximumDepth - depth + minimumDepth)
+    var check = 0
+    for i in 0..iterations {
+        let tree = bottomUpTree(depth)
+        check += itemCheck(tree)
+        release(tree)
+    }
+    checksum = checksum * 31 + check
+    depth += 2
+}
+checksum = checksum * 31 + itemCheck(longLivedTree)
+print(checksum)

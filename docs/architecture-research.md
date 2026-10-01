@@ -75,7 +75,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - **Region inference** for structures that die at the end of a statement or
      call. bintrees: 3.00× → 0.29× C [M7].
    - **Allocation and release specialized per type** instead of the generic
-     descriptor-driven runtime paths. Worth ≈ 2.7× on bintrees [M13].
+     descriptor-driven runtime paths. Worth ≈ 2.7× on bintrees in the C model
+     [M13] and 4.1× in Zephyr (739 → 180 ms, 0.69× C) [M33].
    - **Nullable-pointer optionals** for reference types, no cells (−30% [M13]).
    - **8-byte object header** instead of 24 (−28% [M13]).
    - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
@@ -1088,6 +1089,32 @@ There is no quadratic hotspot: it is per-node cost.
   which is incompatible with whole-program optimization. It is therefore not
   a target. tcc is the reference point for the stencil reserve (C3).
 
+### M33. Specialized reference counting in Zephyr itself (cycle 31)
+
+`research/oracle/bintrees_rcspecial.zeph` keeps reference counting but
+specializes it to `Node`:
+
+- nodes in flat arrays: left, right and count;
+- a per-type free list;
+- recursive release when a count reaches zero;
+- nullable indices instead of optional cells;
+- no regions.
+
+Same checksum, `hyperfine -N`, 6 runs [M]:
+
+| Version | Time | vs C (malloc/free) |
+|---|---:|---:|
+| `bench/bintrees.zeph`, -O2 | 739 ms | 2.8 |
+| **Specialized RC (this oracle)** | **180 ms** | **0.69** |
+| Region + flattening (M7) | 73 ms | 0.28 |
+| C model `rc8` / `rc24` (M13) | 148 / 205 ms | — |
+
+**What this means:** M13's C-model conclusion holds in Zephyr-compiled code.
+Specializing allocation and release to the type, plus nullable optionals, gives
+4.1× and beats C's malloc/free, while keeping reference-counting semantics
+(deterministic frees, peak memory tracks the live set). Regions are a further
+2.5× on top, where the analysis can prove them.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1328,3 +1355,6 @@ There is no quadratic hotspot: it is per-node cost.
     tcc's 63 ms, on 40 k tiny functions.
   - The profile shows per-node cost (memory management ~50%), not a quadratic
     hotspot.
+- **2026-10-01, cycle 31.**
+  - Specialized-RC oracle in Zephyr (M33): bintrees 739 → 180 ms (0.69× C),
+    confirming M13 without regions.
