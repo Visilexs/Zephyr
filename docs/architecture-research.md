@@ -153,6 +153,7 @@ go well below 1.0 on multicore machines [M8].
 | Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
 | Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle | [M] `research/x86bench.py`; oracles M7–M28 |
 | Bit-identical output across modes | required | checksums match on every workload so far | [M] |
+| Compiler size | report it | 24.4 k hand-written Zephyr lines today: zc.zeph 14.3 k (excluding the 4,980-line generated EMBED), optimizer 7.2 k, runtime 2.9 k; plus ~1 k lines of Python/C for macOS. Proposed design: ~28–33 k lines with native x86 and ARM64 backends, an IR interpreter and the cache, after deleting the baseline generator, text assembler, `arm64.py` and `jit.py`; +15–30% overall | [M] today (section markers); [E] proposed |
 
 ## Measurements
 
@@ -1140,6 +1141,38 @@ kernels. Same checksum [M]:
 - Two separately built tiers create cross-tier trade-offs like this one. That
   is one more argument for a single code generator.
 
+### M35. liquid, and where the compiler's lines go (cycle 33)
+
+**liquid** (`neighbours`, 66% of time): the hot instructions are `sqrtsd`, a
+`divsd` by `RADIUS = 7.0`, and bounds-check compares against lengths spilled to
+`[rsp + …]` [M, `research/hotspots.py`]. Division by 7.0 can't be strength-
+reduced exactly, so C divides too. The remaining gap matches the allocator
+finding (M30); there is no new lever.
+
+**Compiler composition** (section markers in `compiler/zc.zeph`) [M]:
+
+| Section | Lines |
+|---|---:|
+| Generated EMBED (runtime and std as text) | 4,980 |
+| "imports" section, which spans much of the frontend | 5,498 |
+| Monomorphization | 1,989 |
+| WebAssembly backend | 1,917 |
+| Parser | 1,243 |
+| Reference counting | 1,196 |
+| AVX2 kernel | 1,035 |
+| Text assembler | 854 |
+| Types | 759 |
+| Lexer | 505 |
+| Checker | 464 |
+| Register calling convention | 204 |
+| ELF writer | 167 |
+| PE writer | 52 |
+
+The proposed design deletes the baseline generator, the text assembler and the
+pattern kernels (subsumed by the vectorizer), and adds native instruction
+selection for x86 and ARM64, the cache and the interpreter. Estimate: +15–30%
+total [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1387,3 +1420,7 @@ kernels. Same checksum [M]:
   - cube (M34): disabling the native-kernel bail optimizes `render` but costs
     +66%. Vectorization must live in the optimizing tier, so functions don't
     have to choose between tiers.
+- **2026-10-01, cycle 33.**
+  - liquid's gap matches the allocator finding.
+  - Added the compiler-size row: 24.4 k hand-written lines today, an estimated
+    28–33 k for the proposed design with two native backends.
