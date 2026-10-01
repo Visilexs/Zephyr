@@ -1464,12 +1464,36 @@ the M39 loop-exit class. Their sources are in
 
 ## Open questions
 
-- **Q1. Answered in cycle 3.** A flat pipeline costs 0.23–0.27 µs per value in
-  Zephyr [M4b]; a production one is estimated at 0.7–1.4 µs [E]. That is
-  ~0.4 ms for an average 530-value region.
-- **Q2. Answered in cycle 2.** 5–16× slower than native [M4].
-- **Q3.** What does copy-and-patch emission cost per IR op, and how fast is its
-  code compared with today's baseline and -O2?
+**Answered:**
+
+- **Q1** (cycle 3): a flat pipeline costs 0.23–0.27 µs per value in Zephyr
+  [M4b]. A production pipeline is estimated at 0.7–1.4 µs.
+- **Q2** (cycle 2): an interpreter runs 5–16× slower than native [M4].
+- **Q3** (cycle 28): copy-and-patch emission costs 18–20 ns per op in C [M31].
+  The quality of its code is still open; see Q8.
+
+**Open, in priority order:**
+
+- **Q4.** What does a linear scan **with splitting** actually gain? Today
+  there is only a hand-allocated oracle (−27% on one loop, M20). Next step:
+  add splitting to `research/proto/flatopt.c`, then reassemble real hot loops
+  with its allocation.
+- **Q5.** How widely does region inference apply in real programs, beyond
+  bintrees? Which allocations in the compiler and the workloads die at
+  statement or call end? Needs allocation-lifetime instrumentation in a scratch
+  runtime.
+- **Q6.** What is wordfreq's 1.95× gap? M24 was inconclusive. Profile the C
+  reference against `research/proto/mapmodels.c` at instruction level.
+- **Q7.** dispatch's remaining loop cost (~1.4× C, M28) is attributed to the
+  interface cell and to density, but no oracle has isolated it.
+- **Q8.** How good is copy-and-patch code compared with today's baseline? This
+  decides whether C3 could replace debug builds.
+- **Q9.** Do x86-64 Linux numbers transfer to Windows (A2), and do the
+  architecture's gains transfer to ARM64? Needs a Windows or Apple Silicon
+  host.
+- **Q10.** Are there more miscompile classes? Extend `genprog.py`/`genpair.py`
+  to floats, closures and interfaces, and fix the evaluation order in the spec
+  first so mismatches become unambiguous.
 
 ## Assumptions (made instead of asking)
 
@@ -1678,3 +1702,7 @@ the M39 loop-exit class. Their sources are in
   - On 400 order-sensitive programs: baseline departs from left-to-right in
     9.75%; -O2 never departs where baseline follows it.
   - Recommended specifying left-to-right evaluation.
+- **2026-10-01, cycle 42.**
+  - Reduced the "all three differ" seed 230: it's order-dependent (a loop where
+    `acc = acc * 1 + f0(…)` and `f0` modifies `acc`), not a new miscompile.
+  - Rewrote the open-questions list (Q4–Q10).
