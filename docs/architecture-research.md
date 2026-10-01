@@ -1754,6 +1754,29 @@ Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
   integer reductions, no shared reference-count traffic. A Zephyr compiler
   could prove each of them.
 
+### M50. Object lifetimes inside the compiler (cycle 61)
+
+The compiler is built with the M43-instrumented runtime, plus
+`research/patches/zc-print-lifetimes.patch`, which prints the counters at the
+end of the driver. zc built at baseline [M]:
+
+| Compile | Allocations | Freed within the allocating frame | Escaped upward | Live until exit |
+|---|---:|---:|---:|---:|
+| `zc.zeph` self-compile | 12.80 M | 7.17 M (56%) | 2.72 M (21%) | 2.91 M (23%) |
+| `bench/lexer.zeph` at -O2 | 3.75 M | 2.49 M (66%) | 0.68 M (18%) | 0.58 M (16%) |
+| compilegen 40 k functions | 33.16 M | 16.71 M (50%) | 8.21 M (25%) | 8.24 M (25%) |
+
+**What this means:**
+
+- In the compiler, half to two-thirds of allocations die before the frame that
+  allocated them returns. That upper bound for function-scope regions is
+  similar to the allocation-heavy workloads (M43).
+- About a quarter (the AST, symbol tables, assembly text) lives for the whole
+  compile and is exactly what the flat-IR rewrite turns into a few big arrays.
+- 12.8 M allocations for one self-compile, at ~0.1–0.25 µs each including
+  release (M13, M33), is 1.3–3 s. That matches M3's finding that allocation,
+  reference counting and GC are ~43% of the 3.14 s self-compile.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1858,10 +1881,10 @@ evaluation order. Does an interpreted design prevent that by construction?
   there is only a hand-allocated oracle (−27% on one loop, M20). Next step:
   add splitting to `research/proto/flatopt.c`, then reassemble real hot loops
   with its allocation.
-- **Q5. Partly answered (cycle 48, M43):** in allocation-heavy workloads,
-  66–100% of freed objects die before their allocating frame returns. Still
-  open: the compiler itself, and how much of that a static escape analysis
-  proves.
+- **Q5. Mostly answered (cycles 48 and 61, M43, M50):** 66–100% of freed
+  objects in allocation-heavy workloads, and 50–66% of all allocations in the
+  compiler, die before their allocating frame returns. Still open: how much of
+  that a static escape analysis proves.
 - **Q6. Answered (cycle 51, M44):** wordfreq's gap is entirely
   string building by repeated concatenation. The fix is in-place append.
 - **Q7. Answered (cycle 52, M45):** dispatch's gap is the `{vtable, data}`
@@ -2155,3 +2178,6 @@ evaluation order. Does an interpreted design prevent that by construction?
     past a five-minute read.
 - **2026-10-01, cycle 60.**
   - Map and generics fuzzing (`genmap.py`, 400 programs): 0 mismatches.
+- **2026-10-01, cycle 61.**
+  - Compiler lifetimes (M50): 50–66% of allocations die in their allocating
+    frame, ~20% escape and ~25% live until exit.

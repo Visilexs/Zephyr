@@ -1,0 +1,13 @@
+--- compiler/zc.zeph	2026-10-01 01:24:40.181652490 +0000
++++ compiler/zc.zeph	2026-10-01 03:34:21.118512731 +0000
+@@ -19309,8 +19309,9 @@
+             currentAssemblySection = sectionText
+             for line in assemblyLines { assembleLine(line) }
+             runInMemory("\"" + inputPath + "\"" + guestCommandLine)
+-        } else {
++                } else {
+             assembleAndLink(outputPath)
+         }
+     }
++    print("LIFE", runtimeLifeCount(0), runtimeLifeCount(1), runtimeLifeCount(2))
+ }
