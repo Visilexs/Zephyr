@@ -1115,6 +1115,31 @@ Specializing allocation and release to the type, plus nullable optionals, gives
 (deterministic frees, peak memory tracks the live set). Regions are a further
 2.5× on top, where the analysis can prove them.
 
+### M34. cube: baseline vector kernels against the optimizer (cycle 32)
+
+`tryOptimizeFunction` (`compiler/optimizer.zeph` line 7022) leaves a whole
+function on baseline when it contains a loop the baseline compiles to a native
+vector kernel. In cube, that is the framebuffer clear and the checksum fold
+inside `render`. A scratch compiler (`/tmp` copy, not the shipping one) with
+the rule disabled optimizes `render` (246 values, 1 spill) but loses the
+kernels. Same checksum [M]:
+
+| Build | cube (80,000) |
+|---|---:|
+| zc -O2 today (`render` on baseline with kernels) | 418 ms |
+| Scratch zc, `render` optimized without kernels | 692 ms (+66%) |
+| C -O2 | 355 ms |
+
+**What this means:**
+
+- The vector kernels are worth more than optimizing the rest of the function,
+  so the current rule is right for today's compiler.
+- The proposed design removes the trade-off: the optimizing tier gets its own
+  vectorizer (layer 3), so no function has to choose between scalar
+  optimization and vectorized loops.
+- Two separately built tiers create cross-tier trade-offs like this one. That
+  is one more argument for a single code generator.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1358,3 +1383,7 @@ Specializing allocation and release to the type, plus nullable optionals, gives
 - **2026-10-01, cycle 31.**
   - Specialized-RC oracle in Zephyr (M33): bintrees 739 → 180 ms (0.69× C),
     confirming M13 without regions.
+- **2026-10-01, cycle 32.**
+  - cube (M34): disabling the native-kernel bail optimizes `render` but costs
+    +66%. Vectorization must live in the optimizing tier, so functions don't
+    have to choose between tiers.
