@@ -42,7 +42,7 @@ M40]. The spec should state left-to-right evaluation.
 
 ## Current best architecture
 
-*(Revised every cycle. Cycle 44 state. Each claim cites a measurement.)*
+*(Revised every cycle. Cycle 72 state. Each claim cites a measurement.)*
 
 **Summary:**
 
@@ -119,9 +119,11 @@ M40]. The spec should state left-to-right evaluation.
      flattened into their containers (SoA). shapes: 1.83× → 1.40× [M11];
      vectors: bound 0.40× C with AVX2 [M7].
    - **Mutable records flattened too**, with element references as (list,
-     index) pairs. records: 1.25× → 1.01× C [M27].
+     index) pairs. records: 1.25× → 1.01–1.05× C [M27, M53].
    - **Region inference** for structures that die at the end of a statement or
-     call. bintrees: 3.00× → 0.29× C [M7].
+     call. bintrees: 3.0–3.1× → 0.28–0.29× C [M7, M53]. Tracing GC was
+     evaluated as an alternative and rejected: no faster than regions, and it
+     breaks the spec's peak-memory promise [M52].
    - **Allocation and release specialized per type** instead of the generic
      descriptor-driven runtime paths. Worth ≈ 2.7× on bintrees in the C model
      [M13] and 4.1× in Zephyr (739 → 180 ms, 0.69× C) [M33].
@@ -133,7 +135,7 @@ M40]. The spec should state left-to-right evaluation.
    - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
      1.56× [M14].
    - **In-place append when the string is uniquely owned**, plus slices.
-     strbuild: 2.2× → 1.45× [M23]. wordfreq's whole 1.9× gap is
+     strbuild: 2.0–2.2× → 1.29× [M23, M53]. wordfreq's whole 1.9× gap is
      concatenation [M44].
    - **No cycle collection when the type graph is acyclic**, and tracing
      restricted to cycle-capable types otherwise. lexer −12.5%, shapes −6%,
@@ -144,13 +146,16 @@ M40]. The spec should state left-to-right evaluation.
 5. **Automatic loop parallelism**, enabled by layer 4 (no reference-count
    traffic on SoA data).
    - 3.17× on 4 cores, bit-identical [M8]. Also mandel 3.94×, matmul 3.69×,
-     bintrees 1.76× (allocator contention) [M48].
+     bintrees 1.76× with malloc and 2.7× with per-thread regions
+     (18 ms, ~16× serial C) [M48].
    - Only for loops with ≥ 5–10 µs of work per invocation.
    - Counts stay non-atomic. Atomic counts are 12× slower and biased ones 1.4×
      [M26], so parallel bodies must provably do no count updates on shared
      objects.
 6. **The IR interpreter as the executable specification.**
-   - A differential-testing oracle for every pass.
+   - A differential-testing oracle for every pass, run with the random program
+     generators in `research/fuzz/`. Those found a real -O2 miscompile class
+     and an evaluation-order split between today's tiers [M39, M40].
    - The compile-time evaluator and the debugger.
    - It is not an execution tier. Interpreters run 5–16× slower than native
      [M4], and with caching there is no latency left for a tier to hide [M10].
@@ -2458,3 +2463,6 @@ All rows are bintrees unless noted, same checksum, one core.
   - Whole-program facts against incremental builds (M54): the worst
     realistic flip rebuilds ~308 functions in ~80–160 ms.
   - Facts become cache inputs; added a fact-flip check to step 8's gate.
+- **2026-10-01, cycle 72.**
+  - Consistency pass on the current-best section: same-session values (M53),
+    per-thread regions, the M52 rejection, and the fuzzing evidence in layer 6.
