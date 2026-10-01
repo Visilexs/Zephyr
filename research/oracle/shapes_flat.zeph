@@ -1,0 +1,155 @@
+// Oracle rewrite of bench/shapes.zeph (revision 398aadd): closed-world interface
+// conversion plus flattening of immutable values into their list (SoA), the
+// stronger form of shapes_tagged.zeph. No per-shape heap object, header or
+// interface cell remains. Same arithmetic in the same order, same checksum.
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn randomLength() -> float {
+    return (nextRandom() % 10000) as float / 1000.0 + 1.0
+}
+
+const kindCircle = 0
+const kindRectangle = 1
+const kindTriangle = 2
+const kindPolygon = 3
+
+// Shapes are immutable and all implementations are known, so a [Shape] list can
+// hold its elements inline: kind plus three float fields, one array each (SoA).
+// Polygon vertex lists live in a side table indexed by the polygon's slot.
+struct ShapeList { kind: [int], a: [float], b: [float], c: [float], polygon: [int] }
+
+var polygonXs: [[float]] = []
+var polygonYs: [[float]] = []
+
+fn newList() -> ShapeList {
+    return ShapeList{kind: [], a: [], b: [], c: [], polygon: []}
+}
+
+fn pushShape(list: ShapeList, kind: int, a: float, b: float, c: float, polygon: int) {
+    list.kind.push(kind)
+    list.a.push(a)
+    list.b.push(b)
+    list.c.push(c)
+    list.polygon.push(polygon)
+}
+
+fn area(list: ShapeList, i: int) -> float {
+    let kind = list.kind[i]
+    if kind == kindCircle { return 3.141592653589793 * list.a[i] * list.a[i] }
+    if kind == kindRectangle { return list.a[i] * list.b[i] }
+    if kind == kindTriangle {
+        let sideA = list.a[i]
+        let sideB = list.b[i]
+        let sideC = list.c[i]
+        let halfPerimeter = (sideA + sideB + sideC) * 0.5
+        return sqrt(halfPerimeter * (halfPerimeter - sideA) * (halfPerimeter - sideB) * (halfPerimeter - sideC))
+    }
+    let xs = polygonXs[list.polygon[i]]
+    let ys = polygonYs[list.polygon[i]]
+    let vertexCount = xs.len()
+    var twiceArea = 0.0
+    for v in 0..vertexCount {
+        let j = (v + 1) % vertexCount
+        twiceArea += xs[v] * ys[j] - xs[j] * ys[v]
+    }
+    if twiceArea < 0.0 { twiceArea = -twiceArea }
+    return twiceArea * 0.5
+}
+
+fn perimeter(list: ShapeList, i: int) -> float {
+    let kind = list.kind[i]
+    if kind == kindCircle { return 2.0 * 3.141592653589793 * list.a[i] }
+    if kind == kindRectangle { return 2.0 * (list.a[i] + list.b[i]) }
+    if kind == kindTriangle { return list.a[i] + list.b[i] + list.c[i] }
+    let xs = polygonXs[list.polygon[i]]
+    let ys = polygonYs[list.polygon[i]]
+    let vertexCount = xs.len()
+    var total = 0.0
+    for v in 0..vertexCount {
+        let j = (v + 1) % vertexCount
+        let deltaX = xs[j] - xs[v]
+        let deltaY = ys[j] - ys[v]
+        total += sqrt(deltaX * deltaX + deltaY * deltaY)
+    }
+    return total
+}
+
+fn cornerCount(list: ShapeList, i: int) -> int {
+    let kind = list.kind[i]
+    if kind == kindCircle { return 0 }
+    if kind == kindRectangle { return 4 }
+    if kind == kindTriangle { return 3 }
+    return polygonXs[list.polygon[i]].len()
+}
+
+fn pushCircle(list: ShapeList) { pushShape(list, kindCircle, randomLength(), 0.0, 0.0, -1) }
+
+fn pushRectangle(list: ShapeList) {
+    let width = randomLength()
+    let height = randomLength()
+    pushShape(list, kindRectangle, width, height, 0.0, -1)
+}
+
+fn pushTriangle(list: ShapeList) {
+    let legA = randomLength()
+    let legB = randomLength()
+    pushShape(list, kindTriangle, legA, legB, sqrt(legA * legA + legB * legB), -1)
+}
+
+fn pushPolygon(list: ShapeList) {
+    let vertexCount = nextRandom() % 4 + 5
+    var xs: [float] = []
+    var ys: [float] = []
+    for v in 0..vertexCount {
+        xs.push(randomLength())
+        ys.push(randomLength())
+    }
+    polygonXs.push(xs)
+    polygonYs.push(ys)
+    pushShape(list, kindPolygon, 0.0, 0.0, 0.0, polygonXs.len() - 1)
+}
+
+var count = 300000
+if args().len() > 1 { count = args()[1] as int }
+let rounds = 20
+
+let monomorphicShapes = newList()
+for i in 0..count { pushCircle(monomorphicShapes) }
+
+let bimorphicShapes = newList()
+for i in 0..count {
+    if nextRandom() % 2 == 0 { pushCircle(bimorphicShapes) } else { pushRectangle(bimorphicShapes) }
+}
+
+let megamorphicShapes = newList()
+for i in 0..count {
+    let kind = nextRandom() % 4
+    if kind == 0 { pushCircle(megamorphicShapes) }
+    else if kind == 1 { pushRectangle(megamorphicShapes) }
+    else if kind == 2 { pushTriangle(megamorphicShapes) }
+    else { pushPolygon(megamorphicShapes) }
+}
+
+var checksum = 0
+for round in 0..rounds {
+    var monomorphicTotal = 0.0
+    for i in 0..count { monomorphicTotal += area(monomorphicShapes, i) }
+    var bimorphicTotal = 0.0
+    for i in 0..count { bimorphicTotal += perimeter(bimorphicShapes, i) }
+    var megamorphicTotal = 0.0
+    var cornerTotal = 0
+    for i in 0..count {
+        megamorphicTotal += area(megamorphicShapes, i) + perimeter(megamorphicShapes, i) * 0.5
+        cornerTotal += cornerCount(megamorphicShapes, i)
+    }
+    checksum = checksum * 31 + (monomorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (bimorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (megamorphicTotal * 1000.0) as int + cornerTotal + round
+}
+print(checksum)

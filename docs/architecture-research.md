@@ -49,7 +49,10 @@ only if the rewritten optimizer costs more than ~2 µs per SSA value.
       magic division, small strings, hashes stored in map slots.
    3. **Regions plus immutable-type flattening:** fewer workloads, but the
       largest single gain (bintrees 3.00× → 0.29× C).
-   4. **Automatic loop parallelism** once SoA values exist: 3.17× on 4 cores
+   4. **Memory density:** an 8-byte object header instead of 24, and immutable
+      values flattened into containers (M11: shapes 1.83× → 1.40× from
+      flattening alone).
+   5. **Automatic loop parallelism** once SoA values exist: 3.17× on 4 cores
       [M8], bit-identical output, with a minimum grain of ~5–10 µs per loop
       invocation.
 6. **An IR interpreter as the executable specification**, not as a tier. It is
@@ -415,6 +418,40 @@ That meets the < 20 ms target, as long as the cache tracks dependencies:
 - So the time an interpreter tier could save is tiny, which strengthens the C1
   verdict.
 
+### M11. shapes: memory density, not dispatch (cycle 7)
+
+Hypothesis tested: the `{vtable, data}` interface cell (spec §3.5) adds an
+allocation and a dependent load per element, as instruction-level sampling
+suggested (`research/hotspots.py`: the hottest instructions are the loads
+through the cell). Results [M]:
+
+| Version | Time | Peak RSS | vs C |
+|---|---:|---:|---:|
+| `bench/shapes.zeph`, -O2 | 1.06 s | 205 MB | 1.83 |
+| Closed-world tagged struct, no interface cell (`research/oracle/shapes_tagged.zeph`) | 1.06 s | 198 MB | 1.83 |
+| Shapes flattened into the list, SoA (`research/oracle/shapes_flat.zeph`) | 0.81 s | 168 MB | 1.40 |
+| C, vtable pointers, malloc | 0.58 s | 93 MB | 1.00 |
+
+**What this means:**
+
+- **Removing the interface cell gains nothing.** The loads it adds overlap
+  with the object loads.
+- **The cost is bytes per element.** Every heap object has a 24-byte header
+  (count, descriptor, size; `runtime.zeph` line 11), so a circle in a `[Shape]`
+  is ~80 bytes against C's ~40. The traversal is sequential, so bandwidth
+  decides the time.
+- **Flattening values into the list recovers 24%.** What's left is call
+  overhead: `area` and `perimeter` are ~1 KB each, too big for the inliner's
+  60-node limit, so each element pays a full prologue.
+- **Implications:**
+  1. A smaller object header. Packing a 32-bit count and a 32-bit descriptor
+     index into one word, with the size taken from the descriptor or size
+     class, would save 16 bytes per object in every allocation-heavy workload [E].
+  2. Flattening immutable values into containers matters more than removing
+     dispatch.
+  3. Profile-guided inlining of hot loop bodies, using the persisted profiles
+     of C1.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -546,3 +583,7 @@ That meets the < 20 ms target, as long as the cache tracks dependencies:
     incremental rebuilds can hit < 20 ms without an interpreter.
   - An interpreter tier would only skip code generation, which is now the
     cheap part.
+- **2026-10-01, cycle 7.**
+  - shapes: the interface cell is not the cost; memory density is.
+  - The 24-byte header makes objects 2× C's size, and flattening recovers 24%
+    (M11).

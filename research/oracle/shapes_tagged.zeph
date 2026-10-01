@@ -1,0 +1,135 @@
+// Oracle rewrite of bench/shapes.zeph (revision 398aadd): the code a
+// closed-world compiler could produce for an interface whose implementations are
+// all known. The `{vtable, data}` cell disappears: each shape is one object
+// whose kind is a field, and methods switch on that kind, which also allows
+// inlining. Same arithmetic in the same order, so the checksum is identical.
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn randomLength() -> float {
+    return (nextRandom() % 10000) as float / 1000.0 + 1.0
+}
+
+const kindCircle = 0
+const kindRectangle = 1
+const kindTriangle = 2
+const kindPolygon = 3
+
+struct AnyShape { kind: int, a: float, b: float, c: float, xs: [float], ys: [float] }
+
+let noPoints: [float] = []
+
+fn area(self: AnyShape) -> float {
+    let kind = self.kind
+    if kind == kindCircle { return 3.141592653589793 * self.a * self.a }
+    if kind == kindRectangle { return self.a * self.b }
+    if kind == kindTriangle {
+        let halfPerimeter = (self.a + self.b + self.c) * 0.5
+        return sqrt(halfPerimeter * (halfPerimeter - self.a) * (halfPerimeter - self.b) * (halfPerimeter - self.c))
+    }
+    let xs = self.xs
+    let ys = self.ys
+    let vertexCount = xs.len()
+    var twiceArea = 0.0
+    for i in 0..vertexCount {
+        let j = (i + 1) % vertexCount
+        twiceArea += xs[i] * ys[j] - xs[j] * ys[i]
+    }
+    if twiceArea < 0.0 { twiceArea = -twiceArea }
+    return twiceArea * 0.5
+}
+
+fn perimeter(self: AnyShape) -> float {
+    let kind = self.kind
+    if kind == kindCircle { return 2.0 * 3.141592653589793 * self.a }
+    if kind == kindRectangle { return 2.0 * (self.a + self.b) }
+    if kind == kindTriangle { return self.a + self.b + self.c }
+    let xs = self.xs
+    let ys = self.ys
+    let vertexCount = xs.len()
+    var total = 0.0
+    for i in 0..vertexCount {
+        let j = (i + 1) % vertexCount
+        let deltaX = xs[j] - xs[i]
+        let deltaY = ys[j] - ys[i]
+        total += sqrt(deltaX * deltaX + deltaY * deltaY)
+    }
+    return total
+}
+
+fn cornerCount(self: AnyShape) -> int {
+    let kind = self.kind
+    if kind == kindCircle { return 0 }
+    if kind == kindRectangle { return 4 }
+    if kind == kindTriangle { return 3 }
+    return self.xs.len()
+}
+
+fn makeCircle() -> AnyShape { return AnyShape{kind: kindCircle, a: randomLength(), b: 0.0, c: 0.0, xs: noPoints, ys: noPoints} }
+
+fn makeRectangle() -> AnyShape {
+    let width = randomLength()
+    let height = randomLength()
+    return AnyShape{kind: kindRectangle, a: width, b: height, c: 0.0, xs: noPoints, ys: noPoints}
+}
+
+fn makeTriangle() -> AnyShape {
+    let legA = randomLength()
+    let legB = randomLength()
+    return AnyShape{kind: kindTriangle, a: legA, b: legB, c: sqrt(legA * legA + legB * legB), xs: noPoints, ys: noPoints}
+}
+
+fn makePolygon() -> AnyShape {
+    let vertexCount = nextRandom() % 4 + 5
+    var xs: [float] = []
+    var ys: [float] = []
+    for i in 0..vertexCount {
+        xs.push(randomLength())
+        ys.push(randomLength())
+    }
+    return AnyShape{kind: kindPolygon, a: 0.0, b: 0.0, c: 0.0, xs: xs, ys: ys}
+}
+
+var count = 300000
+if args().len() > 1 { count = args()[1] as int }
+let rounds = 20
+
+var monomorphicShapes: [AnyShape] = []
+for i in 0..count { monomorphicShapes.push(makeCircle()) }
+
+var bimorphicShapes: [AnyShape] = []
+for i in 0..count {
+    if nextRandom() % 2 == 0 { bimorphicShapes.push(makeCircle()) } else { bimorphicShapes.push(makeRectangle()) }
+}
+
+var megamorphicShapes: [AnyShape] = []
+for i in 0..count {
+    let kind = nextRandom() % 4
+    if kind == 0 { megamorphicShapes.push(makeCircle()) }
+    else if kind == 1 { megamorphicShapes.push(makeRectangle()) }
+    else if kind == 2 { megamorphicShapes.push(makeTriangle()) }
+    else { megamorphicShapes.push(makePolygon()) }
+}
+
+var checksum = 0
+for round in 0..rounds {
+    var monomorphicTotal = 0.0
+    for shape in monomorphicShapes { monomorphicTotal += area(shape) }
+    var bimorphicTotal = 0.0
+    for shape in bimorphicShapes { bimorphicTotal += perimeter(shape) }
+    var megamorphicTotal = 0.0
+    var cornerTotal = 0
+    for shape in megamorphicShapes {
+        megamorphicTotal += area(shape) + perimeter(shape) * 0.5
+        cornerTotal += cornerCount(shape)
+    }
+    checksum = checksum * 31 + (monomorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (bimorphicTotal * 1000.0) as int
+    checksum = checksum * 31 + (megamorphicTotal * 1000.0) as int + cornerTotal + round
+}
+print(checksum)
