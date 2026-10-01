@@ -161,6 +161,32 @@ M40]. The spec should state left-to-right evaluation.
      per value, or for cold builds of programs above ~100 k lines without a
      shared cache (scenario S7).
 
+### What changes on Apple Silicon (cycle 63)
+
+These numbers combine the repository's own M5 results with components measured
+here on x86. ARM64 itself was not measured in this environment (A2, Q9).
+
+| Measure | macOS today [M, `tests/benchmarks/results/`] | Projected with the proposed design [E] |
+|---|---|---|
+| Build of a small benchmark program | median **4.8 s** baseline, **2.6 s** -O2 (19 workloads); clang builds the C versions in 45 ms | ~5–15 ms: the same frontend and cache as x86 (M46), a native ARM64 encoder instead of `arm64.py` + clang |
+| `zc run` startup | ~4.0–4.3 s per run (JIT report) | ≈ 3 ms (M17 components) |
+| Tier-up pause | 321–335 ms per function, constant (clang) | none: no tiers; cached optimized code |
+| -O2 runtime vs clang -O2 (geometric mean) | 1.28× (M5 report) | the same levers as x86. Expected to land near the x86 projection (~0.94×), but unmeasured |
+
+**macOS-specific requirements for the native backend:**
+
+- **Code signing.** Apple Silicon only runs signed executables, and an ad-hoc
+  signature is enough. Today clang's linker produces it. A native Mach-O writer
+  must emit `LC_CODE_SIGNATURE` with a CodeDirectory of SHA-256 page hashes:
+  ~500 KB of code is ~1 ms of hashing [E].
+- **JIT memory for `zc run`.** In-process execution needs `MAP_JIT` memory and
+  `pthread_jit_write_protect_np` toggling, since writable and executable is
+  never allowed at the same time. Today `bootstrap/macos/jit.c` covers this, and
+  it stays.
+- **No clang and no Python on the build path.** Mach-O writing, signing and
+  ARM64 encoding all move into zc. The existing ELF/PE writers (~220 lines,
+  M35) are the model.
+
 ### Language changes the architecture needs
 
 **No syntax changes.** Readability is unaffected, and the bootstrap seed needs
@@ -2211,3 +2237,7 @@ evaluation order. Does an interpreted design prevent that by construction?
   - Stencil-style code quality (M51): 3.4–6.8× native, which is 2–3× better
     than an interpreter but worse than zc's current baseline.
   - Q8 closed; C3 is scoped to S7.
+- **2026-10-01, cycle 63.**
+  - Added the Apple Silicon section: macOS builds take 4.8 s / 2.6 s today
+    (repo results), against a projected 5–15 ms.
+  - Listed the macOS-specific requirements: ad-hoc code signing and MAP_JIT.
