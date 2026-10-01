@@ -1,34 +1,5 @@
 # Native Mac benchmark
 
-## Native JIT run
-
-```sh
-python3 tests/benchmarks/macos_jit.py
-```
-
-This runs all 19 original workloads at their original sizes in five modes:
-C `-O2`, fresh AOT `-O2`, JIT baseline, adaptive JIT, and JIT starting at `-O2`.
-Adaptive execution uses the default 1,000-call threshold. Each measurement
-starts a fresh process; a separate warm-up does not preserve JIT tiers.
-
-Entry timers measure the guest program itself. Reports separate JIT startup,
-synchronous tier-compilation pauses, guest execution including those pauses,
-execution with those pauses subtracted, and full process time. Execution with
-compilation subtracted still contains cold baseline code, tier transitions,
-and profiling overhead; it is **not steady-state timing**. C/AOT entry timers
-include flushing stdout. Native host memory uses `getrusage(RUSAGE_SELF)`, so
-JIT memory figures exclude compiler/assembler child-process peaks.
-
-The runner validates each result against C, rotates mode order across up to
-ten timed rounds, and retains the original 30-second per-mode timing budget
-with at least three samples. That budget uses full process time, including JIT
-startup. C/AOT binaries are built before timing; their build costs are separate.
-No fixed CPU affinity is claimed. The default output is
-`results/apple-silicon-jit-full.json` with an accompanying Markdown report.
-`--workloads fib --runs 3 --output /tmp/jit-check.json` runs a focused check.
-
-## AOT reference run
-
 Run from the repository root on Apple Silicon:
 
 ```sh
@@ -62,9 +33,6 @@ comparable to these native ARM64 measurements.
 
 Saved measurements:
 
-- [Full native JIT run](results/apple-silicon-jit-full.md), comparing all three
-  JIT modes against C and a fresh AOT `-O2` reference, with compilation costs
-  separated from guest execution.
 - [Full 19-workload run](results/apple-silicon-full.md), before the native matrix kernel.
 - [Matrix kernel before/after comparison](results/matmul-arm64-improvement.md),
   with the previous compiler, updated baseline/optimized builds, and C.

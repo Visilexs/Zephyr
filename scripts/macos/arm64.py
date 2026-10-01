@@ -2,7 +2,7 @@
 
 The existing frontend emits an Intel-shaped instruction IR. This pass selects
 ARM64 instructions at build time; generated executables contain ARM64 code only.
-Raw x86 vector/JIT/OS operations fail explicitly rather than emitting x86.
+Raw x86 vector/OS operations fail explicitly rather than emitting x86.
 """
 import re
 import struct

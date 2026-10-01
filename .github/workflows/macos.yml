@@ -27,5 +27,3 @@ jobs:
         run: ./zc selfbuild
       - name: Native language and runtime regressions
         run: python3 tests/macos_tests.py
-      - name: Native JIT transitions and runtime parity
-        run: python3 tests/macos_jit.py

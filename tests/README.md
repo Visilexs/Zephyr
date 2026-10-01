@@ -7,13 +7,6 @@ compile errors, bounds panics, and invocation outside the checkout. The math
 fixture checks 213 assertions at both optimization levels. `./zc selfbuild`
 separately verifies the native compiler's assembly fixpoint.
 
-Run `python3 tests/macos_jit.py` to verify native in-memory execution and adaptive
-tier transitions against the retained AOT path. It covers recursive frames,
-shared globals, references, closures, interfaces, stack and floating arguments,
-cold functions, optimization failures, I/O, guest panics, and compile errors.
-Existing original regression fixtures are also exercised through the JIT.
-See [../docs/jit.md](../docs/jit.md) for the current profiling scope.
-
 The native integer array fast path is checked against 126 independent wrapping
 arithmetic cases, odd loop tails, aliased arrays, empty ranges, overflowing
 indices, expressions with side effects, packed byte lists, and bounds panics.

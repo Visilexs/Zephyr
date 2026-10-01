@@ -383,11 +383,6 @@ var currentUsesRegisterCall = false   // current fn is rt_*: params arrive in rc
 var functionRegisterCall: [bool] = []   // per-function: register convention (see computeRegisterCall)
 // -O2: the optimizing tier (optimizer.zeph)
 var optimizerEnabled = false
-var optimizerHotFunction = ""     // native JIT: optimize only this stable code label
-
-fn optimizerSelectsFunction(label: str) -> bool {
-    return optimizerHotFunction == "" or optimizerHotFunction == label
-}
 var optimizerReport = false                // --opt-report: say what was optimized and why not
 var optimizerDump = false                  // --opt-dump: print the IR of a region that fails its borrow check
 var callGraphReport = false
@@ -11205,7 +11200,7 @@ fn generateProgram(program: Node) {
         if topLevelNode.nodeKind == nodeFunction {
             let functionDefinition = functionDefinitions[topLevelNode.referenceIndex]
             if functionDefinition.typeParameters.len() > 0 { continue }        // a template emits no code
-            optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction(functionCodeLabel(functionDefinition.label))
+            optimizerEnabled = optimizingTierRequested
             generatingUserFunction = functionDefinition.body.file == mainSourceFile
             nextUsesRegisterCall = functionIsRegisterCall(topLevelNode.referenceIndex)
             currentParameterTypes = functionDefinition.parameterTypes
@@ -11219,7 +11214,7 @@ fn generateProgram(program: Node) {
     }
     for i in 0..instantiatedFunctions.len() {                        // one body per monomorphisation
         let functionDefinition = functionDefinitions[instantiatedFunctions[i]]
-        optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction(functionCodeLabel(functionDefinition.label))
+        optimizerEnabled = optimizingTierRequested
         generatingUserFunction = functionDefinition.body.file == mainSourceFile
         nextUsesRegisterCall = functionIsRegisterCall(instantiatedFunctions[i])
         currentParameterTypes = functionDefinition.parameterTypes
@@ -11235,7 +11230,7 @@ fn generateProgram(program: Node) {
         if topLevelNode.nodeKind != nodeFunction and topLevelNode.nodeKind != nodeStructDefinition and topLevelNode.nodeKind != nodeEnumDefinition and topLevelNode.nodeKind != nodeInterface { topLevelStatements.push(topLevelNode) }
     }
     generatingUserFunction = true    // main body: per-node file filter keeps only main-file top statements
-    optimizerEnabled = optimizingTierRequested and optimizerSelectsFunction("zephyrMain")
+    optimizerEnabled = optimizingTierRequested
     nextUsesRegisterCall = false
     var noParameterTypes: [int] = []
     currentParameterTypes = noParameterTypes
@@ -20044,12 +20039,6 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "--version" { showVersion = true }
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
     else if argument == "-O2" { optimizerEnabled = true }
-    else if argument == "--jit-hot" {
-        argumentIndex += 1
-        if argumentIndex >= commandLineArguments.len() { panic("--jit-hot requires a function code label") }
-        optimizerHotFunction = commandLineArguments[argumentIndex]
-        optimizerEnabled = true
-    }
     else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--opt-dump" { optimizerDump = true }
     else if argument == "--callgraph-report" { callGraphReport = true }
@@ -20080,7 +20069,6 @@ if inputPath == "" and showVersion {
     if macosTargetEnabled and (linuxTargetEnabled or wasmTargetEnabled or runInProcess) { panic("--macos-ir requires scalar assembly output; use scripts/macos.py to build or run native ARM64 programs") }
     if macosTargetEnabled and not outputPath.endsWith(".s") { panic("--macos-ir output must end in .s") }
     if macosTargetEnabled and not includeRuntime { panic("--macos-ir requires --rt") }
-    if optimizerHotFunction != "" and not macosTargetEnabled { panic("--jit-hot is an internal native macOS JIT option") }
     if runInProcess and (linuxTargetEnabled or wasmTargetEnabled) { panic("zc run: runs Windows x86-64 code in this process; --linux and --wasm do not apply") }
     currentSourceFile = baseName(inputPath)
     cachedExecutableDirectory = executableDirectory()

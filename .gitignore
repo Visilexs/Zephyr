@@ -6,7 +6,6 @@
 *.obj
 *.s
 !bootstrap/macos/entry.s
-!bootstrap/macos/jit-entry.s
 bootstrap/runtime.zeph
 
 __pycache__/

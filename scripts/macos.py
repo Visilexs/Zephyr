@@ -10,7 +10,6 @@ import sys
 import tempfile
 
 from macos.arm64 import lower_file, LoweringError
-from macos.jit import run as jit_run
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / 'zc-macos'
@@ -87,7 +86,7 @@ def main():
     parser=argparse.ArgumentParser(description='Zephyr native Apple Silicon compiler')
     args=sys.argv[1:]
     if args in (['--help'],['-h']):
-        parser.print_help();print('zc [--rt] [-O2] [--test] input.zeph output\nzc run [--jit-threshold N] [--jit-report PATH] [--jit-baseline] input.zeph [arguments...]\nzc selfbuild');return
+        parser.print_help();print('zc [--rt] [-O2] [--test] input.zeph output\nzc run [-O2] input.zeph [arguments...]\nzc selfbuild');return
     require_host()
     if args==['selfbuild']:
         # Drivers called outside the checkout still use the intended sources.
@@ -98,25 +97,19 @@ def main():
     running=args[0]=='run'
     if running:args=args[1:]
     flags=[]
-    threshold=1000;report=None;adaptive=True
     while args and args[0].startswith('-'):
         flag=args.pop(0)
         if flag=='--rt':continue
-        if running and flag in ('--jit-threshold','--jit-report'):
-            if not args:raise ValueError(f'{flag} requires a value')
-            value=args.pop(0)
-            if flag=='--jit-threshold':threshold=int(value)
-            else:report=value
-            continue
-        if running and flag=='--jit-baseline':adaptive=False;continue
         if flag not in ('-O2','--test','--opt-report','--opt-dump'):
             raise ValueError(f'Unsupported native macOS option: {flag}')
         flags.append(flag)
     if not args:raise ValueError('A .zeph input file is required.')
     source=args.pop(0)
     if running:
-        stats=jit_run(ROOT,CORE,source,flags,args,threshold,report,adaptive)
-        sys.exit(stats['exit_code'])
+        # build to a temporary executable, then run it with the remaining arguments
+        with tempfile.TemporaryDirectory(prefix='zephyr-run-') as directory:
+            program=build(source,Path(directory)/'program',flags)
+            sys.exit(subprocess.run([str(program),*args]).returncode)
     else:
         if len(args)!=1:raise ValueError('Specify exactly one output path.')
         build(source,args[0],flags)

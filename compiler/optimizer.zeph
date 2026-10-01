@@ -1,4 +1,4 @@
-// ================= optimizing tier (-O2 / the JIT's top tier) =================
+// ================= optimizing tier (-O2) =================
 //
 // A second backend for hot code. The baseline generator walks the checked AST
 // straight to accumulator-style x86: every value passes through rax, only six

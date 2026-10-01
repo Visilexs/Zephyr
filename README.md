@@ -7,7 +7,7 @@ assembler and linker for these targets:
 - Windows x86-64 (PE)
 - Linux x86-64 (static ELF, no libc)
 - WebAssembly
-- Apple Silicon macOS (ARM64 Mach-O, with an in-memory JIT)
+- Apple Silicon macOS (ARM64 Mach-O, assembled and linked by Apple Clang)
 
 ```zephyr
 struct Point { x: float, y: float }
@@ -27,7 +27,6 @@ print("total {total}")
 | [docs/spec.md](docs/spec.md) | language rules, types, memory model, targets, command-line flags |
 | [docs/std.md](docs/std.md) | standard library |
 | [docs/optimizer.md](docs/optimizer.md) | the `-O2` tier: inlining, specialization, partial inlining, recursion passes, profile-guided builds, reports, known gaps |
-| [docs/jit.md](docs/jit.md) | the Apple Silicon JIT |
 | [tests/README.md](tests/README.md) | test suites |
 
 ## Windows, Linux and WebAssembly
@@ -103,20 +102,14 @@ The deployment target is macOS 13.
 ```sh
 ./zc tests/fixtures/basics/hello.zeph /tmp/hello && /tmp/hello
 ./zc run program.zeph "argument with spaces"
-./zc run --jit-threshold 1000 --jit-report /tmp/profile.json program.zeph
 ./zc --test program.zeph /tmp/program-tests
 ./zc selfbuild
 python3 tests/macos_tests.py
-python3 tests/macos_jit.py
 ```
 
-`zc run` uses the native JIT. Code starts at the baseline tier. Call counters
-then trigger `-O2` recompilation of hot functions, and later calls reach the
-new code through stable entries. See [docs/jit.md](docs/jit.md).
-
-Builds with an explicit output path use the AOT path: the IR goes through
-`scripts/macos/arm64.py` and Apple Clang, and links against the Darwin runtime
-in `bootstrap/macos/`. On macOS:
+The compiler's IR goes through `scripts/macos/arm64.py` and Apple Clang, and
+links against the Darwin runtime in `bootstrap/macos/`. `zc run` builds to a
+temporary executable and runs it. On macOS:
 
 - `--rt` is always on.
 - `selfbuild` verifies an assembly fixpoint before it replaces `zc-macos`.
