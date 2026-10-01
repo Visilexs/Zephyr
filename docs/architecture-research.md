@@ -1331,6 +1331,13 @@ only reproduces together with a later call that modifies `acc` (`f1(…, f0(1),
   specifying the order (left-to-right is the usual choice) and making both
   tiers follow it.
 
+**Ownership-focused fuzzing (cycle 40):** `GEN=genref.py`, seeds 1–400, gave
+**0 mismatches and no crashes** [M]. The generator covers aliases into lists of
+structs, globals replaced while still in use, string building and slicing,
+lists of lists, closures capturing lists, and string-keyed maps. -O2's
+reference-count handling holds up under these patterns. The bugs found are in
+scalar value forwarding, not in ownership.
+
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
 order. `acc = acc + bump()`, where `bump` modifies `acc`, gives 101 in both
 modes, meaning `acc` is read after the call. Left-to-right would give 1. Both
@@ -1621,3 +1628,5 @@ tiers agree, but the language should state the order.
   - Side-effect-free fuzzing: 1 mismatch in 600 programs, which reduces to the
     same loop-exit forwarding bug as seed 1009.
   - The other reduced mismatches depend on evaluation order (spec gap).
+- **2026-10-01, cycle 40.**
+  - Ownership-focused fuzzing (`genref.py`, 400 programs): 0 mismatches.
