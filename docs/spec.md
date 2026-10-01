@@ -758,8 +758,8 @@ These names are reserved; user functions and variables may not use them.
 ### 3.6 Native interop (unsafe)
 
 The safe language above never exposes a raw address. These builtins do — they
-are the primitives the Zephyr-written runtime, the `lib/vk` Vulkan wrapper and
-the `lib/ui` GUI toolkit are built from, and they bypass the memory-safety
+are the primitives the Zephyr-written runtime and the standard library's native
+wrappers are built from, and they bypass the memory-safety
 guarantees of §4. Use them only through a checked wrapper such as
 `lib/std/bytes.zeph` (the `Bytes` struct) unless you are writing one.
 
@@ -893,18 +893,28 @@ sources for two targets and require byte-identical program output.
 
 ```
 zc.exe [flags] input.zeph [output]
+zc.exe run [flags] input.zeph [program arguments...]
 ```
 
 | Flag | Effect |
 |------|--------|
 | `--rt` | Link the Zephyr-written runtime (memory management, strings, threads, native interop). Output depends only on the target's kernel interface. Required for anything in §3.5/§3.6/§8. |
 | `--linux` / `--wasm` | Select the target (§7.1); default is Windows. |
+| `-O2` | Compile each function through the optimizing SSA tier; functions it cannot handle fall back to baseline code. See [optimizer.md](optimizer.md). |
+| `--profile-generate FILE` | Instrument the program with function and branch counters; a normal exit writes them to `FILE`. |
+| `--profile-use FILE` | Read counters from `FILE` to guide block layout, spill costs and inlining trials under `-O2`. A profile from different source is rejected with a warning. |
+| `--opt-report` | Print one `opt:` line per optimizer decision: functions optimized or left on baseline, inlining, specialization, partial inlining. |
+| `--callgraph-report` | With `-O2`, print the whole-program call graph: SCCs, static frequencies and per-site details. |
+| `--opt-dump` | Print the optimizer's SSA IR for each region it compiles. |
+| `--map` | Write `<output>.map`, one `rva name` line per code symbol, for profilers. |
+| `--test` | Run the main file's `test` blocks instead of `main` (implies `--rt`). |
 | `-g` / `--debug` | Emit a `.zdbg` debug-info sidecar (native-exe output only). |
 | `--version` | Print the compiler version; compiles nothing if given alone. |
 
 The first non-flag argument is the input `.zeph`; the second is the output
 path. An output path ending in `.s` writes the generated assembly instead of a
-linked module.
+linked module. `run` compiles into memory and runs the program in the
+compiler's process; every argument after the program path goes to the program.
 
 ## 8. Concurrency
 

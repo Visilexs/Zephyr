@@ -7704,8 +7704,8 @@ fn prepareOptimizedLoops(label: str, statements: [Node], slotCount: int, paramet
 }
 
 // ================= whole-program call graph =================
-// --callgraph-report (-O2): phase P1 of docs/inlining-design.md, a report
-// only; nothing here changes code generation. One node per function plus a
+// --callgraph-report (-O2), see docs/optimizer.md. Building and reporting
+// the graph changes no code generation. One node per function plus a
 // last one for the top-level statements (zephyrMain). Sites come from the
 // bodies as written, before front-end inlining. Calls the lowering adds on
 // its own (allocation, reference counting) are not in the graph.

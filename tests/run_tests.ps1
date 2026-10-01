@@ -444,12 +444,6 @@ if (-not $mathBuilt) { Write-Host "  math build output: $mathBuild" -ForegroundC
 $mathOut = if ($mathBuilt) { (cmd /c "`"$tmp\math_fns.exe`" 2>&1" | Out-String).Trim() -replace "`r", "" } else { "" }
 Check "std-math-fns" ($mathBuilt -and $mathOut -eq "math: 213 checks passed") "got: $mathOut"
 
-# ML regression sources remain archived; their optional libraries are removed.
-if (Test-Path (Join-Path $root "lib\ml\tensor.zeph")) {
-    . (Join-Path $PSScriptRoot "ml\legacy_checks.ps1")
-} else {
-    Write-Host "SKIP archived ML tests -- ML/GPU libraries are not part of the compiler/runtime checkout"
-}
 
 # ---- modules: import splices declarations, once, resolved relative to the importer ----
 $moddir = Join-Path $tmp "mod"

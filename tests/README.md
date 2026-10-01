@@ -27,10 +27,24 @@ The complete native performance suite is available through
 `python3 tests/benchmarks/macos.py`. See [benchmarks/README.md](benchmarks/README.md)
 for its 19 workloads, comparison toolchains, and measurement policy.
 
-On Windows, run `run_tests.ps1` for language/runtime checks, `std_tests.ps1` for
-the standard library, `optimizer_parity.ps1` for baseline/optimized equivalence,
-and `run_parity.ps1` for executable/in-process equivalence. Target cross-checks
-are `crosscheck-linux.ps1` (x86-64 WSL) and `crosscheck-wasm.ps1` (Node.js).
+On Windows, run these after `scripts/selfbuild.ps1`, in this order:
+
+| runner | checks |
+|---|---|
+| `pgo_roundtrip.ps1` | `--profile-generate`, a training run, then `--profile-use` gives the plain build's output on four programs |
+| `run_tests.ps1` | language and runtime behaviour, including `fixtures/basics/integer_formatting.zeph` (digit boundaries, i64 extremes) |
+| `std_tests.ps1` | the standard library |
+| `optimizer_parity.ps1` | baseline and `-O2` give identical output, including the `regression/` cases and every battle workload at test size |
+| `run_parity.ps1` | executables and `zc run` give identical output |
+| `crosscheck-linux.ps1` | Windows and Linux (x86-64 WSL) output are byte-identical |
+| `crosscheck-wasm.ps1` | Windows and WebAssembly (Node.js) output are byte-identical |
+
+`regression/tail_recursion.zeph` covers the `-O2` tail-recursion rewrite:
+- swapped parameters
+- float chains
+- `*` with the call on the left
+- returns inside loops under an accumulator
+- `^` after an effectful call
 The historical C-bootstrap checks are `bootstrap.ps1` and `nocc.ps1`; they
 require rebuilding the C seed with `bootstrap/build.ps1` first.
 
@@ -76,14 +90,5 @@ generations 2 and 3, allowing the checked-in seed to predate its source.
 programs used by those suites. `fixtures/workloads/` contains the Zephyr-only
 workloads used by the parity tests. The native performance harness lives under
 `benchmarks/` and recovers comparison sources into temporary storage from Git.
-
-All original test files remain in the checkout. `ml/` preserves the former
-optional ML/GPU regressions. `ml/legacy_checks.ps1` holds the checks extracted
-from the main runner, and `ml/reference/` retains their reference tests and
-comparison helpers. These are archived: the ML/Vulkan/UI implementations,
-datasets, and shaders are outside this checkout's scope. The main Windows suite
-prints an explicit skip when the ML library is absent. Running these archived
-tests requires restoring their dependencies from the original repository.
-
-Windows/Linux/WebAssembly suites require their respective hosts and have not
-been execution-tested by the Apple Silicon cleanup validation.
+Cross-language performance comparisons on Windows use the separate
+compiler-battle harness (see [../docs/optimizer.md](../docs/optimizer.md#measuring)).

@@ -14,8 +14,3 @@ __pycache__/
 .mac-build/
 .xcheck/
 .xwasm/
-
-# Archived ML tests may produce these when their dependencies are restored.
-*.ckpt
-*.ckpt.tmp.*
-optim-child.log
