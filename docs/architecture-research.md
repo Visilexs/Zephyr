@@ -1892,6 +1892,35 @@ modelled with a `volatile` frame. Same kernels as M4, same results, one core
   and runs faster.
 - **Q8 is closed.** C3 stays in reserve, scoped to S7.
 
+### M52. Tracing GC instead of reference counting? (cycle 66)
+
+`research/proto/allocmodels.c gc` is a non-moving mark-sweep collector with a
+bump young generation. It marks from the roots (the long-lived tree and the
+partial trees under construction), then sweeps to a free list. Frees happen at
+collections, not at last use. bintrees, same checksum, one core [M]:
+
+| Model | Time | Peak RSS | Collections |
+|---|---:|---:|---:|
+| GC, young generation 2¹⁸ nodes | 163 ms | 6.0 MB | 112 |
+| **GC, young generation 2²⁰ nodes** | **124 ms** | 19.1 MB | 16 |
+| GC, young generation 2²² nodes | 156 ms | 71.3 MB | 3 |
+| GC, young generation 2²³ nodes | 188 ms | 141 MB | 1 |
+| Specialized RC, 8-byte header (`rc8`, M13) | 148–195 ms | 9.8 MB | — |
+| Regions (M7) | 49–80 ms | 5.8 MB | — |
+
+**What this means:**
+
+- At its best young-generation size, tracing is ~1.2–1.5× faster than
+  specialized reference counting on this workload. It uses 2× the memory, and
+  its speed depends strongly on generation size.
+- Regions beat both, at the least memory.
+- **Spec §4 promises that peak memory tracks the live set, "rather than twice
+  it".** Tracing breaks that promise by design.
+- **Verdict:** keep specialized reference counting plus regions. Tracing is
+  not a fallback worth its spec cost. Where region inference fails,
+  specialized reference counting is within ~1.5× of tracing GC with half its
+  memory.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2315,3 +2344,8 @@ evaluation order. Does an interpreted design prevent that by construction?
     the semantic level, and an effects table.
   - Based on the existing 73-opcode IR, whose per-instruction `[[int]]`
     operands are a measured cost (M3).
+- **2026-10-01, cycle 66.**
+  - Tracing GC model (M52): best 124 ms / 19 MB on bintrees, against
+    specialized RC 148–195 ms / 9.8 MB and regions 49–80 ms / 5.8 MB.
+  - Rejected tracing because of the spec's memory promise and because regions
+    win.
