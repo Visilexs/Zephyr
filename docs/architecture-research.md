@@ -1009,6 +1009,27 @@ graph-colouring allocator for hot loops only, if splitting proves insufficient.
 The flat prototype's basic linear scan costs 69 ns per value in Zephyr (M4b);
 splitting is estimated at ≤ 2× that [E].
 
+### M31. Copy-and-patch emission speed (cycle 28)
+
+`research/proto/stencils.c` emits a stream of IR ops from 32 synthetic
+stencils: 12–48 bytes each, with 1–3 holes for frame offsets, immediates and
+backward branch displacements. Each op is a fixed 48-byte copy plus the patches
+[M]:
+
+| Ops | Time | Per op |
+|---:|---:|---:|
+| 24 M (727 MB of code), buffer pre-touched | 0.44–0.48 s | 18–20 ns |
+| 0.6 M | 10.5–12.2 ms | 18–20 ns |
+| 24 M, fresh buffer (first-touch page faults included) | 1.9–3.7 s | 78–155 ns |
+
+**What this means:**
+
+- The 20 ns-per-op estimate used in the cycle 2 and S7 rows is confirmed in C.
+  In Zephyr it is ~40 ns [E, from M4b's ~2× factor].
+- **Page faults dominate when the output buffer is fresh.** Any tier that
+  generates large amounts of code should reuse its code buffers or pre-map
+  them. That applies to the optimizing tier too.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1032,7 +1053,7 @@ splitting is estimated at ≤ 2× that [E].
 | S4 edit one function, rebuild | ms, dominated by frontend re-check | same | same | same | same |
 | S5 long-running simulation | Peak from the first instruction; profiles persist for the next build | Peak after warm-up; profiling overhead stays | Peak after tier-up | Peak after warm-up; best at speculation, which a static closed-world language barely needs | Peak only on loop-shaped code |
 | S6 compile-time evaluation, REPL, debugger | Needs an evaluator anyway | Natural | Natural if stencils come from interpreter handlers | Natural | Natural |
-| S7 cold build of a very large program (1 M lines ≈ 24 M SSA values, using zc's 24 values per line [M5]; empty shared cache) | 24 M × ~1 µs ≈ 24 s single-threaded, ~6 s on 4 cores [E], + frontend ~2–4 s [E] | Starts after the frontend, then interprets at 5–16× slowdown [M4] | 24 M × ~20 ns ≈ 0.5 s of stencils [E] + frontend; full speed comes later from background optimization | n/a | n/a |
+| S7 cold build of a very large program (1 M lines ≈ 24 M SSA values, using zc's 24 values per line [M5]; empty shared cache) | 24 M × ~1 µs ≈ 24 s single-threaded, ~6 s on 4 cores [E], + frontend ~2–4 s [E] | Starts after the frontend, then interprets at 5–16× slowdown [M4] | 24 M × 18–20 ns ≈ 0.5 s of stencils in C [M31], ~1 s in Zephyr [E], + frontend; full speed comes later from background optimization | n/a | n/a |
 | Engineering cost | One code generator | Interpreter + JIT + OSR + deopt | Stencil generator + optimizing tier | A partial evaluator is itself a large optimizing compiler | Tracing JIT + interpreter |
 
 **Verdicts:**
@@ -1239,3 +1260,8 @@ splitting is estimated at ≤ 2× that [E].
   - Added scenario S7, a cold build of ~1 M lines: copy-and-patch wins it,
     ~0.5 s against ~6–24 s of optimized code generation [E].
   - C3's reserve triggers now include program size.
+- **2026-10-01, cycle 28.**
+  - Copy-and-patch emission measured at 18–20 ns per op (M31), confirming the
+    estimate.
+  - First-touch page faults can make it 4–8× slower, so code buffers should be
+    reused.
