@@ -145,6 +145,31 @@ plus the lean convention plus header shrinking on the same workload. Those
 combinations haven't been measured, so they aren't counted. Parallel workloads
 go well below 1.0 on multicore machines [M8].
 
+### Build order with acceptance gates
+
+Each step ships behind a flag, and must pass bit-identical parity against the
+current pipeline on every test and on the 19 workloads before the next step
+starts. A gate is the measured number the step must reach. Each is derived from
+the oracle or prototype that justified the step.
+
+| Step | What | Gate (x86-64 Linux, this VM class) | Basis |
+|---|---|---|---|
+| 1 | Cache the compiled runtime and std as machine code | Empty-program build ≤ 30 ms (today 260 ms) | M3 |
+| 2 | Direct byte emission from the current backend (drop the text assembler) | Self-compile −25% | M3 (28%) |
+| 3 | Flat IR for the optimizer's data (`[int]` arrays) | -O2 cost ≤ 2 µs per value (today 7.3) | M4b, M5 |
+| 4 | Internal convention + linear scan with splitting | fib ≤ 1.05 s; vectors oracle ≤ 0.65 s | M20, M21 |
+| 5 | Specialized per-type allocation and release, nullable optionals, 8-byte header | bintrees ≤ 200 ms (today 740) | M13, M33 |
+| 6 | Immutability/flattening (SoA), slices, in-place append | records ≤ 1.05× C, lexer ≤ 1.6× C, strbuild ≤ 1.5× C | M14, M23, M27 |
+| 7 | Acyclic type-graph analysis: no cycle collector | lexer −10% | M36 |
+| 8 | Declaration-level cache + incremental rebuild | zc edit-one-function rebuild ≤ 20 ms | M10, M17 |
+| 9 | Vectorizer (straight-line + SoA loops), accumulator recursion | nbody ≤ 1.1× C; vectors ≤ 0.6× C; fib ≤ 0.95× C | M18–M21, M29 |
+| 10 | Region inference | bintrees ≤ 100 ms | M7 |
+| 11 | Automatic loop parallelism | vectors ≥ 3× on 4 cores, bit-identical | M8 |
+| 12 | ARM64 instruction selection over the same IR | macOS: no clang, no `arm64.py`; `zc run fib` ≤ 10 ms to first instruction | M17, macOS results |
+
+The IR interpreter (oracle/sanitizer) is built alongside step 3. Every later
+step's parity tests run against it as well as against the old pipeline.
+
 ## Scoreboard
 
 | Target | Goal | Today, x86-64 Linux | Source |
@@ -1459,3 +1484,6 @@ immediately, which is valid only for acyclic programs. Outputs identical
   - Cycle-collection cost (M36): skipping it gives lexer −12.5%, shapes −6%,
     wordfreq −5%.
   - Proposed whole-program type-graph acyclicity analysis to remove it soundly.
+- **2026-10-01, cycle 35.**
+  - Added the build order with measurable acceptance gates, each tied to the
+    oracle or prototype that justified the step.
