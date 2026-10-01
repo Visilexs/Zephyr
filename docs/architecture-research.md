@@ -27,7 +27,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - Change detection costs 7 ms on the 1 MB `zc.zeph` [M10].
    - The compiled runtime and std are cached first: they are 93% of a
      small-program build today [M3].
-   - Projections: small-program cold build ~10–30 ms [E] (from 280 ms [M]);
+   - Projections: small-program cold build ~5–15 ms [M parts: M46, M17]
+     (from ~300 ms [M]);
      zc incremental rebuild ~10–15 ms [E].
    - A warm `zc run` reaches its first instruction in ≈ 3 ms (zc start
      1.7 ms + image load 0.4 ms) [M17].
@@ -1635,6 +1636,24 @@ Same checksum [M]:
   dispatch's small objects the cell is a large share of the bytes. Both
   results point to the same lever, bytes per element.
 
+### M46. User code's share of a small-program build (cycle 54)
+
+`hyperfine -N`, 15 runs, baseline `--linux --rt` [M]:
+
+| Program | Build time |
+|---|---:|
+| Empty `fn main() { }` | 309 ± 11 ms |
+| `fib.zeph` (10 lines) | 307 ± 11 ms |
+| `bench/lexer.zeph` (151 lines) | 318 ± 20 ms |
+| `bench/shapes.zeph` (140 lines) | 318 ± 19 ms |
+
+User code costs ≤ 10 ms even at today's per-node speed (165 µs per function,
+M32); the rest is the runtime. With the compiled runtime cached (build step
+1), a small-program build is ≈ zc start (1.7 ms, M17) + user code (≤ 10 ms) +
+link (~1–3 ms) ≈ **5–15 ms**. That confirms, from measured parts, the
+"10–30 ms" projection and step 1's ≤ 30 ms gate, without any of the other
+steps.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1991,3 +2010,7 @@ Same checksum [M]:
 - **2026-10-01, cycle 53.**
   - Projection with C-representation models (M44, M45): 0.94× C geometric
     mean, and 0.885× with the vectors SoA bound.
+- **2026-10-01, cycle 54.**
+  - User code is ≤ 10 ms of a ~310 ms small-program build (M46). With a cached
+    runtime, small builds take ~5–15 ms; step 1's gate is confirmed by
+    measured parts.
