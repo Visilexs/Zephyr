@@ -83,6 +83,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      1.56× [M14].
    - **In-place append when the string is uniquely owned**, plus slices.
      strbuild: 2.2× → 1.45× [M23].
+   - **No cycle collection when the type graph is acyclic**, and tracing
+     restricted to cycle-capable types otherwise. lexer −12.5%, shapes −6%,
+     wordfreq −5% [M36].
    - **Runtime data structures co-designed with the optimizer:** small strings,
      hashes stored in map slots, a formatter in the fast division domain.
      strings: 1.49× → 1.22× [M7].
@@ -1173,6 +1176,34 @@ pattern kernels (subsumed by the vectorizer), and adds native instruction
 selection for x86 and ARM64, the cache and the interpreter. Estimate: +15–30%
 total [E].
 
+### M36. Skipping cycle collection when no cycle is possible (cycle 34)
+
+Zephyr's conservative mark-sweep collector exists only to reclaim cycles
+(spec §4). It runs whenever the heap grows past its target, so programs whose
+live set grows pay for repeated full scans even when their types cannot form a
+cycle. A scratch runtime (`/tmp` copy) makes `runtimeCollectGarbage` return
+immediately, which is valid only for acyclic programs. Outputs identical
+(md5), `hyperfine -N` [M]:
+
+| Workload | With collector → without | Change |
+|---|---|---:|
+| lexer | 1.190 → 1.041 s, RSS 274 → 268 MB | **−12.5%** |
+| shapes | 1.060 → 0.996 s | −6% |
+| wordfreq | 1.098 → 1.041 s | −5% |
+| dispatch, records, hashmap, sort, closures, strings, strbuild | within ±2–4% | noise |
+
+**Sound version for the architecture:**
+
+- Whole-program type analysis: a cycle needs a cycle in the type graph, where
+  struct fields, list elements, optionals, closures' captured types and
+  interface implementations are the edges.
+- If no type in the program can reach itself, the collector is never needed
+  and is not linked.
+- Otherwise only objects of cycle-capable types need tracing: the collector
+  scans roots, but marks through cycle-capable types only.
+- The compiler itself (`Node.children: [Node]`) is cycle-capable, so it would
+  use the restricted form.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1424,3 +1455,7 @@ total [E].
   - liquid's gap matches the allocator finding.
   - Added the compiler-size row: 24.4 k hand-written lines today, an estimated
     28–33 k for the proposed design with two native backends.
+- **2026-10-01, cycle 34.**
+  - Cycle-collection cost (M36): skipping it gives lexer −12.5%, shapes −6%,
+    wordfreq −5%.
+  - Proposed whole-program type-graph acyclicity analysis to remove it soundly.
