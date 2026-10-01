@@ -1,0 +1,104 @@
+// Evaluation order and global forwarding regressions. Operands, arguments and
+// list elements are evaluated left to right, and a read is not moved past a
+// call that may write what it reads. Baseline and -O2 must agree.
+struct Cell { a: int }
+
+var g = 1
+var xs: [int] = [1, 2, 3]
+var cell = Cell{a: 1}
+var shared = Cell{a: 1}
+
+fn bump() -> int {
+    g = 100
+    return 0
+}
+fn bumpElement() -> int {
+    xs[0] = 100
+    return 0
+}
+fn bumpField() -> int {
+    cell.a = 100
+    return 0
+}
+fn bumpShared() -> int {
+    shared.a = 100
+    return 0
+}
+fn swapList() -> int {
+    xs = [100, 200, 300]
+    return 0
+}
+fn pair(a: int, b: int) -> int { return a * 1000 + b }
+
+// A global assigned from a loop counter, then read after the loop next to a
+// call: -O2 once forwarded the incremented counter (11 instead of 10).
+var loopValues: [int] = [1, 1, 1, 1, 1, 1]
+var acc = 1
+fn f0(a0: int, a1: int, a2: int) -> int {
+    if (((a0 % (((a1 * a1)) % 1 + 1)) >> ((((a2 ^ a2) + loopValues[((1) % loopValues.len() + loopValues.len()) % loopValues.len()])) & 1)) + (((1 - 1) + (a1 << ((a1) & 1))) & ((a1 % ((a0) % 1 + 1)) / ((a0) % 1 + 1)))) < ((a1 >> (((a0 % ((a2) % 1 + 1))) & 1)) + (a0 | (a1 * (a1 * a0)))) {
+    }
+    return (a1 * (max((a0 & a1), 1) * (min(a0, a1) + (a1 ^ a2))))
+}
+fn f2(a0: int) -> int {
+    return min((f0(a0, loopValues[((a0) % loopValues.len() + loopValues.len()) % loopValues.len()], min(a0, 1)) % (((min(a0, 1) % ((a0) % 1 + 1))) % 1 + 1)), (1 & ((if a0 < 1 { a0 } else { a0 }) & (a0 & 1))))
+}
+fn f3(a0: int, a1: int) -> int {
+    if (((1 << ((a0) & 1)) << (((a1 / ((1) % 1 + 1))) & 1)) + 1) < a1 {
+    }
+    return ((if (1 | a0) < (1 / ((min(1, a1)) % 1 + 1)) { 1 } else { ((1 >> ((1) & 1)) - (1 ^ a1)) }) | (loopValues[((a0) % loopValues.len() + loopValues.len()) % loopValues.len()] & a1))
+}
+fn loopExit() -> int {
+    for i in 0..11 {
+        acc = i
+    }
+    if (1 ^ 1) < 1 {
+    } else {
+        acc = acc * 1 + (1 & f3(f2(1), 1))
+    }
+    return acc
+}
+
+fn main() {
+    var operands: [int] = []
+    g = 1
+    operands.push(g + bump())
+    g = 1
+    operands.push(bump() + g)
+    g = 1
+    operands.push(pair(g, bump()))
+    g = 1
+    let literal = [g, bump()]
+    operands.push(literal[0])
+    g = 1
+    operands.push(g * 1 + bump())
+    xs[0] = 1
+    operands.push(xs[0] + bumpElement())
+    cell.a = 1
+    operands.push(cell.a + bumpField())
+    print("operands {operands}")
+
+    var assignments: [int] = []
+    g = 1
+    g = g + bump()
+    assignments.push(g)
+    g = 1
+    g += bump()
+    assignments.push(g)
+    let alias = shared
+    shared.a = 1
+    let declared = alias.a + bumpShared()
+    assignments.push(declared)
+    shared.a = 1
+    var reassigned = 0
+    reassigned = alias.a + bumpShared()
+    assignments.push(reassigned)
+    print("assignments {assignments}")
+
+    xs = [1, 2, 3]
+    let first = xs[swapList()]
+    xs = [1, 2, 3]
+    let second = xs[swapList()] + 0
+    print("index {first} {second}")
+
+    print("loop-exit {loopExit()}")
+}

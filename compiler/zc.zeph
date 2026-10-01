@@ -6388,8 +6388,12 @@ fn expandCall(parent: Node, index: int) {
 fn tryChild(parent: Node, index: int) -> bool {
     let expression = parent.children[index]
     let expressionKind = expression.nodeKind
+    // a later hoisted call may write a global or a field, so reading one ends
+    // the pure prefix: hoisting the call past it would break left-to-right order
+    if expressionKind == nodeIdentifier and expression.auxiliary == identifierKindGlobal { return false }
+    if expressionKind == nodeMember { return false }
     if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean or expressionKind == nodeIdentifier { return true }
-    if expressionKind == nodeNegate or expressionKind == nodeNot or expressionKind == nodeMember { return tryChild(expression, 0) }
+    if expressionKind == nodeNegate or expressionKind == nodeNot { return tryChild(expression, 0) }
     if expressionKind == nodeCast {
         if not tryChild(expression, 0) { return false }
         return expression.auxiliary == castKindNoOperation or expression.auxiliary == castKindIntegerToFloat or expression.auxiliary == castKindTruncate
@@ -7334,7 +7338,7 @@ fn generateFloatOperands(leftNode: Node, rightNode: Node) {
     } else if isLeaf(rightNode) {
         generateFloatExpression(leftNode)               // left -> xmm0
         generateFloatLeaf("xmm1", rightNode)
-    } else if isLeaf(leftNode) {
+    } else if isLeafAfter(leftNode, rightNode) {
         generateFloatExpression(rightNode)               // right -> xmm0
         emitInstruction("movapd xmm1, xmm0")
         generateFloatLeaf("xmm0", leftNode)
@@ -7647,7 +7651,7 @@ fn generateBinaryOperator(expression: Node) {
     // commutative op with a leaf LEFT operand and a complex right one:
     // evaluate the complex side into rax, then apply the leaf directly --
     // no push/pop round-trip.
-    if category != binaryCategoryString and category != binaryCategoryFloat and isLeaf(expression.children[0]) and not isLeaf(expression.children[1]) {
+    if category != binaryCategoryString and category != binaryCategoryFloat and isLeafAfter(expression.children[0], expression.children[1]) and not isLeaf(expression.children[1]) {
         if operator == tokenPlus or operator == tokenStar or operator == tokenAmpersand or operator == tokenPipe or operator == tokenCaret {
             generateExpression(expression.children[1])
             generateLeaf("rcx", expression.children[0])
@@ -7782,6 +7786,15 @@ fn generateBinaryOperator(expression: Node) {
     emitInstruction("cmp rax, rcx")
     emitInstruction("set{conditionCodeFor(operator)} al")
     emitInstruction("movzx eax, al")
+}
+
+// a leaf that is read after `other` is evaluated (a right-first shortcut).
+// A call in `other` may write a global, so a global leaf only qualifies when
+// `other` makes no call; locals are safe, since closures capture by value.
+fn isLeafAfter(expression: Node, other: Node) -> bool {
+    if not isLeaf(expression) { return false }
+    if expression.nodeKind != nodeIdentifier or expression.auxiliary != identifierKindGlobal { return true }
+    return not hasCall(other)
 }
 
 fn isLeaf(expression: Node) -> bool {
@@ -8186,7 +8199,7 @@ fn generateIndexAddress(expression: Node) -> str {
         indexAddressOwnership = 0                   // nothing parked: every caller ends with finishIndexKeepResult
         return indexRegister
     }
-    if isLeaf(expression.children[0]) {            // list is a simple var: no stack shuffle
+    if isLeafAfter(expression.children[0], expression.children[1]) {            // list is a simple var: no stack shuffle
         if indexInRegister { indexRegister = indexOperand } else { generateExpression(expression.children[1]) }
         generateLeaf("rcx", expression.children[0])     // list ptr -> rcx
         indexAddressOwnership = 0

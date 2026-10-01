@@ -4,7 +4,8 @@
 # checkout to a scratch tree whose zc.exe is a wrapper around that compiler
 # (targeting --linux), and runs each suite with Linux PowerShell plus a `cmd`
 # stand-in. Tests that need Windows itself (kernel32 calls, .exe semantics)
-# fail here by construction; compare against a baseline run.
+# fail here by construction; compare against a baseline run. Suites get
+# /dev/null as stdin: some fixtures (basics/cube.zeph) run until input ends.
 # Usage: scripts/linux/suite.sh OUTDIR [suite.ps1 ...]
 #   needs: pwsh on PATH or at /opt/pwsh/pwsh, and a Linux zc seed at $ZC_SEED
 #   (default /tmp/zr/current-zc, left by scripts/linux/selfbuild.sh)
@@ -61,7 +62,7 @@ function global:cmd {
 }
 PRE
 for s in $SUITES; do
-  (cd "$TREE" && "$PWSH" -NoLogo -NoProfile -Command '. ./linux-preamble.ps1; & ./tests/'"$s"'; exit $LASTEXITCODE' > "$OUT/${s%.ps1}.log" 2>&1) || true
+  (cd "$TREE" && "$PWSH" -NoLogo -NoProfile -Command '. ./linux-preamble.ps1; & ./tests/'"$s"'; exit $LASTEXITCODE' < /dev/null > "$OUT/${s%.ps1}.log" 2>&1) || true
   pass=$(grep -c '^PASS' "$OUT/${s%.ps1}.log" || true); fail=$(grep -c '^FAIL' "$OUT/${s%.ps1}.log" || true)
   echo "$s: $pass pass, $fail fail; last line: $(tail -1 "$OUT/${s%.ps1}.log")"
 done

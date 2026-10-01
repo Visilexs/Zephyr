@@ -1353,6 +1353,7 @@ $optimizerRegressions = [ordered]@{
     "numeric_codegen" = "signed 0`nfloat 0`nnearMiss 0"
     "sort_merge" = "sizes 0 0 100537 347208`nstable 33 0 9848`ntrace 62 -4764252242437029482"
     "substring_ranges" = "ranges 0 abcdef 0 def`ntemporary oken`nbounds bcd abcdef changed-end 2`nretained 256 1024 oken oken"
+    "evaluation_order" = "operands [1, 100, 1000, 1, 1, 1, 1]`nassignments [1, 1, 1, 1]`nindex 1 1`nloop-exit 10"
 }
 foreach ($regressionName in $optimizerRegressions.Keys) {
     $regressionExecutable = Join-Path $tmp "$regressionName.exe"

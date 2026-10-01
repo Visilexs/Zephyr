@@ -569,6 +569,15 @@ panic (§6) on any other malformed input.
 - Unary `-`: numeric.
 - Conditions of `if`/`while` must be `bool`.
 
+**Evaluation order.** Expressions are evaluated left to right: both operands
+of a binary operator, the arguments of a call, the elements of a list, tuple,
+map or struct literal, and the list and index of `xs[i]`. Every read happens
+when its turn comes, so in `g + f()`, `g` is read before `f` runs, even if
+`f` assigns `g`. `x = e` and `x op= e` read `x` (on the right) before
+evaluating the rest of `e`. One exception: in an assignment to an element or
+field, `xs[i] = e` or `p.f = e`, the value `e` is evaluated before the
+container `xs` or `p` is read. All compilation modes follow this order.
+
 ### 3.4 Functions
 
 Parameter and return types are declared; a function with a non-void return

@@ -6292,7 +6292,12 @@ fn numberValues() {
                     loadOpcode = irFloatLoadGlobal
                     loadClass = classFloat
                 }
-                known["m{globalEpoch}:{loadOpcode}:{loadClass}:{irImmediates[instruction]}"] = resolveValue(irOperands[instruction][0])
+                // a global store is not forwarded to later loads: across a rotated
+                // loop exit the stored value can be a phi whose register already
+                // holds the next iteration's value. It still starts a new memory
+                // epoch, so earlier loads of globals are not reused past it.
+                epochCount += 1
+                globalEpoch = epochCount
                 continue
             }
             // Raw word reads may reuse an earlier typed slot, preserving its
