@@ -38,6 +38,7 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 3. **One optimizing native backend, emitting machine code directly.**
    - No text assembler, which is 28% of a self-compile today [M3].
    - Instruction selection, register allocation over all 16 GPRs and 16 XMMs.
+     Hand allocation of one hot loop gave −27% (M20).
    - An internal calling convention: no frame pointer, no stack realignment,
      shrink-wrapped saves. Calls cost 1.47× C's today [M12].
    - It decides 11 of the 19 workloads [M6].
@@ -682,6 +683,45 @@ a vectorizer. Priorities inside layer 3 are, in order:
    known length;
 3. straight-line vectorization, then loop vectorization.
 
+### M20. Register allocation, measured by hand-editing zc's output (cycle 14)
+
+**New tool:**
+
+- `research/zc2gas.sh` converts zc's `--linux` assembly so GNU as accepts it:
+  - adds explicit sizes on memory-immediate forms;
+  - marks `.rdata` as allocatable.
+- `research/start.s` supplies the entry stub that zc's ELF writer adds itself.
+- The result links with `gcc -nostdlib -static` and produces identical output.
+
+This makes **hand-edited codegen experiments** possible: change the hot loop
+in the assembly and measure, without building the compiler change first.
+
+**Experiment.** In `research/oracle/vectors_values.zeph`'s inner loop, zc
+spills seven float values to the stack and reloads constants from memory each
+iteration. I re-allocated the loop by hand:
+
+- no spills (zc had used 15 XMM registers without reusing dead ones);
+- two hot constants hoisted into xmm14/xmm15;
+- the same six bounds checks and the same arithmetic order.
+
+Results [M]:
+
+| Version | Time | Checksum at 100 steps |
+|---|---:|---|
+| zc -O2 allocation, reassembled by GNU as | 0.82–0.92 s | 202045867 |
+| Hand allocation | **0.59–0.67 s (−27%)** | 202045867 |
+| C, no vectorization (M19) | 0.56 s | 202045867 |
+| C -O2 | 0.49 s | 202045867 |
+
+**What this means:**
+
+- In vectors, the whole scalar gap comes from register allocation: hand
+  allocation reaches non-vectorized C.
+- The rest (0.56 → 0.49) is vectorization.
+- This confirms M19's ordering: allocator first, then vectorization.
+- Bounds checks were kept, so they are not a significant cost here: predictable
+  branches on registers.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -838,12 +878,16 @@ a vectorizer. Priorities inside layer 3 are, in order:
 - **2026-10-01, cycle 11.**
   - Fixed costs of a cached `zc run` (M17): ~3 ms to the first instruction,
     which confirms S1.
+- **2026-10-01, cycle 12.**
+  - nbody: a scalar-promotion oracle gave no gain. The gap is gcc's
+    straight-line vectorization of x/y pairs (M18), the same capability as in
+    vectors.
 - **2026-10-01, cycle 13.**
   - C without vectorization (M19): vectorization explains ~60% of nbody's gap
     but only ~22% of vectors'.
   - Corrected M18. Register allocation and bounds-check elimination come before
     vectorization.
-- **2026-10-01, cycle 12.**
-  - nbody: a scalar-promotion oracle gave no gain. The gap is gcc's
-    straight-line vectorization of x/y pairs (M18), the same capability as in
-    vectors.
+- **2026-10-01, cycle 14.**
+  - Built a path to reassemble zc output with GNU as (`research/zc2gas.sh`).
+  - Hand register allocation of the vectors loop: −27%, reaching
+    non-vectorized C (M20). Register allocation explains the scalar gap.
