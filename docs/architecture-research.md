@@ -34,10 +34,14 @@ only if the rewritten optimizer costs more than ~2 µs per SSA value.
    - Today -O2 costs ~7.3 µs per SSA value on top of baseline [M: (7.67 s − 3.14 s) / 622,155 values in `--opt-report`].
      That is in the range commonly reported for LLVM -O2, with much less
      optimization.
-   - The target is 0.5–1 µs per value [E]. Whole-zc optimization would then take
-     0.3–0.6 s cold, and edits are cached at function granularity.
-   - Whether this target can be hit is the least-verified claim here (Q1, the
-     next cycle).
+   - A flat-array pipeline written in Zephyr runs at 0.23–0.27 µs per value [M4b]
+     (CFG, fold/copy-propagation/GVN, DCE, bitset liveness, linear scan, x86
+     encoding). A production pipeline does more: inlining, loop optimizations,
+     RC elimination, bounds-check elimination. Allowing 3–5× more work gives
+     0.7–1.4 µs per value [E].
+   - Whole-zc optimization would then take 0.4–0.9 s cold, and edits are cached
+     at function granularity.
+   - The copy-and-patch gate (2 µs) is very likely met, so C3 stays in reserve.
 5. **An IR interpreter as the executable specification**, not as a tier. It is
    used for differential testing of every optimization, compile-time
    evaluation, and debugging. That is the role in which an interpreter is
@@ -196,6 +200,58 @@ still leaves an interpreter 2–5× behind Zephyr's baseline.
 Combined with the timings in M3, that is about 7.3 µs per value of extra -O2
 cost.
 
+### M4b. Flat-array optimizing pipeline: C vs Zephyr (cycle 3)
+
+`research/proto/flatopt.c` and `research/proto/flatopt.zeph` implement the same
+pipeline over preallocated int arrays, run on synthetic functions shaped like
+zc's regions:
+
+- loops and branches;
+- block parameters instead of phis;
+- calls, loads and stores;
+- about 23% of values foldable or dead.
+
+The pipeline:
+
+1. CFG and reverse post-order;
+2. constant folding, copy propagation and hash-based GVN;
+3. DCE with a worklist;
+4. iterative bitset liveness;
+5. live intervals and linear scan over 14 GPRs;
+6. real x86-64 encodings into a byte buffer.
+
+Nothing is allocated per value. Results, one pinned core, ns per SSA value [M]:
+
+| Function size | C (gcc -O2) | Zephyr (zc -O2) | Zephyr / C |
+|---|---:|---:|---:|
+| ~100 values | 149 | 767 | 5.1× |
+| ~500 values | 113 | 270 | 2.4× |
+| ~2000 values | 144 | 233 | 1.6× |
+
+**Per-phase breakdown, Zephyr at ~500 values:**
+
+| Phase | ns per value |
+|---|---:|
+| CFG | 12 |
+| fold/GVN | 102 |
+| DCE | 27 |
+| liveness | 26 |
+| linear scan | 69 |
+| encode | 32 |
+
+The ~100-value case is dominated by fixed per-function costs: clearing a
+65,536-entry hash table every call, which generation counters would remove.
+zc's real regions average ~530 values (622,155 values / 1,171 regions, M5), so
+the ~500 row is the representative one.
+
+**What this means:**
+
+- Zephyr's own int-array code is good enough to host a fast compiler: within
+  1.6–2.4× of C on the same algorithm.
+- The current optimizer's 7.3 µs per value is not inherent to the language or
+  the problem. It comes from heap-object IR, list growth and reference counting
+  (M3).
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -258,11 +314,10 @@ cost.
 
 ## Open questions
 
-- **Q1.** With caching, direct emission and a flat IR, what does -O2 cost per
-  function? If it is under ~0.5 ms, a baseline tier buys nothing in any
-  scenario except the first-ever build of a large program.
-- **Q2.** How fast can an interpreter for Zephyr's IR be, relative to native
-  code? This sets where interpreted tiers could ever win.
+- **Q1. Answered in cycle 3.** A flat pipeline costs 0.23–0.27 µs per value in
+  Zephyr [M4b]; a production one is estimated at 0.7–1.4 µs [E]. That is
+  ~0.4 ms for an average 530-value region.
+- **Q2. Answered in cycle 2.** 5–16× slower than native [M4].
 - **Q3.** What does copy-and-patch emission cost per IR op, and how fast is its
   code compared with today's baseline and -O2?
 
@@ -300,3 +355,12 @@ cost.
     value. That is the claim everything above now rests on.
   - Note on AGENTS.md: Wine is used only once, to produce a Linux-native zc.
     Every measurement runs native Linux code, not emulation.
+- **2026-10-01, cycle 3.**
+  - Q1: built the same flat optimizing pipeline in C and in Zephyr.
+  - Zephyr runs at 0.23–0.27 µs per value, 1.6–2.4× the C version and ~30×
+    cheaper than today's -O2.
+  - This confirms cached AOT with one optimizing tier; C3 stays in reserve.
+  - Next weakest claim: the runtime gains promised by semantic optimizations
+    (value types, borrow inference, regions), which are still pure estimates.
+  - Plan: measure their upper bound by hand-applying each transformation to the
+    worst workloads.

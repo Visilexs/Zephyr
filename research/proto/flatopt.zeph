@@ -1,0 +1,584 @@
+// Zephyr port of research/proto/flatopt.c: the same flat-array optimizing
+// pipeline (CFG, fold/copy-propagation/GVN, DCE, bitset liveness, linear scan,
+// x86-64 encoding), same synthetic functions. Measures how much of the C
+// prototype's speed survives in self-hosted Zephyr (research question Q1).
+// Build: zc --linux --rt -O2 research/proto/flatopt.zeph flatopt
+// Usage: flatopt [values-per-function] [functions]
+import "std/io.zeph"
+
+const opConst = 0
+const opParam = 1
+const opAdd = 2
+const opSub = 3
+const opMul = 4
+const opAnd = 5
+const opLt = 6
+const opCopy = 7
+const opLoad = 8
+const opStore = 9
+const opCall = 10
+const opBr = 11
+const opRet = 12
+const maxValues = 200000
+const maxBlocks = 20000
+const registerCount = 14
+const hashBits = 16
+
+var op = zeros(maxValues)
+var a0 = zeros(maxValues)
+var a1 = zeros(maxValues)
+var block = zeros(maxValues)
+var replacement = zeros(maxValues)
+var immediate = zeros(maxValues)
+var valueCount = 0
+var blockStart = zeros(maxBlocks)
+var blockEnd = zeros(maxBlocks)
+var successor0 = zeros(maxBlocks)
+var successor1 = zeros(maxBlocks)
+var postOrder = zeros(maxBlocks)
+var blockCount = 0
+var parameterStart = zeros(maxBlocks)
+var parameterCount = zeros(maxBlocks)
+var jumpArguments = zeros(maxBlocks * 8)   // [(block * 2 + successor) * 4 + k]
+var rngState = 88172645463325252
+
+fn random() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn newValue(kind: int, x: int, y: int, k: int, b: int) -> int {
+    op[valueCount] = kind
+    a0[valueCount] = x
+    a1[valueCount] = y
+    immediate[valueCount] = k
+    block[valueCount] = b
+    valueCount += 1
+    return valueCount - 1
+}
+
+fn generate(target: int) {
+    valueCount = 0
+    blockCount = 0
+    let perBlock = 12
+    var blocks = target / perBlock
+    if blocks < 2 { blocks = 2 }
+    for b in 0..blocks {
+        blockStart[b] = valueCount
+        parameterStart[b] = valueCount
+        parameterCount[b] = if b == 0 { 2 } else { 1 + random() % 3 }
+        for i in 0..parameterCount[b] { newValue(opParam, -1, -1, i, b) }
+        let first = blockStart[b]
+        for i in 0..perBlock - 2 {
+            let r = random() % 16
+            let x = first + random() % (valueCount - first)
+            let y = first + random() % (valueCount - first)
+            if r < 2 { newValue(opConst, -1, -1, random() % 100, b) }
+            else if r < 6 { newValue(opAdd, x, y, 0, b) }
+            else if r < 8 { newValue(opSub, x, y, 0, b) }
+            else if r < 9 { newValue(opMul, x, y, 0, b) }
+            else if r < 10 { newValue(opAnd, x, y, 0, b) }
+            else if r < 11 { newValue(opCopy, x, -1, 0, b) }
+            else if r < 13 { newValue(opLoad, x, -1, 8 * (random() % 4), b) }
+            else if r < 14 { newValue(opStore, x, y, 0, b) }
+            else if r < 15 { newValue(opCall, x, y, 0, b) }
+            else { newValue(opAdd, x, x, 0, b) }
+        }
+        let condition = newValue(opLt, valueCount - 1, valueCount - 2, 0, b)
+        if b == blocks - 1 {
+            newValue(opRet, condition, -1, 0, b)
+            successor0[b] = -1
+            successor1[b] = -1
+        } else {
+            var target2 = b + 1 + random() % 2
+            if b > 2 and random() % 4 == 0 { target2 = b - 1 - random() % 2 }
+            if target2 >= blocks { target2 = blocks - 1 }
+            successor0[b] = b + 1
+            successor1[b] = target2
+            newValue(opBr, condition, -1, 0, b)
+        }
+        blockEnd[b] = valueCount
+        blockCount += 1
+    }
+    for b in 0..blockCount {
+        for s in 0..2 {
+            let t = if s == 1 { successor1[b] } else { successor0[b] }
+            if t < 0 { continue }
+            for k in 0..parameterCount[t] {
+                jumpArguments[(b * 2 + s) * 4 + k] = blockStart[b] + random() % (blockEnd[b] - blockStart[b] - 1)
+            }
+        }
+    }
+}
+
+// --- 1. CFG: reverse post-order by iterative DFS ---
+var dfsStack = zeros(maxBlocks)
+var visited = zeros(maxBlocks)
+var childIndex = zeros(maxBlocks)
+
+fn controlFlow() {
+    for b in 0..blockCount { visited[b] = 0 }
+    var sp = 0
+    var n = blockCount
+    dfsStack[0] = 0
+    sp = 1
+    visited[0] = 1
+    childIndex[0] = 0
+    while sp > 0 {
+        let b = dfsStack[sp - 1]
+        let c = childIndex[b]
+        if c >= 2 {
+            n -= 1
+            postOrder[n] = b
+            sp -= 1
+            continue
+        }
+        let s = if c == 0 { successor0[b] } else { successor1[b] }
+        childIndex[b] = c + 1
+        if s >= 0 and visited[s] == 0 {
+            visited[s] = 1
+            childIndex[s] = 0
+            dfsStack[sp] = s
+            sp += 1
+        }
+    }
+}
+
+// --- 2. fold + copy propagation + GVN ---
+var hashTable = zeros(1 << hashBits)
+
+fn resolve(value: int) -> int {
+    var v = value
+    while v >= 0 and replacement[v] != v { v = replacement[v] }
+    return v
+}
+
+fn fold() {
+    for v in 0..valueCount { replacement[v] = v }
+    for h in 0..1 << hashBits { hashTable[h] = -1 }
+    let mask = (1 << hashBits) - 1
+    for i in 0..blockCount {
+        let b = postOrder[i]
+        for v in blockStart[b]..blockEnd[b] {
+            if a0[v] >= 0 { a0[v] = resolve(a0[v]) }
+            if a1[v] >= 0 { a1[v] = resolve(a1[v]) }
+            let kind = op[v]
+            if kind == opCopy {
+                replacement[v] = a0[v]
+                continue
+            }
+            if kind >= opAdd and kind <= opLt and op[a0[v]] == opConst and op[a1[v]] == opConst {
+                let x = immediate[a0[v]]
+                let y = immediate[a1[v]]
+                var r = 0
+                if kind == opAdd { r = x + y }
+                else if kind == opSub { r = x - y }
+                else if kind == opMul { r = x * y }
+                else if kind == opAnd { r = x & y }
+                else if x < y { r = 1 }
+                immediate[v] = r
+                op[v] = opConst
+                a0[v] = -1
+                a1[v] = -1
+            }
+            if op[v] == opSub and a0[v] == a1[v] {
+                op[v] = opConst
+                immediate[v] = 0
+                a0[v] = -1
+                a1[v] = -1
+            }
+            if (op[v] >= opAdd and op[v] <= opLt) or op[v] == opConst {
+                var h = (op[v] * 31 + a0[v] * 1000003 + a1[v] * 7919 + immediate[v]) & mask
+                while true {
+                    let w = hashTable[h]
+                    if w < 0 {
+                        hashTable[h] = v
+                        break
+                    }
+                    if op[w] == op[v] and a0[w] == a0[v] and a1[w] == a1[v] and immediate[w] == immediate[v] and block[w] == block[v] {
+                        replacement[v] = w
+                        break
+                    }
+                    h = (h + 1) & mask
+                }
+            }
+        }
+        for s in 0..2 {
+            let t = if s == 1 { successor1[b] } else { successor0[b] }
+            if t < 0 { continue }
+            for k in 0..parameterCount[t] {
+                let index = (b * 2 + s) * 4 + k
+                jumpArguments[index] = resolve(jumpArguments[index])
+            }
+        }
+    }
+}
+
+// --- 3. DCE ---
+var work = zeros(maxValues)
+var live = zeros(maxValues)
+
+fn dce() {
+    var n = 0
+    for v in 0..valueCount {
+        live[v] = 0
+        let kind = op[v]
+        if replacement[v] == v and (kind == opStore or kind == opCall or kind == opBr or kind == opRet or kind == opParam) {
+            live[v] = 1
+            work[n] = v
+            n += 1
+        }
+    }
+    for b in 0..blockCount {
+        for s in 0..2 {
+            let t = if s == 1 { successor1[b] } else { successor0[b] }
+            if t < 0 { continue }
+            for k in 0..parameterCount[t] {
+                let x = jumpArguments[(b * 2 + s) * 4 + k]
+                if live[x] == 0 {
+                    live[x] = 1
+                    work[n] = x
+                    n += 1
+                }
+            }
+        }
+    }
+    while n > 0 {
+        n -= 1
+        let v = work[n]
+        let x = a0[v]
+        if x >= 0 and live[x] == 0 {
+            live[x] = 1
+            work[n] = x
+            n += 1
+        }
+        let y = a1[v]
+        if y >= 0 and live[y] == 0 {
+            live[y] = 1
+            work[n] = y
+            n += 1
+        }
+    }
+}
+
+// --- 4. liveness on bitsets ---
+const maxBitWords = 400000
+var liveIn = zeros(maxBitWords)
+var liveOut = zeros(maxBitWords)
+var scratchBits = zeros(maxValues / 64 + 1)
+var words = 0
+
+fn liveness() {
+    words = (valueCount + 63) / 64
+    if blockCount * words > maxBitWords { panic("liveness storage too small") }
+    for i in 0..blockCount * words {
+        liveIn[i] = 0
+        liveOut[i] = 0
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var i = blockCount - 1
+        while i >= 0 {
+            let b = postOrder[i]
+            let out = b * words
+            for s in 0..2 {
+                let t = if s == 1 { successor1[b] } else { successor0[b] }
+                if t < 0 { continue }
+                let inBase = t * words
+                for w in 0..words { liveOut[out + w] = liveOut[out + w] | liveIn[inBase + w] }
+                for k in 0..parameterCount[t] {
+                    let x = jumpArguments[(b * 2 + s) * 4 + k]
+                    liveOut[out + (x >> 6)] = liveOut[out + (x >> 6)] | (1 << (x & 63))
+                }
+                for k in 0..parameterCount[t] {
+                    let p = parameterStart[t] + k
+                    liveOut[out + (p >> 6)] = liveOut[out + (p >> 6)] & ~(1 << (p & 63))
+                }
+            }
+            for w in 0..words { scratchBits[w] = liveOut[out + w] }
+            var v = blockEnd[b] - 1
+            while v >= blockStart[b] {
+                if live[v] != 0 and replacement[v] == v {
+                    scratchBits[v >> 6] = scratchBits[v >> 6] & ~(1 << (v & 63))
+                    let x = a0[v]
+                    if x >= 0 { scratchBits[x >> 6] = scratchBits[x >> 6] | (1 << (x & 63)) }
+                    let y = a1[v]
+                    if y >= 0 { scratchBits[y >> 6] = scratchBits[y >> 6] | (1 << (y & 63)) }
+                }
+                v -= 1
+            }
+            let inBase = b * words
+            for w in 0..words {
+                if liveIn[inBase + w] != scratchBits[w] {
+                    liveIn[inBase + w] = scratchBits[w]
+                    changed = true
+                }
+            }
+            i -= 1
+        }
+    }
+}
+
+// --- 5. intervals + linear scan ---
+var position = zeros(maxValues)
+var intervalStart = zeros(maxValues)
+var intervalEnd = zeros(maxValues)
+var register = zeros(maxValues)
+var order = zeros(maxValues)
+var bucketCount = zeros(maxValues + 1)
+var active = zeros(registerCount + 1)
+var spillCount = 0
+let deBruijn = 285870213051386505   // 0x03f79d71b4ca8b09
+var deBruijnTable = zeros(64)
+
+fn lowestBit(m: int) -> int {
+    return deBruijnTable[(((m & -m) * deBruijn) >> 58) & 63]
+}
+
+fn registerAllocate() {
+    var p = 0
+    for i in 0..blockCount {
+        let b = postOrder[i]
+        for v in blockStart[b]..blockEnd[b] {
+            position[v] = p
+            p += 1
+        }
+    }
+    for v in 0..valueCount {
+        intervalStart[v] = 1 << 30
+        intervalEnd[v] = -1
+    }
+    for i in 0..blockCount {
+        let b = postOrder[i]
+        let bs = position[blockStart[b]]
+        let be = position[blockEnd[b] - 1]
+        let base = b * words
+        for w in 0..words {
+            let inWord = liveIn[base + w]
+            let outWord = liveOut[base + w]
+            var m = inWord | outWord
+            while m != 0 {
+                let bit = lowestBit(m)
+                let v = w * 64 + bit
+                m = m & (m - 1)
+                if (inWord >> bit) & 1 != 0 and bs < intervalStart[v] { intervalStart[v] = bs }
+                if (outWord >> bit) & 1 != 0 and be > intervalEnd[v] { intervalEnd[v] = be }
+            }
+        }
+        for v in blockStart[b]..blockEnd[b] {
+            if live[v] == 0 or replacement[v] != v { continue }
+            let here = position[v]
+            if here < intervalStart[v] { intervalStart[v] = here }
+            if here > intervalEnd[v] { intervalEnd[v] = here }
+            let x = a0[v]
+            if x >= 0 and here > intervalEnd[x] { intervalEnd[x] = here }
+            let y = a1[v]
+            if y >= 0 and here > intervalEnd[y] { intervalEnd[y] = here }
+        }
+    }
+    // Order intervals by start with a counting sort (positions are dense).
+    for i in 0..p + 1 { bucketCount[i] = 0 }
+    var n = 0
+    for v in 0..valueCount {
+        if live[v] != 0 and replacement[v] == v and intervalEnd[v] >= 0 {
+            bucketCount[intervalStart[v] + 1] += 1
+            n += 1
+        }
+    }
+    for i in 0..p { bucketCount[i + 1] += bucketCount[i] }
+    for v in 0..valueCount {
+        if live[v] != 0 and replacement[v] == v and intervalEnd[v] >= 0 {
+            order[bucketCount[intervalStart[v]]] = v
+            bucketCount[intervalStart[v]] += 1
+        }
+    }
+    var freeMask = (1 << registerCount) - 1
+    var activeCount = 0
+    spillCount = 0
+    for i in 0..n {
+        let v = order[i]
+        var j = 0
+        while j < activeCount {
+            let w = active[j]
+            if intervalEnd[w] < intervalStart[v] {
+                freeMask = freeMask | (1 << register[w])
+                activeCount -= 1
+                active[j] = active[activeCount]
+            } else {
+                j += 1
+            }
+        }
+        if freeMask != 0 {
+            let r = lowestBit(freeMask)
+            freeMask = freeMask & ~(1 << r)
+            register[v] = r
+            active[activeCount] = v
+            activeCount += 1
+        } else {
+            var far = 0
+            for k in 1..activeCount {
+                if intervalEnd[active[k]] > intervalEnd[active[far]] { far = k }
+            }
+            let w = active[far]
+            if intervalEnd[w] > intervalEnd[v] {
+                register[v] = register[w]
+                register[w] = -1 - spillCount
+                spillCount += 1
+                active[far] = v
+            } else {
+                register[v] = -1 - spillCount
+                spillCount += 1
+            }
+        }
+    }
+}
+
+// --- 6. encode ---
+var code = zeros(64 * maxValues)
+var codeLength = 0
+let hardware = [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+fn emitByte(x: int) {
+    code[codeLength] = x & 255
+    codeLength += 1
+}
+
+fn word32(x: int) {
+    emitByte(x)
+    emitByte(x >> 8)
+    emitByte(x >> 16)
+    emitByte(x >> 24)
+}
+
+fn registerRegister(opcode: int, d: int, s: int) {
+    emitByte(72 | ((s >> 3) & 1) << 2 | ((d >> 3) & 1))
+    emitByte(opcode)
+    emitByte(192 | (s & 7) << 3 | (d & 7))
+}
+
+fn physical(v: int, scratch: int) -> int {
+    let r = register[v]
+    if r >= 0 { return hardware[r] }
+    emitByte(72 | ((scratch >> 3) & 1) << 2)
+    emitByte(139)
+    emitByte(132 | (scratch & 7) << 3)
+    emitByte(36)
+    word32(8 * (-1 - r))
+    return scratch
+}
+
+fn encode() {
+    codeLength = 0
+    for i in 0..blockCount {
+        let b = postOrder[i]
+        for v in blockStart[b]..blockEnd[b] {
+            if live[v] == 0 or replacement[v] != v { continue }
+            let kind = op[v]
+            let d = if register[v] >= 0 { hardware[register[v]] } else { 0 }
+            if kind == opConst {
+                emitByte(72 | ((d >> 3) & 1))
+                emitByte(184 | (d & 7))
+                word32(immediate[v])
+                word32(immediate[v] >> 32)
+            } else if kind == opAdd or kind == opSub or kind == opAnd {
+                let x = physical(a0[v], 0)
+                let y = physical(a1[v], 5)
+                if d != x { registerRegister(137, d, x) }
+                registerRegister(if kind == opAdd { 1 } else if kind == opSub { 41 } else { 33 }, d, y)
+            } else if kind == opMul {
+                let x = physical(a0[v], 0)
+                let y = physical(a1[v], 5)
+                if d != x { registerRegister(137, d, x) }
+                emitByte(72 | ((d >> 3) & 1) << 2 | ((y >> 3) & 1))
+                emitByte(15)
+                emitByte(175)
+                emitByte(192 | (d & 7) << 3 | (y & 7))
+            } else if kind == opLt {
+                let x = physical(a0[v], 0)
+                let y = physical(a1[v], 5)
+                registerRegister(57, x, y)
+                emitByte(15)
+                emitByte(156)
+                emitByte(192 | (d & 7))
+            } else if kind == opLoad {
+                let x = physical(a0[v], 0)
+                emitByte(72 | ((d >> 3) & 1) << 2 | ((x >> 3) & 1))
+                emitByte(139)
+                emitByte(128 | (d & 7) << 3 | (x & 7))
+                word32(immediate[v])
+            } else if kind == opStore {
+                let x = physical(a0[v], 0)
+                let y = physical(a1[v], 5)
+                emitByte(72 | ((y >> 3) & 1) << 2 | ((x >> 3) & 1))
+                emitByte(137)
+                emitByte(128 | (y & 7) << 3 | (x & 7))
+                word32(0)
+            } else if kind == opCall {
+                emitByte(232)
+                word32(0)
+            } else if kind == opBr {
+                let x = physical(a0[v], 0)
+                registerRegister(133, x, x)
+                emitByte(15)
+                emitByte(133)
+                word32(0)
+                emitByte(233)
+                word32(0)
+            } else if kind == opRet {
+                emitByte(195)
+            }
+        }
+    }
+}
+
+fn main() {
+    for i in 0..64 { deBruijnTable[((((1 << i) * deBruijn) >> 58) & 63)] = i }
+    var size = 500
+    var count = 2000
+    if args().len() > 1 { size = args()[1] as int }
+    if args().len() > 2 { count = args()[2] as int }
+    var phase = zeros(7)
+    var totalValues = 0
+    var totalBytes = 0
+    var spills = 0
+    var removed = 0
+    for f in 0..count {
+        let t0 = nowNanoseconds()
+        generate(size)
+        let t1 = nowNanoseconds()
+        controlFlow()
+        let t2 = nowNanoseconds()
+        fold()
+        let t3 = nowNanoseconds()
+        dce()
+        let t4 = nowNanoseconds()
+        liveness()
+        let t5 = nowNanoseconds()
+        registerAllocate()
+        let t6 = nowNanoseconds()
+        encode()
+        let t7 = nowNanoseconds()
+        phase[0] += t1 - t0
+        phase[1] += t2 - t1
+        phase[2] += t3 - t2
+        phase[3] += t4 - t3
+        phase[4] += t5 - t4
+        phase[5] += t6 - t5
+        phase[6] += t7 - t6
+        totalValues += valueCount
+        totalBytes += codeLength
+        spills += spillCount
+        for v in 0..valueCount {
+            if live[v] == 0 or replacement[v] != v { removed += 1 }
+        }
+    }
+    print("{count} functions x ~{size} values: {totalValues} values, removed {removed}, {spills} spills, {totalBytes} code bytes")
+    let names = ["generate (not counted)", "cfg", "fold/copyprop/gvn", "dce", "liveness", "intervals+linear scan", "encode"]
+    var pipeline = 0
+    for i in 0..7 {
+        if i > 0 { pipeline += phase[i] }
+        print("  {names[i]}: {phase[i] / totalValues} ns/value")
+    }
+    print("  TOTAL pipeline: {pipeline / totalValues} ns/value")
+}
