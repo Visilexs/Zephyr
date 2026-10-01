@@ -314,7 +314,7 @@ the oracle or prototype that justified the step.
 | 5 | Specialized per-type allocation and release, nullable optionals, 8-byte header | bintrees ≤ 200 ms (today 740) | M13, M33 |
 | 6 | Immutability/flattening (SoA), slices, in-place append | records ≤ 1.05× C, lexer ≤ 1.6× C, strbuild ≤ 1.5× C | M14, M23, M27 |
 | 7 | Acyclic type-graph analysis: no cycle collector | lexer −10% | M36 |
-| 8 | Declaration-level cache + incremental rebuild | zc edit-one-function rebuild ≤ 20 ms | M10, M17 |
+| 8 | Declaration-level cache + incremental rebuild | zc edit-one-function rebuild ≤ 20 ms; a forced whole-program fact flip rebuilds byte-identically to a clean build | M10, M17, M54 |
 | 9 | Vectorizer (straight-line + SoA loops), accumulator recursion | nbody ≤ 1.1× C; vectors ≤ 0.6× C; fib ≤ 0.95× C; matmul stays ≤ 0.55× C without the pattern kernel; cube ≤ 1.0× C | M18–M21, M29, M34, M38 |
 | 10 | Region inference | bintrees ≤ 100 ms | M7 |
 | 11 | Automatic loop parallelism | vectors ≥ 3× on 4 cores, bit-identical | M8 |
@@ -1942,6 +1942,41 @@ All earlier single-session results are confirmed within the noise band.
 strbuild's in-place oracle comes out better than first measured (1.29 against
 1.45).
 
+### M54. Whole-program facts against incremental rebuilds (cycle 71)
+
+**The attack:**
+
+- Layer 4's decisions rest on whole-program facts: "`Vec3` is never mutated",
+  "the type graph is acyclic", "these are all of `Shape`'s implementations".
+- An edit anywhere can flip a fact and invalidate code everywhere, which could
+  defeat the 10–15 ms incremental target (M10).
+
+**Design:** every fact becomes a cache input. Each function's cache key
+includes the hashes of the facts it relied on, so a flip recompiles exactly the
+dependents.
+
+**Cost of the worst flips in the compiler itself** [M for counts, E for time]:
+
+- The 813 functions of `zc.zeph` + `optimizer.zeph`, counted by type name:
+  - `Node`: 308 functions;
+  - `Token`: 8;
+  - `StructDefinition`, `FunctionDefinition`: 6 each;
+  - `Operand`: 5;
+  - `VariableInformation`: 4;
+  - `InlineFrame`: 3;
+  - every other type: ≤ 2.
+- A flip on `Node` would recompile ~308 functions × ~530 values × 0.5–1 µs
+  (M47) ≈ **80–160 ms**. Recompiling all 813 functions ≈ 0.2–0.45 s.
+- `Node` is already mutable and cycle-capable, so in practice its facts never
+  flip. The types whose facts can flip (the immutable ones, M16) are named in
+  1–3 functions.
+
+**Verdict:** whole-program facts are compatible with incremental builds. A
+fact flip is a rare, bounded rebuild in the hundreds of milliseconds, against
+~10–15 ms for a normal edit. The cache must record fact dependencies
+explicitly. This adds one item to step 8's gate: a forced fact flip rebuilds
+correctly, verified by a byte-compare against a clean build.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2419,3 +2454,7 @@ All rows are bintrees unless noted, same checksum, one core.
   - Parity of all 39 repository fixtures, including the threads fixtures:
     identical at baseline and -O2 on Linux. Random fuzzing finds what the
     fixtures don't.
+- **2026-10-01, cycle 71.**
+  - Whole-program facts against incremental builds (M54): the worst
+    realistic flip rebuilds ~308 functions in ~80–160 ms.
+  - Facts become cache inputs; added a fact-flip check to step 8's gate.
