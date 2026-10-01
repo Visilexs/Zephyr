@@ -1577,7 +1577,7 @@ invalidation: seed 1009 printed 8. Results [M]:
   Baseline's 13 comes from baseline reading `acc` after the call. The
   remaining gap is evaluation order, not the miscompile.
 - The other four repros are order-dependent and don't change.
-- `PURE=1` seeds 1000–1599 with the patch: run pending (cycle 82).
+- `PURE=1` seeds 1000–1599 with the patch: **0 mismatches in 600** [M] (1 without it).
 - The patch is a diagnosis tool, not the fix to ship. It gives up all
   store-to-load forwarding for globals. Fix (a) keeps that forwarding where
   it is safe. Its cost was not measured.
@@ -1619,7 +1619,7 @@ Seeds 1–500 gave **0 mismatches** [M].
 | Generator | Programs | Mismatches |
 |---|---:|---:|
 | `genprog` | 600 | 18 (1 miscompile class plus evaluation order) |
-| `genprog` PURE | 600 | 1 (same class) |
+| `genprog` PURE | 600 | 1 (same class); 0 with the cycle 81 patch |
 | `genref` | 400 | 0 |
 | `genext` | 500 | 0 |
 | `genmap` (maps, generics) | 400 | 0 |
