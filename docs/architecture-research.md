@@ -652,6 +652,36 @@ iteration (straight-line vectorization).
 independent lanes is the missing backend capability. Loop vectorization over
 SoA is the larger version of the same thing. Both belong in layer 3.
 
+### M19. How much of each float gap is vectorization? (cycle 13)
+
+Rebuilding the C references with `-fno-tree-vectorize -fno-tree-slp-vectorize`
+gives a scalar-only C [M]:
+
+| Workload | C -O2 | C, no vectorization | Zephyr -O2 | Gap explained by vectorization |
+|---|---:|---:|---:|---:|
+| nbody | 0.44 s | 0.49 s | 0.52 s | ~60% |
+| vectors | 0.49 s | 0.56 s | 0.81 s | ~22% |
+| mandel | 0.63 s | 0.63 s | 0.54 s | none (Zephyr is faster) |
+| cube | 0.38 s | 0.38 s | 0.43 s | none |
+| liquid | 0.90 s | 0.89 s | 1.09 s | none |
+
+**Correction to M18:** vectorization explains most of nbody's gap but only a
+fifth of vectors'. The larger remaining factor across vectors, cube and liquid
+is scalar code quality. The vectors inner loop (M7) shows the specific losses:
+
+- floats spilled to the stack while XMM registers are free;
+- six separate bounds checks;
+- constants reloaded from memory.
+
+These point at the register allocator and at bounds-check elimination, not at
+a vectorizer. Priorities inside layer 3 are, in order:
+
+1. register allocation over the full XMM file, with no spills under low
+   pressure;
+2. bounds-check elimination for loops with a constant trip count over lists of
+   known length;
+3. straight-line vectorization, then loop vectorization.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -808,6 +838,11 @@ SoA is the larger version of the same thing. Both belong in layer 3.
 - **2026-10-01, cycle 11.**
   - Fixed costs of a cached `zc run` (M17): ~3 ms to the first instruction,
     which confirms S1.
+- **2026-10-01, cycle 13.**
+  - C without vectorization (M19): vectorization explains ~60% of nbody's gap
+    but only ~22% of vectors'.
+  - Corrected M18. Register allocation and bounds-check elimination come before
+    vectorization.
 - **2026-10-01, cycle 12.**
   - nbody: a scalar-promotion oracle gave no gain. The gap is gcc's
     straight-line vectorization of x/y pairs (M18), the same capability as in
