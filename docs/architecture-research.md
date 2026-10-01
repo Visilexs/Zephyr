@@ -24,7 +24,7 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 | Representation: per-type allocation, nullable optionals, 8-byte headers, values flattened into lists, interface value = object pointer, slices, in-place append, regions | bintrees 3.0× → 0.29× C; records 1.25× → 1.01×; wordfreq and dispatch gaps fully explained [M7, M13, M27, M33, M44, M45] |
 | Every function compiled whole, the same analyses everywhere | vectors −32%; removes a 6× placement cliff [M41, M42] |
 | Backend: lean calling convention, accumulator recursion, vectorization | fib 1.46× → 0.95× C [M29] |
-| Automatic parallelism | 3.2–3.9× on 4 cores, bit-identical [M8, M48] |
+| Automatic parallelism | 1.94× geomean on 4 cores over all 19 workloads, bit-identical (12 parallelizable at 2.86×; best cases 3.8–4.4×) [M59] |
 
 **Today → projected:**
 
@@ -347,6 +347,7 @@ step's parity tests run against it as well as against the old pipeline.
 | 40,000 small functions (compilegen 200×200) | — | zc 6.6 s (baseline) / 22.5 s (-O2); tcc 0.063 s; clang -O0 3.5 s; gcc -O2 6.3 s | [M] M32 |
 | Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
 | Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle; **0.94×** including C-representation models | [M] `research/x86bench.py`; oracles M7–M45 |
+| Multicore speedup, 4 cores | report it | none today (zc doesn't parallelize). C oracles of what the design would emit: **1.94× geomean over all 19**, bit-identical; 12 of 19 parallelizable at 2.86×; 7 have no safe parallel form | [M] M59 |
 | Bit-identical output across modes | required | **Not met by shipping zc:** the 19 workloads match, but 18 of 600 random programs (3%) print different results at baseline and -O2. **Met with three scratch patches** (~25 lines): 0 mismatches across 2,300 fuzz programs and 400/400 three-way agreement with a left-to-right reference, at no measured runtime cost | [M] M2, M39, M56, M57 |
 | Peak memory vs C | report it | geometric mean 0.66×. Small programs are 0.2–0.5× (static binary, no libc). Allocation-heavy: lexer 4.23×, dispatch 2.26×, shapes 2.20×, bintrees 1.97×, records 1.65×. Oracles: bintrees 19 → 5 MB (region, M7), shapes 205 → 168 MB (flattening, M11) | [M] M37 |
 | Compiler size | report it | 24.4 k hand-written Zephyr lines today: zc.zeph 14.3 k (excluding the 4,980-line generated EMBED), optimizer 7.2 k, runtime 2.9 k; plus ~1 k lines of Python/C for macOS. Proposed design: ~28–33 k lines with native x86 and ARM64 backends, an IR interpreter and the cache, after deleting the baseline generator, text assembler, `arm64.py` and `jit.py`; +15–30% overall | [M] today (section markers); [E] proposed |
@@ -2404,6 +2405,93 @@ frame-local (stack) allocation, which these workloads barely use.
 - **Reference counting stays the fallback** for everything else. Regions
   take objects off the RC path; they don't replace RC.
 
+### M59. Parallelism coverage over all 19 workloads (cycle 88)
+
+M8 and M48 measured the best cases with the loop picked by hand. This cycle
+checks every workload against the safety rules and times a C OpenMP oracle
+wherever a parallel form exists. Whole programs are timed, serial phases
+included, on 4 vCPUs with `hyperfine -N` and the benchmark's own arguments.
+Oracles: `research/oracle/parallel/*_omp.c`.
+
+| Workload | What it needs | Serial C | 4 threads | Speedup | Checksum |
+|---|---|---:|---:|---:|---|
+| mandel | loop rules (row loop, integer sum) | 583 ms | 150 ms | **3.88×** | identical |
+| matmul | loop rules (`i` loop) | 1142 ms | 304 ms | **3.76×** | identical |
+| strings | loop rules + per-thread allocation | 418 ms | 110 ms | **3.79×** | identical |
+| vectors | loop rules, SoA kernel (M8) | 604 ms | 191 ms | **3.17×** | identical |
+| bintrees | loop rules + per-thread regions | 52 ms (regions) | 20 ms | **2.60×** (1.63× with malloc) | identical |
+| hashmap | loop rules on the lookup loop; inserts stay serial | 1079 ms | 685 ms | 1.57× | identical |
+| records | loop rules on the update loop only; the three sum loops are float | 1309 ms | 1036 ms | 1.26× | identical |
+| records, float sums blocked | 64 fixed blocks summed in block order | 1321 ms | 300 ms | 4.40× | **differs from serial**; same on 1 and 4 threads |
+| dispatch | distribute the rounds loop; the checksum fold stays serial | 361 ms | 121 ms | **2.97×** | identical |
+| shapes | distribute rounds; each round's float sums keep serial order | 628 ms | 210 ms | **2.99×** | identical |
+| closures | distribute rounds (10 rounds: bound 3.33×) | 694 ms | 218 ms | **3.18×** | identical |
+| sort | parallel library sort: 4 chunks, then 2 merge rounds | 567 ms | 218 ms | 2.60× | identical |
+| fib | pure recursion expanded to 1,024 leaves, then a dynamic parallel loop | 907 ms | 204 ms | **4.44×** | identical |
+| cube, pi, liquid, nbody, lexer, wordfreq, strbuild | none found (see below) | | | 1.00× | |
+
+**Why seven have no parallelism:**
+
+- **cube:** frames carry state (`c`, `s`), and `draw_line` writes the shared
+  framebuffer at computed indices. The per-frame loops are 10,000
+  iterations, ~2–5 µs, below M8's threshold.
+- **pi:** the long division carries `rem` along `i`, and both `arctan`
+  calls share `w`.
+- **liquid:** `viscosity` and `relax` write neighbours (`vx[j]`, `px[j]`)
+  through shared scratch lists, Gauss–Seidel style. Results depend on order.
+- **nbody:** symmetric pair updates (`second.vx +=`). Rewriting to full
+  pairs is an algorithm change, not a compiler transformation.
+- **lexer, wordfreq, strbuild:** their input comes from a sequential random
+  number generator or a sequential scan, and they fold into a polynomial
+  hash or a shared map.
+
+**Geometric mean over all 19, 4 cores, bit-identical output [M]:**
+
+| Compiler capability | Workloads | 19-workload geomean |
+|---|---:|---:|
+| Loop rules only (M8) | 7 | 1.43× |
+| + distributing an outer loop and serializing the fold | 10 | 1.71× |
+| + a parallel library sort | 11 | 1.79× |
+| + pure recursion expanded to a fixed depth | 12 | **1.94×** |
+| + blocked float sums (gives up bit-identity with serial) | 12 | 2.07× |
+
+Among the 12 parallelizable workloads alone, the geomean is **2.86×**.
+
+**Findings:**
+
+- **The headline 3.2–3.9× was best cases.** Across the whole suite,
+  automatic parallelism is worth ~1.9× on 4 cores. More than half of that
+  comes from capabilities beyond simple loop rules.
+- **Loop distribution is the most valuable addition** (+0.28 in geomean).
+  dispatch, shapes and closures all have the shape "independent rounds, then
+  a serial fold". It keeps float order inside each round, so it stays
+  bit-identical even with float sums.
+- **Blocked float sums are deterministic but not equal to serial.** The
+  checksum is the same on 1 and 4 threads but differs from the serial
+  program. Under the "bit-identical across modes" target they are off.
+  Allowing them takes a language-level opt-in (for example a `sum` builtin
+  defined to reduce in blocks), and buys +0.13 geomean here.
+- **Pure recursion:** OpenMP tasks reached only ~2.2× on fib. libgomp left
+  threads idle (user time ≈ serial work, wall time 0.39 s) whether tasks were
+  tied or untied. Expanding the call tree to 1,024 leaves and running them as
+  a dynamic loop reached 4.0–4.4×. The compiler should emit that, not rely on
+  a task runtime.
+- **What Zephyr needs on top, which C doesn't model:**
+  - Allocation inside parallel bodies (strings, bintrees, closures) needs
+    per-thread heaps or regions. The spec forbids sharing heap references
+    across threads, and fresh temporaries don't cross.
+  - Shared read-only objects (transforms, shapes, records, `data`) must
+    produce **no reference-count traffic** in the parallel body. Counts are
+    non-atomic, so a retain/release there would be a data race. Borrow
+    inference over read-only loops is a hard prerequisite, not an
+    optimization.
+  - Effect inference must prove `apply`, `area` and the closure bodies
+    write nothing shared. For interface calls that means every
+    implementation, which whole-program compilation allows.
+- **Panic order** wasn't exercised: none of the parallel bodies can panic
+  after hoisting. The rule stays "report the lowest-index panic", which
+  M8's hoisted bounds checks give for free [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2963,3 +3051,13 @@ All rows are bintrees unless noted, same checksum, one core.
     bit-identical row was stale and now carries the M56/M57 result.
   - Next, per rule 1: Q5's remaining part (the compiler's own allocations,
     M50) by the same L1/L2/L3 classification.
+- **2026-10-01, cycle 88.**
+  - Parallelism coverage over all 19 workloads (M59). Bit-identical 4-core
+    geomean 1.94×, and 12 of 19 have a parallel form.
+  - Loop distribution (independent rounds, serial fold) is the most
+    valuable capability after the basic loop rules.
+  - Blocked float sums are deterministic but differ from serial, so they
+    stay off.
+  - Pure recursion needs leaf expansion; libgomp's tasks reach only 2.2×.
+  - Borrow inference with zero RC traffic in parallel bodies is a hard
+    prerequisite.
