@@ -162,7 +162,7 @@ the oracle or prototype that justified the step.
 | 6 | Immutability/flattening (SoA), slices, in-place append | records ≤ 1.05× C, lexer ≤ 1.6× C, strbuild ≤ 1.5× C | M14, M23, M27 |
 | 7 | Acyclic type-graph analysis: no cycle collector | lexer −10% | M36 |
 | 8 | Declaration-level cache + incremental rebuild | zc edit-one-function rebuild ≤ 20 ms | M10, M17 |
-| 9 | Vectorizer (straight-line + SoA loops), accumulator recursion | nbody ≤ 1.1× C; vectors ≤ 0.6× C; fib ≤ 0.95× C | M18–M21, M29 |
+| 9 | Vectorizer (straight-line + SoA loops), accumulator recursion | nbody ≤ 1.1× C; vectors ≤ 0.6× C; fib ≤ 0.95× C; matmul stays ≤ 0.55× C without the pattern kernel; cube ≤ 1.0× C | M18–M21, M29, M34, M38 |
 | 10 | Region inference | bintrees ≤ 100 ms | M7 |
 | 11 | Automatic loop parallelism | vectors ≥ 3× on 4 cores, bit-identical | M8 |
 | 12 | ARM64 instruction selection over the same IR | macOS: no clang, no `arm64.py`; `zc run fib` ≤ 10 ms to first instruction | M17, macOS results |
@@ -1262,6 +1262,24 @@ Measured as peak RSS from `/usr/bin/time -f %M`, at the benchmark sizes [M]:
 - The representation layer (layer 4) addresses memory and time together.
   bintrees falls from 19 MB to 5 MB with a region (M7), below C's 9.5 MB.
 
+### M38. Where Zephyr already beats C, and must keep winning (cycle 37)
+
+| Workload | -O2 / C | Reason | Evidence |
+|---|---:|---|---|
+| pi | 0.58 | Loop-invariant divisors (`cur / x2`, `curt / d`) get a magic multiplier computed once at loop entry (`irDivideByInvariant`). gcc emits `idiv` every iteration. | C source lines 34–39; gcc output has 4 `idiv`/`div` in loops |
+| sort | 0.53 | The runtime's sort is specialized to the element type. C's `qsort` calls a comparator through a function pointer on every comparison. | `bench/sort.c` line 16 |
+| hashmap | 0.71 | Hash tags stored in map slots (commit "map hash tags"). The C reference keeps a separate `used` byte array. | `bench/hashmap.c` |
+| matmul | 0.55 | AVX2 kernel for the AXPY pattern | `zc.zeph` "AVX2 kernel" section |
+
+All four are specialization wins: knowledge a C compiler doesn't have, or
+that C's library interface hides. They belong in the new design:
+
+- **invariant-divisor magic:** a pass in layer 3;
+- **monomorphized runtime algorithms:** layer 4's runtime co-design;
+- **stored hash tags:** already in the runtime;
+- **the AXPY kernel:** subsumed by the vectorizer. Its result (0.55×) is the
+  vectorizer's gate for matmul.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1523,3 +1541,8 @@ Measured as peak RSS from `/usr/bin/time -f %M`, at the benchmark sizes [M]:
 - **2026-10-01, cycle 36.**
   - Peak memory (M37): geometric mean 0.66× C, but 1.4–4.2× on the
     allocation-heavy workloads. Same causes and fixes as the time gaps.
+- **2026-10-01, cycle 37.**
+  - Where Zephyr beats C (M38): invariant-divisor magic (pi), a type-specialized
+    sort, map hash tags, the AXPY kernel.
+  - All four are kept in the design; matmul's 0.55× becomes the vectorizer's
+    gate.
