@@ -18,7 +18,7 @@
 typedef int64_t i64;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
-enum { PARAM, CONST, ADD, SUB, ADDI, LOAD, CALL };
+enum { PARAM, CONST, ADD, SUB, ADDI, LOAD, CALL, LOADNC };   // LOADNC: element load after bounds-check elimination
 enum { T_JMP, T_BR_LT, T_BR_GE, T_RET };
 #define MV 256
 #define MB 32
@@ -129,6 +129,10 @@ static void *compile(int listPtrReg /* the list base is the 2nd param */) {
                 b8(0x0F); b8(0x83); panicFix[npanic++] = len; b32(0);                                     // jae panic
                 rex(1, d, 0); code[len - 1] |= (I >> 3) << 1 | (L >> 3); b8(0x8B); b8(0x44 | (d & 7) << 3); b8((3 << 6) | (I & 7) << 3 | (L & 7)); b8(8);   // mov d, [L + I*8 + 8]
                 break; }
+            case LOADNC: {  // d = list[index], check proved away: mov d, [L + I*8 + 8]
+                int L = reg[a0[v]], I = reg[a1[v]];
+                rex(1, d, 0); code[len - 1] |= (I >> 3) << 1 | (L >> 3); b8(0x8B); b8(0x44 | (d & 7) << 3); b8((3 << 6) | (I & 7) << 3 | (L & 7)); b8(8);
+                break; }
             case CALL: {   // self call with one argument
                 movrr(7, reg[a0[v]]); if (a1[v] >= 0) movrr(6, reg[a1[v]]);
                 b8(0xE8); b32(-(len + 4)); movrr(d, 0); break; }
@@ -211,5 +215,27 @@ int main(void) {
     i64 *data = malloc(8 * (1000000 + 1)); data[0] = 1000000; for (int k = 0; k < 1000000; k++) data[1 + k] = k % 7;
     t0 = now(); x = sum(data, 50); t1 = now(); y = nsum(data, 50); t2 = now();
     printf("  sum(50 x 1M): generated %.0f ms, gcc -O2 %.0f ms, ratio %.2f  %s (%lld)\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) / (t2 - t1), x == y ? "ok" : "MISMATCH", (long long)x);
+
+    // sum, as loop rotation + bounds-check elimination would leave it (cycle 74):
+    // the test moves to the bottom of the loop and the per-element check is gone
+    // (proved by i < length <= list.len, with one check hoisted before the loop).
+    reset();
+    b0 = block(); list = newv(PARAM, -1, -1, 0, b0); reps = newv(PARAM, -1, -1, 1, b0); zero = newv(CONST, -1, -1, 0, b0);
+    length = newv(CONST, -1, -1, 1000000, b0); endb(b0); term[b0] = T_JMP; tgt[b0][0] = 1; ntargs[b0][0] = 2; targs[b0][0][0] = zero; targs[b0][0][1] = zero;
+    b1 = block(); s1 = newv(PARAM, -1, -1, 99, b1); r1 = newv(PARAM, -1, -1, 99, b1); endb(b1); bparams[b1][0] = s1; bparams[b1][1] = r1; nbp[b1] = 2;
+    term[b1] = T_BR_LT; tx[b1] = r1; ty[b1] = reps; tgt[b1][1] = 2; ntargs[b1][1] = 3; targs[b1][1][0] = s1; targs[b1][1][1] = r1; targs[b1][1][2] = zero;
+    tgt[b1][0] = 4; ntargs[b1][0] = 1; targs[b1][0][0] = s1;
+    b2 = block(); s2 = newv(PARAM, -1, -1, 99, b2); r2 = newv(PARAM, -1, -1, 99, b2); i2 = newv(PARAM, -1, -1, 99, b2);
+    xv = newv(LOADNC, list, i2, 0, b2); s3 = newv(ADD, s2, xv, 0, b2); i3 = newv(ADDI, i2, -1, 1, b2); endb(b2);
+    bparams[b2][0] = s2; bparams[b2][1] = r2; bparams[b2][2] = i2; nbp[b2] = 3;
+    term[b2] = T_BR_LT; tx[b2] = i3; ty[b2] = length; tgt[b2][1] = 2; ntargs[b2][1] = 3; targs[b2][1][0] = s3; targs[b2][1][1] = r2; targs[b2][1][2] = i3;
+    tgt[b2][0] = 3; ntargs[b2][0] = 2; targs[b2][0][0] = s3; targs[b2][0][1] = r2;
+    b3 = block(); s5 = newv(PARAM, -1, -1, 99, b3); r5 = newv(PARAM, -1, -1, 99, b3); r5n = newv(ADDI, r5, -1, 1, b3); endb(b3);
+    bparams[b3][0] = s5; bparams[b3][1] = r5; nbp[b3] = 2; term[b3] = T_JMP; tgt[b3][0] = 1; ntargs[b3][0] = 2; targs[b3][0][0] = s5; targs[b3][0][1] = r5n;
+    b4 = block(); sOut = newv(PARAM, -1, -1, 99, b4); endb(b4); bparams[b4][0] = sOut; nbp[b4] = 1; term[b4] = T_RET; tx[b4] = sOut;
+    c0 = now(); allocate(); i64 (*sum2)(const i64 *, i64) = (i64 (*)(const i64 *, i64))compile(0); c1 = now();
+    printf("sum, rotated + checks eliminated: %d values compiled in %.1f us (%d bytes)\n", nv, (c1 - c0) * 1e6, len);
+    t0 = now(); x = sum2(data, 50); t1 = now(); y = nsum(data, 50); t2 = now();
+    printf("  sum(50 x 1M): generated %.0f ms, gcc -O2 %.0f ms, ratio %.2f  %s\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) / (t2 - t1), x == y ? "ok" : "MISMATCH");
     return 0;
 }

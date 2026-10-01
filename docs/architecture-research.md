@@ -2016,6 +2016,20 @@ correct on both kernels, one core [M]:
   coalescing, rotation, bounds-check elimination) come before or with the new
   encoder. A new backend without them would regress against today's -O2.
 
+**Cycle 74: the same loop after loop rotation and bounds-check elimination**
+(hand-built IR: the test at the bottom, element loads without checks since
+`i < length ≤ list.len` is proved once before the loop), compiled by the same
+prototype [M]:
+
+| Version | Time | vs gcc -O2 |
+|---|---:|---:|
+| Naive | 55 ms | 2.5–2.8× |
+| + coalescing | 42 ms | 1.8–2.0× |
+| **+ rotation + bounds-check elimination** | **20 ms** | **0.99–1.08×** |
+
+With three standard passes and nothing clever in instruction selection, the
+flat pipeline's code reaches gcc -O2 on this loop.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2506,3 +2520,6 @@ All rows are bintrees unless noted, same checksum, one core.
   - Without mid-end passes, code is 1.8–2.8× gcc. Coalescing gives −24%;
     inlining, rotation and bounds-check elimination are required before the
     new backend can replace -O2.
+- **2026-10-01, cycle 74.**
+  - Rotation + bounds-check elimination + coalescing: the prototype's loop
+    reaches gcc parity (20 ms, 0.99–1.08×).
