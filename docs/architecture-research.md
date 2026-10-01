@@ -37,8 +37,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      7.3 µs for today's -O2 [M5].
 3. **One optimizing native backend, emitting machine code directly.**
    - No text assembler, which is 28% of a self-compile today [M3].
-   - Instruction selection, register allocation over all 16 GPRs and 16 XMMs,
-     and an internal calling convention.
+   - Instruction selection, register allocation over all 16 GPRs and 16 XMMs.
+   - An internal calling convention: no frame pointer, no stack realignment,
+     shrink-wrapped saves. Calls cost 1.47× C's today [M12].
    - It decides 11 of the 19 workloads [M6].
    - Missing passes, measured or identified:
      - accumulator recursion elimination (fib) [M9];
@@ -52,7 +53,10 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      vectors: bound 0.40× C with AVX2 [M7].
    - **Region inference** for structures that die at the end of a statement or
      call. bintrees: 3.00× → 0.29× C [M7].
-   - **8-byte object header** instead of 24 [E, M11].
+   - **Allocation and release specialized per type** instead of the generic
+     descriptor-driven runtime paths. Worth ≈ 2.7× on bintrees [M13].
+   - **Nullable-pointer optionals** for reference types, no cells (−30% [M13]).
+   - **8-byte object header** instead of 24 (−28% [M13]).
    - **Runtime data structures co-designed with the optimizer:** small strings,
      hashes stored in map slots, a formatter in the fast division domain.
      strings: 1.49× → 1.22× [M7].
@@ -470,6 +474,58 @@ through the cell). Results [M]:
   3. Profile-guided inlining of hot loop bodies, using the persisted profiles
      of C1.
 
+### M12. Per-call overhead (cycle 8)
+
+A function too large to inline but with a two-instruction hot path, called
+200 M times (`/tmp` microbenchmark, recipe in the log) [M]:
+
+| | Time per call |
+|---|---:|
+| zc -O2 | 1.9 ns |
+| gcc -O2 `noinline` | 1.3 ns |
+| **Ratio** | **1.47×** |
+
+zc's prologue always does `push rbp; mov rbp, rsp; and rsp, -16; sub rsp, N`
+and saves the callee-saved registers on entry, even when the hot path uses none
+of them. gcc keeps no frame and saves registers only on the paths that need
+them (shrink-wrapping).
+
+An internal Zephyr-to-Zephyr convention would fix this:
+
+- no stack realignment, because it is kept by construction;
+- no frame pointer, because unwinding uses the frame map;
+- shrink-wrapped saves.
+
+This matters for every call-bound workload: fib, closures, dispatch, shapes.
+
+### M13. Allocation strategy, isolated (cycle 8)
+
+`research/proto/allocmodels.c` runs bintrees in C under different allocation
+models. All models produce the same checksum as Zephyr [M]:
+
+| Model | Time | Peak RSS |
+|---|---:|---:|
+| Zephyr today (`bench/bintrees.zeph`, -O2) | 800 ms | 19 MB |
+| `rc24cell`: same representation as today (24-byte header, a counted cell per optional child, free list), but code specialized to the type | 294 ms | 26 MB |
+| `rc24`: optionals as nullable pointers (no cells) | 205 ms | 14 MB |
+| `rc8`: plus an 8-byte header | 148 ms | 10 MB |
+| `region`: bump arena, reset per tree | 49 ms | 6 MB |
+| glibc malloc/free (the C reference) | 290 ms | 10 MB |
+
+**Decomposition of Zephyr's 800 ms:**
+
+| Cause | Approximate cost | Fix |
+|---|---:|---|
+| Generic runtime paths (descriptor-driven release loops, out-of-line allocation with thread and heap checks, separate zeroing calls) | ≈ 500 ms | Allocation and release specialized per type at compile time; the compiler knows every layout statically |
+| Optional cells | ≈ 90 ms | Nullable-pointer representation for reference optionals; `T?` has no identity, so this is unobservable |
+| 24-byte header | ≈ 55 ms | 8-byte header |
+
+A region on top of those fixes takes it to ~50 ms.
+
+**Even without regions, reference counting with these representation fixes
+beats malloc/free C by ~2×** (148 ms against 290 ms). Reference counting is not
+the problem. The generic runtime is.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -605,3 +661,13 @@ through the cell). Results [M]:
   - shapes: the interface cell is not the cost; memory density is.
   - The 24-byte header makes objects 2× C's size, and flattening recovers 24%
     (M11).
+- **2026-10-01, cycle 8.**
+  - Per-call overhead is 1.47× C, from the prologue and missing shrink-wrapping
+    (M12).
+  - C allocation models (M13) split bintrees' 800 ms into: ~500 ms of generic
+    runtime paths, ~90 ms of optional cells and ~55 ms of header size.
+  - Reference counting with fixed representation beats malloc C 2×; regions
+    reach 49 ms.
+  - Microbenchmark recipe for M12: `work(a, b)` with a cold 40-statement branch
+    (over the 60-node inline limit) and a hot `return a + b`, called in a
+    200 M-iteration loop; C uses `__attribute__((noinline))`.
