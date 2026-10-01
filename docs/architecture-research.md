@@ -1032,6 +1032,7 @@ splitting is estimated at ≤ 2× that [E].
 | S4 edit one function, rebuild | ms, dominated by frontend re-check | same | same | same | same |
 | S5 long-running simulation | Peak from the first instruction; profiles persist for the next build | Peak after warm-up; profiling overhead stays | Peak after tier-up | Peak after warm-up; best at speculation, which a static closed-world language barely needs | Peak only on loop-shaped code |
 | S6 compile-time evaluation, REPL, debugger | Needs an evaluator anyway | Natural | Natural if stencils come from interpreter handlers | Natural | Natural |
+| S7 cold build of a very large program (1 M lines ≈ 24 M SSA values, using zc's 24 values per line [M5]; empty shared cache) | 24 M × ~1 µs ≈ 24 s single-threaded, ~6 s on 4 cores [E], + frontend ~2–4 s [E] | Starts after the frontend, then interprets at 5–16× slowdown [M4] | 24 M × ~20 ns ≈ 0.5 s of stencils [E] + frontend; full speed comes later from background optimization | n/a | n/a |
 | Engineering cost | One code generator | Interpreter + JIT + OSR + deopt | Stencil generator + optimizing tier | A partial evaluator is itself a large optimizing compiler | Tracing JIT + interpreter |
 
 **Verdicts:**
@@ -1046,6 +1047,13 @@ splitting is estimated at ≤ 2× that [E].
   optimizing compiler that buys nothing the lowering doesn't already know.
 - **C3's only win is S2/S3, an empty cache:** tens to a few hundred
   milliseconds, once per compiler version.
+- **C3 also wins S7 (added in cycle 27):** a cold build of a program of about
+  1 M lines with an empty cache. There, stencils cut seconds of code
+  generation to about half a second.
+  - This is the one scenario where the stencil family, the closest relative of
+    an interpreted compiler, clearly wins.
+  - So C3 stays in reserve, triggered either by the 2 µs-per-value gate or by
+    programs above ~100 k lines without a shared cache.
 - **The interpreted-compiler idea survives in a different role (C6):** an IR
   interpreter as the executable specification.
   - It acts as an oracle: every optimized function is tested for identical
@@ -1225,3 +1233,9 @@ splitting is estimated at ≤ 2× that [E].
   - Characterised zc's allocator (M30): linear scan without splitting, 14 XMMs
     with 2 reserved, and callee-saved constraints across calls.
   - Recommended linear scan with splitting and two-address hints.
+- **2026-10-01, cycles 26–27.**
+  - -O2 coverage on all 19 workloads: only 2 baseline fallbacks (a pi loop with
+    `call kind 15`, and cube's `render`, which holds a native kernel).
+  - Added scenario S7, a cold build of ~1 M lines: copy-and-patch wins it,
+    ~0.5 s against ~6–24 s of optimized code generation [E].
+  - C3's reserve triggers now include program size.
