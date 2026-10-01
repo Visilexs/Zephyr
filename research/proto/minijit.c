@@ -237,5 +237,27 @@ int main(void) {
     printf("sum, rotated + checks eliminated: %d values compiled in %.1f us (%d bytes)\n", nv, (c1 - c0) * 1e6, len);
     t0 = now(); x = sum2(data, 50); t1 = now(); y = nsum(data, 50); t2 = now();
     printf("  sum(50 x 1M): generated %.0f ms, gcc -O2 %.0f ms, ratio %.2f  %s\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) / (t2 - t1), x == y ? "ok" : "MISMATCH");
+
+    // fib after accumulator recursion elimination (cycle 75), as the pass would produce it:
+    //   b0: n param; jmp b1(acc=0, m=n)
+    //   b1(acc, m): br m < 2 -> b3(acc, m) else b2(acc, m)
+    //   b2(acc, m): t = fib(m - 1); acc' = acc + t; m' = m - 2; jmp b1(acc', m')
+    //   b3(acc, m): ret acc + m
+    reset();
+    b0 = block(); n = newv(PARAM, -1, -1, 0, b0); zero = newv(CONST, -1, -1, 0, b0); endb(b0);
+    term[b0] = T_JMP; tgt[b0][0] = 1; ntargs[b0][0] = 2; targs[b0][0][0] = zero; targs[b0][0][1] = n;
+    b1 = block(); int accA = newv(PARAM, -1, -1, 99, b1); int mA = newv(PARAM, -1, -1, 99, b1); two = newv(CONST, -1, -1, 2, b1); endb(b1);
+    bparams[b1][0] = accA; bparams[b1][1] = mA; nbp[b1] = 2;
+    term[b1] = T_BR_LT; tx[b1] = mA; ty[b1] = two; tgt[b1][1] = 3; ntargs[b1][1] = 2; targs[b1][1][0] = accA; targs[b1][1][1] = mA;
+    tgt[b1][0] = 2; ntargs[b1][0] = 2; targs[b1][0][0] = accA; targs[b1][0][1] = mA;
+    b2 = block(); int accB = newv(PARAM, -1, -1, 99, b2); int mB = newv(PARAM, -1, -1, 99, b2); int m1 = newv(ADDI, mB, -1, -1, b2);
+    int tB = newv(CALL, m1, -1, 0, b2); int accN = newv(ADD, accB, tB, 0, b2); int mN = newv(ADDI, mB, -1, -2, b2); endb(b2);
+    bparams[b2][0] = accB; bparams[b2][1] = mB; nbp[b2] = 2; term[b2] = T_JMP; tgt[b2][0] = 1; ntargs[b2][0] = 2; targs[b2][0][0] = accN; targs[b2][0][1] = mN;
+    b3 = block(); int accC = newv(PARAM, -1, -1, 99, b3); int mC = newv(PARAM, -1, -1, 99, b3); int resC = newv(ADD, accC, mC, 0, b3); endb(b3);
+    bparams[b3][0] = accC; bparams[b3][1] = mC; nbp[b3] = 2; term[b3] = T_RET; tx[b3] = resC;
+    c0 = now(); allocate(); i64 (*fibAcc)(i64) = (i64 (*)(i64))compile(0); c1 = now();
+    printf("fib, accumulator form: %d values compiled in %.1f us (%d bytes)\n", nv, (c1 - c0) * 1e6, len);
+    t0 = now(); x = fibAcc(38); t1 = now(); y = nfib(38); t2 = now();
+    printf("  fib(38): generated %.0f ms, gcc -O2 %.0f ms, ratio %.2f  %s\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) / (t2 - t1), x == y ? "ok" : "MISMATCH");
     return 0;
 }

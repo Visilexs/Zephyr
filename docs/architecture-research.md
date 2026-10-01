@@ -2030,6 +2030,23 @@ prototype [M]:
 With three standard passes and nothing clever in instruction selection, the
 flat pipeline's code reaches gcc -O2 on this loop.
 
+**Cycle 75: fib in accumulator form** (one recursive call plus a loop, as the
+M9 pass would produce it), compiled by the same prototype without inlining
+[M]:
+
+| Version | fib(38) | vs gcc -O2 |
+|---|---:|---:|
+| Prototype, naive | 280 ms | 2.9–4.2× |
+| Prototype, accumulator form | 205–231 ms | 2.4–3.3× |
+| zc -O2 today (self-inlined 4 levels) | ~102 ms | ~1.4× |
+| zc oracle: accumulator + inlining + lean frame (M29) | 777 ms for fib(43); 0.95× C | 0.95× |
+| gcc -O2 (accumulator **and** multi-level unrolling of the recursion) | 63–96 ms | 1.00× |
+
+For recursive code, the backend alone is far from enough. Inlining recursion a
+few levels (bounded unrolling) is what closes the gap, and the accumulator
+transform adds to it. Both are mid-end passes on the flat IR, which reinforces
+the M55 lesson.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2523,3 +2540,6 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 74.**
   - Rotation + bounds-check elimination + coalescing: the prototype's loop
     reaches gcc parity (20 ms, 0.99–1.08×).
+- **2026-10-01, cycle 75.**
+  - Prototype with accumulator-form fib: 2.4–3.3× gcc without inlining.
+    Bounded recursive inlining is the essential pass for recursion.
