@@ -743,6 +743,27 @@ Both results use the reassembly path from M20 [M]:
 - Accumulator recursion elimination alone reaches C.
 - Together they should beat C [E].
 
+### M22. Sampled profiles overstate long-latency instructions (cycle 16)
+
+The formatter fix from M7, timed with `hyperfine -N`, 8 runs [M]:
+
+| Workload | Formatter's sampled self-time (before → after) | Time (before → after) |
+|---|---|---|
+| strings | 63% → much lower | 544 → 423 ms (**−22%**) |
+| strbuild | 25% → 11% | 1.020 → 0.992 s (**−3%**) |
+
+In strbuild, the sampled share fell 14 points but the time barely moved.
+Samples pile up on long-latency instructions (`idiv`) and the instructions just
+after them, while the CPU overlaps that latency with other work.
+
+**Method rule from now on:** profiles generate hypotheses, and only oracle
+timings count as evidence. Every gain in the current-best section is backed by
+an oracle or a rebuilt binary, not by a profile share.
+
+strbuild's remaining 2.1× gap: its C version views substrings in place
+(pointer + length), while Zephyr's `.sub` copies. That is the same lever as
+lexer's slices (M14, −30%) [E for strbuild].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -916,3 +937,7 @@ Both results use the reassembly path from M20 [M]:
   - fib via reassembly (M21): the lean internal prologue is −15%;
     shrink-wrapping adds nothing here.
   - An accumulator-recursion oracle runs at 0.80 s against C's 0.83 s.
+- **2026-10-01, cycle 16.**
+  - The formatter fix gives strings −22% but strbuild only −3%, although
+    strbuild's profile share fell 14 points (M22).
+  - Adopted the rule that profiles are hypotheses and oracles are evidence.
