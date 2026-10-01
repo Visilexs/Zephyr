@@ -1,0 +1,172 @@
+// Oracle rewrite of bench/lexer.zeph (revision 398aadd): Token is immutable, so
+// [Token] is flattened into parallel lists (SoA), and token text is a slice
+// (start, end) of the source instead of a copied substring, which is what a
+// slice representation for str.sub would produce. Same checksum.
+//
+// Original header: String-processing benchmark: generate deterministic source-code-like text
+// (identifiers, keywords, numbers, string literals, operators, comments,
+// whitespace), then tokenize it several times: classify bytes, cut substrings,
+// push tokens with their kinds, and fold counts and a hash of every token.
+// Usage: lexer [tokens]   (default 1000000)
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+enum TokenKind { Identifier, Keyword, Number, StringLiteral, Operator }
+
+struct Token { kind: TokenKind, text: str }
+
+let identifierCharacters = "abcdefghijklmnopqrstuvwxyz0123456789_"
+let commentCharacters = "abcdefghijklmnopqrstuvwxyz "
+let keywords = ["if", "else", "while", "fn", "return", "let", "var", "for"]
+let operators = ["+", "-", "*", "/", "=", "==", "<", "<=", ">", ">=", "->", "(", ")", "\{", "\}", ",", "."]
+
+fn appendText(buffer: [u8], text: str) {
+    for character in text { buffer.push(character) }
+}
+
+fn generateSource(tokenCount: int) -> str {
+    var buffer: [u8] = []
+    for i in 0..tokenCount {
+        let choice = nextRandom() % 10
+        if choice < 3 {
+            let length = nextRandom() % 8 + 1
+            buffer.push('a' + nextRandom() % 26)
+            for j in 1..length { buffer.push(identifierCharacters.byte(nextRandom() % 37)) }
+        } else if choice == 3 {
+            appendText(buffer, keywords[nextRandom() % 8])
+        } else if choice < 6 {
+            let length = nextRandom() % 6 + 1
+            for j in 0..length { buffer.push('0' + nextRandom() % 10) }
+        } else if choice < 8 {
+            appendText(buffer, operators[nextRandom() % 17])
+        } else if choice == 8 {
+            let length = nextRandom() % 10
+            buffer.push('"')
+            for j in 0..length { buffer.push(identifierCharacters.byte(nextRandom() % 37)) }
+            buffer.push('"')
+        } else {
+            let length = nextRandom() % 12
+            appendText(buffer, "//")
+            for j in 0..length { buffer.push(commentCharacters.byte(nextRandom() % 27)) }
+            buffer.push('\n')
+        }
+        let separator = nextRandom() % 8
+        if separator == 0 { buffer.push('\n') }
+        else if separator == 1 { appendText(buffer, "  ") }
+        else if separator > 2 { buffer.push(' ') }
+    }
+    return buffer as str
+}
+
+fn isLetter(character: int) -> bool {
+    return ('a' <= character and character <= 'z') or ('A' <= character and character <= 'Z') or character == '_'
+}
+
+fn isDigit(character: int) -> bool {
+    return '0' <= character and character <= '9'
+}
+
+fn sliceEquals(source: str, start: int, end: int, word: str) -> bool {
+    if end - start != word.len() { return false }
+    for i in 0..word.len() {
+        if source.byte(start + i) != word.byte(i) { return false }
+    }
+    return true
+}
+
+fn isKeyword(source: str, start: int, end: int) -> bool {
+    for keyword in keywords {
+        if sliceEquals(source, start, end, keyword) { return true }
+    }
+    return false
+}
+
+var lineCount = 0
+var commentCount = 0
+var tokenKinds: [int] = []
+var tokenStarts: [int] = []
+var tokenEnds: [int] = []
+
+fn tokenize(source: str) {
+    let noKinds: [int] = []
+    let noStarts: [int] = []
+    let noEnds: [int] = []
+    tokenKinds = noKinds
+    tokenStarts = noStarts
+    tokenEnds = noEnds
+    let length = source.len()
+    var position = 0
+    while position < length {
+        let character = source.byte(position)
+        if character == ' ' or character == '\t' or character == '\r' {
+            position += 1
+            continue
+        }
+        if character == '\n' {
+            lineCount += 1
+            position += 1
+            continue
+        }
+        let start = position
+        var kind = 4
+        if isLetter(character) {
+            while position < length and (isLetter(source.byte(position)) or isDigit(source.byte(position))) { position += 1 }
+            kind = 0
+        } else if isDigit(character) {
+            while position < length and isDigit(source.byte(position)) { position += 1 }
+            kind = 2
+        } else if character == '"' {
+            position += 1
+            while position < length and source.byte(position) != '"' { position += 1 }
+            if position < length { position += 1 }
+            kind = 3
+        } else if character == '/' and position + 1 < length and source.byte(position + 1) == '/' {
+            while position < length and source.byte(position) != '\n' { position += 1 }
+            commentCount += 1
+            continue
+        } else {
+            position += 1
+            if position < length {
+                let next = source.byte(position)
+                if (next == '=' and (character == '=' or character == '<' or character == '>')) or (character == '-' and next == '>') {
+                    position += 1
+                }
+            }
+        }
+        if kind == 0 and isKeyword(source, start, position) { kind = 1 }
+        tokenKinds.push(kind)
+        tokenStarts.push(start)
+        tokenEnds.push(position)
+    }
+}
+
+var tokenCount = 1000000
+if args().len() > 1 { tokenCount = args()[1] as int }
+let passes = 3
+
+let source = generateSource(tokenCount)
+var checksum = 0
+for pass in 0..passes {
+    lineCount = 0
+    commentCount = 0
+    tokenize(source)
+    var kindCounts = [0, 0, 0, 0, 0]
+    var hash = 0
+    for t in 0..tokenKinds.len() {
+        let kindIndex = tokenKinds[t]
+        kindCounts[kindIndex] += 1
+        hash = hash * 31 + kindIndex
+        for i in tokenStarts[t]..tokenEnds[t] { hash = hash * 131 + source.byte(i) }
+    }
+    checksum = checksum * 31 + tokenKinds.len()
+    for kindTotal in kindCounts { checksum = checksum * 31 + kindTotal }
+    checksum = checksum * 31 + lineCount
+    checksum = checksum * 31 + commentCount
+    checksum = checksum * 31 + hash
+}
+print(source.len(), checksum)

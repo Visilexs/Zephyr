@@ -57,6 +57,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      descriptor-driven runtime paths. Worth ≈ 2.7× on bintrees [M13].
    - **Nullable-pointer optionals** for reference types, no cells (−30% [M13]).
    - **8-byte object header** instead of 24 (−28% [M13]).
+   - **Slices for substrings** and flattened token-like records. lexer: 2.22× →
+     1.56× [M14].
    - **Runtime data structures co-designed with the optimizer:** small strings,
      hashes stored in map slots, a formatter in the fast division domain.
      strings: 1.49× → 1.22× [M7].
@@ -526,6 +528,54 @@ A region on top of those fixes takes it to ~50 ms.
 beats malloc/free C by ~2×** (148 ms against 290 ms). Reference counting is not
 the problem. The generic runtime is.
 
+### M14. lexer: substrings as slices, tokens flattened (cycle 9)
+
+**Profile of -O2 [M]:**
+
+- `tokenize` takes 64% inclusive.
+- Substring copying takes 22%.
+- Allocation takes 24%.
+- **The conservative GC takes 15%.** The token list keeps the heap growing past
+  its target, so collections run.
+
+`research/oracle/lexer_slices.zeph` is the oracle. `Token` is immutable, so
+`[Token]` becomes parallel lists, and `str.sub` returns a (start, end) slice of
+the source instead of a copy. Same checksum [M]:
+
+| Version | Time | Peak RSS | vs C |
+|---|---:|---:|---:|
+| `bench/lexer.zeph`, -O2 | 1.20 s | 274 MB | 2.22 |
+| Slices + SoA tokens | 0.84 s | 248 MB | 1.56 |
+| C | 0.54 s | 65 MB | 1.00 |
+
+**What this means:**
+
+- Substrings as slices (a string view that keeps its parent alive) plus
+  flattening remove the allocation and GC pressure: −30%.
+- The rest is the scanning loop itself. It goes through `source.byte(i)` with a
+  bounds check per byte, and the character tests are calls (`isLetter`,
+  `isDigit`). Bounds-check elimination over monotone indices, and a
+  256-entry class table, are the remaining levers [E].
+- **Slice risk:** a small slice can keep a huge parent alive. The standard
+  mitigation is to copy when the slice is under 1/k of its parent at the moment
+  it is stored into a long-lived container [E].
+
+### M15. Evidence for the interpreter as executable specification (cycle 9)
+
+`git log` on `main` (172 commits, full history) shows about 25 commits about
+the -O2 tier. At least 3 of them fix ownership or reference-count correctness:
+
+- "never sink a string length load past a release"
+- "a local copied from a global owns its value when the region may replace the global"
+- "GC: mark objects through interior pointers"
+
+Parity between tiers is maintained by `tests/optimizer_parity.ps1`,
+`tests/run_parity.ps1` and the macOS JIT/AOT parity script. An IR interpreter
+with checked memory semantics would catch premature frees deterministically,
+which compiled code can silently survive. It would poison freed objects and
+check counts on every access. That makes it a sanitizer and an oracle in one,
+which supports role C6.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -671,3 +721,8 @@ the problem. The generic runtime is.
   - Microbenchmark recipe for M12: `work(a, b)` with a cold 40-statement branch
     (over the 60-node inline limit) and a hot `return a + b`, called in a
     200 M-iteration loop; C uses `__attribute__((noinline))`.
+- **2026-10-01, cycle 9.**
+  - lexer oracle (M14): slices + SoA tokens take it from 2.22× to 1.56× C, and
+    remove GC pressure (15% of time).
+  - Commit history (M15): at least 3 ownership miscompile fixes in about 25
+    -O2 commits, which supports the interpreter-as-sanitizer/oracle role.
