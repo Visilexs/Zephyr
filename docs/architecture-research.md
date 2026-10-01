@@ -149,7 +149,8 @@ go well below 1.0 on multicore machines [M8].
 
 Each step ships behind a flag, and must pass bit-identical parity against the
 current pipeline on every test and on the 19 workloads before the next step
-starts. A gate is the measured number the step must reach. Each is derived from
+starts. It must also pass a differential-fuzzing run of `research/fuzz/` with
+zero unexplained mismatches (M39). A gate is the measured number the step must reach. Each is derived from
 the oracle or prototype that justified the step.
 
 | Step | What | Gate (x86-64 Linux, this VM class) | Basis |
@@ -1280,6 +1281,50 @@ that C's library interface hides. They belong in the new design:
 - **the AXPY kernel:** subsumed by the vectorizer. Its result (0.55×) is the
   vectorizer's gate for matmul.
 
+### M39. Differential fuzzing finds -O2 miscompiles in today's zc (cycle 38)
+
+**Tools:**
+
+- `research/fuzz/genprog.py` generates random, deterministic, panic-free
+  Zephyr programs: functions, loops, wrapping ints, lists, structs, optionals,
+  interpolation and globals mutated inside called functions.
+- `research/fuzz/difftest.py` compiles each at baseline and at -O2 with the
+  same zc and compares the output.
+- `research/fuzz/reduce.py` shrinks a mismatch.
+- `research/fuzz/genref.py` is a second generator aimed at ownership and
+  reference-count patterns.
+
+**Result [M]:** seeds 1000–1599 of `genprog.py` gave **18 mismatches in 600
+programs (3%)**. Every program compiles and exits 0 in both modes; only the
+printed checksums differ. The failing sources are in `research/fuzz/failures/`.
+
+**Seed 1009, reduced** to 20 lines in
+`research/fuzz/repro/loop-exit-global-1009.zeph`:
+
+- baseline prints 13, -O2 prints 12;
+- `for i in 0..1 { acc = i }` stores into the global `acc`;
+- the next statement `acc = acc * 1 + max(…)` reads `acc`.
+
+-O2 computes that read as `lea rbx, [r8 + r9]`, where `r8` is the loop
+counter after its final increment (1), not the last value stored to `acc` (0).
+The forwarded value of the global after the loop is off by one iteration. It
+only reproduces together with a later call that modifies `acc` (`f1(…, f0(1),
+…)`); in simpler programs the read goes back to memory and the result is right.
+
+**Spec gap found at the same time:** `docs/spec.md` does not define evaluation
+order. `acc = acc + bump()`, where `bump` modifies `acc`, gives 101 in both
+modes, meaning `acc` is read after the call. Left-to-right would give 1. Both
+tiers agree, but the language should state the order.
+
+**What this means for the architecture:**
+
+- Random differential testing finds real optimizer bugs at a rate of about 3%
+  of generated programs, on a compiler that passes its own parity suites.
+- That is direct evidence for layer 6, the interpreter as oracle, and for
+  making differential fuzzing part of every step's gate.
+- A third opinion is needed to know which side is wrong when tiers disagree.
+  The spec-level IR interpreter provides it.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1546,3 +1591,9 @@ that C's library interface hides. They belong in the new design:
     sort, map hash tags, the AXPY kernel.
   - All four are kept in the design; matmul's 0.55× becomes the vectorizer's
     gate.
+- **2026-10-01, cycle 38.**
+  - Built random-program differential fuzzing (M39): 18 of 600 programs (3%)
+    print different results at baseline and -O2.
+  - Reduced seed 1009 to 20 lines: after `for i in 0..1 { acc = i }`, -O2 uses
+    the incremented loop counter as the global's value.
+  - Also found that the spec doesn't define evaluation order.

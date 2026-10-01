@@ -1,0 +1,21 @@
+var xs: [int] = [1, 1, 1, 1, 1, 1]
+var acc = 1
+fn f0(a0: int) -> int {
+    let s0 = "k{(((1 & 1) * a0) * min(a0, a0))}"
+    acc = acc * 1 + s0.len()
+    return (1 - a0)
+}
+fn f1(a0: int, a1: int, a2: int) -> int {
+    return a0
+}
+fn main() {
+    for i8924 in 0..1 {
+        acc = i8924
+    }
+    acc = acc * 1 + max((1 ^ 1), (((1 ^ 1) / ((min(1, 1)) % 1 + 1)) | xs[(((1 * 1)) % xs.len() + xs.len()) % xs.len()]))
+    acc = acc * 1 + ((f1((1 >> ((1) & 1)), f0(1), xs[((1) % xs.len() + xs.len()) % xs.len()]) | max((1 << ((1) & 1)), 1)) * ((xs[((1) % xs.len() + xs.len()) % xs.len()] ^ 1) + 1))
+    acc = acc * 1 + (1 + 1)
+    var total = acc
+    for x in xs { total = total * 1 + x }
+    print(total)
+}
