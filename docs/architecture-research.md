@@ -263,9 +263,9 @@ no new syntax.
 | Basis | Geometric mean |
 |---|---:|
 | Today [M] | 1.253 |
-| Every workload at its best **measured** oracle (each one applies a single transformation; untested workloads at today's value) [M] | **0.99** |
+| Every workload at its best **measured** oracle (each one applies a single transformation; untested workloads at today's value) [M] | **0.98** (cycle 68, same-session values) |
 | The same, with vectors at its C-measured SoA + AVX2 bound (0.40) | 0.93 |
-| Measured oracles + C-representation models: wordfreq ≈ 1.0 (M44), dispatch ≈ 1.05 (M45) | **0.94** |
+| Measured oracles + C-representation models: wordfreq ≈ 1.0 (M44), dispatch ≈ 1.05 (M45) | **0.935** |
 | The same, plus the vectors SoA + AVX2 bound | 0.885 |
 
 Per-workload values used in the 0.99 row:
@@ -281,16 +281,16 @@ Per-workload values used in the 0.99 row:
 | cube | 1.15 | today |
 | pi | 0.58 | today |
 | liquid | 1.20 | today |
-| shapes | 1.40 | M11 |
+| shapes | 1.41 | M11, M53 |
 | closures | 1.10 | today |
 | wordfreq | 1.95 | today; M24 inconclusive |
 | nbody | 1.23 | today |
 | lexer | 1.56 | M14 |
 | vectors | 1.24 | M20, hand register allocation |
 | dispatch | 1.43 | M28 |
-| records | 1.01 | M27 |
-| strbuild | 1.45 | M23 |
-| bintrees | 0.29 | M7 |
+| records | 1.05 | M27, M53 |
+| strbuild | 1.29 | M23, M53 |
+| bintrees | 0.28 | M7, M53 |
 
 Combining transformations should compound: for example, register allocation
 plus the lean convention plus header shrinking on the same workload. Those
@@ -1921,6 +1921,26 @@ collections, not at last use. bintrees, same checksum, one core [M]:
   specialized reference counting is within ~1.5× of tracing GC with half its
   memory.
 
+### M53. Every oracle re-timed in one session (cycle 68)
+
+`hyperfine -N`, 6 runs each, core 3, one quiet session
+(`research/results/oracles-same-session.json`) [M]. Ratios are to C in the
+same session:
+
+| Workload | Original -O2 | Oracle(s) | C |
+|---|---|---|---:|
+| bintrees | 770 ms (3.10) | specialized RC 175 ms (0.70); region 70 ms (0.28) | 248 ms |
+| vectors | 694 ms (1.59) | SoA values at top level 764 ms (1.75); **SoA values in a function 542 ms (1.24)** | 436 ms |
+| lexer | 1232 ms (2.35) | slices + SoA tokens 816 ms (1.56) | 524 ms |
+| strbuild | 974 ms (2.01) | slices 852 ms (1.76); **slices + in-place append 625 ms (1.29)** | 485 ms |
+| records | 1326 ms (1.25) | SoA 1117 ms (1.05) | 1061 ms |
+| shapes | 1134 ms (1.90) | flattened 840 ms (1.41) | 596 ms |
+| fib | 1247 ms (1.43) | accumulator 838 ms (0.96) | 870 ms |
+
+All earlier single-session results are confirmed within the noise band.
+strbuild's in-place oracle comes out better than first measured (1.29 against
+1.45).
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2367,3 +2387,7 @@ All rows are bintrees unless noted, same checksum, one core.
     win.
 - **2026-10-01, cycle 67.**
   - Consolidated the memory-management candidates into one table.
+- **2026-10-01, cycle 68.**
+  - Re-timed all oracles in one session (M53); results are consistent.
+  - Projection updated with the same-session values: measured-only ≈ 0.98,
+    with C models ≈ 0.93.
