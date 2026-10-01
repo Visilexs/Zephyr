@@ -1466,6 +1466,7 @@ Seeds 1–500 gave **0 mismatches** [M].
 | `genprog` PURE | 600 | 1 (same class) |
 | `genref` | 400 | 0 |
 | `genext` | 500 | 0 |
+| `genmap` (maps, generics) | 400 | 0 |
 | `genpair` three-way | 400 | 47 departures from left-to-right, almost all in baseline |
 
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
@@ -1872,8 +1873,8 @@ evaluation order. Does an interpreted design prevent that by construction?
   architecture's gains transfer to ARM64? Needs a Windows or Apple Silicon
   host.
 - **Q10.** Are there more miscompile classes? Partly answered: floats,
-  closures and interfaces found 0 in 500 programs (cycle 47). Still uncovered:
-  maps, threads and generics.
+  closures and interfaces found 0 in 500 programs (cycle 47), and maps and
+  generics 0 in 400 (cycle 60). Still uncovered: threads.
 
 ## Assumptions (made instead of asking)
 
@@ -2152,3 +2153,5 @@ evaluation order. Does an interpreted design prevent that by construction?
   - Closures is fully inlined; its gap is about half region placement.
   - Added an "At a glance" summary, since the current-best section had grown
     past a five-minute read.
+- **2026-10-01, cycle 60.**
+  - Map and generics fuzzing (`genmap.py`, 400 programs): 0 mismatches.
