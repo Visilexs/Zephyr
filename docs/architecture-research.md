@@ -576,6 +576,30 @@ which compiled code can silently survive. It would poison freed objects and
 check counts on every access. That makes it a sanitizer and an oracle in one,
 which supports role C6.
 
+### M16. How often immutability inference applies (cycle 10)
+
+`research/immutable_scan.py`, grouped per program (the compiler's files count
+as one program), counts struct types never field-assigned. It is conservative:
+any `.f =` or compound assignment to a field name counts against every struct
+in that program with a field of that name [M].
+
+**Across the repo:** 46 of 62 struct types (74%) are never field-assigned.
+
+| Program | Immutable types | Mutated types |
+|---|---|---|
+| Workloads | vectors `Vec3`, lexer `Token`, all four shapes | nbody `Body` (updated in place), Mandelbrot-style numeric code has no structs |
+| The compiler | 3 of 14: `InlineFrame`, `FunctionSignature`, `Instantiation` | The rest, including `Node`, `Token` and `Operand` |
+
+**What this means:**
+
+- Immutability inference covers the common case in user programs.
+- The compiler itself barely benefits: its speed must come from the flat-IR
+  rewrite (layer 2), not from inference.
+- Mutable records stored in lists (nbody) need a second mechanism: element
+  references represented as (list, index) pairs, so a flattened element can be
+  mutated in place through an alias. This is future work [E]; nbody is already
+  at 1.23× C.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -726,3 +750,6 @@ which supports role C6.
     remove GC pressure (15% of time).
   - Commit history (M15): at least 3 ownership miscompile fixes in about 25
     -O2 commits, which supports the interpreter-as-sanitizer/oracle role.
+- **2026-10-01, cycle 10.**
+  - Immutability scan (M16): 74% of struct types in the repo's programs are
+    never mutated, but only 3 of 14 in the compiler.
