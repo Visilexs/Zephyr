@@ -141,13 +141,15 @@ no new syntax.
   `addr()` exposes addresses (spec §3.6, §4). So flattening must exclude any
   type whose values reach `addr()`, and no moving collector is possible.
 
-**Projected single-core geometric mean vs gcc -O2** (cycle 23 update):
+**Projected single-core geometric mean vs gcc -O2** (cycle 53 update):
 
 | Basis | Geometric mean |
 |---|---:|
 | Today [M] | 1.253 |
 | Every workload at its best **measured** oracle (each one applies a single transformation; untested workloads at today's value) [M] | **0.99** |
 | The same, with vectors at its C-measured SoA + AVX2 bound (0.40) | 0.93 |
+| Measured oracles + C-representation models: wordfreq ≈ 1.0 (M44), dispatch ≈ 1.05 (M45) | **0.94** |
+| The same, plus the vectors SoA + AVX2 bound | 0.885 |
 
 Per-workload values used in the 0.99 row:
 
@@ -214,7 +216,7 @@ step's parity tests run against it as well as against the old pipeline.
 | Self-compile (`zc.zeph`, 19k lines + runtime) | — | 3.14 s baseline, 7.67 s -O2; 256 MB / 471 MB peak RSS | [M] |
 | 40,000 small functions (compilegen 200×200) | — | zc 6.6 s (baseline) / 22.5 s (-O2); tcc 0.063 s; clang -O0 3.5 s; gcc -O2 6.3 s | [M] M32 |
 | Incremental rebuild | < 20 ms | same as a cold build today; ~10–15 ms projected for zc with declaration-level caching | [M] today; [E] projection from M10 |
-| Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle | [M] `research/x86bench.py`; oracles M7–M28 |
+| Single-core geometric mean, -O2 vs gcc -O2 | ≤ 1.0–1.1× | **1.253×** over 19 workloads today; **0.99×** with each workload at its best measured oracle; **0.94×** including C-representation models | [M] `research/x86bench.py`; oracles M7–M45 |
 | Bit-identical output across modes | required | **Not met today:** the 19 workloads match, but 18 of 600 random programs (3%) print different results at baseline and -O2 | [M] M2, M39 |
 | Peak memory vs C | report it | geometric mean 0.66×. Small programs are 0.2–0.5× (static binary, no libc). Allocation-heavy: lexer 4.23×, dispatch 2.26×, shapes 2.20×, bintrees 1.97×, records 1.65×. Oracles: bintrees 19 → 5 MB (region, M7), shapes 205 → 168 MB (flattening, M11) | [M] M37 |
 | Compiler size | report it | 24.4 k hand-written Zephyr lines today: zc.zeph 14.3 k (excluding the 4,980-line generated EMBED), optimizer 7.2 k, runtime 2.9 k; plus ~1 k lines of Python/C for macOS. Proposed design: ~28–33 k lines with native x86 and ARM64 backends, an IR interpreter and the cache, after deleting the baseline generator, text assembler, `arm64.py` and `jit.py`; +15–30% overall | [M] today (section markers); [E] proposed |
@@ -1986,3 +1988,6 @@ Same checksum [M]:
   - dispatch solved (M45): C with Zephyr's cell + header representation takes
     464 ms against Zephyr's 480 ms and plain C's 329 ms.
   - Q7 closed. Interface value = object pointer joins layer 4.
+- **2026-10-01, cycle 53.**
+  - Projection with C-representation models (M44, M45): 0.94× C geometric
+    mean, and 0.885× with the vectors SoA bound.
