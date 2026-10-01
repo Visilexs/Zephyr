@@ -49,6 +49,9 @@ only if the rewritten optimizer costs more than ~2 µs per SSA value.
       magic division, small strings, hashes stored in map slots.
    3. **Regions plus immutable-type flattening:** fewer workloads, but the
       largest single gain (bintrees 3.00× → 0.29× C).
+   4. **Automatic loop parallelism** once SoA values exist: 3.17× on 4 cores
+      [M8], bit-identical output, with a minimum grain of ~5–10 µs per loop
+      invocation.
 6. **An IR interpreter as the executable specification**, not as a tier. It is
    used for differential testing of every optimization, compile-time
    evaluation, and debugging. That is the role in which an interpreter is
@@ -326,6 +329,56 @@ constant −1,500,000,000 (total = −1500 exactly) for any implementation that
 converges, so it barely checks correctness. It should be checked at a smaller
 step count, such as 100 steps, where it is 202,045,867.
 
+### M8. Automatic loop parallelism: overhead and gain (cycle 5)
+
+`research/proto/forkjoin.c` runs the SoA vectors kernel with one fork-join per
+time step, which is exactly what automatic parallelization of the inner loop
+would produce. It uses a spinning pool with a generation counter. 4 vCPUs [M]:
+
+| Threads | Empty parallel-for round trip | Kernel, 35,000 steps | Speedup |
+|---:|---:|---:|---:|
+| 1 | 0.02 µs | 604 ms | 1.00 |
+| 2 | 0.16 µs | 314 ms | 1.92 |
+| 3 | 0.44 µs | 230 ms | 2.63 |
+| 4 | 0.67 µs | 191 ms | **3.17** |
+
+Results are bit-identical to the serial run at 100 steps and at 35,000 steps.
+Splitting by index doesn't change any element's arithmetic order.
+
+**What this means:**
+
+- A spinning pool's round trip is ~0.6 µs. A compiler should parallelize a loop
+  only when its estimated work per invocation is ≥ 5–10 µs [E: 10× overhead],
+  roughly 2,000 iterations of a vectors-sized body.
+- A sleeping pool (futex wake ~5–50 µs [E]) raises that threshold 10–100×.
+  So the runtime should spin briefly before sleeping.
+- **The safety conditions a compiler must prove:**
+  - each iteration writes only element `i` of lists it doesn't read at other
+    indices;
+  - no calls with effects;
+  - lengths are constant in the loop, so bounds checks can be hoisted and the
+    first panic stays deterministic;
+  - no float reduction across iterations;
+  - and the one Zephyr-specific condition: no reference-count traffic on shared
+    objects.
+- Value types and SoA (M7) are what make the last condition hold.
+- Bound for vectors with SoA + AVX2 + 4 threads: ~0.06 s against C's 0.45 s
+  (0.13× C) [E: 0.18 s / 3.17].
+
+### M9. fib: not a calling-convention problem (cycle 5)
+
+gcc -O2 turns one of fib's two recursive calls into a loop that accumulates the
+result: `fib(n) = fib(n−1) + fib(n−2)` becomes a loop over the second call.
+That's legal because integer `+` is associative under wraparound.
+
+- gcc's `fib` contains 4 calls in total. zc self-inlines 4 levels and contains
+  32 [M: `fibc.s` vs zc `-O2` output].
+- The prologues are comparable: gcc pushes 6 registers, zc stores 6 and also
+  realigns the stack.
+- So the 1.46× gap comes from one missing pass, accumulator recursion
+  elimination, not from the convention. It applies to every recursive function
+  of the shape `f(x) = g(f(a), f(b))` with `g` associative.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -447,3 +500,7 @@ step count, such as 100 steps, where it is 202,045,867.
   - Per-workload cost breakdown (M6) reordered the priorities: backend first,
     runtime library second, memory model third.
   - Found that the vectors checksum is degenerate at its benchmark size.
+- **2026-10-01, cycle 5.**
+  - Parallel-loop prototype (M8): 3.17× on 4 vCPUs, bit-identical; 0.6 µs fork-join.
+  - fib's gap comes from one missing pass, accumulator recursion elimination
+    (M9), not from the calling convention.
