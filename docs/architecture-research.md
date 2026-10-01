@@ -1352,6 +1352,48 @@ tiers agree, but the language should state the order.
 - A third opinion is needed to know which side is wrong when tiers disagree.
   The spec-level IR interpreter provides it.
 
+### M40. A three-way oracle: baseline, -O2 and an executable reference (cycle 41)
+
+`research/fuzz/genpair.py` emits each random program twice:
+
+- as Zephyr;
+- as Python with explicitly defined semantics: 64-bit wraparound after every
+  int operation, `/` truncating toward zero, `%` with the dividend's sign,
+  arithmetic `>>`, and strict left-to-right evaluation, including reads of
+  globals before calls further right in the same expression.
+
+`research/fuzz/tritest.py` runs all three and classifies the outcome. This is a
+miniature of layer 6, the interpreter as executable specification.
+
+**The reference itself is validated:** with `PURE=1`, where functions never
+write globals so order can't matter, 60 of 60 programs agree three ways [M].
+
+**Order-sensitive programs, seeds 100–499** [M]:
+
+| Outcome | Programs |
+|---|---:|
+| All three agree | 353 (88%) |
+| **Baseline departs from left-to-right; -O2 follows it** | **39 (9.75%)** |
+| Both tiers agree with each other but not with left-to-right | 6 (1.5%) |
+| All three differ | 2 (0.5%) |
+| -O2 departs; baseline follows | 0 |
+
+**What this means:**
+
+- -O2 almost always evaluates left to right. Baseline often reads a global
+  after a later call in the same expression has changed it.
+- Today's tiers therefore implement different evaluation orders, and the spec
+  doesn't say which is right.
+- **Recommendation:** specify left-to-right in `docs/spec.md`, since it's what
+  -O2 already does in 98% of these programs. Then fix baseline, and the
+  remaining -O2 cases, to match.
+- For the architecture: the executable specification decides such questions
+  once, and both tiers are tested against it.
+
+The 2 "all three differ" seeds are candidates for further miscompiles, such as
+the M39 loop-exit class. Their sources are in
+`research/fuzz/failures/pair-seed*.zeph`, with `.py` references.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1630,3 +1672,9 @@ tiers agree, but the language should state the order.
   - The other reduced mismatches depend on evaluation order (spec gap).
 - **2026-10-01, cycle 40.**
   - Ownership-focused fuzzing (`genref.py`, 400 programs): 0 mismatches.
+- **2026-10-01, cycle 41.**
+  - Three-way oracle (M40) with a Python executable reference, validated
+    60/60 on side-effect-free programs.
+  - On 400 order-sensitive programs: baseline departs from left-to-right in
+    9.75%; -O2 never departs where baseline follows it.
+  - Recommended specifying left-to-right evaluation.
