@@ -3,6 +3,43 @@
 Working document for `GOAL.md`. Every number is marked **[M]** (measured, with
 the tool used) or **[E]** (estimated, with the reasoning). Tools live in `research/`.
 
+## At a glance (cycle 59)
+
+**Verdict:**
+
+- One optimizing native compiler over one flat IR, made cheap by caching every
+  compiled declaration under a hash of its content.
+- An IR interpreter as the executable specification and oracle, **not as an
+  execution tier**.
+- Interpreters run 5–16× slower than native [M4]. Runtime profiles are worth
+  ≤ 5–13% for this language [M25]. A warm cached `zc run` reaches its first
+  instruction in ≈ 3 ms [M17]. So an interpreted or JIT tier has nothing left
+  to win, except cold builds of very large programs (copy-and-patch is kept in
+  reserve for that) [S7, M31].
+
+**Where the speed comes from, measured by oracles:**
+
+| Lever | Example |
+|---|---|
+| Representation: per-type allocation, nullable optionals, 8-byte headers, values flattened into lists, interface value = object pointer, slices, in-place append, regions | bintrees 3.0× → 0.29× C; records 1.25× → 1.01×; wordfreq and dispatch gaps fully explained [M7, M13, M27, M33, M44, M45] |
+| Every function compiled whole, the same analyses everywhere | vectors −32%; removes a 6× placement cliff [M41, M42] |
+| Backend: lean calling convention, accumulator recursion, vectorization | fib 1.46× → 0.95× C [M29] |
+| Automatic parallelism | 3.2–3.9× on 4 cores, bit-identical [M8, M48] |
+
+**Today → projected:**
+
+| Measure | Today | Projected |
+|---|---|---|
+| Geometric mean vs gcc -O2 | 1.253× | 0.94× from measured oracles and C models; lower with SoA/AVX2 |
+| Small-program build | ~300 ms | 5–15 ms |
+| Incremental rebuild of zc | full rebuild | ~10–15 ms |
+
+**Correctness:** differential fuzzing found an -O2 miscompile class, and an
+evaluation-order split between the tiers that the spec leaves open [M39,
+M40]. The spec should state left-to-right evaluation.
+
+**No syntax changes are needed.** The build order with gates is below.
+
 ## Current best architecture
 
 *(Revised every cycle. Cycle 44 state. Each claim cites a measurement.)*
@@ -2111,3 +2148,7 @@ evaluation order. Does an interpreted design prevent that by construction?
     from the interpreter). The fuzzing bugs were in lowering and an
     optimization pass, which neither design derives from the interpreter.
     Verdict unchanged.
+- **2026-10-01, cycle 59.**
+  - Closures is fully inlined; its gap is about half region placement.
+  - Added an "At a glance" summary, since the current-best section had grown
+    past a five-minute read.
