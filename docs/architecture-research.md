@@ -971,6 +971,44 @@ functions it cannot rewrite safely. Applied to the accumulator oracle (M21),
 The two transformations compound, as expected, and fib ends up faster than C.
 This is the first measured combination. The projection now uses 0.95 for fib.
 
+### M30. Lean frames on shapes; what zc's register allocator lacks (cycle 25)
+
+**Negative results [M]:**
+
+| Experiment | Before | After |
+|---|---:|---:|
+| `leanframe.py` on `area`, `perimeter`, `cornerCount` in `shapes_flat` | 794 ms | 798 ms (no change; C 606 ms) |
+| Moving the vectors oracle's top-level loop into `fn main()` | 816 ms | 784 ms (−4%) |
+
+Call overhead does not limit shapes. Its remaining 1.31× sits with memory:
+system time is 81–91 ms against C's 42 ms. In the function version, `main`
+falls back to baseline (`call kind 7`), and its outlined hot loop still reports
+**17 spills over 217 values**.
+
+**The allocator, from `compiler/optimizer.zeph` line 4168:**
+
+- Linear scan over live ranges with holes ("inactive" intervals), phi
+  coalescing, spill costs, and eviction of the cheapest active group.
+- **No interval splitting.** A value is either in one register for its whole
+  life or spilled for its whole life.
+- 14 allocatable XMMs (`xmm2`–`xmm15`). `xmm0` and `xmm1` are reserved as
+  scratch.
+- A value that crosses any call must take a callee-saved register. Under the
+  Win64-style convention that means `xmm6`–`xmm15` only, and the prologue saves
+  all ten of them.
+
+The hand allocation in M20 used splitting-free but two-address-aware reuse
+(computing `pull = offset × f` in place) and freed the scratch registers. That
+was worth −27%.
+
+**Recommendation for layer 3:** linear scan with interval splitting (the
+Wimmer & Franz design used in HotSpot C1), with hints from x86's two-operand
+instructions and a smaller scratch reservation. Reserve the cost of a full
+graph-colouring allocator for hot loops only, if splitting proves insufficient.
+
+The flat prototype's basic linear scan costs 69 ns per value in Zephyr (M4b);
+splitting is estimated at ≤ 2× that [E].
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1181,3 +1219,9 @@ This is the first measured combination. The projection now uses 0.95 for fib.
   - Built `research/leanframe.py`.
   - The accumulator oracle + lean frame gives fib 0.95× C (M29), the first
     measured combination of two transformations.
+- **2026-10-01, cycle 25.**
+  - Lean frames: no gain on shapes. Moving the top-level loop into a function:
+    −4% on vectors.
+  - Characterised zc's allocator (M30): linear scan without splitting, 14 XMMs
+    with 2 reserved, and callee-saved constraints across calls.
+  - Recommended linear scan with splitting and two-address hints.
