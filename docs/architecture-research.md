@@ -1368,6 +1368,21 @@ lists of lists, closures capturing lists, and string-keyed maps. -O2's
 reference-count handling holds up under these patterns. The bugs found are in
 scalar value forwarding, not in ownership.
 
+**Floats, closures and interfaces (cycle 47):** `GEN=genext.py` covers
+bounded float arithmetic, sqrt and division, interface dispatch over three
+implementations, closures capturing values, and float lists. Side-effect free.
+Seeds 1–500 gave **0 mismatches** [M].
+
+**Fuzzing totals:**
+
+| Generator | Programs | Mismatches |
+|---|---:|---:|
+| `genprog` | 600 | 18 (1 miscompile class plus evaluation order) |
+| `genprog` PURE | 600 | 1 (same class) |
+| `genref` | 400 | 0 |
+| `genext` | 500 | 0 |
+| `genpair` three-way | 400 | 47 departures from left-to-right, almost all in baseline |
+
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
 order. `acc = acc + bump()`, where `bump` modifies `acc`, gives 101 in both
 modes, meaning `acc` is read after the call. Left-to-right would give 1. Both
@@ -1583,9 +1598,9 @@ Outputs identical [M]:
 - **Q9.** Do x86-64 Linux numbers transfer to Windows (A2), and do the
   architecture's gains transfer to ARM64? Needs a Windows or Apple Silicon
   host.
-- **Q10.** Are there more miscompile classes? Extend `genprog.py`/`genpair.py`
-  to floats, closures and interfaces, and fix the evaluation order in the spec
-  first so mismatches become unambiguous.
+- **Q10.** Are there more miscompile classes? Partly answered: floats,
+  closures and interfaces found 0 in 500 programs (cycle 47). Still uncovered:
+  maps, threads and generics.
 
 ## Assumptions (made instead of asking)
 
@@ -1813,3 +1828,6 @@ Outputs identical [M]:
   - Wrote down the language changes the architecture needs: none in syntax,
     one spec clarification (left-to-right evaluation), and representation
     changes that programs cannot observe.
+- **2026-10-01, cycle 47.**
+  - Float/closure/interface fuzzing (`genext.py`, 500 programs): 0 mismatches.
+  - Added the fuzzing totals table.
