@@ -42,7 +42,14 @@ only if the rewritten optimizer costs more than ~2 µs per SSA value.
    - Whole-zc optimization would then take 0.4–0.9 s cold, and edits are cached
      at function granularity.
    - The copy-and-patch gate (2 µs) is very likely met, so C3 stays in reserve.
-5. **An IR interpreter as the executable specification**, not as a tier. It is
+5. **Priorities by measured payoff (cycle 4, M6/M7):**
+   1. **Backend quality** decides 11 of 19 workloads: calling convention,
+      register allocation over all GPRs and XMMs, vectorization with SoA.
+   2. **Runtime library co-designed with the optimizer** decides 5: signed
+      magic division, small strings, hashes stored in map slots.
+   3. **Regions plus immutable-type flattening:** fewer workloads, but the
+      largest single gain (bintrees 3.00× → 0.29× C).
+6. **An IR interpreter as the executable specification**, not as a tier. It is
    used for differential testing of every optimization, compile-time
    evaluation, and debugging. That is the role in which an interpreter is
    worth having for Zephyr.
@@ -252,6 +259,73 @@ the ~500 row is the representative one.
   the problem. It comes from heap-object IR, list growth and reference counting
   (M3).
 
+### M6. Where -O2 time goes in each workload (cycle 4)
+
+`research/profile_all.py` profiles each workload with the sampler and groups
+self time by function category [M].
+
+| Dominant cost | Workloads (-O2 / C on x86) | Lever |
+|---|---|---|
+| User code, ≥ 90% | fib 1.46, mandel 0.98, cube 1.15, pi 0.58, liquid 1.20, shapes 1.69, closures 1.10, nbody 1.23, vectors 1.69, dispatch 1.47, records 1.29 | Backend quality: calling convention, register allocation, vectorization, dispatch |
+| Runtime library, 60–91% | strings 1.49, hashmap 0.71, wordfreq 1.95, strbuild 2.19, sort 0.53 | Runtime data structures and their codegen |
+| Allocation + reference counting | bintrees 3.00 (60%), lexer 2.19 (25%) | Regions, flattening, borrow inference |
+
+**Correction:** the conversation that produced `GOAL.md` claimed the memory
+model was the biggest lever. On x86, that is true only for 2 of the 19
+workloads. Backend quality decides 11 of them, and the runtime library 5.
+
+Two labelling notes:
+
+- Optimized whole functions keep their `lm_` names; `zopt_regionN` names are
+  outlined loops. Both are user code.
+- matmul's time sits in the guarded native kernel, which falls outside the
+  categories.
+
+### M7. Oracle rewrites: hand-applied transformations (cycle 4)
+
+Each oracle is the program the proposed optimization would produce, written by
+hand and timed. This bounds the gain without building the optimization.
+
+| Workload | Transformation | -O2 today | Oracle | C | Oracle / C |
+|---|---|---:|---:|---:|---:|
+| bintrees | Region per statement + Node flattened into int arrays (`research/oracle/bintrees_region.zeph`) | 0.80 s, 19 MB | **0.075 s, 5 MB** | 0.259 s | **0.29** |
+| vectors | `Vec3` as values in SoA arrays (`vectors_values.zeph`) | 0.81 s | 0.82 s (no change) | 0.45 s | 1.82 |
+| vectors | The same SoA loop in C at -O2 / -O3 -mavx2 (`vectors_soa.c`): the vectorization bound | | 0.29 s / 0.18 s | 0.45 s | 0.64 / 0.40 |
+| strings | Integer formatter on positive values, so /10 uses the multiply path (scratch runtime copy) | 0.55 s | **0.44 s** | 0.36 s | 1.22 |
+
+**What the oracles show:**
+
+1. **Regions plus flattening are worth 11× on tree workloads** and beat
+   malloc/free C by 3.4×. A tree that dies at the end of its statement is the
+   common pattern: build, consume, drop. Arena allocation is a bump; freeing it
+   is one reset.
+2. **-O2 already scalar-replaces small structs without reference fields** in
+   vectors. The remaining 1.8× gap is that gcc pairs x/y arithmetic into SSE2
+   (`mulpd`, `divpd`) and zc doesn't vectorize. SoA plus 4-wide AVX2 would put
+   Zephyr at 0.40× C.
+   - The inner loop also spills XMM values to the stack while XMM registers are
+     free, and saves all ten callee-saved XMM registers, as the Win64 ABI
+     requires. The allocator doesn't use the full register file well.
+3. **A small runtime fix moved strings 20%.** The optimizer's fast
+   divide-by-constant handles only non-negative values. The runtime's integer
+   formatter deliberately works on negative values (to survive i64 MIN), so
+   every digit took two slow `idiv`s.
+   - Lesson for the architecture: the runtime library has to be co-designed with
+     the optimizer. Signed magic-number division would fix the whole class.
+4. **wordfreq (map runtime 63%):**
+   - The C version builds words in a stack buffer and keeps each key's hash in
+     its table slot.
+   - Zephyr allocates every concatenated word, and every probe follows the key
+     pointer to compare.
+   - Small-string optimization (short strings stored inline in the 64-bit word)
+     and hashes stored in slots are the expected fix [E].
+
+**Benchmark validity issue found:** at its benchmark size (35,000 steps), every
+particle in vectors converges onto the anchor. The checksum is then the
+constant −1,500,000,000 (total = −1500 exactly) for any implementation that
+converges, so it barely checks correctness. It should be checked at a smaller
+step count, such as 100 steps, where it is 202,045,867.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -364,3 +438,12 @@ the ~500 row is the representative one.
     (value types, borrow inference, regions), which are still pure estimates.
   - Plan: measure their upper bound by hand-applying each transformation to the
     worst workloads.
+- **2026-10-01, cycle 4.**
+  - Oracle rewrites (M7):
+    - bintrees with a region plus flattening: 0.29× C;
+    - vectors: allocation is already gone, the remaining gap is vectorization
+      (SoA + AVX2 bound 0.40× C);
+    - strings: formatter fix 1.49× → 1.22× C.
+  - Per-workload cost breakdown (M6) reordered the priorities: backend first,
+    runtime library second, memory model third.
+  - Found that the vectors checksum is degenerate at its benchmark size.

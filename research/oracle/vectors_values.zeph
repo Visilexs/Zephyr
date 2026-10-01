@@ -1,0 +1,80 @@
+// Oracle rewrite of bench/vectors.zeph (revision 398aadd): the code a compiler
+// would produce from immutability inference. Vec3's fields are never assigned
+// after construction and Vec3 is never compared by identity, so it becomes a
+// value. Temporaries are scalarized into locals (registers), and [Vec3] lists
+// are flattened into one float list per field (SoA). The helper calls are
+// inlined, as -O2 already does for small functions. Same arithmetic in the same
+// order, so the checksum is identical.
+
+var rngState = 12345
+
+fn nextRandom() -> int {
+    rngState = rngState * 6364136223846793005 + 1442695040888963407
+    return (rngState >> 33) & 2147483647
+}
+
+fn randomUnit() -> float { return (nextRandom() % 20001 - 10000) as float / 10000.0 }
+
+const particleCount = 4000
+
+var steps = 1000
+if args().len() > 1 { steps = args()[1] as int }
+
+var px: [float] = []
+var py: [float] = []
+var pz: [float] = []
+var vx: [float] = []
+var vy: [float] = []
+var vz: [float] = []
+for i in 0..particleCount {
+    let x = randomUnit()
+    let y = randomUnit()
+    let z = randomUnit()
+    px.push(x)
+    py.push(y)
+    pz.push(z)
+    vx.push(0.0)
+    vy.push(0.0)
+    vz.push(0.0)
+}
+let ax = 0.25
+let ay = -0.5
+let az = 0.125
+
+for step in 0..steps {
+    for i in 0..particleCount {
+        let positionX = px[i]
+        let positionY = py[i]
+        let positionZ = pz[i]
+        let offsetX = ax - positionX
+        let offsetY = ay - positionY
+        let offsetZ = az - positionZ
+        let distanceSquared = offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ + 0.01
+        let factor = 0.001 / distanceSquared
+        let pullX = offsetX * factor
+        let pullY = offsetY * factor
+        let pullZ = offsetZ * factor
+        let velocityX = vx[i]
+        let velocityY = vy[i]
+        let velocityZ = vz[i]
+        let dragX = velocityX * 0.002
+        let dragY = velocityY * 0.002
+        let dragZ = velocityZ * 0.002
+        let newX = velocityX + pullX - dragX
+        let newY = velocityY + pullY - dragY
+        let newZ = velocityZ + pullZ - dragZ
+        vx[i] = newX
+        vy[i] = newY
+        vz[i] = newZ
+        px[i] = positionX + newX * 0.01
+        py[i] = positionY + newY * 0.01
+        pz[i] = positionZ + newZ * 0.01
+    }
+}
+
+var total = 0.0
+for i in 0..particleCount {
+    total += px[i] + 2.0 * py[i] + 3.0 * pz[i]
+    total += vx[i] - vy[i] + vz[i]
+}
+print((total * 1000000.0) as int)

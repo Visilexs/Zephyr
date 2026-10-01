@@ -1,0 +1,58 @@
+// Oracle rewrite of bench/bintrees.zeph (revision 398aadd): the code a compiler
+// would produce with (1) region inference, since each short-lived tree dies at
+// the end of its statement, and (2) flattening Node into parallel int arrays,
+// since Node is never mutated after construction. A node is an index into the
+// arena and -1 is none. Same trees, same checksum.
+
+const minimumDepth = 4
+var leftOf = zeros(1 << 22)
+var rightOf = zeros(1 << 22)
+var top = 0
+
+fn bottomUpTree(depth: int) -> int {
+    let node = top
+    top += 1
+    if depth > 0 {
+        let left = bottomUpTree(depth - 1)
+        let right = bottomUpTree(depth - 1)
+        leftOf[node] = left
+        rightOf[node] = right
+    } else {
+        leftOf[node] = -1
+        rightOf[node] = -1
+    }
+    return node
+}
+
+fn itemCheck(node: int) -> int {
+    var total = 1
+    let left = leftOf[node]
+    if left >= 0 { total += itemCheck(left) }
+    let right = rightOf[node]
+    if right >= 0 { total += itemCheck(right) }
+    return total
+}
+
+var maximumDepth = 16
+if args().len() > 1 { maximumDepth = args()[1] as int }
+if maximumDepth < minimumDepth + 2 { maximumDepth = minimumDepth + 2 }
+
+var mark = top
+var checksum = itemCheck(bottomUpTree(maximumDepth + 1))
+top = mark
+let longLivedTree = bottomUpTree(maximumDepth)
+
+var depth = minimumDepth
+while depth <= maximumDepth {
+    let iterations = 1 << (maximumDepth - depth + minimumDepth)
+    var check = 0
+    mark = top
+    for i in 0..iterations {
+        check += itemCheck(bottomUpTree(depth))
+        top = mark
+    }
+    checksum = checksum * 31 + check
+    depth += 2
+}
+checksum = checksum * 31 + itemCheck(longLivedTree)
+print(checksum)

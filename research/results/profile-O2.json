@@ -1,0 +1,557 @@
+{
+ "fib": {
+  "samples": 3461,
+  "categories": {
+   "user code": 100.0
+  },
+  "top": [
+   [
+    "lm_fib",
+    100.0
+   ]
+  ]
+ },
+ "matmul": {
+  "samples": 1632,
+  "categories": {
+   "other": 96.3,
+   "user code": 3.3,
+   "refcount": 0.4
+  },
+  "top": [
+   [
+    "zephyrMain",
+    96.3
+   ],
+   [
+    "zopt_region184",
+    2.6
+   ],
+   [
+    "zopt_region26",
+    0.5
+   ],
+   [
+    "runtimeRetainReference",
+    0.4
+   ],
+   [
+    "zopt_region185",
+    0.2
+   ]
+  ]
+ },
+ "mandel": {
+  "samples": 1653,
+  "categories": {
+   "user code": 99.9,
+   "other runtime": 0.1
+  },
+  "top": [
+   [
+    "zopt_region184",
+    99.9
+   ],
+   [
+    "runtimePrintTypedValue",
+    0.1
+   ]
+  ]
+ },
+ "sort": {
+  "samples": 761,
+  "categories": {
+   "other runtime": 49.9,
+   "list runtime": 29.7,
+   "user code": 20.4
+  },
+  "top": [
+   [
+    "runtimePartitionInteger",
+    46.8
+   ],
+   [
+    "runtimeListSortInteger",
+    29.7
+   ],
+   [
+    "zopt_region184",
+    10.6
+   ],
+   [
+    "zopt_region185",
+    9.7
+   ],
+   [
+    "runtimeIntrospectiveSortIntegers",
+    3.2
+   ]
+  ]
+ },
+ "strings": {
+  "samples": 1572,
+  "categories": {
+   "string runtime": 87.0,
+   "user code": 11.6,
+   "refcount": 1.4
+  },
+  "top": [
+   [
+    "runtimeAppendStringBuilderInteger",
+    66.4
+   ],
+   [
+    "runtimeAppendInterpolationText",
+    5.9
+   ],
+   [
+    "runtimeEndStringInterpolation",
+    5.3
+   ],
+   [
+    "runtimeGetStringBuilder",
+    3.2
+   ],
+   [
+    "zopt_region157",
+    2.4
+   ],
+   [
+    "runtimeFormatValueIntoBuilder",
+    2.2
+   ]
+  ]
+ },
+ "hashmap": {
+  "samples": 2363,
+  "categories": {
+   "map runtime": 90.5,
+   "user code": 9.4,
+   "alloc": 0.1
+  },
+  "top": [
+   [
+    "runtimeIntegerMapInsert",
+    55.1
+   ],
+   [
+    "runtimeIntegerMapLookup",
+    29.3
+   ],
+   [
+    "runtimeMapSet",
+    5.8
+   ],
+   [
+    "zopt_region185",
+    4.9
+   ],
+   [
+    "zopt_region184",
+    3.7
+   ],
+   [
+    "zopt_region26",
+    0.8
+   ]
+  ]
+ },
+ "cube": {
+  "samples": 1284,
+  "categories": {
+   "user code": 99.9,
+   "refcount": 0.1
+  },
+  "top": [
+   [
+    "lm_render",
+    56.1
+   ],
+   [
+    "lm_draw_line",
+    21.2
+   ],
+   [
+    "zopt_region184",
+    18.6
+   ],
+   [
+    "zopt_region186",
+    2.1
+   ],
+   [
+    "zopt_region185",
+    1.9
+   ],
+   [
+    "runtimeRetainReference",
+    0.1
+   ]
+  ]
+ },
+ "pi": {
+  "samples": 1172,
+  "categories": {
+   "user code": 99.3,
+   "string runtime": 0.6,
+   "alloc": 0.1
+  },
+  "top": [
+   [
+    "lm_arctan_small",
+    99.3
+   ],
+   [
+    "runtimeEmitString",
+    0.5
+   ],
+   [
+    "runtimeAllocateObjectPayload",
+    0.1
+   ],
+   [
+    "runtimeAppendStringBuilderInteger",
+    0.1
+   ]
+  ]
+ },
+ "liquid": {
+  "samples": 3037,
+  "categories": {
+   "user code": 100.0,
+   "alloc": 0.0
+  },
+  "top": [
+   [
+    "lm_neighbours",
+    65.9
+   ],
+   [
+    "lm_viscosity",
+    21.0
+   ],
+   [
+    "lm_relax",
+    11.9
+   ],
+   [
+    "lm_step",
+    0.6
+   ],
+   [
+    "lm_build_grid",
+    0.6
+   ],
+   [
+    "runtimeAllocateObjectPayload",
+    0.0
+   ]
+  ]
+ },
+ "shapes": {
+  "samples": 3096,
+  "categories": {
+   "user code": 90.5,
+   "alloc": 8.1,
+   "list runtime": 1.4
+  },
+  "top": [
+   [
+    "zopt_region187",
+    76.6
+   ],
+   [
+    "runtimeAllocateObjectPayload",
+    5.3
+   ],
+   [
+    "zopt_region26",
+    4.7
+   ],
+   [
+    "zopt_region186",
+    2.0
+   ],
+   [
+    "zopt_region81",
+    1.7
+   ],
+   [
+    "zopt_region29",
+    1.6
+   ]
+  ]
+ },
+ "closures": {
+  "samples": 2003,
+  "categories": {
+   "user code": 96.1,
+   "alloc": 3.8,
+   "list runtime": 0.0,
+   "refcount": 0.0
+  },
+  "top": [
+   [
+    "zopt_region185",
+    91.7
+   ],
+   [
+    "runtimeCarveFreeBlock",
+    3.7
+   ],
+   [
+    "zopt_region81",
+    2.5
+   ],
+   [
+    "zopt_region26",
+    1.4
+   ],
+   [
+    "zopt_region184",
+    0.3
+   ],
+   [
+    "lm_linuxFindStack",
+    0.0
+   ]
+  ]
+ },
+ "wordfreq": {
+  "samples": 3180,
+  "categories": {
+   "map runtime": 62.7,
+   "user code": 24.6,
+   "string runtime": 10.9,
+   "refcount": 1.7,
+   "alloc": 0.1
+  },
+  "top": [
+   [
+    "runtimeFindMapEntry",
+    61.7
+   ],
+   [
+    "runtimeAppendString",
+    10.9
+   ],
+   [
+    "zopt_region184",
+    6.8
+   ],
+   [
+    "zopt_region40",
+    2.5
+   ],
+   [
+    "zopt_region38",
+    2.0
+   ],
+   [
+    "zopt_region45",
+    1.9
+   ]
+  ]
+ },
+ "nbody": {
+  "samples": 1463,
+  "categories": {
+   "user code": 100.0
+  },
+  "top": [
+   [
+    "lm_advance",
+    99.6
+   ],
+   [
+    "lm_energy",
+    0.4
+   ]
+  ]
+ },
+ "lexer": {
+  "samples": 3461,
+  "categories": {
+   "user code": 64.5,
+   "alloc": 14.3,
+   "refcount": 10.8,
+   "string runtime": 10.4
+  },
+  "top": [
+   [
+    "lm_tokenize",
+    22.4
+   ],
+   [
+    "zopt_region184",
+    11.9
+   ],
+   [
+    "zopt_region26",
+    11.0
+   ],
+   [
+    "lm_generateSource",
+    8.4
+   ],
+   [
+    "runtimeReleaseChildReference",
+    8.3
+   ],
+   [
+    "runtimeSubstringFromCheckedBounds",
+    8.0
+   ]
+  ]
+ },
+ "vectors": {
+  "samples": 2089,
+  "categories": {
+   "user code": 100.0
+  },
+  "top": [
+   [
+    "zopt_region185",
+    100.0
+   ],
+   [
+    "zopt_region184",
+    0.0
+   ]
+  ]
+ },
+ "dispatch": {
+  "samples": 1418,
+  "categories": {
+   "user code": 91.4,
+   "alloc": 8.6
+  },
+  "top": [
+   [
+    "zopt_region185",
+    39.2
+   ],
+   [
+    "lm_Clamper__apply",
+    7.1
+   ],
+   [
+    "lm_Divider__apply",
+    6.8
+   ],
+   [
+    "runtimeAllocateObjectPayload",
+    4.8
+   ],
+   [
+    "lm_Multiplier__apply",
+    4.4
+   ],
+   [
+    "lm_AffineMixer__apply",
+    4.2
+   ]
+  ]
+ },
+ "records": {
+  "samples": 3598,
+  "categories": {
+   "user code": 98.6,
+   "alloc": 1.4
+  },
+  "top": [
+   [
+    "zopt_region185",
+    94.4
+   ],
+   [
+    "zopt_region184",
+    3.4
+   ],
+   [
+    "runtimeAllocateObjectPayload",
+    0.9
+   ],
+   [
+    "zopt_region81",
+    0.4
+   ],
+   [
+    "runtimeAllocateDescribedObject",
+    0.3
+   ],
+   [
+    "zopt_region26",
+    0.2
+   ]
+  ]
+ },
+ "strbuild": {
+  "samples": 3070,
+  "categories": {
+   "string runtime": 62.2,
+   "user code": 33.0,
+   "refcount": 4.8
+  },
+  "top": [
+   [
+    "runtimeAppendStringBuilderInteger",
+    24.5
+   ],
+   [
+    "zopt_region184",
+    16.3
+   ],
+   [
+    "runtimeAppendStringBuilderByte",
+    10.2
+   ],
+   [
+    "runtimeSubstringFromCheckedBounds",
+    6.8
+   ],
+   [
+    "runtimeAppendString",
+    5.8
+   ],
+   [
+    "runtimeReleaseReference",
+    4.8
+   ]
+  ]
+ },
+ "bintrees": {
+  "samples": 2291,
+  "categories": {
+   "user code": 40.0,
+   "refcount": 33.1,
+   "alloc": 26.9
+  },
+  "top": [
+   [
+    "runtimeAllocateDescribedObject",
+    25.8
+   ],
+   [
+    "lm_itemCheck",
+    19.6
+   ],
+   [
+    "runtimeReleaseChildReference",
+    18.1
+   ],
+   [
+    "runtimeReleaseObjectChildren",
+    14.9
+   ],
+   [
+    "zopt_region31",
+    7.7
+   ],
+   [
+    "zopt_region35",
+    4.2
+   ]
+  ]
+ }
+}
