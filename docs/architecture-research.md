@@ -1556,6 +1556,7 @@ Seeds 1–500 gave **0 mismatches** [M].
 | `genref` | 400 | 0 |
 | `genext` | 500 | 0 |
 | `genmap` (maps, generics) | 400 | 0 |
+| Repository fixtures (`tests/*.zeph`, `tests/fixtures/basics`, `tests/regression`, thread fixtures), baseline vs -O2 on Linux | 39 | 0 |
 | `genpair` three-way | 400 | 47 departures from left-to-right, almost all in baseline |
 
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
@@ -2095,7 +2096,9 @@ All rows are bintrees unless noted, same checksum, one core.
   host.
 - **Q10.** Are there more miscompile classes? Partly answered: floats,
   closures and interfaces found 0 in 500 programs (cycle 47), and maps and
-  generics 0 in 400 (cycle 60). Still uncovered: threads.
+  generics 0 in 400 (cycle 60). Threads: the two thread fixtures match across
+  tiers (cycle 70), but random thread programs aren't generated, because
+  scheduling makes them nondeterministic.
 
 ## Assumptions (made instead of asking)
 
@@ -2412,3 +2415,7 @@ All rows are bintrees unless noted, same checksum, one core.
 - **2026-10-01, cycle 69.**
   - Consolidated the backend candidates into one table.
   - Deprioritized Q4 (interval splitting) on the strength of M41.
+- **2026-10-01, cycle 70.**
+  - Parity of all 39 repository fixtures, including the threads fixtures:
+    identical at baseline and -O2 on Linux. Random fuzzing finds what the
+    fixtures don't.
