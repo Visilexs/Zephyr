@@ -106,7 +106,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      strings: 1.49× → 1.22× [M7].
 5. **Automatic loop parallelism**, enabled by layer 4 (no reference-count
    traffic on SoA data).
-   - 3.17× on 4 cores, bit-identical [M8].
+   - 3.17× on 4 cores, bit-identical [M8]. Also mandel 3.94×, matmul 3.69×,
+     bintrees 1.76× (allocator contention) [M48].
    - Only for loops with ≥ 5–10 µs of work per invocation.
    - Counts stay non-atomic. Atomic counts are 12× slower and biased ones 1.4×
      [M26], so parallel bodies must provably do no count updates on shared
@@ -1681,6 +1682,36 @@ instruction selection. Even if those double the cost again, the total stays at
 ~0.6–1.1 µs per value: within the 0.7–1.4 µs estimate used in the cycle 2
 evaluation, toward its low end, and below the 2 µs copy-and-patch gate.
 
+### M48. Parallel speedups on more workloads (cycle 56)
+
+The C references get one OpenMP pragma each
+(`research/oracle/parallel/*_omp.c`) on the loop an auto-parallelizer would
+pick:
+
+- mandel's row loop;
+- matmul's `i` loop;
+- bintrees' per-depth iteration loop.
+
+Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
+
+| Workload | Serial | 4 threads | Speedup | Checksum |
+|---|---:|---:|---:|---|
+| mandel | 0.587 s | 0.149 s | **3.94×** | identical |
+| matmul | 1.100 s | 0.299 s | **3.69×** | identical |
+| bintrees | 0.284 s | 0.162 s | 1.76× | identical |
+| vectors (M8, SoA) | 604 ms | 191 ms | 3.17× | identical |
+
+**What this means:**
+
+- Data-parallel kernels scale nearly linearly.
+- bintrees is limited by `malloc` lock contention and its serial phases (the
+  stretch tree and the long-lived tree).
+- In the proposed design, per-thread regions (M7) remove the allocator
+  contention [E].
+- The safety conditions from M8 hold for all three: index-disjoint writes,
+  integer reductions, no shared reference-count traffic. A Zephyr compiler
+  could prove each of them.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2045,3 +2076,6 @@ evaluation, toward its low end, and below the 2 µs copy-and-patch gate.
   - Extended the prototype to 11 passes (M47): 0.18–0.23 µs per value in C,
     ~0.3–0.55 µs projected for Zephyr.
   - The production estimate of 0.7–1.4 µs holds, at its low end.
+- **2026-10-01, cycle 56.**
+  - OpenMP versions of the C references (M48): mandel 3.94×, matmul 3.69×,
+    bintrees 1.76× on 4 cores, all bit-identical.
