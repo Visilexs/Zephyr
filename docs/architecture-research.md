@@ -1311,6 +1311,26 @@ The forwarded value of the global after the loop is off by one iteration. It
 only reproduces together with a later call that modifies `acc` (`f1(…, f0(1),
 …)`); in simpler programs the read goes back to memory and the result is right.
 
+**Classification of the 18 (cycle 39):**
+
+- `PURE=1 genprog.py` makes called functions never assign globals or push to
+  `xs`, so no result can depend on evaluation order. Seeds 1000–1599 in that
+  mode gave **1 mismatch in 600** (seed 1292).
+- Seed 1292, reduced (`research/fuzz/repro/pure-1292.zeph`), shows the same
+  bug as seed 1009: `for i in 0..11 { acc = i }`, then a read of `acc` gives
+  11 at -O2 (the incremented counter) where baseline gives 10.
+- Reduced seeds 1162, 1260 and 1404 (`research/fuzz/repro/min*.zeph`) all have
+  the shape `acc = acc * 1 + (… f0(…) …)` where `f0` assigns `acc`. Their
+  results depend on when the outer `acc` is read relative to the call.
+- **Conclusion:**
+  - one definite miscompile class: a global assigned from the loop counter,
+    forwarded past the loop exit with the post-increment value;
+  - the remaining ~16 mismatches are the two tiers disagreeing on evaluation
+    order, which the spec leaves undefined.
+- Both break the project's parity requirement. The second is fixed by
+  specifying the order (left-to-right is the usual choice) and making both
+  tiers follow it.
+
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
 order. `acc = acc + bump()`, where `bump` modifies `acc`, gives 101 in both
 modes, meaning `acc` is read after the call. Left-to-right would give 1. Both
@@ -1597,3 +1617,7 @@ tiers agree, but the language should state the order.
   - Reduced seed 1009 to 20 lines: after `for i in 0..1 { acc = i }`, -O2 uses
     the incremented loop counter as the global's value.
   - Also found that the spec doesn't define evaluation order.
+- **2026-10-01, cycle 39.**
+  - Side-effect-free fuzzing: 1 mismatch in 600 programs, which reduces to the
+    same loop-exit forwarding bug as seed 1009.
+  - The other reduced mismatches depend on evaluation order (spec gap).

@@ -9,7 +9,12 @@ divisors and list indexes are reduced modulo the length, so no generated
 program can panic.
 Usage: genprog.py SEED > program.zeph
 """
-import random, sys
+import os, random, sys
+
+# PURE=1: functions never assign globals or push to xs, so no expression's
+# value can depend on evaluation order (spec gap, M39); mismatches are then
+# unambiguous miscompiles.
+PURE = os.environ.get('PURE') == '1'
 
 class Gen:
     def __init__(self, seed):
@@ -40,7 +45,7 @@ class Gen:
             return f'(if {a} < {b} {{ {self.intExpr(vars, depth + 1)} }} else {{ {self.intExpr(vars, depth + 1)} }})'
         return f'({a} {op if op != "call" and op != "list" else "+"} {b})'
 
-    def block(self, vars, indent, budget):
+    def block(self, vars, indent, budget, inFunction=False):
         r = self.r; out = []; local = list(vars)
         for _ in range(r.randint(1, budget)):
             k = r.random(); pad = '    ' * indent
@@ -49,32 +54,39 @@ class Gen:
                 out.append(f'{pad}var {v} = {self.intExpr(local)}'); local.append(v)
             elif k < 0.45 and local:
                 v = r.choice([x for x in local if x.startswith('v') or x == 'acc'] or ['acc'])
+                if PURE and inFunction and v == 'acc': continue
                 out.append(f'{pad}{v} = {self.intExpr(local)}')
             elif k < 0.55:
+                if PURE and inFunction: continue
                 out.append(f'{pad}acc = acc * 31 + {self.intExpr(local)}')
             elif k < 0.65 and indent < 4:
                 i = f'i{r.randint(0, 99999)}'
                 out.append(f'{pad}for {i} in 0..{r.randint(1, 12)} {{')
-                out += self.block(local + [i], indent + 1, 3)
+                out += self.block(local + [i], indent + 1, 3, inFunction)
                 out.append(f'{pad}}}')
             elif k < 0.75 and indent < 4:
                 out.append(f'{pad}if {self.intExpr(local)} < {self.intExpr(local)} {{')
-                out += self.block(local, indent + 1, 3)
+                out += self.block(local, indent + 1, 3, inFunction)
                 out.append(f'{pad}}} else {{')
-                out += self.block(local, indent + 1, 2)
+                out += self.block(local, indent + 1, 2, inFunction)
                 out.append(f'{pad}}}')
             elif k < 0.82:
+                if PURE and inFunction: continue
                 out.append(f'{pad}xs[(({self.intExpr(local)}) % xs.len() + xs.len()) % xs.len()] = {self.intExpr(local)}')
             elif k < 0.87:
+                if PURE and inFunction: continue
                 out.append(f'{pad}xs.push({self.intExpr(local)})')
             elif k < 0.92:
                 out.append(f'{pad}let p{len(out)} = Pair{{a: {self.intExpr(local)}, b: {self.intExpr(local)}}}')
+                if PURE and inFunction: out.pop(); continue
                 out.append(f'{pad}acc = acc * 7 + p{len(out) - 1}.a - p{len(out) - 1}.b')
             elif k < 0.96:
                 out.append(f'{pad}let o{len(out)}: int? = if {self.intExpr(local)} < 0 {{ none }} else {{ {self.intExpr(local)} }}')
+                if PURE and inFunction: out.pop(); continue
                 out.append(f'{pad}acc = acc + o{len(out) - 1}.or({self.intExpr(local)})')
             else:
                 out.append(f'{pad}let s{len(out)} = "k{{{self.intExpr(local)}}}"')
+                if PURE and inFunction: out.pop(); continue
                 out.append(f'{pad}acc = acc * 3 + s{len(out) - 1}.len()')
         return out
 
@@ -84,7 +96,7 @@ class Gen:
         for f in range(r.randint(1, 5)):
             arity = r.randint(1, 3); params = [f'a{k}' for k in range(arity)]
             name = f'f{f}'
-            body = self.block(params, 1, 4)
+            body = self.block(params, 1, 4, True)
             lines.append(f'fn {name}({", ".join(p + ": int" for p in params)}) -> int {{')
             lines += body
             lines.append(f'    return {self.intExpr(params)}')

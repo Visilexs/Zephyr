@@ -1,0 +1,26 @@
+var xs: [int] = [1, 1, 1, 1, 1, 1]
+var acc = 1
+fn f0(a0: int, a1: int, a2: int) -> int {
+    if (((a0 % (((a1 * a1)) % 1 + 1)) >> ((((a2 ^ a2) + xs[((1) % xs.len() + xs.len()) % xs.len()])) & 1)) + (((1 - 1) + (a1 << ((a1) & 1))) & ((a1 % ((a0) % 1 + 1)) / ((a0) % 1 + 1)))) < ((a1 >> (((a0 % ((a2) % 1 + 1))) & 1)) + (a0 | (a1 * (a1 * a0)))) {
+    }
+    return (a1 * (max((a0 & a1), 1) * (min(a0, a1) + (a1 ^ a2))))
+}
+fn f2(a0: int) -> int {
+    return min((f0(a0, xs[((a0) % xs.len() + xs.len()) % xs.len()], min(a0, 1)) % (((min(a0, 1) % ((a0) % 1 + 1))) % 1 + 1)), (1 & ((if a0 < 1 { a0 } else { a0 }) & (a0 & 1))))
+}
+fn f3(a0: int, a1: int) -> int {
+    if (((1 << ((a0) & 1)) << (((a1 / ((1) % 1 + 1))) & 1)) + 1) < a1 {
+    }
+    return ((if (1 | a0) < (1 / ((min(1, a1)) % 1 + 1)) { 1 } else { ((1 >> ((1) & 1)) - (1 ^ a1)) }) | (xs[((a0) % xs.len() + xs.len()) % xs.len()] & a1))
+}
+fn main() {
+    for i67082 in 0..11 {
+        acc = i67082
+    }
+    if (1 ^ 1) < 1 {
+    } else {
+        acc = acc * 1 + (1 & f3(f2(1), 1))
+    }
+    var total = acc
+    print(total)
+}
