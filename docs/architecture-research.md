@@ -2009,6 +2009,22 @@ evaluation order. Does an interpreted design prevent that by construction?
 | C5 meta-tracing | Rejected | Recursion and branchy code trace poorly; same warm-up problem as C2 |
 | C6 IR interpreter as executable spec and oracle | **Adopted** in that role | Removes the parity-bug class; required for compile-time evaluation anyway |
 
+### Memory management candidates (consolidated in cycle 67)
+
+All rows are bintrees unless noted, same checksum, one core.
+
+| Candidate | Result | Verdict | Evidence |
+|---|---|---|---|
+| Today's generic reference counting: 24-byte header, optional cells, descriptor-driven release | 739–800 ms, 19 MB | Replace | M7, M33 |
+| Reference counting specialized per type, nullable optionals | 180 ms in Zephyr (0.69× C); C model 148–205 ms | **Adopted as the default** | M13, M33 |
+| + 8-byte header | −28% in the C model | **Adopted** | M13 |
+| + regions where escape analysis proves death at statement or call end | 49–80 ms, 5–6 MB (0.29× C) | **Adopted, guarded by proof** | M7, M43, M50 |
+| Per-thread regions in parallel loops | 2.7× on 4 threads (18 ms) | **Adopted with layer 5** | M48, cycle 57 |
+| Tracing GC (non-moving, generational) | best 124 ms / 19 MB; breaks the spec's peak-memory promise | Rejected | M52 |
+| Atomic reference counts everywhere | 12× per count update | Rejected | M26 |
+| Biased reference counting | 1.4× per count update | Rejected; parallel bodies are proven count-free instead | M26 |
+| Cycle collector always linked | lexer −12.5% without it | **Only when the type graph has cycles**; tracing restricted to cycle-capable types | M36 |
+
 ## Open questions
 
 **Answered:**
@@ -2349,3 +2365,5 @@ evaluation order. Does an interpreted design prevent that by construction?
     specialized RC 148–195 ms / 9.8 MB and regions 49–80 ms / 5.8 MB.
   - Rejected tracing because of the spec's memory promise and because regions
     win.
+- **2026-10-01, cycle 67.**
+  - Consolidated the memory-management candidates into one table.
