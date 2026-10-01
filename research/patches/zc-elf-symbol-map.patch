@@ -1,0 +1,11 @@
+--- compiler/zc.zeph	2026-10-01 01:24:40.181652490 +0000
++++ zc.zeph	2026-10-01 01:51:01.585746493 +0000
+@@ -19146,7 +19146,7 @@
+         assembleLine(assemblyLines[i])
+     }
+     if linuxTargetEnabled { writeElf(path) } else { writePe(path) }
+-    if symbolMapEnabled and not linuxTargetEnabled { writeSymbolMap(path + ".map") }
++    if symbolMapEnabled { writeSymbolMap(path + ".map") }
+     if debugEnabled and not linuxTargetEnabled { writeDebugSymbols(path + ".zdbg") }
+ }
+ 

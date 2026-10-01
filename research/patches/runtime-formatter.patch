@@ -1,0 +1,43 @@
+--- compiler/runtime.zeph	2026-10-01 01:00:34.937568704 +0000
++++ compiler/runtime.zeph	2026-10-01 02:04:53.709051576 +0000
+@@ -2467,24 +2467,35 @@
+         return
+     }
+     let isNegative = value < 0
+-    // work in the non-positive domain so i64 MIN never overflows a negate
++    // Peel the lowest digit in the non-positive domain once, so that i64 MIN
++    // never overflows a negate; the rest runs on a positive value, where
++    // division by 10 compiles to a multiply.
++    var lowDigit = -1
+     var remainingValue = value
+-    if remainingValue > 0 { remainingValue = 0 - remainingValue }
++    if isNegative {
++        lowDigit = 0 - remainingValue % 10
++        remainingValue = 0 - remainingValue / 10
++    }
+     var digitCount = 0
+     var remainingDigits = remainingValue
+-    while remainingDigits < 0 {
++    while remainingDigits > 0 {
+         digitCount += 1
+         remainingDigits = remainingDigits / 10
+     }
+     var total = digitCount
++    if lowDigit >= 0 { total += 1 }
+     if isNegative { total += 1 }
+     let builderAddress = runtimeGetStringBuilder()
+     runtimeEnsureStringBuilderCapacity(builderAddress, total)
+     let buffer = load64(builderAddress)
+     let usedLength = load64(builderAddress + 8)
+     var position = usedLength + total - 1
+-    while remainingValue < 0 {
+-        store8(buffer + position, 48 - remainingValue % 10)      // x%10 is <= 0, so -(x%10) is the digit
++    if lowDigit >= 0 {
++        store8(buffer + position, 48 + lowDigit)
++        position -= 1
++    }
++    while remainingValue > 0 {
++        store8(buffer + position, 48 + remainingValue % 10)
+         position -= 1
+         remainingValue = remainingValue / 10
+     }

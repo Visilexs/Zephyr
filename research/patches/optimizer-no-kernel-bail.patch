@@ -1,0 +1,11 @@
+--- compiler/optimizer.zeph	2026-10-01 01:24:40.177652490 +0000
++++ compiler/optimizer.zeph	2026-10-01 02:46:32.516227561 +0000
+@@ -7021,7 +7021,7 @@
+ fn tryOptimizeFunction(functionIndex: int) -> bool {
+     let functionDefinition = functionDefinitions[functionIndex]
+     if functionDefinition.name == "runtimeCollectGarbage" { return false }
+-    if containsBaselineVectorCandidate(functionDefinition.body) {
++    if false and containsBaselineVectorCandidate(functionDefinition.body) {
+         optimizerNote("function {functionDefinition.name}: baseline (holds a target-native kernel loop)")
+         return false
+     }

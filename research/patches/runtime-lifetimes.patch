@@ -1,0 +1,83 @@
+--- compiler/runtime.zeph	2026-10-01 01:00:34.937568704 +0000
++++ compiler/runtime.zeph	2026-10-01 03:23:01.471942155 +0000
+@@ -497,6 +497,7 @@
+         // nothing inside to release (a string, a buffer): straight back on its free list
+         let size = load64(value - 8) & (0 - 8)
+         store64(value - 8, size | runtimeHeapFlagFree)
++        runtimeLifeDeath(value)
+         runtimePushFreeBlock(value, size)
+         return
+     }
+@@ -554,6 +555,7 @@
+         if descriptor != 0 { runtimeReleaseObjectChildren(object, descriptor) }
+         let size = load64(object - 8) & (0 - 8)
+         store64(object - 8, size | runtimeHeapFlagFree)
++        runtimeLifeDeath(object)
+         runtimePushFreeBlock(object, size)
+     }
+     runtimeUnlockHeap()
+@@ -700,6 +702,36 @@
+ // An object whose payload holds references: `desc` (see runtimeReleaseObjectChildren) says
+ // which words, so dropping it can drop them. Count starts at 1 - the caller
+ // owns the fresh object.
++
++// ---- research instrumentation (scratch copy only): object lifetimes vs frames ----
++var runtimeLifeTable = 0
++var runtimeLifeAllocations = 0
++var runtimeLifeInFrame = 0
++var runtimeLifeEscaped = 0
++fn runtimeLifeBirth(object: int) {
++    if runtimeLifeTable == 0 { runtimeLifeTable = linuxMapMemory(0, runtimeHeapReserve, 3, 16418) }
++    if runtimeLifeTable == 0 { return }
++    let offset = object - runtimeHeapBaseAddress
++    if offset < 0 or offset >= runtimeHeapReserve { return }
++    store64(runtimeLifeTable + (offset & (0 - 8)), stackPointer())
++    runtimeLifeAllocations += 1
++}
++fn runtimeLifeDeath(object: int) {
++    if runtimeLifeTable == 0 { return }
++    let offset = object - runtimeHeapBaseAddress
++    if offset < 0 or offset >= runtimeHeapReserve { return }
++    let slot = runtimeLifeTable + (offset & (0 - 8))
++    let birth = load64(slot)
++    if birth == 0 { return }
++    if stackPointer() <= birth + 512 { runtimeLifeInFrame += 1 } else { runtimeLifeEscaped += 1 }
++    store64(slot, 0)
++}
++fn runtimeLifeCount(which: int) -> int {
++    if which == 0 { return runtimeLifeAllocations }
++    if which == 1 { return runtimeLifeInFrame }
++    return runtimeLifeEscaped
++}
++
+ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
+     if runtimeRegisteredThreadCount == 0 and runtimeHeapInitialized != 0 and size > 0 and size <= 8 * runtimeSmallAllocationClassCount {
+         // a small block its size class can hand back at once
+@@ -712,6 +744,7 @@
+             runtimeZeroMemory(block, need)
+             store64(block - 24, 1)
+             store64(block - 16, descriptor)
++            runtimeLifeBirth(block)
+             return block
+         }
+     }
+@@ -728,7 +761,10 @@
+     var need = (size + 7) & (0 - 8)
+     if need == 0 { need = 8 }
+     let freeBlock = runtimeTakeFreeBlock(need)
+-    if freeBlock != 0 { return freeBlock }
++    if freeBlock != 0 {
++        runtimeLifeBirth(freeBlock)
++        return freeBlock
++    }
+     // free list exhausted and the heap has doubled: collect, then retry.
+     // ponytail: first-fit over one free list; size-segregated lists would let
+     // us collect more often without the O(n) search, but this is correct and
+@@ -773,6 +809,7 @@
+     store64(object - 8, need)
+     runtimeHeapBumpAddress = object + need
+     runtimeSetBitmapBit(runtimeObjectStartBitmap, (object - runtimeHeapBaseAddress) >> 3)
++    runtimeLifeBirth(object)
+     return object                                       // committed pages start zeroed
+ }
+ 

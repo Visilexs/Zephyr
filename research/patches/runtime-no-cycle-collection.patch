@@ -1,0 +1,10 @@
+--- compiler/runtime.zeph	2026-10-01 01:00:34.937568704 +0000
++++ compiler/runtime.zeph	2026-10-01 02:48:09.675784753 +0000
+@@ -343,6 +343,7 @@
+ }
+ 
+ fn runtimeCollectGarbage() {
++    if 1 == 1 { return }   // research: skip cycle collection (valid only for acyclic programs)
+     // ponytail: Linux cannot suspend stacks yet, including the unregistered
+     // main thread. Defer cyclic garbage until all workers are joined; add signal
+     // safepoints if long-lived workers need bounded cyclic-heap growth.
