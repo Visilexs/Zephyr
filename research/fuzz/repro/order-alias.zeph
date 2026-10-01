@@ -1,0 +1,16 @@
+// research/fuzz/repro: field read through an alias (M57). Left-to-right expects 1 1 1
+struct P { a: int }
+var gp = P{a: 1}
+fn mut() -> int { gp.a = 100
+    return 0 }
+fn main() {
+    let q = gp
+    gp.a = 1
+    print(q.a + mut())          // LTR gives 1
+    gp.a = 1
+    var s = q.a + mut()
+    print(s)                    // LTR gives 1
+    gp.a = 1
+    s = q.a + mut()
+    print(s)                    // LTR gives 1
+}

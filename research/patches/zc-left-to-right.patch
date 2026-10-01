@@ -1,0 +1,26 @@
+--- compiler/zc.zeph
++++ compiler/zc.zeph
+@@ -6388,8 +6388,12 @@
+ fn tryChild(parent: Node, index: int) -> bool {
+     let expression = parent.children[index]
+     let expressionKind = expression.nodeKind
++    // research experiment (cycle 83): a later hoisted call may write a global or
++    // a field, so reading one ends the pure prefix (keeps left-to-right order)
++    if expressionKind == nodeIdentifier and expression.auxiliary == identifierKindGlobal { return false }
++    if expressionKind == nodeMember { return false }
+     if expressionKind == nodeInteger or expressionKind == nodeFloat or expressionKind == nodeBoolean or expressionKind == nodeIdentifier { return true }
+-    if expressionKind == nodeNegate or expressionKind == nodeNot or expressionKind == nodeMember { return tryChild(expression, 0) }
++    if expressionKind == nodeNegate or expressionKind == nodeNot { return tryChild(expression, 0) }
+     if expressionKind == nodeCast {
+         if not tryChild(expression, 0) { return false }
+         return expression.auxiliary == castKindNoOperation or expression.auxiliary == castKindIntegerToFloat or expression.auxiliary == castKindTruncate
+@@ -7786,6 +7790,9 @@
+ 
+ fn isLeaf(expression: Node) -> bool {
+     if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindFunction { return false }   // allocates a closure cell
++    // research experiment (cycle 83): a call may write a global, so a global is
++    // never a leaf; right-first shortcuts then can't move its read after a call
++    if expression.nodeKind == nodeIdentifier and expression.auxiliary == identifierKindGlobal { return false }
+     return expression.nodeKind == nodeInteger or expression.nodeKind == nodeFloat or expression.nodeKind == nodeBoolean or expression.nodeKind == nodeIdentifier
+ }
+ 

@@ -2193,6 +2193,49 @@ hyperfine (10 runs, CPU 1), patched vs original:
   of the flat IR, with dominance checked on the store instruction. Global
   store-to-load forwarding is not a lever; correctness comes first here.
 
+### M57. Where evaluation order leaves left-to-right, and a fix (cycle 83)
+
+The spec doesn't fix evaluation order (M39), and genpair found baseline
+leaving left-to-right in 47 of 400 programs (M40). Probes of one expression
+shape each, where a call writes a global `g`, an element `xs[0]` or a field
+(`research/fuzz/repro/order-probe.zeph`, `order-alias.zeph`) [M]:
+
+| Expression | Left-to-right | Baseline | -O2 |
+|---|---:|---:|---:|
+| `print(g + bump())` | 1 | **100** | 1 |
+| `print(bump() + g)` | 100 | 100 | 100 |
+| `two(g, bump())` | 1000 | 1000 | 1000 |
+| `[g, bump()]` | 1 | 1 | 1 |
+| `xs[0] + bumpx()` | 1 | 1 | 1 |
+| `p.a + bumpp()` (global `p`) | 1 | 1 | 1 |
+| `g = g + bump()` | 1 | **100** | **100** |
+| `g += bump()` | 1 | **100** | **100** |
+| `g * 1 + bump()` | 1 | 1 | 1 |
+| `var s = q.a + mut()` (`q` local, aliases global `gp`) | 1 | **100** | **100** |
+
+The tiers even disagree on the first row. Closures capture by value
+(assignment to a captured local is a compile error), so a call can't change a
+caller's local. Only globals and heap fields are exposed.
+
+**Two causes, both in `compiler/zc.zeph` (read-only, found by reading the
+code and confirmed by scratch patches):**
+
+1. **Baseline right-first shortcuts.** `isLeaf` (line 7787) counts every
+   identifier as a leaf. Several emitters evaluate a complex right operand
+   before a leaf left one to avoid a push/pop: the commutative-op shortcut
+   (line 7650), float operands (7337), and others. That is safe for locals,
+   not for globals. Fix: a global identifier is never a leaf.
+2. **Inliner hoisting.** `tryChild` (line 6389) hoists an inlinable call
+   ahead of the statement when everything to its left is a "pure prefix". It
+   counts global reads and field reads (`nodeMember`) as pure. The hoisted
+   body then writes `g` or `gp.a` before the read. This hits both tiers,
+   since inlining happens on the AST before either tier. Fix: a global
+   identifier or a field read ends the pure prefix.
+
+With both fixes (`research/patches/zc-left-to-right.patch`), every probe row
+gives the left-to-right value in both tiers [M]. Fuzz results with both
+patches: FUZZ_PENDING.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2719,3 +2762,9 @@ All rows are bintrees unless noted, same checksum, one core.
     is within σ.
   - Recommended fix for today's compiler: stop forwarding global stores.
   - Lesson: run-to-run noise of ~10% needs σ before attributing any change.
+- **2026-10-01, cycle 83.**
+  - Found the two causes of evaluation-order divergence (M57): baseline
+    right-first shortcuts treat globals as leaves, and the inliner hoists calls
+    past global and field reads.
+  - A scratch patch makes every probe left-to-right in both tiers. Fuzzing
+    with both patches is running.

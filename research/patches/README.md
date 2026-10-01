@@ -16,3 +16,4 @@ next to its own binary.
 | `runtime-probe-count.patch` | M24 (cycle 50) | count string-map probes per lookup |
 | `zc-print-lifetimes.patch` | M50 | print the M43 lifetime counters at the end of the driver |
 | `optimizer-no-global-store-forwarding.patch` | M39 (cycle 81) | a global store starts a new memory epoch instead of being forwarded; confirms the loop-exit miscompile diagnosis |
+| `zc-left-to-right.patch` | M57 (cycle 83) | globals are never leaves, and global or field reads end the inliner's pure prefix: both tiers evaluate left to right |
