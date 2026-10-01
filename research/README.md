@@ -88,4 +88,5 @@ Raw JSON from the runs cited in the document:
 
 - `x86-linux.json` and `x86-linux-rerun.json` (M2, cycle 64);
 - `profile-O2.json` (M6);
-- `oracles-same-session.json` (M53).
+- `oracles-same-session.json` (M53);
+- `store-forwarding-O2-original.json` and `store-forwarding-O2-patched.json` (M56).

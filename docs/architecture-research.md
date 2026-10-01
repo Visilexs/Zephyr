@@ -1578,9 +1578,9 @@ invalidation: seed 1009 printed 8. Results [M]:
   remaining gap is evaluation order, not the miscompile.
 - The other four repros are order-dependent and don't change.
 - `PURE=1` seeds 1000–1599 with the patch: **0 mismatches in 600** [M] (1 without it).
-- The patch is a diagnosis tool, not the fix to ship. It gives up all
-  store-to-load forwarding for globals. Fix (a) keeps that forwarding where
-  it is safe. Its cost was not measured.
+- The patch gives up all store-to-load forwarding for globals. M56 (cycle 82)
+  measured that cost as nil on the 19 workloads, so the patch itself is the
+  fix to recommend for today's compiler.
 
 **Classification of the 18 (cycle 39):**
 
@@ -2151,6 +2151,48 @@ which revives a narrow form of Q4. The prototype has served its purpose:
 backend mechanics plus standard passes reach gcc on loops (cycle 74), and
 recursion depends on inlining combined with good spilling.
 
+### M56. What forwarding global stores is worth (cycle 82)
+
+The cycle 81 patch turns off forwarding of global stores in `numberValues`
+(M39). Before choosing a fix, I measured what that forwarding buys today.
+
+**Code [M]:** the 19 workloads were compiled at -O2 with both compilers and
+the instruction streams compared (`objdump`, addresses normalized):
+
+- Every program changes by a single extra global reload in a shared runtime
+  function. Alignment padding absorbs it, so the layout doesn't move. fib and
+  cube change by 14–16 lines out of ~67k.
+- closures changes by 2 instructions.
+- dispatch adds 17 instructions, all reloads of globals.
+
+**Time [M]:** `x86bench.py --kinds zO2 --runs 3`, both compilers in one
+session: patched / original geomean **1.003**. Per workload it ranged from
+0.90 to 1.09, in both directions. Re-timing the four largest swings with
+hyperfine (10 runs, CPU 1), patched vs original:
+
+| Workload | Original | Patched | Ratio |
+|---|---:|---:|---:|
+| dispatch | 435 ± 42 ms | 423 ± 16 ms | 1.03 ± 0.11 faster |
+| cube | 408 ± 23 ms | 407 ± 20 ms | 1.00 ± 0.08 |
+| closures | 658 ± 28 ms | 614 ± 11 ms | 1.07 ± 0.05 faster |
+| fib | 1140 ± 48 ms | 1118 ± 28 ms | 1.02 ± 0.05 faster |
+
+- The patch has no measurable cost. closures got 7% faster from 2
+  instructions, which is a code-placement effect, not the transformation.
+- On this machine, single-run differences up to ~10% are noise when code
+  barely changes. Changes smaller than that need hyperfine with
+  σ reported (this agrees with M53).
+
+**Consequence:**
+
+- For today's compiler, the safe fix is the patch itself: don't forward
+  global stores, keep the epoch invalidation. It fixes the miscompile
+  (0/600 PURE fuzz, M39) at no measured cost. Fix (a), which is more
+  precise, isn't worth its complexity on this evidence.
+- For the new design: forward global stores only through the effects table
+  of the flat IR, with dominance checked on the store instruction. Global
+  store-to-load forwarding is not a lever; correctness comes first here.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2671,3 +2713,9 @@ All rows are bintrees unless noted, same checksum, one core.
   - Confirmed the diagnosis with a scratch compiler. Disabling global-store
     forwarding (and keeping invalidation) fixes `pure-1292`. The other repros
     differ only by evaluation order. Patch saved in `research/patches/`.
+- **2026-10-01, cycle 82.**
+  - Measured the patch's cost (M56). Code changes by 1–17 global reloads per
+    program, and the geomean is 1.003. On hyperfine re-runs every difference
+    is within σ.
+  - Recommended fix for today's compiler: stop forwarding global stores.
+  - Lesson: run-to-run noise of ~10% needs σ before attributing any change.
