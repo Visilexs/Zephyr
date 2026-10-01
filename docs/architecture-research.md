@@ -116,6 +116,27 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
      per value, or for cold builds of programs above ~100 k lines without a
      shared cache (scenario S7).
 
+### Language changes the architecture needs
+
+**No syntax changes.** Readability is unaffected, and the bootstrap seed needs
+no new syntax.
+
+- **One spec clarification:** expression operands, including reads of globals,
+  are evaluated **left to right**. -O2 already follows this in 98% of
+  order-sensitive cases; baseline doesn't [M40].
+- **Representation changes programs cannot observe:**
+  - **nullable-pointer optionals:** `T?` has no identity or `addr()`;
+  - **an 8-byte header:** sizes and headers are not observable;
+  - **flattened and SoA values:** only for types with no `addr()` use; struct
+    `==` is already structural;
+  - **slices for `str.sub`:** strings are immutable;
+  - **regions:** the spec says freeing time is unobservable, but promises that
+    peak memory tracks the live set, so regions must be per statement or per
+    call, never long-lived.
+- **One place the spec constrains the design:** the heap is non-moving and
+  `addr()` exposes addresses (spec §3.6, §4). So flattening must exclude any
+  type whose values reach `addr()`, and no moving collector is possible.
+
 **Projected single-core geometric mean vs gcc -O2** (cycle 23 update):
 
 | Basis | Geometric mean |
@@ -1788,3 +1809,7 @@ Outputs identical [M]:
     records has no cliff.
   - The cliff is in rebuilding a struct and storing it into a list element.
   - Recommended function-style variants for the benchmark suite.
+- **2026-10-01, cycle 46.**
+  - Wrote down the language changes the architecture needs: none in syntax,
+    one spec clarification (left-to-right evaluation), and representation
+    changes that programs cannot observe.
