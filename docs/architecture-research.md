@@ -1775,6 +1775,26 @@ Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
   (then C3 becomes worthwhile for S3), or a use case where code must run without
   any cache or code generation, such as a read-only sandbox.
 
+**Attack in cycle 58: correctness by construction.** The fuzzing (M39, M40)
+showed today's tiers diverge, through one miscompile class and through
+evaluation order. Does an interpreted design prevent that by construction?
+
+- In C3, copy-and-patch stencils are compiled from the interpreter's handlers.
+  That is a crude first Futamura projection: the interpreter specialized to one
+  program. A stencil tier therefore can't disagree with the interpreter on
+  per-op semantics.
+- In C1, the debug build is the optimizing backend with passes off. It shares
+  the AST → IR lowering with the optimized build. The IR interpreter defines
+  each op's meaning, and tests check both.
+- **What actually diverged in M39/M40:** evaluation order, which is decided in
+  lowering, and value forwarding across a loop exit, which is an optimization
+  pass. Both designs share the lowering. Neither derives optimization passes
+  from the interpreter, so neither prevents pass bugs by construction.
+- **Verdict unchanged.** Per-op correctness by construction is a real but
+  small benefit of C3, because per-op semantics weren't where the bugs were.
+  The oracle plus differential fuzzing is what catches lowering and pass bugs,
+  under either design. Recorded so the attack isn't repeated.
+
 | Candidate | Verdict | Deciding evidence |
 |---|---|---|
 | C1 cached AOT, one optimizing tier | **Adopted** as the execution model | S1, S4, S5 above; M3 |
@@ -2086,3 +2106,8 @@ Integer reductions only, so results stay exact. 4 vCPUs, `hyperfine -N` [M]:
 - **2026-10-01, cycle 57.**
   - Parallel bintrees with per-thread regions: 2.7× on 4 threads (18 ms),
     against 1.76× with malloc. Confirms that regions remove the contention.
+- **2026-10-01, cycle 58.**
+  - Attacked the C1 verdict with correctness by construction (stencils derived
+    from the interpreter). The fuzzing bugs were in lowering and an
+    optimization pass, which neither design derives from the interpreter.
+    Verdict unchanged.
