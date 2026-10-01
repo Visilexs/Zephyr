@@ -1624,7 +1624,7 @@ Seeds 1–500 gave **0 mismatches** [M].
 | `genext` | 500 | 0 |
 | `genmap` (maps, generics) | 400 | 0 |
 | Repository fixtures (`tests/*.zeph`, `tests/fixtures/basics`, `tests/regression`, thread fixtures), baseline vs -O2 on Linux | 39 | 0 |
-| `genpair` three-way | 400 | 47 departures from left-to-right, almost all in baseline |
+| `genpair` three-way | 400 | 47 departures from left-to-right, almost all in baseline; 0 with the M57 + M39 patches |
 
 **Spec gap found at the same time:** `docs/spec.md` does not define evaluation
 order. `acc = acc + bump()`, where `bump` modifies `acc`, gives 101 in both
@@ -2233,8 +2233,22 @@ code and confirmed by scratch patches):**
    identifier or a field read ends the pure prefix.
 
 With both fixes (`research/patches/zc-left-to-right.patch`), every probe row
-gives the left-to-right value in both tiers [M]. Fuzz results with both
-patches: FUZZ_PENDING.
+gives the left-to-right value in both tiers [M].
+
+**Fuzzing with both patches** (this one plus M39's store-forwarding patch) [M]:
+
+| Generator | Before | With both patches |
+|---|---:|---:|
+| `genpair` three-way (`tritest.py 100 400 4`) | 47 departures from left-to-right | **400 / 400 agree** |
+| `genprog` (side effects allowed) | 18 / 600 | **0 / 600** |
+| `genref` | 0 / 400 | 0 / 400 |
+| `genext` | 0 / 500 | 0 / 500 |
+| `genmap` | 0 / 400 | 0 / 400 |
+
+Every divergence the fuzzers found between baseline, -O2 and the
+left-to-right reference has one of these three causes. Two small changes
+remove all of them. The spec should then state left-to-right (operands,
+arguments, then the assignment), so the rule has something to enforce.
 
 ## Candidates evaluated
 
@@ -2767,4 +2781,5 @@ All rows are bintrees unless noted, same checksum, one core.
     right-first shortcuts treat globals as leaves, and the inliner hoists calls
     past global and field reads.
   - A scratch patch makes every probe left-to-right in both tiers. Fuzzing
-    with both patches is running.
+    with both patches: 0 mismatches across all five generators. The three-way
+    test fully agrees (400/400).
