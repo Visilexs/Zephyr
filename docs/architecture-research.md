@@ -2285,6 +2285,46 @@ list base of an index. The inliner fix is the same.
   a list `f` freed). The spec should state this as the one exception:
   "the container of an assignment target is read after the value".
 
+**Targeted patch, verified (cycle 85)** [M]:
+
+- **Fuzzing**, together with M39's store-forwarding patch: tritest 400/400
+  agree, genprog 0/600, genref 0/400, genext 0/500, genmap 0/400. Same as
+  the blunt patch.
+- **Benchmark** (`x86bench.py --kinds z,zO2 --runs 3`): geomean **0.994**
+  baseline, **1.000** -O2.
+- **Re-timed outliers:**
+
+| Workload | Original | Targeted | |
+|---|---:|---:|---|
+| baseline vectors | 27.47 ± 0.13 s | 27.34 ± 0.24 s | 1.00 (the blunt patch's 9% is gone) |
+| -O2 dispatch | 493 ± 30 ms | 499 ± 14 ms | 1.01 ± 0.07 |
+| -O2 records | 1.282 ± 0.06 s | 1.285 ± 0.06 s | 1.00 |
+| baseline records | 2.51 s median | 2.53 s median | 20 interleaved pairs: paired median **1.006**, patched slower in 12/20 |
+
+- Baseline records first read 1.21 (3 runs), then 1.10 ± 0.09 and
+  1.08 ± 0.13 (hyperfine, σ ≈ 9% on this workload). Interleaving the two
+  binaries in pairs removed the drift, and the difference was noise. Its
+  changed code is all in the runtime: register renaming and a 24-byte
+  smaller frame, and the patched functions are 1–4% shorter.
+- `perf` is not usable on this kernel, so instruction counts weren't
+  available.
+- **Method lesson:** when σ is large, interleaved pairs beat back-to-back
+  hyperfine. The machine drifts within a minute.
+
+**Conclusion:** for today's compiler, three small changes give both tiers
+one defined, left-to-right order and remove every divergence the five
+fuzzers find, at no measurable runtime cost:
+
+1. store-forwarding (M39/M56);
+2. the inliner's pure prefix;
+3. `isLeafAfter`.
+
+They add up to about 25 changed lines. For the new design, the same rule
+belongs in the flat IR's effects table: a read of a global or a field may
+not move past an instruction whose effects include writing memory. The
+evaluation order is then a property of IR construction, not of each
+emitter's shortcuts.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2824,3 +2864,9 @@ All rows are bintrees unless noted, same checksum, one core.
   - Wrote a targeted patch: a global stops being a leaf only when the other
     operand makes a call. It also fixes `xs[swap()]` (baseline 100, -O2 1).
     Fuzzing and benchmarking it now.
+- **2026-10-01, cycle 85.**
+  - Targeted order patch verified: 0 mismatches on every fuzzer. Geomean
+    0.994 baseline and 1.000 -O2; the vectors loss is gone.
+  - The baseline records "slowdown" was drift: the interleaved paired median
+    is 1.006.
+  - Three changes, about 25 lines, define the order with no measured cost.
