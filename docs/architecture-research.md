@@ -36,7 +36,11 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
 
 **Correctness:** differential fuzzing found an -O2 miscompile class, and an
 evaluation-order split between the tiers that the spec leaves open [M39,
-M40]. The spec should state left-to-right evaluation.
+M40]. Both are diagnosed. Three scratch patches, about 25 lines in all,
+remove every mismatch across five fuzzers and the three-way reference test,
+at no measured runtime cost [M56, M57]. The spec should state left-to-right
+evaluation, with one exception: the container of an assignment target is
+read after the value.
 
 **No syntax changes are needed.** The build order with gates is below.
 
@@ -155,7 +159,8 @@ M40]. The spec should state left-to-right evaluation.
 6. **The IR interpreter as the executable specification.**
    - A differential-testing oracle for every pass, run with the random program
      generators in `research/fuzz/`. Those found a real -O2 miscompile class
-     and an evaluation-order split between today's tiers [M39, M40].
+     and an evaluation-order split between today's tiers [M39, M40]. Both
+     were traced to their source lines and fixed in scratch [M57].
    - The compile-time evaluator and the debugger.
    - It is not an execution tier. Interpreters run 5–16× slower than native
      [M4], and with caching there is no latency left for a tier to hide [M10].
