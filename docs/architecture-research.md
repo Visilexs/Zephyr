@@ -44,7 +44,9 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - Missing passes, measured or identified:
      - accumulator recursion elimination (fib) [M9];
      - signed magic-number division [M7];
-     - SoA vectorization with alias versioning [M7];
+     - SoA loop vectorization with alias versioning [M7], and straight-line
+       vectorization of paired x/y/z arithmetic, which gcc uses in both vectors
+       and nbody [M7, M18];
      - profile-guided inlining of hot loop bodies [M11].
    - Debug builds are this backend with passes off.
 4. **Representation layer**, using closed-world, whole-program facts:
@@ -622,6 +624,34 @@ compile, and 4 s on macOS. An interpreter tier could save at most the ~0.1 ms
 of code generation inside that 3 ms. Scenario S1 of the cycle 2 evaluation is
 now confirmed with measured components.
 
+### M18. nbody: straight-line vectorization, not aliasing (cycle 12)
+
+**Hypothesis:** body `i`'s velocity is loaded, updated and stored on every
+inner iteration, a chain carried through memory. Instruction samples cluster on
+that `subsd`/`movsd` pair. zc cannot keep the velocity in a register because
+`bodies[j]` might be the same object as `bodies[i]`.
+
+**Test:** `research/oracle/nbody_promoted.zeph` keeps `first.v*` in locals
+across the inner loop. That's legal here, and a compiler would guard it with
+one identity check. Results [M]:
+
+| Version | Time |
+|---|---:|
+| `bench/nbody.zeph`, -O2 | 0.52 s |
+| Scalar promotion oracle | 0.52 s |
+| C | 0.43 s |
+
+**Rejected.** Out-of-order execution hides the store-to-load forwarding chain,
+and the samples were skid from the long-latency `divsd`/`sqrtsd` before it.
+
+gcc's code contains packed `mulpd`, `addpd`, `subpd` and `divpd` (5 + 4 + 2 + 3
+packed ops alongside the scalar ones). It vectorizes x/y pairs within one
+iteration (straight-line vectorization).
+
+**Same finding as vectors (M7).** For float workloads, straight-line pairing of
+independent lanes is the missing backend capability. Loop vectorization over
+SoA is the larger version of the same thing. Both belong in layer 3.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -778,3 +808,7 @@ now confirmed with measured components.
 - **2026-10-01, cycle 11.**
   - Fixed costs of a cached `zc run` (M17): ~3 ms to the first instruction,
     which confirms S1.
+- **2026-10-01, cycle 12.**
+  - nbody: a scalar-promotion oracle gave no gain. The gap is gcc's
+    straight-line vectorization of x/y pairs (M18), the same capability as in
+    vectors.
