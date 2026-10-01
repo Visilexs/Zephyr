@@ -77,6 +77,8 @@ the tool used) or **[E]** (estimated, with the reasoning). Tools live in `resear
    - The compile-time evaluator and the debugger.
    - It is not an execution tier. Interpreters run 5–16× slower than native
      [M4], and with caching there is no latency left for a tier to hide [M10].
+   - Runtime profiles, a JIT's other advantage, are worth ≤ 5–13% at best and
+     −4% on average here [M25]. So profiles stay opt-in.
    - Copy-and-patch from the interpreter's handlers stays in reserve, in case
      the optimizer ever exceeds ~2 µs per value.
 
@@ -815,6 +817,30 @@ are recorded so they aren't repeated:
 construction and map representation". Proposed next step: profile the C
 reference against the model at instruction level before drawing conclusions.
 
+### M25. What profiles are worth: gcc PGO on the 19 C references (cycle 19)
+
+This is a proxy for the value of a JIT's runtime profiles, or of C1's
+persisted profiles. Each program is built with `-fprofile-generate`, trained on
+its own benchmark input, rebuilt with `-fprofile-use`, and timed as the median
+of 3 runs on one core [M]:
+
+| Effect | Workloads (PGO time / plain time) |
+|---|---|
+| Faster | strbuild 0.869, lexer 0.915, bintrees 0.930, sort 0.960, mandel 0.968, shapes 0.977, wordfreq 0.990 |
+| Neutral (±1.5%) | matmul 0.997, records 1.005, fib 1.008, nbody 1.012, dispatch 1.015 |
+| Slower | closures 1.041, liquid 1.045, hashmap 1.033, strings 1.061, pi 1.061, **vectors 1.507**, **cube 1.674** |
+| **Geometric mean** | **1.042 (slower)** |
+
+**What this means:**
+
+- Even with training input identical to the test input, the best case for a
+  profile, profile feedback buys at most ~5–13% on branchy string and
+  allocation code. Elsewhere it does nothing or does harm.
+- For a statically typed, monomorphized language, the information a JIT gathers
+  at runtime is worth little.
+- **That strengthens C1 (cached AOT, no JIT tier).** Persisted profiles should
+  be an opt-in, measured optimization applied per function, never a default.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1000,3 +1026,7 @@ reference against the model at instruction level before drawing conclusions.
     than today's runtime, and the C model didn't reproduce the C reference.
   - Recorded the method lesson: C models for runtime representation, Zephyr
     oracles for compiler transformations.
+- **2026-10-01, cycle 19.**
+  - gcc PGO on the C references (M25): geometric mean 1.042 (slower), best
+    −13%, worst +67%. Profile feedback is a weak lever here, which supports C1
+    further.
