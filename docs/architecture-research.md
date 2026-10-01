@@ -948,6 +948,25 @@ reference against the model at instruction level before drawing conclusions.
 - Next test: count probes per lookup in a scratch runtime and compare with C's
   table.
 
+**Cycle 50: probes per lookup** (`research/patches/runtime-probe-count.patch`,
+14 M words, 69,904 distinct) [M]:
+
+- 14.07 M lookups and 14.93 M probe steps, so **1.06 probes per lookup**.
+- 14.0 M tag hits, so essentially every lookup finds its key at once.
+
+**Probing is near-ideal. Rejected:** probe count and slot-index derivation.
+What's left for Q6:
+
+- **Memory latency:** at 2¹⁸ slots × 24 B ≈ 6 MB plus ~3.5 MB of keys, the
+  table exceeds this core's 2 MB of L2. C's table is 2¹⁸ × 32 B, also outside L2.
+- **Per-lookup overhead:**
+  - the call into `runtimeStringsEqual`;
+  - hashing a string built by 1–4 concatenations, against C's stack buffer;
+  - the concatenations' allocations (`runtimeAppendString`, 11.6%).
+
+The remaining oracle to write: a C model differing from the C reference only
+in string allocation per concatenation.
+
 ### M25. What profiles are worth: gcc PGO on the 19 C references (cycle 19)
 
 This is a proxy for the value of a JIT's runtime profiles, or of C1's
@@ -1897,3 +1916,7 @@ Part of strbuild's "escaped" share is the same artifact.
     (hash tags, 50% load).
   - Two cache-missing loads take 42% of time. Q6 remains open; next is
     counting probes per lookup.
+- **2026-10-01, cycle 50.**
+  - wordfreq probes: 1.06 per lookup, which rejects probing as the cause.
+  - The candidates left are memory latency and per-lookup overheads (string
+    building, comparison call, hashing).

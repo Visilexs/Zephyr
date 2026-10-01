@@ -1,0 +1,32 @@
+--- compiler/runtime.zeph	2026-10-01 01:00:34.937568704 +0000
++++ compiler/runtime.zeph	2026-10-01 03:25:13.273047622 +0000
+@@ -1388,7 +1388,16 @@
+     return runtimeHashMix(0, value)
+ }
+ // slot holding k, or -1
++var runtimeProbeLookups = 0
++var runtimeProbeSteps = 0
++var runtimeProbeTagHits = 0
++fn runtimeProbeCount(which: int) -> int {
++    if which == 0 { return runtimeProbeLookups }
++    if which == 1 { return runtimeProbeSteps }
++    return runtimeProbeTagHits
++}
+ fn runtimeFindGenericMapEntry(mapAddress: int, key: int) -> int {
++    runtimeProbeLookups += 1
+     let capacity = load64(mapAddress + 8)
+     let slots = load64(mapAddress + 16)
+     let hasStringKeys = load64(mapAddress + 24) == 1
+@@ -1396,10 +1405,12 @@
+     let tag = (hash << 1) | 1                          // a live slot's state: its key's hash, odd
+     var index = hash & (capacity - 1)
+     while true {
++        runtimeProbeSteps += 1
+         let slot = slots + index * 24
+         let slotState = load64(slot)
+         if slotState == 0 { return 0 - 1 }
+         if slotState == tag {
++            runtimeProbeTagHits += 1
+             // Expose the string comparison to inlining without the structural dispatch.
+             if hasStringKeys {
+                 if runtimeStringsEqual(load64(slot + 8), key) == 1 { return index }
