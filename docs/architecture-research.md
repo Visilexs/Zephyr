@@ -125,7 +125,9 @@ read after the value.
    - **Mutable records flattened too**, with element references as (list,
      index) pairs. records: 1.25× → 1.01–1.05× C [M27, M53].
    - **Region inference** for structures that die at the end of a statement or
-     call. bintrees: 3.0–3.1× → 0.28–0.29× C [M7, M53]. Tracing GC was
+     call. bintrees: 3.0–3.1× → 0.28–0.29× C [M7, M53]. Regions must be
+     passed into callees that return fresh results: frame-local analysis alone
+     proves ~19% of allocations, regions passed in ~83% [M58]. Tracing GC was
      evaluated as an alternative and rejected: no faster than regions, and it
      breaks the spec's peak-memory promise [M52].
    - **Allocation and release specialized per type** instead of the generic
@@ -2330,6 +2332,78 @@ not move past an instruction whose effects include writing memory. The
 evaluation order is then a property of IR construction, not of each
 emitter's shortcuts.
 
+### M58. What a static escape analysis proves, by analysis level (Q5, cycle 86)
+
+M43 measured that two-thirds to all objects in the allocation-heavy workloads
+"die before their allocating frame returns". This cycle asks how much of that
+a compiler can prove, and with which analysis. Method: the allocation sites
+of the four workloads were classified by hand. Each site's dynamic count was
+derived from the source and checked against M43's measured totals:
+
+- bintrees: 2 × 14,985,902 nodes (each non-root node also has a `Some` box)
+  = 29.97 M, measured 29.9 M;
+- wordfreq: one string per multi-syllable word, 0.75 × 14 M = 10.5 M,
+  measured 10.5 M;
+- 69,904 distinct words, as in cycle 50.
+
+Three analysis levels:
+
+- **L1, Go-style:** intraprocedural and flow-insensitive, plus "parameter
+  does not escape" summaries. An object is frame-local if no path stores it
+  into a global, a field or a list, or returns it.
+- **L2, L1 plus region parameters for fresh results:** the
+  Tofte–Talpin/MLKit idea, cut down. A function whose result graph is
+  entirely freshly allocated takes the caller's region and allocates into
+  it. The caller's region is the statement or loop iteration where the
+  result dies.
+- **L3, L2 plus promotion on escape:** an object in a region that is stored
+  into a longer-lived structure (a map insert) is copied to the heap at that
+  store, with a check that the region doesn't escape otherwise.
+
+| Workload | Allocations [M] | Dominant pattern | L1 | L2 | L3 |
+|---|---:|---|---:|---:|---:|
+| bintrees | 29.9 M | `bottomUpTree` returns a fresh tree, dropped by the caller's statement `itemCheck(bottomUpTree(d))` | **0%** | 99.1% | 99.1% |
+| lexer | 13.0 M | `tokenize` returns a fresh list of fresh `Token`s and substrings, dropped at the end of the caller's pass | **~0%** | ~100% | ~100% |
+| wordfreq | 10.5 M | the word dies at the end of the iteration unless it is a new map key (69,904 times) | **0%** | 0% | 99.3% |
+| strbuild | 16.0 M | substrings and interpolated pieces die in their own frame; `buildLine`'s result dies at the end of the caller's iteration | ~84% [E] | ~100% [E] | ~100% [E] |
+| **All four, by allocation** | 69.4 M | | **~19%** | **~83%** | **~98%** |
+
+Notes:
+
+- bintrees' 0.9% that L2 misses is the long-lived tree, which lives until
+  exit by design.
+- `itemCheck`, `isKeyword`, `keyIndex` and `parseDigits` never capture their
+  parameters, so L1's summaries already handle the call boundaries. The loss
+  at L1 is only the **return**.
+- strbuild's split is estimated: 9 substrings + ~4.5 pieces + ~2.5
+  line/growth allocations per line, out of 16 measured.
+
+**Correction to M43's reading.** bintrees' nodes are allocated in
+`bottomUpTree` and returned, yet M43 counted 99% as "freed in frame". M43's
+512 bytes of slack covers a caller several small frames up, so it measured
+"dies within a few frames of where it was born", not "dies in its own frame".
+That is the right upper bound for L2 regions. It is not an upper bound for
+frame-local (stack) allocation, which these workloads barely use.
+
+**Consequences for the design (layer 4, build step 10):**
+
+- **Stack allocation of non-escaping objects (L1) is not enough.** It
+  captures ~19% of these allocations and none of bintrees, which is the
+  workload regions were chosen for (M7).
+- **Region inference must pass regions into callees for fresh results
+  (L2).** That is the step from ~19% to ~83%. It is interprocedural, but
+  needs only one summary bit per function ("result graph is fresh; allocate
+  it into a region the caller provides") plus the existing non-capture bits.
+  It works with per-declaration caching, because the summary is part of the
+  declaration's interface hash.
+- **Promotion on escape (L3)** covers the "usually dies, sometimes kept"
+  pattern of map keys and interning. It costs one copy per escape (70 k
+  copies against 10.5 M allocations in wordfreq). Use it only where a site
+  dies in ≥ 90% of executions. That needs a profile or a static
+  likely-escape heuristic [E].
+- **Reference counting stays the fallback** for everything else. Regions
+  take objects off the RC path; they don't replace RC.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -2470,10 +2544,12 @@ All rows are bintrees unless noted, same checksum, one core.
   whole-function compilation leaves hot spills. Exception (cycle 77): splitting
   around calls matters for bounded recursive inlining, since whole-lifetime
   spills cancel its gain.
-- **Q5. Mostly answered (cycles 48 and 61, M43, M50):** 66–100% of freed
-  objects in allocation-heavy workloads, and 50–66% of all allocations in the
-  compiler, die before their allocating frame returns. Still open: how much of
-  that a static escape analysis proves.
+- **Q5. Answered (cycles 48, 61 and 86, M43, M50, M58):** in the
+  allocation-heavy workloads, a Go-style frame-local analysis proves ~19% of
+  allocations. Regions passed into callees for fresh results prove ~83%, and
+  promotion on escape ~98%. M43's "in frame" share actually measured "dies
+  within a few frames", so it is the L2 bound. Still open: the same
+  classification for the compiler itself (M50's 50–66%).
 - **Q6. Answered (cycle 51, M44):** wordfreq's gap is entirely
   string building by repeated concatenation. The fix is in-place append.
 - **Q7. Answered (cycle 52, M45):** dispatch's gap is the `{vtable, data}`
@@ -2875,3 +2951,9 @@ All rows are bintrees unless noted, same checksum, one core.
   - The baseline records "slowdown" was drift: the interleaved paired median
     is 1.006.
   - Three changes, about 25 lines, define the order with no measured cost.
+- **2026-10-01, cycle 86.**
+  - Q5: classified the allocation sites of four workloads by analysis level
+    (M58). Frame-local escape analysis proves ~19% of allocations, regions
+    passed into fresh-result callees ~83%, and promotion on escape ~98%.
+  - Corrected M43's reading: its slack counts deaths in nearby callers.
+  - Region inference needs a one-bit "fresh result" summary per function.
