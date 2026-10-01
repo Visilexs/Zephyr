@@ -1777,6 +1777,32 @@ end of the driver. zc built at baseline [M]:
   release (M13, M33), is 1.3–3 s. That matches M3's finding that allocation,
   reference counting and GC are ~43% of the 3.14 s self-compile.
 
+### M51. How good is simple copy-and-patch code? (cycle 62)
+
+`research/proto/stencilcode.c` models stencil code that keeps every value in
+a frame slot: each op loads its operands from the frame and stores its result,
+modelled with a `volatile` frame. Same kernels as M4, same results, one core
+[M]:
+
+| Kernel | Stencil-style | Native gcc -O2 | Interpreter (M4) | zc baseline today, vs C (M2, M4 basis) |
+|---|---:|---:|---:|---:|
+| fib(32) | 15–17 ms (**~4×**) | 3.8–4.3 ms | 14× | ~2.3× |
+| Bounds-checked sum, 50 M | 98–100 ms (**~6.8×**) | 14.5 ms | 19× | — |
+| mandel 600² | 58–64 ms (**~3.4×**) | 17.9 ms | 5.3× | ~1.3× |
+
+**What this means (Q8):**
+
+- Simple stencil code is 2–3× faster than an interpreter, but 1.5–3× slower
+  than zc's current baseline, which keeps values in registers within
+  expressions.
+- Stencils that pass the top values in registers would close part of that
+  [E].
+- Either way, a copy-and-patch tier suits only scenario S7: the first build of
+  a very large program with an empty cache. It should not replace debug builds.
+  The optimizing backend with passes off compiles at similar cost per value
+  and runs faster.
+- **Q8 is closed.** C3 stays in reserve, scoped to S7.
+
 ## Candidates evaluated
 
 ### Cycle 2: execution and tiering architecture
@@ -1890,8 +1916,8 @@ evaluation order. Does an interpreted design prevent that by construction?
 - **Q7. Answered (cycle 52, M45):** dispatch's gap is the `{vtable, data}`
   cell and 24-byte headers. The fix is interface value = object pointer, with
   the vtable through the header.
-- **Q8.** How good is copy-and-patch code compared with today's baseline? This
-  decides whether C3 could replace debug builds.
+- **Q8. Answered (cycle 62, M51):** simple stencil code runs 3.4–6.8× native,
+  slower than today's baseline. C3 is for S7 only.
 - **Q9.** Do x86-64 Linux numbers transfer to Windows (A2), and do the
   architecture's gains transfer to ARM64? Needs a Windows or Apple Silicon
   host.
@@ -2181,3 +2207,7 @@ evaluation order. Does an interpreted design prevent that by construction?
 - **2026-10-01, cycle 61.**
   - Compiler lifetimes (M50): 50–66% of allocations die in their allocating
     frame, ~20% escape and ~25% live until exit.
+- **2026-10-01, cycle 62.**
+  - Stencil-style code quality (M51): 3.4–6.8× native, which is 2–3× better
+    than an interpreter but worse than zc's current baseline.
+  - Q8 closed; C3 is scoped to S7.
