@@ -18,7 +18,7 @@
 // anything the compiler's dup/drop insertion misses: a start bit marks each
 // payload address, which is how a conservatively-scanned word is recognised
 // as a real object pointer. Roots are the machine stack and the globals array.
-let runtimeHeapReserve = 4294967296       // 4 GiB of address space (reserved, not committed)
+let runtimeHeapReserve = 17179869184     // 16 GiB of address space (reserved, not committed)
 let runtimeCommitStep = 4194304           // commit 4 MiB at a time
 let runtimeHeapFlagMarked = 1
 let runtimeHeapFlagFree = 2
@@ -36,6 +36,11 @@ var runtimeBitmapCommittedBytes = 0    // committed bytes in each bitmap
 // allocation O(n) and the compiler 11x slower.
 let runtimeSmallAllocationClassCount = 128     // classes 1..128 => payloads of 8..1024 bytes
 var runtimeFreeListHeads = 0         // array of runtimeSmallAllocationClassCount+1 list heads (off-heap)
+// Free lists are doubly linked; the back pointer lives in an off-heap table
+// (one slot per 8-byte heap word) because a block's payload may be too short
+// to hold it (an 8-byte payload would overflow into the next header).
+var runtimeFreeBackTable = 0
+var runtimeFreeBackTableCommittedBytes = 0
 // Blocks larger than 1 KiB sit in power-of-two bins (bin k: sizes 2^k up to
 // 2^(k+1)), whose heads follow the small classes' in the same off-heap page.
 // Any block in a higher bin fits, so a large allocation never walks more
@@ -59,7 +64,7 @@ var runtimeWorklistCommittedBytes = 0
 var runtimeWorklistCount = 0
 var runtimeHeapInitialized = 0      // 1 once the heap is initialised
 var runtimeUnreleasedObjectCount = 0     // objects the backstop collector found that counting missed
-
+var runtimeSweepInProgress = 0      // 1 while the collector's sweep walks the heap
 fn runtimeSetBitmapBit(base: int, bitIndex: int) {
     let byteAddress = base + (bitIndex >> 3)
     store8(byteAddress, load8(byteAddress) | (1 << (bitIndex & 7)))
@@ -84,15 +89,62 @@ fn runtimeCommitMemory(base: int, byteCount: int) {
 }
 
 fn runtimePushFreeBlock(object: int, size: int) {
-    let sizeClass = size >> 3
-    if sizeClass <= runtimeSmallAllocationClassCount {
-        store64(object, load64(runtimeFreeListHeads + sizeClass * 8))
-        store64(runtimeFreeListHeads + sizeClass * 8, object)
-    } else {
-        let head = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(size) * 8
-        store64(object, load64(head))
-        store64(head, object)
+    // Forward coalesce: absorb the address-adjacent successor if it is free. The
+    // mark-sweep is deferred while worker threads are alive (Linux cannot suspend
+    // stacks), so without this the free pool stays shredded into slivers between
+    // collections and the bump pointer advances past reusable space until the
+    // reservation is full -- a radius-32 scene OOM'd at 4 GiB committed with only
+    // ~300 MiB live. The successor is unlinked from its list first, so no stale
+    // entries are left behind.
+    let next = object + runtimeObjectHeaderBytes + size
+    var mergedSize = size
+    // The sweep walks the heap in address order and re-reads size words after
+    // pushing a run, so coalescing there would extend a word the walk has
+    // already consumed and make it jump over live objects.
+    if runtimeSweepInProgress == 0 and next < runtimeHeapBumpAddress {
+        let nextWord = load64(next - 8)
+        if (nextWord & runtimeHeapFlagFree) != 0 {
+            let nextSize = nextWord & (0 - 8)
+            runtimeUnlinkFreeBlock(next, nextSize)
+            mergedSize = size + runtimeObjectHeaderBytes + nextSize
+            store64(object - 8, mergedSize | runtimeHeapFlagFree)
+            runtimeClearBitmapBit(runtimeObjectStartBitmap, (next - runtimeHeapBaseAddress) >> 3)
+        }
     }
+    // doubly linked: payload [0] = next, [8] = back
+    let sizeClass = mergedSize >> 3
+    var headAddress = 0
+    if sizeClass <= runtimeSmallAllocationClassCount {
+        headAddress = runtimeFreeListHeads + sizeClass * 8
+    } else {
+        headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(mergedSize) * 8
+    }
+    let oldHead = load64(headAddress)
+    store64(object, oldHead)
+    store64(runtimeFreeBackSlot(object), 0)
+    if oldHead != 0 { store64(runtimeFreeBackSlot(oldHead), object) }
+    store64(headAddress, object)
+}
+
+// remove a free block from its list (O(1) through the back-pointer table); used
+// when a forward coalesce absorbs it
+fn runtimeUnlinkFreeBlock(block: int, size: int) {
+    let sizeClass = size >> 3
+    var headAddress = 0
+    if sizeClass <= runtimeSmallAllocationClassCount {
+        headAddress = runtimeFreeListHeads + sizeClass * 8
+    } else {
+        headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(size) * 8
+    }
+    let backSlot = runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)
+    let back = load64(backSlot)
+    let forward = load64(block)
+    if back != 0 { store64(back, forward) } else { store64(headAddress, forward) }
+    if forward != 0 { store64(runtimeFreeBackTable + (((forward - runtimeHeapBaseAddress) >> 3) << 3), back) }
+}
+
+fn runtimeFreeBackSlot(block: int) -> int {
+    return runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)
 }
 
 fn runtimeInitializeHeap() {
@@ -106,6 +158,8 @@ fn runtimeInitializeHeap() {
     runtimeNextCollectionAddress = runtimeHeapBaseAddress + 8388608                   // first collection after 8 MiB of growth
     runtimeObjectStartBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word
     runtimeObjectMarkBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)
+    runtimeFreeBackTable = runtimeReserveMemory(runtimeHeapReserve)          // back pointer per 8-byte word (same span as the heap)
+    runtimeFreeBackTableCommittedBytes = 0
     runtimeBitmapCommittedBytes = 0
     runtimeMarkWorklist = runtimeReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to 16M pending objects
     runtimeWorklistCommittedBytes = 0                         // (reserve is address space only -- free)
@@ -126,6 +180,10 @@ fn runtimeGrowHeap(endAddress: int) {
         runtimeCommitMemory(runtimeObjectStartBitmap, bitmapBytesNeeded)
         runtimeCommitMemory(runtimeObjectMarkBitmap, bitmapBytesNeeded)
         runtimeBitmapCommittedBytes = bitmapBytesNeeded
+    }
+    if want > runtimeFreeBackTableCommittedBytes {
+        runtimeCommitMemory(runtimeFreeBackTable, want)
+        runtimeFreeBackTableCommittedBytes = want
     }
 }
 
@@ -194,6 +252,11 @@ fn runtimeFindObjectStart(bitIndex: int) -> int {
 //
 // Slot layout, 32 bytes: [0] handle  [8] stack base (0 = not yet registered)
 //                        [16] thread id  [24] spare
+let runtimeCacheCountsOffset = 1040
+let runtimeCacheBatchBytes = 16384
+let runtimeCacheClassLimit = 512
+var runtimeThreadCacheSlot = 0 - 1      // TLS index, set when the first thread is registered
+var runtimeThreadCaches = 0             // registry: every cache, linked through [4000]
 let runtimeMaximumThreadCount = 64
 var runtimeThreadRecords = 0
 var runtimeCollectorScratchAddress = 0        // collector's own scratch: runtimeGetScratchPage() is shared
@@ -245,6 +308,7 @@ fn runtimeUnlockHeap() {
 // which matters because its stack base is still 0 too.
 fn runtimeRegisterThread(handle: int, threadId: int) -> int {
     runtimeInitializeThreadRegistry()
+    if runtimeThreadCacheSlot < 0 { runtimeThreadCacheSlot = win("TlsAlloc") }
     let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
     var slotIndex = -1
     var index = 0
@@ -289,6 +353,15 @@ fn runtimeMarkThreadReady() {
 }
 
 fn runtimeMarkThreadDone() {
+    if runtimeThreadCacheSlot >= 0 {
+        // give the blocks back and the cache up: the thread only returns from here on
+        let cache = win("TlsGetValue", runtimeThreadCacheSlot)
+        if cache != 0 {
+            runtimeFlushThreadCache(cache)
+            let tlsResult = win("TlsSetValue", runtimeThreadCacheSlot, 0)
+            store64(cache + 4032, 0)
+        }
+    }
     let currentThreadId = win("GetCurrentThreadId")
     let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
     var index = 0
@@ -347,6 +420,7 @@ fn runtimeCollectGarbage() {
     // main thread. Defer cyclic garbage until all workers are joined; add signal
     // safepoints if long-lived workers need bounded cyclic-heap growth.
     if runtimeUnsuspendableThreadCount != 0 { return }
+    runtimeEmptyThreadCaches()
     // clear marks
     var index = 0
     while index < runtimeBitmapCommittedBytes {
@@ -405,6 +479,7 @@ fn runtimeCollectGarbage() {
     // whether a conservatively scanned word points at one. runtimeTakeFreeBlock's
     // split path already re-sets the bit for any remainder it carves off, so
     // the two stay consistent.
+    runtimeSweepInProgress = 1
     var object = runtimeHeapBaseAddress + runtimeObjectHeaderBytes
     var runStart = 0                                      // payload of the open run, 0 if none
     var runSize = 0
@@ -439,6 +514,7 @@ fn runtimeCollectGarbage() {
         store64(runStart - 8, runSize | runtimeHeapFlagFree)
         runtimePushFreeBlock(runStart, runSize)
     }
+    runtimeSweepInProgress = 0
 }
 
 // ---- reference counting ----
@@ -449,8 +525,96 @@ fn runtimeCollectGarbage() {
 // data section and a closure's env may be 0.
 fn runtimeRetainReference(value: int) -> int {
     if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress { return value }
+    if runtimeRegisteredThreadCount != 0 {
+        if load64(value - 24) < 0 { return value }           // frozen: shared without counting
+        let counted = runtimeAtomicAdd(value - 24, 1)
+        return value
+    }
     store64(value - 24, load64(value - 24) + 1)
     return value
+}
+
+// ---- freezing ----
+// A frozen object's count has the sign bit set: counting skips it (threads read
+// its header without writing it, so shared read-only data does not bounce
+// between cores) and it is never freed by counting -- only the collector can
+// reclaim it once nothing reaches it. freeze(x) (std/thread.zeph) freezes x and
+// everything reachable from it; mutating a frozen structure stays safe.
+fn runtimeFreezeObject(value: int) {
+    let frozenBit = 0 - 9223372036854775807 - 1
+    runtimeLockHeap()
+    runtimePushMarkWorklist(value)
+    while runtimeWorklistCount > 0 {
+        runtimeWorklistCount -= 1
+        let object = load64(runtimeMarkWorklist + runtimeWorklistCount * 8)
+        if object >= runtimeHeapBaseAddress and object < runtimeHeapBumpAddress and load64(object - 24) >= 0 {
+            store64(object - 24, load64(object - 24) | frozenBit)
+            let descriptor = load64(object - 16)
+            if descriptor != 0 {
+                let kind = load64(descriptor)
+                if kind == 1 {
+                    let count = load64(descriptor + 8)
+                    var index = 0
+                    while index < count {
+                        if (load64(descriptor + 16 + (index >> 6) * 8) >> (index & 63)) & 1 == 1 { runtimePushMarkWorklist(load64(object + index * 8)) }
+                        index += 1
+                    }
+                } else if kind == 2 {
+                    let data = load64(object + 16)
+                    if load64(descriptor + 8) == 1 {
+                        var index = 0
+                        while index < load64(object) {
+                            runtimePushMarkWorklist(load64(data + index * 8))
+                            index += 1
+                        }
+                    }
+                    runtimePushMarkWorklist(data)
+                } else if kind == 3 {
+                    let slots = load64(object + 16)
+                    var index = 0
+                    while index < load64(object + 8) {
+                        let slot = slots + index * 24
+                        if (load64(slot) & 1) == 1 {
+                            if load64(descriptor + 8) == 1 { runtimePushMarkWorklist(load64(slot + 8)) }
+                            if load64(descriptor + 16) == 1 { runtimePushMarkWorklist(load64(slot + 16)) }
+                        }
+                        index += 1
+                    }
+                    runtimePushMarkWorklist(slots)
+                }
+            }
+        }
+    }
+    runtimeUnlockHeap()
+}
+
+// ---- atomics ----
+// The x86 back ends never call this: a call to it is emitted in place as
+// `lock xadd` (baseline and -O2 alike). This body is what a target without
+// threads (wasm) runs. Returns the value after adding.
+fn runtimeAtomicAdd(address: int, delta: int) -> int {
+    let updated = load64(address) + delta
+    store64(address, updated)
+    return updated
+}
+
+// Once a second thread exists every count changes atomically. A thread is
+// registered (runtimeRegisteredThreadCount > 0) before it runs, and the count
+// never drops back, so no update can race with a non-atomic one.
+//
+// The -O2 tier's inline release in a program that spawns threads decrements
+// with `lock xadd` itself and, when it took the last count, calls this: the
+// count is already 0, only the freeing is left.
+fn runtimeReleaseLastReference(value: int) {
+    runtimeReleaseObject(value)
+}
+
+// a count of 1 dropped atomically: true when that was the last holder
+fn runtimeAtomicDropIsLast(value: int) -> bool {
+    if load64(value - 24) < 0 { return false }               // frozen
+    let remaining = runtimeAtomicAdd(value - 24, 0 - 1)
+    if remaining < 0 { runtimeFail("reference count underflow") }
+    return remaining == 0
 }
 
 // `*addr = v` for a reference slot: the old holder's count goes away with it.
@@ -461,9 +625,15 @@ fn runtimeAssignReference(address: int, value: int) {
     let oldValue = load64(address)
     store64(address, value)
     if oldValue >= runtimeHeapBaseAddress and oldValue < runtimeHeapBumpAddress {
+        if runtimeRegisteredThreadCount != 0 {
+            if runtimeAtomicDropIsLast(oldValue) { runtimeReleaseObject(oldValue) }
+            return
+        }
         let referenceCount = load64(oldValue - 24)
         if referenceCount > 1 {
             store64(oldValue - 24, referenceCount - 1)
+        } else if referenceCount < 0 {
+            return                                          // frozen
         } else {
             if referenceCount < 1 { runtimeFail("reference count underflow") }
             store64(oldValue - 24, 0)
@@ -486,11 +656,16 @@ fn runtimeMapValueIsReference(mapAddress: int) -> int {
 
 fn runtimeReleaseReference(value: int) {
     if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress { return }
+    if runtimeRegisteredThreadCount != 0 {
+        if runtimeAtomicDropIsLast(value) { runtimeReleaseLastReference(value) }
+        return
+    }
     let referenceCount = load64(value - 24)
     if referenceCount > 1 {
         store64(value - 24, referenceCount - 1)
         return
     }
+    if referenceCount < 0 { return }                        // frozen
     if referenceCount < 1 { runtimeFail("reference count underflow") }
     store64(value - 24, 0)
     if load64(value - 16) == 0 and runtimeRegisteredThreadCount == 0 {
@@ -512,10 +687,14 @@ fn runtimeReleaseFrameSlots(framePointer: int, slotOffsetTable: int, slotCount: 
     var index = 0
     while index < slotCount {
         let value = load64(framePointer - load64(slotOffsetTable + index * 8))
-        if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress {
+        if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress and runtimeRegisteredThreadCount != 0 {
+            if runtimeAtomicDropIsLast(value) { runtimeReleaseObject(value) }
+        } else if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress {
             let referenceCount = load64(value - 24)
             if referenceCount > 1 {
                 store64(value - 24, referenceCount - 1)
+            } else if referenceCount < 0 {
+                index += 0                                  // frozen
             } else {
                 if referenceCount < 1 { runtimeFail("reference count underflow") }
                 store64(value - 24, 0)
@@ -531,11 +710,19 @@ fn runtimeReleaseFrameSlots(framePointer: int, slotOffsetTable: int, slotCount: 
 // million-element linked structure from overflowing the stack.
 fn runtimeReleaseChildReference(childAddress: int) {
     if childAddress < runtimeHeapBaseAddress or childAddress >= runtimeHeapBumpAddress { return }
+    if runtimeRegisteredThreadCount != 0 {
+        if runtimeAtomicDropIsLast(childAddress) {
+            if runtimeThreadCacheSlot >= 0 { runtimeThreadWorklistPush(runtimeThreadCache(), childAddress) }
+            else { runtimePushMarkWorklist(childAddress) }
+        }
+        return
+    }
     let referenceCount = load64(childAddress - 24)
     if referenceCount > 1 {
         store64(childAddress - 24, referenceCount - 1)
         return
     }
+    if referenceCount < 0 { return }                        // frozen
     if referenceCount < 1 { runtimeFail("reference count underflow") }
     store64(childAddress - 24, 0)
     runtimePushMarkWorklist(childAddress)
@@ -545,6 +732,10 @@ fn runtimeReleaseChildReference(childAddress: int) {
 // collector's worklist; the two never run at once because the collector is only
 // ever entered from allocation, which release never performs.
 fn runtimeReleaseObject(value: int) {
+    if runtimeRegisteredThreadCount != 0 and runtimeThreadCacheSlot >= 0 {
+        runtimeReleaseObjectThreaded(value)
+        return
+    }
     runtimeLockHeap()
     runtimePushMarkWorklist(value)
     while runtimeWorklistCount > 0 {
@@ -595,8 +786,12 @@ fn runtimeReleaseObjectChildren(object: int, descriptor: int) {
         while index < capacity {
             let slot = slots + index * 24
             if (load64(slot) & 1) == 1 {
-                if mapKeyIsReference == 1 { runtimeReleaseChildReference(load64(slot + 8)) }
-                if mapValueIsReference == 1 { runtimeReleaseChildReference(load64(slot + 16)) }
+                if mapKeyIsReference == 1 {
+                runtimeReleaseChildReference(load64(slot + 8))
+            }
+                if mapValueIsReference == 1 {
+                runtimeReleaseChildReference(load64(slot + 16))
+            }
             }
             index += 1
         }
@@ -646,7 +841,9 @@ fn runtimeTakeFreeBlock(need: int) -> int {
     if sizeClass <= runtimeSmallAllocationClassCount {
         let head = load64(runtimeFreeListHeads + sizeClass * 8)
         if head == 0 { return 0 }
-        store64(runtimeFreeListHeads + sizeClass * 8, load64(head))        // pop
+        let headNext = load64(head)
+        store64(runtimeFreeListHeads + sizeClass * 8, headNext)        // pop
+        if headNext != 0 { store64(runtimeFreeBackSlot(headNext), 0) }
         store64(head - 8, need)                      // live again, flags cleared
         runtimeZeroMemory(head, need)
         return head
@@ -664,6 +861,7 @@ fn runtimeTakeFreeBlock(need: int) -> int {
             let nextBlock = load64(current)
             if size >= need {
                 if previous == 0 { store64(head, nextBlock) } else { store64(previous, nextBlock) }
+                if nextBlock != 0 { store64(runtimeFreeBackSlot(nextBlock), previous) }
                 return runtimeCarveFreeBlock(current, size, need)
             }
             probes += 1
@@ -707,7 +905,9 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
         let listHead = runtimeFreeListHeads + need            // class need / 8, 8 bytes a head
         let block = load64(listHead)
         if block != 0 {
-            store64(listHead, load64(block))
+            let blockNext = load64(block)
+            store64(listHead, blockNext)
+            if blockNext != 0 { store64(runtimeFreeBackSlot(blockNext), 0) }
             store64(block - 8, need)                          // live again, flags cleared
             runtimeZeroMemory(block, need)
             store64(block - 24, 1)
@@ -715,12 +915,180 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
             return block
         }
     }
+    if runtimeRegisteredThreadCount != 0 and runtimeThreadCacheSlot >= 0 and size > 0 and size <= 8 * runtimeSmallAllocationClassCount {
+        // a thread's own exact-size lists: no lock unless they run dry
+        let need = (size + 7) & (0 - 8)
+        let cache = runtimeThreadCache()
+        var block = load64(cache + need)
+        if block == 0 {
+            runtimeRefillThreadCache(cache, need)
+            block = load64(cache + need)
+        }
+        store64(cache + need, load64(block))
+        store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) - 1)
+        store64(block - 8, need)
+        runtimeZeroMemory(block, need)
+        store64(block - 24, 1)
+        store64(block - 16, descriptor)
+        return block
+    }
     runtimeLockHeap()
     let result = runtimeAllocateObjectPayload(size)
     store64(result - 24, 1)
     store64(result - 16, descriptor)
     runtimeUnlockHeap()
     return result
+}
+
+// ---- per-thread allocation caches ----
+// Once threads exist, every thread allocates small blocks from its own
+// exact-size free lists and frees into them, so allocation-heavy parallel code
+// does not serialize on the heap lock. A cache refills a class in batches
+// under the lock and gives half back when a class grows long. Off-heap,
+// 8 KiB per thread:
+//   [0 .. 1032)    list heads, indexed by size (class * 8 == size)
+//   [1040 .. 2072) block count per class
+//   [4000] next cache in the registry   [4008] worklist   [4016] count   [4024] capacity
+//   [4032] 1 while a thread owns it
+// The collector only runs with no workers alive, and empties every cache first
+// (the sweep rebuilds the global lists from free-flagged blocks anyway).
+
+fn runtimeThreadCache() -> int {
+    let cache = win("TlsGetValue", runtimeThreadCacheSlot)
+    if cache != 0 { return cache }
+    // a cache a finished thread gave up, else a new one
+    runtimeLockHeap()
+    var created = runtimeThreadCaches
+    while created != 0 and load64(created + 4032) != 0 { created = load64(created + 4000) }
+    if created == 0 {
+        created = win("VirtualAlloc", 0, 8192, 12288, 4)
+        if created == 0 { runtimeFail("out of memory (thread cache)") }
+        store64(created + 4000, runtimeThreadCaches)
+        runtimeThreadCaches = created
+    }
+    store64(created + 4032, 1)                     // in use
+    runtimeUnlockHeap()
+    let tlsResult = win("TlsSetValue", runtimeThreadCacheSlot, created)
+    return created
+}
+
+// a batch of `need`-byte blocks for the cache, under the heap lock
+fn runtimeRefillThreadCache(cache: int, need: int) {
+    var count = runtimeCacheBatchBytes / (need + runtimeObjectHeaderBytes)
+    if count < 4 { count = 4 }
+    if count > 64 { count = 64 }
+    runtimeLockHeap()
+    var index = 0
+    while index < count {
+        let block = runtimeAllocateObjectPayload(need)
+        store64(block - 8, need)     // no FREE flag while cached (see runtimeCacheFreeBlock)
+        store64(block, load64(cache + need))
+        store64(cache + need, block)
+        index += 1
+    }
+    store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) + count)
+    runtimeUnlockHeap()
+}
+
+// a freed small block onto this thread's list; a long list gives half back
+fn runtimeCacheFreeBlock(cache: int, object: int, size: int) {
+    // no FREE flag while cached: coalesce must not absorb a cached successor
+    // (it is not on the shared free lists, so its back-pointer slot is stale)
+    store64(object - 8, size)
+    store64(object, load64(cache + size))
+    store64(cache + size, object)
+    let count = load64(cache + runtimeCacheCountsOffset + size) + 1
+    store64(cache + runtimeCacheCountsOffset + size, count)
+    if count > runtimeCacheClassLimit {
+        runtimeLockHeap()
+        var index = 0
+        while index < runtimeCacheClassLimit / 2 {
+            let block = load64(cache + size)
+            store64(cache + size, load64(block))
+            store64(block - 8, size | runtimeHeapFlagFree)
+            runtimePushFreeBlock(block, size)
+            index += 1
+        }
+        store64(cache + runtimeCacheCountsOffset + size, count - runtimeCacheClassLimit / 2)
+        runtimeUnlockHeap()
+    }
+}
+
+fn runtimeThreadWorklistPush(cache: int, object: int) {
+    var count = load64(cache + 4016)
+    var capacity = load64(cache + 4024)
+    if count >= capacity {
+        var grown = capacity * 2
+        if grown < 512 { grown = 512 }
+        let list = win("VirtualAlloc", 0, grown * 8, 12288, 4)
+        if list == 0 { runtimeFail("out of memory (release worklist)") }
+        let old = load64(cache + 4008)
+        if old != 0 {
+            runtimeCopyMemory(list, old, count * 8)
+            let released = win("VirtualFree", old, 0, 32768)
+        }
+        store64(cache + 4008, list)
+        store64(cache + 4024, grown)
+    }
+    store64(load64(cache + 4008) + count * 8, object)
+    store64(cache + 4016, count + 1)
+}
+
+// runtimeReleaseObject once threads exist: this thread's worklist and cache, no lock for small blocks
+fn runtimeReleaseObjectThreaded(value: int) {
+    let cache = runtimeThreadCache()
+    runtimeThreadWorklistPush(cache, value)
+    var count = load64(cache + 4016)
+    while count > 0 {
+        count -= 1
+        store64(cache + 4016, count)
+        let object = load64(load64(cache + 4008) + count * 8)
+        let descriptor = load64(object - 16)
+        if descriptor != 0 { runtimeReleaseObjectChildren(object, descriptor) }
+        let size = load64(object - 8) & (0 - 8)
+        if size > 0 and size <= 8 * runtimeSmallAllocationClassCount {
+            runtimeCacheFreeBlock(cache, object, size)
+        } else {
+            runtimeLockHeap()
+            store64(object - 8, size | runtimeHeapFlagFree)
+            runtimePushFreeBlock(object, size)
+            runtimeUnlockHeap()
+        }
+        count = load64(cache + 4016)
+    }
+}
+
+// a finished thread's blocks go back to the global lists
+fn runtimeFlushThreadCache(cache: int) {
+    runtimeLockHeap()
+    var size = 8
+    while size <= 8 * runtimeSmallAllocationClassCount {
+        var block = load64(cache + size)
+        while block != 0 {
+            let next = load64(block)
+            store64(block - 8, size | runtimeHeapFlagFree)
+            runtimePushFreeBlock(block, size)
+            block = next
+        }
+        store64(cache + size, 0)
+        store64(cache + runtimeCacheCountsOffset + size, 0)
+        size += 8
+    }
+    runtimeUnlockHeap()
+}
+
+// before a collection: the sweep rebuilds every free list, cached blocks included
+fn runtimeEmptyThreadCaches() {
+    var cache = runtimeThreadCaches
+    while cache != 0 {
+        var size = 8
+        while size <= 8 * runtimeSmallAllocationClassCount {
+            store64(cache + size, 0)
+            store64(cache + runtimeCacheCountsOffset + size, 0)
+            size += 8
+        }
+        cache = load64(cache + 4000)
+    }
 }
 
 fn runtimeAllocateObjectPayload(size: int) -> int {
@@ -2308,7 +2676,16 @@ fn runtimeU8Push(listAddress: int, value: int) {
     }
     runtimePackedPush(listAddress, value, 1)
 }
-fn runtimeF32Push(listAddress: int, value: int) { runtimePackedPush(listAddress, value, 4) }
+// with room, one 32-bit store: small enough for -O2 to inline at the push
+fn runtimeF32Push(listAddress: int, value: int) {
+    let count = load64(listAddress)
+    if count < load64(listAddress + 8) {
+        store32(load64(listAddress + 16) + count * 4, runtimeNarrowFloat32Bits(value))
+        store64(listAddress, count + 1)
+        return
+    }
+    runtimePackedPush(listAddress, value, 4)
+}
 fn runtimeU8Pop(listAddress: int, site: str) -> int { return runtimePackedPop(listAddress, 1, site) }
 fn runtimeF32Pop(listAddress: int, site: str) -> int { return runtimePackedPop(listAddress, 4, site) }
 
