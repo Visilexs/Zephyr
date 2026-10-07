@@ -250,6 +250,10 @@ let callKindWasmHostWrite = 38     // wasm: host import that takes (fd, ptr, len
 let callKindWasmHostExit = 39      // wasm: host import that ends the program
 let callKindLoad32 = 40
 let callKindLoad16 = 41
+let callKindRoundToSingle = 42    // toSingle(x): round a double to the nearest IEEE single, widen back
+let callKindSystemVCall = 43       // Linux: System V AMD64 call through a raw code address (dlsym)
+let callKindSystemVCallFloat = 44  // the same, returning xmm0
+let callKindDynamicImport = 45     // Linux: address of a GOT slot ld.so fills (dlopen, dlsym)
 // cast kinds
 let castKindNoOperation = 0
 let castKindTruncate = 1
@@ -318,6 +322,20 @@ var mainSourceFile = ""
 var wasmTargetEnabled = false    // --wasm: emit a WebAssembly module instead of a native executable
 var macosTargetEnabled = false   // --macos-ir: target IR for native ARM64 instruction selection
 var linuxTargetEnabled = false   // --linux: emit a static ELF64 that talks to the kernel by syscall
+var linuxDynamicLinking = false  // --linux program with `extern fn`: dynamic ELF importing dlopen/dlsym from libc
+// A dynamic --linux image keeps its loader tables in the header page, after
+// the six program headers: .interp, .dynstr ("\0libc.so.6\0dlopen\0dlsym\0"),
+// .dynsym (null, dlopen, dlsym), a one-bucket .hash and two GLOB_DAT relocations.
+// .dynamic and the two-slot GOT live in .rdata (writable), see generateProgram.
+const elfDynamicImageBase = 4194304
+const elfDynamicHeaderCount = 6
+const elfInterpreterOffset = 400
+const elfDynamicStringOffset = 432
+const elfDynamicStringSize = 24
+const elfDynamicSymbolOffset = 456
+const elfDynamicHashOffset = 528
+const elfDynamicRelocationOffset = 552
+const elfDynamicTablesEnd = 600
 var debugOffsets: [int] = []
 var debugLines: [int] = []
 var generatingUserFunction = false    // generating a main-file function body right now?
@@ -480,6 +498,35 @@ fn byteAt(text: str, index: int) -> int {
 // Looking ahead from just past a newline: does the next real token start with a
 // `.` that continues the current statement? Skips blank lines, indentation and
 // line comments; rejects `..` (range) and `.5` (float).
+// the last token is a binary operator: the expression goes on past the newline
+fn operatorContinues(output: [Token]) -> bool {
+    if output.len() == 0 { return false }
+    let kind = output[output.len() - 1].tokenKind
+    if kind == tokenAnd or kind == tokenOr or kind == tokenNot or kind == tokenAssign { return true }
+    if kind >= tokenPlus and kind <= tokenNotEquals { return true }       // + - * / % < > <= >= == !=
+    return kind == tokenAmpersand or kind == tokenPipe or kind == tokenCaret or kind == tokenShiftLeft or kind == tokenShiftRight
+}
+
+// the next line starts with `and` or `or`
+fn logicalContinues(source: str, from: int) -> bool {
+    let sourceLength = source.len()
+    var index = from
+    while index < sourceLength {
+        let character = source.byte(index)
+        if character == 32 or character == 9 or character == 13 or character == 10 {
+            index += 1
+        } else {
+            var word = 0
+            if character == 97 and byteAt(source, index + 1) == 110 and byteAt(source, index + 2) == 100 { word = 3 }     // and
+            else if character == 111 and byteAt(source, index + 1) == 114 { word = 2 }                                // or
+            if word == 0 { return false }
+            let after = byteAt(source, index + word)
+            return not isIdentifierCharacter(after)
+        }
+    }
+    return false
+}
+
 fn dotContinues(source: str, from: int) -> bool {
     let sourceLength = source.len()
     var index = from
@@ -758,6 +805,154 @@ fn singleBytePunctuation(character: int) -> int {
     return -1
 }
 
+// ---------------- float literals ----------------
+//
+// A literal's double is computed exactly, with one round-to-nearest-even at
+// the end, so it is the value every other language gives for the same text.
+// (The runtime's `str as float` scales a 17-digit mantissa by a power of ten,
+// which rounds twice; fine at run time, but constants such as
+// 10430.378350470453 must be exact.) The value is mantissa * 10^exponent as a
+// fraction of big integers, divided out to 53 bits.
+
+// big naturals: little-endian 32-bit limbs, no high zero limbs
+fn literalBigMultiplyAdd(number: [int], factor: int, addend: int) {
+    var carry = addend
+    for i in 0..number.len() {
+        let product = number[i] * factor + carry
+        number[i] = product & 4294967295
+        carry = product >> 32
+    }
+    if carry != 0 { number.push(carry) }
+}
+
+fn literalBigBitLength(number: [int]) -> int {
+    if number.len() == 0 { return 0 }
+    var top = number[number.len() - 1]
+    var length = 32 * (number.len() - 1)
+    while top != 0 {
+        length += 1
+        top = top >> 1
+    }
+    return length
+}
+
+fn literalBigShiftLeft(number: [int], shift: int) -> [int] {
+    var result: [int] = []
+    for i in 0..shift / 32 { result.push(0) }
+    let bitShift = shift % 32
+    var carry = 0
+    for limb in number {
+        result.push(((limb << bitShift) & 4294967295) | carry)
+        carry = if bitShift == 0 { 0 } else { limb >> (32 - bitShift) }
+    }
+    if carry != 0 { result.push(carry) }
+    while result.len() > 0 and result[result.len() - 1] == 0 { let dropped = result.pop() }
+    return result
+}
+
+fn literalBigCompare(left: [int], right: [int]) -> int {
+    if left.len() != right.len() { return if left.len() < right.len() { -1 } else { 1 } }
+    var i = left.len() - 1
+    while i >= 0 {
+        if left[i] != right[i] { return if left[i] < right[i] { -1 } else { 1 } }
+        i -= 1
+    }
+    return 0
+}
+
+// left -= right, given left >= right
+fn literalBigSubtract(left: [int], right: [int]) {
+    var borrow = 0
+    for i in 0..left.len() {
+        var difference = left[i] - borrow
+        if i < right.len() { difference -= right[i] }
+        borrow = 0
+        if difference < 0 {
+            difference += 4294967296
+            borrow = 1
+        }
+        left[i] = difference
+    }
+    while left.len() > 0 and left[left.len() - 1] == 0 { let dropped = left.pop() }
+}
+
+fn literalFloatBits(text: str) -> int {
+    var numerator: [int] = []
+    var exponent = 0
+    var index = 0
+    var seenPoint = false
+    while index < text.len() {
+        let character = text.byte(index)
+        if character == 46 {
+            seenPoint = true
+        } else if character >= 48 and character <= 57 {
+            literalBigMultiplyAdd(numerator, 10, character - 48)
+            if numerator.len() == 1 and numerator[0] == 0 { let dropped = numerator.pop() }
+            if seenPoint { exponent -= 1 }
+        } else {
+            break
+        }
+        index += 1
+    }
+    if index < text.len() {                                   // e/E, sign, digits
+        index += 1
+        var negative = false
+        if text.byte(index) == 43 or text.byte(index) == 45 {
+            negative = text.byte(index) == 45
+            index += 1
+        }
+        var written = 0
+        while index < text.len() {
+            if written < 100000 { written = written * 10 + text.byte(index) - 48 }
+            index += 1
+        }
+        exponent += if negative { 0 - written } else { written }
+    }
+    if numerator.len() == 0 { return 0 }
+    let digitCount = literalBigBitLength(numerator) * 3 / 10 + 1     // over-estimate is fine
+    if exponent + digitCount > 330 { return 9218868437227405312 }     // +infinity
+    if exponent + digitCount < -345 { return 0 }
+    var denominator: [int] = [1]
+    if exponent >= 0 {
+        for i in 0..exponent { literalBigMultiplyAdd(numerator, 10, 0) }
+    } else {
+        for i in 0..(0 - exponent) { literalBigMultiplyAdd(denominator, 10, 0) }
+    }
+    // binary exponent e with 2^e <= numerator / denominator < 2^(e+1)
+    var binaryExponent = literalBigBitLength(numerator) - literalBigBitLength(denominator)
+    let probeShift = 0 - binaryExponent
+    let probe = if probeShift >= 0 { literalBigCompare(literalBigShiftLeft(numerator, probeShift), denominator) } else { literalBigCompare(numerator, literalBigShiftLeft(denominator, 0 - probeShift)) }
+    if probe < 0 { binaryExponent -= 1 }
+    if binaryExponent > 1023 { return 9218868437227405312 }
+    // keep 53 significant bits, fewer once the result is subnormal
+    var lowBit = binaryExponent - 52
+    if lowBit < -1074 { lowBit = -1074 }
+    var remainder = numerator
+    var divisor = denominator
+    if lowBit < 0 { remainder = literalBigShiftLeft(numerator, 0 - lowBit) } else { divisor = literalBigShiftLeft(denominator, lowBit) }
+    // quotient = remainder / divisor < 2^53, one bit at a time
+    var quotient = 0
+    var bit = 53
+    while bit >= 0 {
+        let shifted = literalBigShiftLeft(divisor, bit)
+        if literalBigCompare(remainder, shifted) >= 0 {
+            literalBigSubtract(remainder, shifted)
+            quotient = quotient | (1 << bit)
+        }
+        bit -= 1
+    }
+    let half = literalBigCompare(literalBigShiftLeft(remainder, 1), divisor)
+    if half > 0 or (half == 0 and (quotient & 1) == 1) { quotient += 1 }
+    if quotient >= 9007199254740992 {                          // rounded up to 2^53
+        quotient = quotient >> 1
+        lowBit += 1
+    }
+    if quotient < 4503599627370496 { return quotient }         // subnormal (or rounded up into the smallest normal)
+    let biased = lowBit + 52 + 1023
+    if biased >= 2047 { return 9218868437227405312 }
+    return (biased << 52) | (quotient - 4503599627370496)
+}
+
 fn tokenizeSource(source: str, startLine: int) -> [Token] {
     var output: [Token] = []
     var position = 0
@@ -772,7 +967,12 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
             // A following line that begins with `.` continues this statement, so
             // a method chain can be written one call per line. `..` is the range
             // operator and a digit after the dot is a float, so neither counts.
-            if depth == 0 and not dotContinues(source, position + 1) { output.push(makeToken(tokenNewline, line)) }
+            // A line ending in a binary operator, or a following line that starts
+            // with `and` / `or`, continues the expression: long conditions need
+            // no wrapping parentheses.
+            if depth == 0 and not dotContinues(source, position + 1) and not operatorContinues(output) and not logicalContinues(source, position + 1) {
+                output.push(makeToken(tokenNewline, line))
+            }
             position += 1
             line += 1
             continue
@@ -866,7 +1066,7 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
                 let text = source.sub(position, tokenEnd).replace("_", "")
                 if isFloat {
                     token = makeToken(tokenFloatLiteral, tokenLine)
-                    token.floatValue = text as float
+                    token.floatValue = floatFromBits(literalFloatBits(text))
                 } else {
                     var value = 0
                     for k in 0..text.len() {
@@ -1435,12 +1635,54 @@ fn parseValueBlock(what: str) -> Node {
     return value
 }
 
+// a local or a chain of fields: reading it twice is the same as reading it once
+fn isPlainPlace(node: Node) -> bool {
+    if node.nodeKind == nodeIdentifier { return true }
+    if node.nodeKind == nodeMember and node.children.len() == 1 { return isPlainPlace(node.children[0]) }
+    return false
+}
+
+// receiver.name() as the parser builds it
+fn methodCallNode(receiver: Node, name: str) -> Node {
+    var member = makeNode(nodeMember, receiver.line)
+    member.name = name
+    member.children.push(cloneNode(receiver))
+    var call = makeNode(nodeCall, receiver.line)
+    call.children.push(member)
+    return call
+}
+
+// a copy of `node` with every identifier `name` replaced by `replacement`
+fn substituteName(node: Node, name: str, replacement: Node) -> Node {
+    if node.nodeKind == nodeIdentifier and node.name == name { return cloneNode(replacement) }
+    var copy = node
+    var children: [Node] = []
+    for child in node.children { children.push(substituteName(child, name, replacement)) }
+    copy.children = children
+    return copy
+}
+
 // if c { a } else { b } used as a value
 fn parseIfExpression() -> Node {
     let start = nextToken()
     var ifExpressionNode = makeNode(nodeIfExpression, start.line)
-    ifExpressionNode.children.push(parseHeaderExpression())
-    ifExpressionNode.children.push(parseValueBlock("a branch of an if-expression"))
+    if atTokenKind(tokenLet) {
+        // if let v = opt { a } else { b } as a value: `opt` names a place (a local or a
+        // field chain), so it reads again as `if opt.has() { a[v := opt.get()] } else { b }`
+        let letWord = nextToken()
+        let bound = expect(tokenIdentifier, "a name after 'if let'").text
+        let equals = expect(tokenAssign, "'='")
+        let optional = parseHeaderExpression()
+        if not isPlainPlace(optional) {
+            failCompilation(start.line, "an if-let expression needs a variable or field (bind a call's result with `let` first)")
+        }
+        ifExpressionNode.children.push(methodCallNode(optional, "has"))
+        var thenBranch = parseValueBlock("a branch of an if-expression")
+        ifExpressionNode.children.push(substituteName(thenBranch, bound, methodCallNode(optional, "get")))
+    } else {
+        ifExpressionNode.children.push(parseHeaderExpression())
+        ifExpressionNode.children.push(parseValueBlock("a branch of an if-expression"))
+    }
     if not elseAhead() { failCompilation(start.line, "an if-expression needs an else branch: if c \{ a \} else \{ b \}") }
     let elseWord = nextToken()
     if atTokenKind(tokenIf) { ifExpressionNode.children.push(parseIfExpression()) }
@@ -2884,7 +3126,7 @@ fn displayName(name: str) -> str {
 }
 
 fn isBuiltinName(name: str) -> bool {
-    if name == "print" or name == "panic" or name == "sqrt" { return true }
+    if name == "print" or name == "panic" or name == "sqrt" or name == "toSingle" { return true }
     if name == "len" or name == "push" or name == "pop" { return true }
     if name == "args" or name == "readFile" or name == "writeFile" { return true }
     if name == "chr" or name == "byte" or name == "sub" or name == "join" or name == "bits" { return true }
@@ -3762,12 +4004,17 @@ fn checkIndirect(expression: Node, valueType: int) -> int {
     return signature.returnType
 }
 
+var checkCallBuiltinNames: [str: bool] = [:]       // every name checkCall handles itself, ahead of user functions
+for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV", "callSysVFloat", "chr", "dynamicImport", "emit", "floatFromBits", "growMemory", "hostExit", "hostWrite", "load16", "load32", "load64", "load8", "max", "min", "panic", "pow", "print", "readFile", "sqrt", "stackPointer", "store32", "store64", "store8", "syscall", "toSingle", "win", "writeFile", "zeros"] { checkCallBuiltinNames[name] = true }
+
 fn checkCall(expression: Node) -> int {
     let callee = expression.children[0]
     resolveNamespace(callee)                                   // geo.area(r) is a plain call
     if callee.nodeKind == nodeMember { return checkMethod(expression) }
     if callee.nodeKind != nodeIdentifier { return checkIndirect(expression, checkExpression(callee)) }   // any expression of fn type
     var argumentCount = expression.children.len() - 1
+    // the builtins below, one name comparison each: most calls are to user functions
+    if checkCallBuiltinNames.has(callee.name) {
     if callee.name == "print" {
         if argumentCount != 1 {                      // print(a, b) prints "{a} {b}"; print() an empty line
             var printedLine = makeNode(nodeStringLiteral, expression.line)
@@ -3808,6 +4055,13 @@ fn checkCall(expression: Node) -> int {
         if not isNumericType(checkExpression(expression.children[1])) { failCompilation(expression.line, "sqrt needs a number") }
         expression.children[1] = coerce(expression.children[1], typeIdFloat, "sqrt")
         expression.auxiliary = callKindSquareRoot
+        return typeIdFloat
+    }
+    if callee.name == "toSingle" {
+        if argumentCount != 1 { failCompilation(expression.line, "toSingle(x) takes exactly one argument") }
+        if not isNumericType(checkExpression(expression.children[1])) { failCompilation(expression.line, "toSingle needs a number") }
+        expression.children[1] = coerce(expression.children[1], typeIdFloat, "toSingle")
+        expression.auxiliary = callKindRoundToSingle
         return typeIdFloat
     }
     if callee.name == "args" {
@@ -3956,6 +4210,36 @@ fn checkCall(expression: Node) -> int {
         }
         return typeIdInteger
     }
+    if callee.name == "callSysV" or callee.name == "callSysVFloat" {
+        // callSysV(addr, args...) -- a System V AMD64 call to a native code address
+        // (dlsym): int arguments in rdi rsi rdx rcx r8 r9, float ones in
+        // xmm0-xmm7, the rest on the stack. callSysVFloat returns xmm0.
+        if not linuxTargetEnabled { failCompilation(expression.line, "{callee.name}() is only available on --linux") }
+        if argumentCount < 1 or argumentCount > 17 { failCompilation(expression.line, "{callee.name}(addr, args...) takes 1-17 arguments") }
+        if typeKinds[checkExpression(expression.children[1])] != kindInteger { failCompilation(expression.line, "{callee.name}() address must be int") }
+        for j in 2..expression.children.len() {
+            let argumentKind = typeKinds[checkExpression(expression.children[j])]
+            if argumentKind != kindInteger and argumentKind != kindFloat { failCompilation(expression.line, "{callee.name}() arguments must be int or float") }
+        }
+        if callee.name == "callSysVFloat" {
+            expression.auxiliary = callKindSystemVCallFloat
+            return typeIdFloat
+        }
+        expression.auxiliary = callKindSystemVCall
+        return typeIdInteger
+    }
+    if callee.name == "dynamicImport" {
+        // dynamicImport(n) -- address of the GOT slot ld.so fills with libc's
+        // dlopen (0) or dlsym (1); using it makes the --linux output dynamic
+        if not linuxTargetEnabled { failCompilation(expression.line, "dynamicImport() is only available on --linux") }
+        if argumentCount != 1 or expression.children[1].nodeKind != nodeInteger or expression.children[1].integerValue < 0 or expression.children[1].integerValue > 1 {
+            failCompilation(expression.line, "dynamicImport(n) takes the literal 0 (dlopen) or 1 (dlsym)")
+        }
+        checkExpression(expression.children[1])
+        linuxDynamicLinking = true
+        expression.auxiliary = callKindDynamicImport
+        return typeIdInteger
+    }
     if callee.name == "syscall" {
         // syscall(number, args...) -- raw Linux syscall, up to 6 arguments
         if argumentCount < 1 or argumentCount > 7 { failCompilation(expression.line, "syscall(n, args...) takes 1-7 arguments") }
@@ -4006,6 +4290,7 @@ fn checkCall(expression: Node) -> int {
         }
         expression.auxiliary = callKindFunctionPointerCall
         return typeIdInteger
+    }
     }
     if environmentFind(callee.name) >= 0 { return checkIndirect(expression, checkExpression(callee)) }   // variable holding a function
     let functionIndex = findFunction(callee.name)
@@ -4414,6 +4699,14 @@ fn checkExpectedExpression(expression: Node, wantedType: int) -> int {
     if expression.nodeKind == nodeTuple and isTuple(wantedType) and structDefinitions[typeDefinitionIds[wantedType]].fieldNames.len() == expression.children.len() {
         return checkTuple(expression, structDefinitions[typeDefinitionIds[wantedType]].fieldTypes)
     }
+    if (expression.nodeKind == nodeList or expression.nodeKind == nodeMapLiteral) and expression.children.len() == 0 and typeKinds[wantedType] == kindOptional {
+        // `[]` where a `[T]?` is expected: the list, wrapped by the caller's coerce
+        let innerType = typeElementIds[wantedType]
+        if (expression.nodeKind == nodeList and typeKinds[innerType] == kindList) or (expression.nodeKind == nodeMapLiteral and typeKinds[innerType] == kindMap) {
+            expression.typeIndex = innerType
+            return innerType
+        }
+    }
     if expression.nodeKind == nodeList and expression.children.len() == 0 and typeKinds[wantedType] == kindList {
         expression.typeIndex = wantedType
         return wantedType
@@ -4472,7 +4765,9 @@ fn checkStatement(statement: Node) {
     if statement.nodeKind == nodeDefer { failCompilation(statement.line, "internal: defer was not lowered") }
     if statement.nodeKind == nodeDeclaration {
         if environmentFindHere(statement.name) { failCompilation(statement.line, "'{statement.name}' is already declared in this scope") }
-        if isBuiltinName(statement.name) { failCompilation(statement.line, "'{statement.name}' is a builtin name") }
+        // a local may share a builtin's name: builtin calls resolve before locals
+        // (min(a, b) is still the builtin), and the plain name reads the local
+        if atGlobal and isBuiltinName(statement.name) { failCompilation(statement.line, "'{statement.name}' is a builtin name") }
         // a global may not collide with a function; a local may shadow one
         if atGlobal and findFunction(statement.name) >= 0 { failCompilation(statement.line, "'{statement.name}' is already a function") }
         var annotatedType = -1                  // the declared type, if any
@@ -4482,12 +4777,12 @@ fn checkStatement(statement: Node) {
         if statement.operator == declarationFlagPrechecked {
             variableType = statement.children[0].typeIndex
             if typeKinds[variableType] == kindVoid or typeKinds[variableType] == kindNone { failCompilation(statement.line, "this expression has no usable value") }
-        } else if statement.children[0].nodeKind == nodeList and statement.children[0].children.len() == 0 {
+        } else if statement.children[0].nodeKind == nodeList and statement.children[0].children.len() == 0 and not (annotatedType >= 0 and typeKinds[annotatedType] == kindOptional) {
             if annotatedType < 0 { failCompilation(statement.line, "cannot infer the type of an empty list; annotate it") }
             variableType = annotatedType
             if typeKinds[variableType] != kindList { failCompilation(statement.line, "empty list literal needs a list type") }
             statement.children[0].typeIndex = variableType
-        } else if statement.children[0].nodeKind == nodeMapLiteral and statement.children[0].children.len() == 0 {
+        } else if statement.children[0].nodeKind == nodeMapLiteral and statement.children[0].children.len() == 0 and not (annotatedType >= 0 and typeKinds[annotatedType] == kindOptional) {
             if annotatedType < 0 { failCompilation(statement.line, "cannot infer the type of an empty map; annotate it") }
             variableType = annotatedType
             if typeKinds[variableType] != kindMap { failCompilation(statement.line, "empty map literal '[:]' needs a map type") }
@@ -4539,7 +4834,10 @@ fn checkStatement(statement: Node) {
     }
     if statement.nodeKind == nodeAssign {
         let target = statement.children[0]
-        let checkedType = checkExpression(statement.children[1])
+        // `[]` / `[:]` take the target's type; they have no effects to order
+        let assignedValue = statement.children[1]
+        let emptyLiteral = (assignedValue.nodeKind == nodeList or assignedValue.nodeKind == nodeMapLiteral) and assignedValue.children.len() == 0
+        if not emptyLiteral { let checkedType = checkExpression(statement.children[1]) }
         if target.nodeKind == nodeIdentifier {
             let handle = findVariable(target.name)
             if handle < 0 { failCompilation(target.line, "unknown variable '{target.name}'") }
@@ -4552,11 +4850,13 @@ fn checkStatement(statement: Node) {
             target.auxiliary = variableInformation.kind
             target.slot = variableInformation.index
             target.typeIndex = variableInformation.typeIndex
+            if emptyLiteral { let literalType = checkExpectedExpression(statement.children[1], variableInformation.typeIndex) }
             statement.children[1] = coerce(statement.children[1], variableInformation.typeIndex, "assignment")
         } else {
             var targetType = 0
             if target.nodeKind == nodeCall and target.auxiliary == callKindRuntimeCall { targetType = target.typeIndex }      // buf[i] += 1: lowered with the value
             else { targetType = checkExpression(target) }
+            if emptyLiteral { let literalType = checkExpectedExpression(statement.children[1], targetType) }
             if target.nodeKind == nodeCall and target.auxiliary == callKindRuntimeCall and (target.name == "runtimeU8Get" or target.name == "runtimeF32Get") {
                 // Packed stores are calls after checking. Save the RHS first so
                 // they keep the same assignment order as ordinary list stores.
@@ -5224,6 +5524,11 @@ fn desugarExtern(program: Node) {
         else { output.push(topLevelNode) }
     }
     if externs.len() == 0 { return }
+    if linuxTargetEnabled {
+        desugarExternLinux(output, externs)
+        program.children = output
+        return
+    }
     var source: [str] = []
     source.push("fn __xcstr(s: str) -> int \{\n")
     source.push("    let n = s.len()\n")
@@ -5302,6 +5607,103 @@ fn desugarExtern(program: Node) {
     currentSourceFile = savedSourceFile
     for topLevelNode in generatedProgram.children { output.push(topLevelNode) }
     program.children = output
+}
+
+// --linux: the same lazily-resolving wrappers, over libc's dlopen/dlsym (which
+// the dynamic ELF imports, see writeElfDynamicTables) and System V calls.
+// Parameters may be int or float (xmm registers); returns int, i32, bool (the
+// low byte, as C's bool), float, or nothing.
+fn desugarExternLinux(output: [Node], externs: [Node]) {
+    linuxDynamicLinking = true
+    var libraries: [str] = []
+    var source: [str] = []
+    source.push("fn __xcstr(s: str) -> int \{\n")
+    source.push("    let n = s.len()\n")
+    source.push("    let p = win(\"VirtualAlloc\", 0, n + 1, 12288, 4)\n")
+    source.push("    var i = 0\n")
+    source.push("    while i < n \{\n        store8(p + i, s.byte(i))\n        i += 1\n    \}\n")
+    source.push("    store8(p + n, 0)\n    return p\n\}\n")
+    source.push("fn __xsext32(v: int) -> int \{\n")
+    source.push("    let low = v & 4294967295\n")
+    source.push("    if low >= 2147483648 \{ return low - 4294967296 \}\n")
+    source.push("    return low\n\}\n")
+    // dlerror's message, looked up through dlsym(RTLD_DEFAULT, "dlerror")
+    source.push("fn __xdlerror() -> str \{\n")
+    source.push("    let f = callSysV(load64(dynamicImport(1)), 0, __xcstr(\"dlerror\"))\n")
+    source.push("    if f == 0 \{ return \"\" \}\n")
+    source.push("    let p = callSysV(f)\n")
+    source.push("    if p == 0 \{ return \"\" \}\n")
+    source.push("    var parts: [str] = []\n")
+    source.push("    var i = 0\n")
+    source.push("    while load8(p + i) != 0 \{\n        parts.push(chr(load8(p + i)))\n        i += 1\n    \}\n")
+    source.push("    return \": \" + parts.join()\n\}\n")
+    for j in 0..externs.len() {
+        let externNode = externs[j]
+        let parameters = externNode.children[0]
+        let returnType = externNode.children[1]
+        let libraryName = externNode.children[2].name
+        var signature: [str] = []
+        var callArguments: [str] = []
+        for i in 0..parameters.children.len() {
+            let parameter = parameters.children[i]
+            let parameterType = parameter.children[0]
+            if parameterType.nodeKind != nodeTypeName or (parameterType.name != "int" and parameterType.name != "float") {
+                failCompilation(parameter.line, "extern parameter '{parameter.name}' must be int or float (foreign arguments are addresses or scalars)")
+            }
+            if i > 0 {
+                signature.push(", ")
+                callArguments.push(", ")
+            }
+            signature.push("a{i}: {parameterType.name}")
+            callArguments.push("a{i}")
+        }
+        var returnName = ""
+        if returnType.nodeKind != nodeNone {
+            if returnType.nodeKind != nodeTypeName or (returnType.name != "int" and returnType.name != "i32" and returnType.name != "bool" and returnType.name != "float") {
+                failCompilation(externNode.line, "extern '{externNode.name}' must return int, i32, bool, float, or nothing")
+            }
+            returnName = returnType.name
+        }
+        var libraryIndex = 0 - 1
+        for i in 0..libraries.len() {
+            if libraries[i] == libraryName { libraryIndex = i }
+        }
+        if libraryIndex < 0 {
+            libraries.push(libraryName)
+            libraryIndex = libraries.len() - 1
+            source.push("var __xh{libraryIndex} = 0\n")
+            source.push("fn __xd{libraryIndex}() -> int \{\n")
+            source.push("    if __xh{libraryIndex} == 0 \{\n")
+            // RTLD_NOW | RTLD_GLOBAL
+            source.push("        __xh{libraryIndex} = callSysV(load64(dynamicImport(0)), __xcstr(\"{libraryName}\"), 258)\n")
+            source.push("        if __xh{libraryIndex} == 0 \{ panic(\"extern: cannot load {libraryName}\" + __xdlerror()) \}\n")
+            source.push("    \}\n    return __xh{libraryIndex}\n\}\n")
+        }
+        var argumentList = ""
+        if parameters.children.len() > 0 { argumentList = ", " + callArguments.join() }
+        source.push("var __xf{j} = 0\n")
+        source.push(externalResolverPrefix + "{j}() -> int \{\n")
+        source.push("    let f = callSysV(load64(dynamicImport(1)), __xd{libraryIndex}(), __xcstr(\"{externNode.name}\"))\n")
+        source.push("    if f == 0 \{ panic(\"extern: {libraryName} has no symbol {externNode.name}\") \}\n")
+        source.push("    return f\n\}\n")
+        source.push("fn {externNode.name}(" + signature.join() + ")")
+        if returnName == "i32" { source.push(" -> int") }
+        else if returnName != "" { source.push(" -> {returnName}") }
+        source.push(" \{\n")
+        source.push("    if __xf{j} == 0 \{ __xf{j} = __xresolve{j}() \}\n")
+        let call = "callSysV(__xf{j}" + argumentList + ")"
+        if returnName == "" { source.push("    let __r = {call}\n") }
+        else if returnName == "i32" { source.push("    return __xsext32({call})\n") }
+        else if returnName == "bool" { source.push("    return ({call} & 255) != 0\n") }
+        else if returnName == "float" { source.push("    return callSysVFloat(__xf{j}" + argumentList + ")\n") }
+        else { source.push("    return {call}\n") }
+        source.push("\}\n")
+    }
+    let savedSourceFile = currentSourceFile
+    currentSourceFile = "<extern>"
+    let generatedProgram = parse(tokenizeSource(source.join(), 1))
+    currentSourceFile = savedSourceFile
+    for topLevelNode in generatedProgram.children { output.push(topLevelNode) }
 }
 
 // Desugar impl blocks into plain functions. `impl Point { fn dist(self) {...} }`
@@ -5438,13 +5840,23 @@ fn check(program: Node) {
             }
         }
     }
-    // pass 1a.5: interface names + method signatures (self excluded from sigs)
+    // pass 1a.5: interface names, then method signatures (self excluded from
+    // sigs). Names come first so a signature may mention any interface,
+    // including its own (`fn fork(self) -> RandomSource`) or a later one.
     for topLevelNode in program.children {
         currentSourceFile = topLevelNode.file
         if topLevelNode.nodeKind == nodeInterface {
             if findInterface(topLevelNode.name) >= 0 { failCompilation(topLevelNode.line, "duplicate interface '{topLevelNode.name}'") }
             if findStruct(topLevelNode.name) >= 0 { failCompilation(topLevelNode.line, "'{topLevelNode.name}' is already a struct") }
             if findEnum(topLevelNode.name) >= 0 { failCompilation(topLevelNode.line, "'{topLevelNode.name}' is already an enum") }
+            interfaceDefinitions.push(InterfaceDefinition{name: topLevelNode.name, methodNames: [], methodSignatures: [], line: topLevelNode.line})
+            if not interfaceNameIndices.has(topLevelNode.name) { interfaceNameIndices[topLevelNode.name] = interfaceDefinitions.len() - 1 }
+            topLevelNode.referenceIndex = interfaceDefinitions.len() - 1
+        }
+    }
+    for topLevelNode in program.children {
+        currentSourceFile = topLevelNode.file
+        if topLevelNode.nodeKind == nodeInterface {
             var methodNames: [str] = []
             var methodSignatures: [int] = []
             for memberNode in topLevelNode.children {
@@ -5462,9 +5874,9 @@ fn check(program: Node) {
                 methodNames.push(memberNode.name)
                 methodSignatures.push(functionTypeOf(methodParameterTypes, returnType))
             }
-            interfaceDefinitions.push(InterfaceDefinition{name: topLevelNode.name, methodNames: methodNames, methodSignatures: methodSignatures, line: topLevelNode.line})
-            if not interfaceNameIndices.has(topLevelNode.name) { interfaceNameIndices[topLevelNode.name] = interfaceDefinitions.len() - 1 }
-            topLevelNode.referenceIndex = interfaceDefinitions.len() - 1
+            let definition = interfaceDefinitions[topLevelNode.referenceIndex]
+            definition.methodNames = methodNames
+            definition.methodSignatures = methodSignatures
         }
     }
     // pass 1b: struct fields
@@ -7486,6 +7898,12 @@ fn tailAssign(target: Node, value: Node) -> Node {
     return assignment
 }
 
+// runtime functions whose x86 calls are emitted as instructions (lock xadd,
+// cvtsd2ss/cvtss2sd): their bodies are the portable fallback, never inlined
+fn isNativeRuntimeCallee(name: str) -> bool {
+    return name == "runtimeAtomicAdd" or name == "runtimeNarrowFloat32Bits" or name == "runtimeWidenFloat32Bits"
+}
+
 fn inlinePass(program: Node) {
     // Borrow pristine bodies until their first expansion would mutate them.
     // Functions that never expand need no copy, even when used as callees.
@@ -7501,7 +7919,8 @@ fn inlinePass(program: Node) {
         // prologue then saved and restored on every call; freeing is heavy
         // enough that one more call there costs nothing measurable.
         // ponytail: a name list; shrink-wrapping the saves would cover every function
-        let callOnly = functionDefinition.name == "runtimeFail" or functionDefinition.name == "runtimeReleaseObject"
+        // runtimeAtomicAdd's body is the threadless fallback: every x86 call site becomes `lock xadd`
+        let callOnly = functionDefinition.name == "runtimeFail" or functionDefinition.name == "runtimeReleaseObject" or isNativeRuntimeCallee(functionDefinition.name)
         functionDefinition.inlinable = not functionDefinition.hasEnvironment and functionDefinition.typeParameters.len() == 0 and nodeCount(functionDefinition.body) <= 128 and not textStartsWith(functionDefinition.name, "__xresolve") and not callOnly
         if functionDefinition.inlinable {
             functionDefinition.pristine = functionDefinition.body
@@ -7664,7 +8083,7 @@ fn listDataSlot(pair: int) -> str { return "[rbp - {16 + 8 * (listBoundsScratchB
 fn listLengthSlot(pair: int) -> str { return "[rbp - {16 + 8 * (listBoundsScratchBase + 2 * pair + 1)}]" }
 
 fn isInlineCallKind(callKind: int) -> bool {
-    if callKind == callKindSquareRoot or callKind == callKindLength or callKind == callKindBits { return true }
+    if callKind == callKindSquareRoot or callKind == callKindRoundToSingle or callKind == callKindLength or callKind == callKindBits { return true }
     if callKind == callKindLoad64 or callKind == callKindLoad32 or callKind == callKindLoad16 or callKind == callKindLoad8 { return true }
     if callKind == callKindStore64 or callKind == callKindStore32 or callKind == callKindStore8 { return true }
     if callKind == callKindStackPointer or callKind == callKindAbsolute or callKind == callKindMin or callKind == callKindMax { return true }
@@ -8236,6 +8655,12 @@ fn generateFloatExpression(expression: Node) {
     if expression.nodeKind == nodeCall and expression.auxiliary == callKindSquareRoot {
         generateFloatExpression(expression.children[1])
         emitInstruction("sqrtsd xmm0, xmm0")
+        return
+    }
+    if expression.nodeKind == nodeCall and expression.auxiliary == callKindRoundToSingle {
+        generateFloatExpression(expression.children[1])
+        emitInstruction("cvtsd2ss xmm0, xmm0")
+        emitInstruction("cvtss2sd xmm0, xmm0")
         return
     }
     if isFloatArithmetic(expression) {
@@ -9316,6 +9741,14 @@ fn generateCall(expression: Node) {
         emitInstruction("movq rax, xmm0")
         return
     }
+    if callKind == callKindRoundToSingle {
+        generateExpression(expression.children[1])
+        emitInstruction("movq xmm0, rax")
+        emitInstruction("cvtsd2ss xmm0, xmm0")
+        emitInstruction("cvtss2sd xmm0, xmm0")
+        emitInstruction("movq rax, xmm0")
+        return
+    }
     if callKind == callKindLength {
         let ownsTemporary = generateTemporary(expression.children[0].children[0], true)
         holdTemporary(ownsTemporary)
@@ -9632,6 +10065,71 @@ fn generateCall(expression: Node) {
         emitInstruction("add rsp, {8 * (argumentCount + 1)}")
         return
     }
+    if callKind == callKindDynamicImport {
+        emitInstruction("lea rax, [rip + __zdyngot]")
+        if expression.children[1].integerValue == 1 { emitInstruction("add rax, 8") }
+        return
+    }
+    if callKind == callKindSystemVCall or callKind == callKindSystemVCallFloat {
+        // System V AMD64 call through a code address (the target is pushed first,
+        // deepest). Win64 keeps rsi, rdi and xmm6-xmm15 across calls and generated
+        // code parks promoted locals there (promotionRegisters,
+        // floatPromotionRegisters); System V doesn't, so they are saved around the
+        // call. r12 holds the pre-alignment rsp (callee-saved in both ABIs).
+        let operandCount = expression.children.len() - 1          // kids[0]=callee, kids[1]=target, then args
+        emitInstruction("push rdi")
+        emitInstruction("push rsi")
+        for i in 0..operandCount {
+            generateExpression(expression.children[i + 1])
+            emitInstruction("push rax")
+        }
+        // operand i lives at [r12 + 8 * (operandCount - 1 - i)]
+        let integerRegisters = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+        var integerOperands: [int] = []
+        var floatOperands: [int] = []
+        var stackOperands: [int] = []
+        for i in 1..operandCount {
+            if typeKinds[expression.children[i + 1].typeIndex] == kindFloat {
+                if floatOperands.len() < 8 { floatOperands.push(i) } else { stackOperands.push(i) }
+            } else {
+                if integerOperands.len() < 6 { integerOperands.push(i) } else { stackOperands.push(i) }
+            }
+        }
+        emitInstruction("mov r12, rsp")
+        emitInstruction("and rsp, -16")
+        emitInstruction("sub rsp, 48")
+        for k in 0..6 {
+            emitInstruction("movq rax, xmm{k + 6}")
+            emitInstruction("mov [rsp + {8 * k}], rax")
+        }
+        let stackFrameSize = (8 * stackOperands.len() + 15) & (0 - 16)
+        if stackFrameSize > 0 { emitInstruction("sub rsp, {stackFrameSize}") }
+        for k in 0..stackOperands.len() {
+            emitInstruction("mov rax, [r12 + {8 * (operandCount - 1 - stackOperands[k])}]")
+            emitInstruction("mov [rsp + {8 * k}], rax")
+        }
+        for k in 0..floatOperands.len() {
+            emitInstruction("mov rax, [r12 + {8 * (operandCount - 1 - floatOperands[k])}]")
+            emitInstruction("movq xmm{k}, rax")
+        }
+        for k in 0..integerOperands.len() {
+            emitInstruction("mov {integerRegisters[k]}, [r12 + {8 * (operandCount - 1 - integerOperands[k])}]")
+        }
+        emitInstruction("mov r10, [r12 + {8 * (operandCount - 1)}]")
+        emitInstruction("mov eax, {floatOperands.len()}")          // al: vector registers used, for varargs callees
+        emitInstruction("call r10")
+        if callKind == callKindSystemVCallFloat { emitInstruction("movq rax, xmm0") }
+        if stackFrameSize > 0 { emitInstruction("add rsp, {stackFrameSize}") }
+        for k in 0..6 {
+            emitInstruction("mov r10, [rsp + {8 * k}]")
+            emitInstruction("movq xmm{k + 6}, r10")
+        }
+        emitInstruction("mov rsp, r12")
+        emitInstruction("add rsp, {8 * operandCount}")
+        emitInstruction("pop rsi")
+        emitInstruction("pop rdi")
+        return
+    }
     if callKind == callKindSyscall {
         // System V syscall convention: number in rax, args in rdi rsi rdx r10 r8 r9.
         // No shadow space and no alignment requirement -- the kernel doesn't care.
@@ -9732,6 +10230,34 @@ fn generateCall(expression: Node) {
     if expression.operator == 1 { callArguments.push(expression.children[0].children[0]) }        // UFCS receiver
     for i in 1..expression.children.len() { callArguments.push(expression.children[i]) }
     var callArgumentCount = callArguments.len()
+    if (functionDefinition.name == "runtimeNarrowFloat32Bits" or functionDefinition.name == "runtimeWidenFloat32Bits") and callArgumentCount == 1 and not macosTargetEnabled {
+        // the hardware conversion: cvtsd2ss / cvtss2sd round exactly as the runtime's software does
+        generateExpression(callArguments[0])
+        emitInstruction("movq xmm0, rax")
+        if functionDefinition.name == "runtimeNarrowFloat32Bits" {
+            emitInstruction("cvtsd2ss xmm0, xmm0")
+            emitInstruction("movq rax, xmm0")
+            emitInstruction("shl rax, 32")
+            emitInstruction("shr rax, 32")
+        } else {
+            emitInstruction("cvtss2sd xmm0, xmm0")
+            emitInstruction("movq rax, xmm0")
+        }
+        return
+    }
+    if functionDefinition.name == "runtimeAtomicAdd" and callArgumentCount == 2 {
+        // in place: lock xadd [rcx], rax (raw bytes: the assembler has no lock
+        // prefix), then rax = old + delta
+        generateExpression(callArguments[1])
+        emitInstruction("push rax")
+        generateExpression(callArguments[0])
+        emitInstruction("mov rcx, rax")
+        emitInstruction("pop rax")
+        emitInstruction("mov rdx, rax")
+        emitInstruction(".byte 240,72,15,193,1")
+        emitInstruction("add rax, rdx")
+        return
+    }
     // Runtime-internal failures with fixed text name their own source line.
     if functionDefinition.name == "runtimeFail" and callArgumentCount == 1 and callArguments[0].nodeKind == nodeStringLiteral {
         if callArguments[0].children.len() == 1 and callArguments[0].children[0].nodeKind == nodeStringText {
@@ -11324,6 +11850,26 @@ fn generateProgram(program: Node) {
         emitBytes(cStringLiterals[i])
         emitInstruction(".byte 0")
     }
+    if linuxDynamicLinking {
+        // GOT slots ld.so fills with dlopen and dlsym, then the .dynamic table
+        // pointing at the header-page tables (writeElf). No DT_HASH-less shortcuts:
+        // glibc looks symbols up in the executable too, so it gets a .hash.
+        emitAssemblyLine(".balign 8")
+        emitAssemblyLine("__zdyngot:")
+        emitInstruction(".quad 0")
+        emitInstruction(".quad 0")
+        emitAssemblyLine("__zdyndynamic:")
+        let dynamicEntries = [1, 1,                                                 // DT_NEEDED libc.so.6
+            4, elfDynamicImageBase + elfDynamicHashOffset,                          // DT_HASH
+            5, elfDynamicImageBase + elfDynamicStringOffset,                        // DT_STRTAB
+            6, elfDynamicImageBase + elfDynamicSymbolOffset,                        // DT_SYMTAB
+            7, elfDynamicImageBase + elfDynamicRelocationOffset,                    // DT_RELA
+            8, 48, 9, 24,                                                           // DT_RELASZ, DT_RELAENT
+            10, elfDynamicStringSize, 11, 24,                                       // DT_STRSZ, DT_SYMENT
+            30, 8, 1879048187, 1,                                                   // DT_FLAGS BIND_NOW, DT_FLAGS_1 NOW
+            21, 0, 0, 0]                                                            // DT_DEBUG, DT_NULL
+        for entry in dynamicEntries { emitInstruction(".quad {entry}") }
+    }
     if globalCount > 0 {
         emitAssemblyLine(".section .bss")
         emitAssemblyLine(".balign 8")
@@ -11758,7 +12304,8 @@ let assemblyMnemonics: [str: int] = [
     "movzx": 24, "lea": 25, "jmp": 26, "call": 27, "movq": 28, "movsd": 29,
     "movapd": 30, "addsd": 31, "subsd": 32, "mulsd": 33, "divsd": 34,
     "minsd": 35, "maxsd": 36, "sqrtsd": 37, "comisd": 38, "ucomisd": 39,
-    "cvtsi2sd": 40, "cvttsd2si": 41,
+    "cvtsi2sd": 40, "cvttsd2si": 41, "cvtpd2ps": 42, "cvtps2pd": 43,
+    "cvtsd2ss": 44, "cvtss2sd": 45, "addss": 46, "subss": 47, "mulss": 48, "divss": 49, "movss": 50,
     "je": 104, "jne": 105, "jl": 112, "jle": 114, "jg": 115, "jge": 113,
     "ja": 107, "jae": 103, "jb": 102, "jbe": 106, "jp": 110, "jnp": 111,
     "js": 108, "jns": 109,
@@ -11769,11 +12316,11 @@ let assemblyMnemonics: [str: int] = [
 let memoryRegisterOpcodes = [1, 9, 33, 41, 49, 57]     // 0x01 0x09 0x21 0x29 0x31 0x39
 let registerMemoryOpcodes = [3, 11, 35, 43, 51, 59]
 let arithmeticOpcodeExtensions = [0, 1, 4, 5, 6, 7]
-// Minimum operand counts for IDs 0..41; every jcc/setcc takes one. imul's
+// Minimum operand counts for IDs 0..50; every jcc/setcc takes one. imul's
 // one-, two-, and three-operand forms are selected in assembleInstruction.
 let assemblyMinOperands = [2, 2, 2, 2, 2, 2, 2, 1, 1, 0, 0, 0, 2, 2,
     1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2,
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
 
 // Encode a numeric mnemonic ID; preserve the existing x86 instruction forms.
 fn assembleInstruction(mnemonic: int, operands: [Operand], operandCount: int) {
@@ -12066,6 +12613,34 @@ fn assembleInstruction(mnemonic: int, operands: [Operand], operandCount: int) {
         encodeRegisterPair(1, 15, 44, operands[0].register, operands[1].register, false, true)
         return
     }
+    if mnemonic == 42 { // cvtpd2ps
+        encodeRegisterPair(0, 15, 90, operands[0].register, operands[1].register, true, false)
+        return
+    }
+    if mnemonic == 43 { // cvtps2pd
+        encodeRegisterPair(0, 15, 90, operands[0].register, operands[1].register, false, false)
+        return
+    }
+    if mnemonic == 44 { // cvtsd2ss
+        encodeRegisterPair(0, 15, 90, operands[0].register, operands[1].register, false, true)
+        return
+    }
+    if mnemonic == 50 { // movss: F3 0F 10 (load or reg copy) / F3 0F 11 (store)
+        writeTextByte(243)
+        if operands[0].kind == operandKindFloatRegister {
+            encodeRegisterMemory(0, 15, 16, operands[0].register, operands[1], false, false)
+        } else {
+            encodeRegisterMemory(0, 15, 17, operands[1].register, operands[0], false, false)
+        }
+        return
+    }
+    if mnemonic >= 45 and mnemonic <= 49 {
+        // F3-prefixed scalar single ops: cvtss2sd, addss, subss, mulss, divss
+        writeTextByte(243)
+        let secondaryOpcodes = [90, 88, 92, 89, 94]
+        encodeRegisterPair(0, 15, secondaryOpcodes[mnemonic - 45], operands[0].register, operands[1].register, false, false)
+        return
+    }
     assemblyFail("unknown mnemonic")
 }
 
@@ -12315,7 +12890,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// anything the compiler's dup/drop insertion misses: a start bit marks each\n")
     sourceLines.push("// payload address, which is how a conservatively-scanned word is recognised\n")
     sourceLines.push("// as a real object pointer. Roots are the machine stack and the globals array.\n")
-    sourceLines.push("let runtimeHeapReserve = 4294967296       // 4 GiB of address space (reserved, not committed)\n")
+    sourceLines.push("let runtimeHeapReserve = 17179869184     // 16 GiB of address space (reserved, not committed)\n")
     sourceLines.push("let runtimeCommitStep = 4194304           // commit 4 MiB at a time\n")
     sourceLines.push("let runtimeHeapFlagMarked = 1\n")
     sourceLines.push("let runtimeHeapFlagFree = 2\n")
@@ -12333,6 +12908,11 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// allocation O(n) and the compiler 11x slower.\n")
     sourceLines.push("let runtimeSmallAllocationClassCount = 128     // classes 1..128 => payloads of 8..1024 bytes\n")
     sourceLines.push("var runtimeFreeListHeads = 0         // array of runtimeSmallAllocationClassCount+1 list heads (off-heap)\n")
+    sourceLines.push("// Free lists are doubly linked; the back pointer lives in an off-heap table\n")
+    sourceLines.push("// (one slot per 8-byte heap word) because a block's payload may be too short\n")
+    sourceLines.push("// to hold it (an 8-byte payload would overflow into the next header).\n")
+    sourceLines.push("var runtimeFreeBackTable = 0\n")
+    sourceLines.push("var runtimeFreeBackTableCommittedBytes = 0\n")
     sourceLines.push("// Blocks larger than 1 KiB sit in power-of-two bins (bin k: sizes 2^k up to\n")
     sourceLines.push("// 2^(k+1)), whose heads follow the small classes' in the same off-heap page.\n")
     sourceLines.push("// Any block in a higher bin fits, so a large allocation never walks more\n")
@@ -12356,7 +12936,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("var runtimeWorklistCount = 0\n")
     sourceLines.push("var runtimeHeapInitialized = 0      // 1 once the heap is initialised\n")
     sourceLines.push("var runtimeUnreleasedObjectCount = 0     // objects the backstop collector found that counting missed\n")
-    sourceLines.push("\n")
+    sourceLines.push("var runtimeSweepInProgress = 0      // 1 while the collector's sweep walks the heap\n")
     sourceLines.push("fn runtimeSetBitmapBit(base: int, bitIndex: int) \{\n")
     sourceLines.push("    let byteAddress = base + (bitIndex >> 3)\n")
     sourceLines.push("    store8(byteAddress, load8(byteAddress) | (1 << (bitIndex & 7)))\n")
@@ -12381,15 +12961,62 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("fn runtimePushFreeBlock(object: int, size: int) \{\n")
-    sourceLines.push("    let sizeClass = size >> 3\n")
-    sourceLines.push("    if sizeClass <= runtimeSmallAllocationClassCount \{\n")
-    sourceLines.push("        store64(object, load64(runtimeFreeListHeads + sizeClass * 8))\n")
-    sourceLines.push("        store64(runtimeFreeListHeads + sizeClass * 8, object)\n")
-    sourceLines.push("    \} else \{\n")
-    sourceLines.push("        let head = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(size) * 8\n")
-    sourceLines.push("        store64(object, load64(head))\n")
-    sourceLines.push("        store64(head, object)\n")
+    sourceLines.push("    // Forward coalesce: absorb the address-adjacent successor if it is free. The\n")
+    sourceLines.push("    // mark-sweep is deferred while worker threads are alive (Linux cannot suspend\n")
+    sourceLines.push("    // stacks), so without this the free pool stays shredded into slivers between\n")
+    sourceLines.push("    // collections and the bump pointer advances past reusable space until the\n")
+    sourceLines.push("    // reservation is full -- a radius-32 scene OOM'd at 4 GiB committed with only\n")
+    sourceLines.push("    // ~300 MiB live. The successor is unlinked from its list first, so no stale\n")
+    sourceLines.push("    // entries are left behind.\n")
+    sourceLines.push("    let next = object + runtimeObjectHeaderBytes + size\n")
+    sourceLines.push("    var mergedSize = size\n")
+    sourceLines.push("    // The sweep walks the heap in address order and re-reads size words after\n")
+    sourceLines.push("    // pushing a run, so coalescing there would extend a word the walk has\n")
+    sourceLines.push("    // already consumed and make it jump over live objects.\n")
+    sourceLines.push("    if runtimeSweepInProgress == 0 and next < runtimeHeapBumpAddress \{\n")
+    sourceLines.push("        let nextWord = load64(next - 8)\n")
+    sourceLines.push("        if (nextWord & runtimeHeapFlagFree) != 0 \{\n")
+    sourceLines.push("            let nextSize = nextWord & (0 - 8)\n")
+    sourceLines.push("            runtimeUnlinkFreeBlock(next, nextSize)\n")
+    sourceLines.push("            mergedSize = size + runtimeObjectHeaderBytes + nextSize\n")
+    sourceLines.push("            store64(object - 8, mergedSize | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimeClearBitmapBit(runtimeObjectStartBitmap, (next - runtimeHeapBaseAddress) >> 3)\n")
+    sourceLines.push("        \}\n")
     sourceLines.push("    \}\n")
+    sourceLines.push("    // doubly linked: payload [0] = next, [8] = back\n")
+    sourceLines.push("    let sizeClass = mergedSize >> 3\n")
+    sourceLines.push("    var headAddress = 0\n")
+    sourceLines.push("    if sizeClass <= runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("        headAddress = runtimeFreeListHeads + sizeClass * 8\n")
+    sourceLines.push("    \} else \{\n")
+    sourceLines.push("        headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(mergedSize) * 8\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    let oldHead = load64(headAddress)\n")
+    sourceLines.push("    store64(object, oldHead)\n")
+    sourceLines.push("    store64(runtimeFreeBackSlot(object), 0)\n")
+    sourceLines.push("    if oldHead != 0 \{ store64(runtimeFreeBackSlot(oldHead), object) \}\n")
+    sourceLines.push("    store64(headAddress, object)\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// remove a free block from its list (O(1) through the back-pointer table); used\n")
+    sourceLines.push("// when a forward coalesce absorbs it\n")
+    sourceLines.push("fn runtimeUnlinkFreeBlock(block: int, size: int) \{\n")
+    sourceLines.push("    let sizeClass = size >> 3\n")
+    sourceLines.push("    var headAddress = 0\n")
+    sourceLines.push("    if sizeClass <= runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("        headAddress = runtimeFreeListHeads + sizeClass * 8\n")
+    sourceLines.push("    \} else \{\n")
+    sourceLines.push("        headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(size) * 8\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    let backSlot = runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)\n")
+    sourceLines.push("    let back = load64(backSlot)\n")
+    sourceLines.push("    let forward = load64(block)\n")
+    sourceLines.push("    if back != 0 \{ store64(back, forward) \} else \{ store64(headAddress, forward) \}\n")
+    sourceLines.push("    if forward != 0 \{ store64(runtimeFreeBackTable + (((forward - runtimeHeapBaseAddress) >> 3) << 3), back) \}\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("fn runtimeFreeBackSlot(block: int) -> int \{\n")
+    sourceLines.push("    return runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("fn runtimeInitializeHeap() \{\n")
@@ -12403,6 +13030,8 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    runtimeNextCollectionAddress = runtimeHeapBaseAddress + 8388608                   // first collection after 8 MiB of growth\n")
     sourceLines.push("    runtimeObjectStartBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word\n")
     sourceLines.push("    runtimeObjectMarkBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)\n")
+    sourceLines.push("    runtimeFreeBackTable = runtimeReserveMemory(runtimeHeapReserve)          // back pointer per 8-byte word (same span as the heap)\n")
+    sourceLines.push("    runtimeFreeBackTableCommittedBytes = 0\n")
     sourceLines.push("    runtimeBitmapCommittedBytes = 0\n")
     sourceLines.push("    runtimeMarkWorklist = runtimeReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to 16M pending objects\n")
     sourceLines.push("    runtimeWorklistCommittedBytes = 0                         // (reserve is address space only -- free)\n")
@@ -12423,6 +13052,10 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        runtimeCommitMemory(runtimeObjectStartBitmap, bitmapBytesNeeded)\n")
     sourceLines.push("        runtimeCommitMemory(runtimeObjectMarkBitmap, bitmapBytesNeeded)\n")
     sourceLines.push("        runtimeBitmapCommittedBytes = bitmapBytesNeeded\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    if want > runtimeFreeBackTableCommittedBytes \{\n")
+    sourceLines.push("        runtimeCommitMemory(runtimeFreeBackTable, want)\n")
+    sourceLines.push("        runtimeFreeBackTableCommittedBytes = want\n")
     sourceLines.push("    \}\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
@@ -12491,6 +13124,11 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("//\n")
     sourceLines.push("// Slot layout, 32 bytes: [0] handle  [8] stack base (0 = not yet registered)\n")
     sourceLines.push("//                        [16] thread id  [24] spare\n")
+    sourceLines.push("let runtimeCacheCountsOffset = 1040\n")
+    sourceLines.push("let runtimeCacheBatchBytes = 16384\n")
+    sourceLines.push("let runtimeCacheClassLimit = 512\n")
+    sourceLines.push("var runtimeThreadCacheSlot = 0 - 1      // TLS index, set when the first thread is registered\n")
+    sourceLines.push("var runtimeThreadCaches = 0             // registry: every cache, linked through [4000]\n")
     sourceLines.push("let runtimeMaximumThreadCount = 64\n")
     sourceLines.push("var runtimeThreadRecords = 0\n")
     sourceLines.push("var runtimeCollectorScratchAddress = 0        // collector's own scratch: runtimeGetScratchPage() is shared\n")
@@ -12542,6 +13180,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// which matters because its stack base is still 0 too.\n")
     sourceLines.push("fn runtimeRegisterThread(handle: int, threadId: int) -> int \{\n")
     sourceLines.push("    runtimeInitializeThreadRegistry()\n")
+    sourceLines.push("    if runtimeThreadCacheSlot < 0 \{ runtimeThreadCacheSlot = win(\"TlsAlloc\") \}\n")
     sourceLines.push("    let lockResult = win(\"EnterCriticalSection\", runtimeHeapLockAddress)\n")
     sourceLines.push("    var slotIndex = -1\n")
     sourceLines.push("    var index = 0\n")
@@ -12586,6 +13225,15 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("fn runtimeMarkThreadDone() \{\n")
+    sourceLines.push("    if runtimeThreadCacheSlot >= 0 \{\n")
+    sourceLines.push("        // give the blocks back and the cache up: the thread only returns from here on\n")
+    sourceLines.push("        let cache = win(\"TlsGetValue\", runtimeThreadCacheSlot)\n")
+    sourceLines.push("        if cache != 0 \{\n")
+    sourceLines.push("            runtimeFlushThreadCache(cache)\n")
+    sourceLines.push("            let tlsResult = win(\"TlsSetValue\", runtimeThreadCacheSlot, 0)\n")
+    sourceLines.push("            store64(cache + 4032, 0)\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    let currentThreadId = win(\"GetCurrentThreadId\")\n")
     sourceLines.push("    let lockResult = win(\"EnterCriticalSection\", runtimeHeapLockAddress)\n")
     sourceLines.push("    var index = 0\n")
@@ -12644,6 +13292,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    // main thread. Defer cyclic garbage until all workers are joined; add signal\n")
     sourceLines.push("    // safepoints if long-lived workers need bounded cyclic-heap growth.\n")
     sourceLines.push("    if runtimeUnsuspendableThreadCount != 0 \{ return \}\n")
+    sourceLines.push("    runtimeEmptyThreadCaches()\n")
     sourceLines.push("    // clear marks\n")
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    while index < runtimeBitmapCommittedBytes \{\n")
@@ -12702,6 +13351,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    // whether a conservatively scanned word points at one. runtimeTakeFreeBlock's\n")
     sourceLines.push("    // split path already re-sets the bit for any remainder it carves off, so\n")
     sourceLines.push("    // the two stay consistent.\n")
+    sourceLines.push("    runtimeSweepInProgress = 1\n")
     sourceLines.push("    var object = runtimeHeapBaseAddress + runtimeObjectHeaderBytes\n")
     sourceLines.push("    var runStart = 0                                      // payload of the open run, 0 if none\n")
     sourceLines.push("    var runSize = 0\n")
@@ -12736,6 +13386,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        store64(runStart - 8, runSize | runtimeHeapFlagFree)\n")
     sourceLines.push("        runtimePushFreeBlock(runStart, runSize)\n")
     sourceLines.push("    \}\n")
+    sourceLines.push("    runtimeSweepInProgress = 0\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("// ---- reference counting ----\n")
@@ -12746,8 +13397,100 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// data section and a closure's env may be 0.\n")
     sourceLines.push("fn runtimeRetainReference(value: int) -> int \{\n")
     sourceLines.push("    if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress \{ return value \}\n")
+    sourceLines.push("    if runtimeRegisteredThreadCount != 0 \{\n")
+    sourceLines.push("        if load64(value - 24) < 0 \{ return value \}           // frozen: shared without counting\n")
+    sourceLines.push("        let counted = runtimeAtomicAdd(value - 24, 1)\n")
+    sourceLines.push("        return value\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    store64(value - 24, load64(value - 24) + 1)\n")
     sourceLines.push("    return value\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// ---- freezing ----\n")
+    sourceLines.push("// A frozen object's count has the sign bit set: counting skips it (threads read\n")
+    sourceLines.push("// its header without writing it, so shared read-only data does not bounce\n")
+    sourceLines.push("// between cores) and it is never freed by counting -- only the collector can\n")
+    sourceLines.push("// reclaim it once nothing reaches it. freeze(x) (std/thread.zeph) freezes x and\n")
+    sourceLines.push("// everything reachable from it; mutating a frozen structure stays safe.\n")
+    sourceLines.push("fn runtimeFreezeObject(value: int) \{\n")
+    sourceLines.push("    let frozenBit = 0 - 9223372036854775807 - 1\n")
+    sourceLines.push("    // already frozen: the bit is only ever set, so one unlocked read settles it\n")
+    sourceLines.push("    if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress and (load64(value - 24) & frozenBit) != 0 \{\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    runtimeLockHeap()\n")
+    sourceLines.push("    runtimePushMarkWorklist(value)\n")
+    sourceLines.push("    while runtimeWorklistCount > 0 \{\n")
+    sourceLines.push("        runtimeWorklistCount -= 1\n")
+    sourceLines.push("        let object = load64(runtimeMarkWorklist + runtimeWorklistCount * 8)\n")
+    sourceLines.push("        if object >= runtimeHeapBaseAddress and object < runtimeHeapBumpAddress and load64(object - 24) >= 0 \{\n")
+    sourceLines.push("            store64(object - 24, load64(object - 24) | frozenBit)\n")
+    sourceLines.push("            let descriptor = load64(object - 16)\n")
+    sourceLines.push("            if descriptor != 0 \{\n")
+    sourceLines.push("                let kind = load64(descriptor)\n")
+    sourceLines.push("                if kind == 1 \{\n")
+    sourceLines.push("                    let count = load64(descriptor + 8)\n")
+    sourceLines.push("                    var index = 0\n")
+    sourceLines.push("                    while index < count \{\n")
+    sourceLines.push("                        if (load64(descriptor + 16 + (index >> 6) * 8) >> (index & 63)) & 1 == 1 \{ runtimePushMarkWorklist(load64(object + index * 8)) \}\n")
+    sourceLines.push("                        index += 1\n")
+    sourceLines.push("                    \}\n")
+    sourceLines.push("                \} else if kind == 2 \{\n")
+    sourceLines.push("                    let data = load64(object + 16)\n")
+    sourceLines.push("                    if load64(descriptor + 8) == 1 \{\n")
+    sourceLines.push("                        var index = 0\n")
+    sourceLines.push("                        while index < load64(object) \{\n")
+    sourceLines.push("                            runtimePushMarkWorklist(load64(data + index * 8))\n")
+    sourceLines.push("                            index += 1\n")
+    sourceLines.push("                        \}\n")
+    sourceLines.push("                    \}\n")
+    sourceLines.push("                    runtimePushMarkWorklist(data)\n")
+    sourceLines.push("                \} else if kind == 3 \{\n")
+    sourceLines.push("                    let slots = load64(object + 16)\n")
+    sourceLines.push("                    var index = 0\n")
+    sourceLines.push("                    while index < load64(object + 8) \{\n")
+    sourceLines.push("                        let slot = slots + index * 24\n")
+    sourceLines.push("                        if (load64(slot) & 1) == 1 \{\n")
+    sourceLines.push("                            if load64(descriptor + 8) == 1 \{ runtimePushMarkWorklist(load64(slot + 8)) \}\n")
+    sourceLines.push("                            if load64(descriptor + 16) == 1 \{ runtimePushMarkWorklist(load64(slot + 16)) \}\n")
+    sourceLines.push("                        \}\n")
+    sourceLines.push("                        index += 1\n")
+    sourceLines.push("                    \}\n")
+    sourceLines.push("                    runtimePushMarkWorklist(slots)\n")
+    sourceLines.push("                \}\n")
+    sourceLines.push("            \}\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    runtimeUnlockHeap()\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// ---- atomics ----\n")
+    sourceLines.push("// The x86 back ends never call this: a call to it is emitted in place as\n")
+    sourceLines.push("// `lock xadd` (baseline and -O2 alike). This body is what a target without\n")
+    sourceLines.push("// threads (wasm) runs. Returns the value after adding.\n")
+    sourceLines.push("fn runtimeAtomicAdd(address: int, delta: int) -> int \{\n")
+    sourceLines.push("    let updated = load64(address) + delta\n")
+    sourceLines.push("    store64(address, updated)\n")
+    sourceLines.push("    return updated\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// Once a second thread exists every count changes atomically. A thread is\n")
+    sourceLines.push("// registered (runtimeRegisteredThreadCount > 0) before it runs, and the count\n")
+    sourceLines.push("// never drops back, so no update can race with a non-atomic one.\n")
+    sourceLines.push("//\n")
+    sourceLines.push("// The -O2 tier's inline release in a program that spawns threads decrements\n")
+    sourceLines.push("// with `lock xadd` itself and, when it took the last count, calls this: the\n")
+    sourceLines.push("// count is already 0, only the freeing is left.\n")
+    sourceLines.push("fn runtimeReleaseLastReference(value: int) \{\n")
+    sourceLines.push("    runtimeReleaseObject(value)\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// a count of 1 dropped atomically: true when that was the last holder\n")
+    sourceLines.push("fn runtimeAtomicDropIsLast(value: int) -> bool \{\n")
+    sourceLines.push("    if load64(value - 24) < 0 \{ return false \}               // frozen\n")
+    sourceLines.push("    let remaining = runtimeAtomicAdd(value - 24, 0 - 1)\n")
+    sourceLines.push("    if remaining < 0 \{ runtimeFail(\"reference count underflow\") \}\n")
+    sourceLines.push("    return remaining == 0\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("// `*addr = v` for a reference slot: the old holder's count goes away with it.\n")
@@ -12758,9 +13501,15 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    let oldValue = load64(address)\n")
     sourceLines.push("    store64(address, value)\n")
     sourceLines.push("    if oldValue >= runtimeHeapBaseAddress and oldValue < runtimeHeapBumpAddress \{\n")
+    sourceLines.push("        if runtimeRegisteredThreadCount != 0 \{\n")
+    sourceLines.push("            if runtimeAtomicDropIsLast(oldValue) \{ runtimeReleaseObject(oldValue) \}\n")
+    sourceLines.push("            return\n")
+    sourceLines.push("        \}\n")
     sourceLines.push("        let referenceCount = load64(oldValue - 24)\n")
     sourceLines.push("        if referenceCount > 1 \{\n")
     sourceLines.push("            store64(oldValue - 24, referenceCount - 1)\n")
+    sourceLines.push("        \} else if referenceCount < 0 \{\n")
+    sourceLines.push("            return                                          // frozen\n")
     sourceLines.push("        \} else \{\n")
     sourceLines.push("            if referenceCount < 1 \{ runtimeFail(\"reference count underflow\") \}\n")
     sourceLines.push("            store64(oldValue - 24, 0)\n")
@@ -12783,11 +13532,16 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("\n")
     sourceLines.push("fn runtimeReleaseReference(value: int) \{\n")
     sourceLines.push("    if value < runtimeHeapBaseAddress or value >= runtimeHeapBumpAddress \{ return \}\n")
+    sourceLines.push("    if runtimeRegisteredThreadCount != 0 \{\n")
+    sourceLines.push("        if runtimeAtomicDropIsLast(value) \{ runtimeReleaseLastReference(value) \}\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    let referenceCount = load64(value - 24)\n")
     sourceLines.push("    if referenceCount > 1 \{\n")
     sourceLines.push("        store64(value - 24, referenceCount - 1)\n")
     sourceLines.push("        return\n")
     sourceLines.push("    \}\n")
+    sourceLines.push("    if referenceCount < 0 \{ return \}                        // frozen\n")
     sourceLines.push("    if referenceCount < 1 \{ runtimeFail(\"reference count underflow\") \}\n")
     sourceLines.push("    store64(value - 24, 0)\n")
     sourceLines.push("    if load64(value - 16) == 0 and runtimeRegisteredThreadCount == 0 \{\n")
@@ -12809,10 +13563,14 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    while index < slotCount \{\n")
     sourceLines.push("        let value = load64(framePointer - load64(slotOffsetTable + index * 8))\n")
-    sourceLines.push("        if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress \{\n")
+    sourceLines.push("        if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress and runtimeRegisteredThreadCount != 0 \{\n")
+    sourceLines.push("            if runtimeAtomicDropIsLast(value) \{ runtimeReleaseObject(value) \}\n")
+    sourceLines.push("        \} else if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress \{\n")
     sourceLines.push("            let referenceCount = load64(value - 24)\n")
     sourceLines.push("            if referenceCount > 1 \{\n")
     sourceLines.push("                store64(value - 24, referenceCount - 1)\n")
+    sourceLines.push("            \} else if referenceCount < 0 \{\n")
+    sourceLines.push("                index += 0                                  // frozen\n")
     sourceLines.push("            \} else \{\n")
     sourceLines.push("                if referenceCount < 1 \{ runtimeFail(\"reference count underflow\") \}\n")
     sourceLines.push("                store64(value - 24, 0)\n")
@@ -12828,11 +13586,19 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// million-element linked structure from overflowing the stack.\n")
     sourceLines.push("fn runtimeReleaseChildReference(childAddress: int) \{\n")
     sourceLines.push("    if childAddress < runtimeHeapBaseAddress or childAddress >= runtimeHeapBumpAddress \{ return \}\n")
+    sourceLines.push("    if runtimeRegisteredThreadCount != 0 \{\n")
+    sourceLines.push("        if runtimeAtomicDropIsLast(childAddress) \{\n")
+    sourceLines.push("            if runtimeThreadCacheSlot >= 0 \{ runtimeThreadWorklistPush(runtimeThreadCache(), childAddress) \}\n")
+    sourceLines.push("            else \{ runtimePushMarkWorklist(childAddress) \}\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    let referenceCount = load64(childAddress - 24)\n")
     sourceLines.push("    if referenceCount > 1 \{\n")
     sourceLines.push("        store64(childAddress - 24, referenceCount - 1)\n")
     sourceLines.push("        return\n")
     sourceLines.push("    \}\n")
+    sourceLines.push("    if referenceCount < 0 \{ return \}                        // frozen\n")
     sourceLines.push("    if referenceCount < 1 \{ runtimeFail(\"reference count underflow\") \}\n")
     sourceLines.push("    store64(childAddress - 24, 0)\n")
     sourceLines.push("    runtimePushMarkWorklist(childAddress)\n")
@@ -12842,6 +13608,10 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// collector's worklist; the two never run at once because the collector is only\n")
     sourceLines.push("// ever entered from allocation, which release never performs.\n")
     sourceLines.push("fn runtimeReleaseObject(value: int) \{\n")
+    sourceLines.push("    if runtimeRegisteredThreadCount != 0 and runtimeThreadCacheSlot >= 0 \{\n")
+    sourceLines.push("        runtimeReleaseObjectThreaded(value)\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    runtimeLockHeap()\n")
     sourceLines.push("    runtimePushMarkWorklist(value)\n")
     sourceLines.push("    while runtimeWorklistCount > 0 \{\n")
@@ -12892,8 +13662,12 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        while index < capacity \{\n")
     sourceLines.push("            let slot = slots + index * 24\n")
     sourceLines.push("            if (load64(slot) & 1) == 1 \{\n")
-    sourceLines.push("                if mapKeyIsReference == 1 \{ runtimeReleaseChildReference(load64(slot + 8)) \}\n")
-    sourceLines.push("                if mapValueIsReference == 1 \{ runtimeReleaseChildReference(load64(slot + 16)) \}\n")
+    sourceLines.push("                if mapKeyIsReference == 1 \{\n")
+    sourceLines.push("                runtimeReleaseChildReference(load64(slot + 8))\n")
+    sourceLines.push("            \}\n")
+    sourceLines.push("                if mapValueIsReference == 1 \{\n")
+    sourceLines.push("                runtimeReleaseChildReference(load64(slot + 16))\n")
+    sourceLines.push("            \}\n")
     sourceLines.push("            \}\n")
     sourceLines.push("            index += 1\n")
     sourceLines.push("        \}\n")
@@ -12940,17 +13714,39 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("// their exact-size class in O(1); large ones use first fit with splitting.\n")
     sourceLines.push("fn runtimeTakeFreeBlock(need: int) -> int \{\n")
     sourceLines.push("    let sizeClass = need >> 3\n")
+    sourceLines.push("    var bin = 0\n")
     sourceLines.push("    if sizeClass <= runtimeSmallAllocationClassCount \{\n")
     sourceLines.push("        let head = load64(runtimeFreeListHeads + sizeClass * 8)\n")
-    sourceLines.push("        if head == 0 \{ return 0 \}\n")
-    sourceLines.push("        store64(runtimeFreeListHeads + sizeClass * 8, load64(head))        // pop\n")
-    sourceLines.push("        store64(head - 8, need)                      // live again, flags cleared\n")
-    sourceLines.push("        runtimeZeroMemory(head, need)\n")
-    sourceLines.push("        return head\n")
+    sourceLines.push("        if head != 0 \{\n")
+    sourceLines.push("            let headNext = load64(head)\n")
+    sourceLines.push("            store64(runtimeFreeListHeads + sizeClass * 8, headNext)        // pop\n")
+    sourceLines.push("            if headNext != 0 \{ store64(runtimeFreeBackSlot(headNext), 0) \}\n")
+    sourceLines.push("            store64(head - 8, need)                      // live again, flags cleared\n")
+    sourceLines.push("            runtimeZeroMemory(head, need)\n")
+    sourceLines.push("            return head\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        // An empty class carves from the next non-empty larger class, then from\n")
+    sourceLines.push("        // a large block, before the heap bumps. Counting frees blocks into\n")
+    sourceLines.push("        // whatever class they were, and the sweep (and forward coalescing)\n")
+    sourceLines.push("        // merge dead neighbours into large blocks, so the class asked for is\n")
+    sourceLines.push("        // often empty while plenty of memory is free. Without this, every such\n")
+    sourceLines.push("        // allocation bumped past that free space: pi-desk reached a 1 GB extent\n")
+    sourceLines.push("        // in 53 s with 5 MB live, and hit \"heap full\" after 1h41m.\n")
+    sourceLines.push("        var stealClass = sizeClass + 1\n")
+    sourceLines.push("        while stealClass <= runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("            let block = load64(runtimeFreeListHeads + stealClass * 8)\n")
+    sourceLines.push("            if block != 0 \{\n")
+    sourceLines.push("                let blockNext = load64(block)\n")
+    sourceLines.push("                store64(runtimeFreeListHeads + stealClass * 8, blockNext)\n")
+    sourceLines.push("                if blockNext != 0 \{ store64(runtimeFreeBackSlot(blockNext), 0) \}\n")
+    sourceLines.push("                return runtimeCarveFreeBlock(block, stealClass * 8, need)\n")
+    sourceLines.push("            \}\n")
+    sourceLines.push("            stealClass += 1\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        bin = runtimeLargeBin(1024)\n")
+    sourceLines.push("    \} else \{\n")
+    sourceLines.push("        bin = runtimeLargeBin(need)                  // first fit over a few blocks of need's own bin, else the head of any higher one\n")
     sourceLines.push("    \}\n")
-    sourceLines.push("    // first fit over a few blocks of need's own bin, else the head of any higher one\n")
-    sourceLines.push("    let needBin = runtimeLargeBin(need)\n")
-    sourceLines.push("    var bin = needBin\n")
     sourceLines.push("    while bin < runtimeLargeBinCount \{\n")
     sourceLines.push("        let head = runtimeFreeListHeads + runtimeLargeBinsOffset + bin * 8\n")
     sourceLines.push("        var probes = 0\n")
@@ -12961,6 +13757,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("            let nextBlock = load64(current)\n")
     sourceLines.push("            if size >= need \{\n")
     sourceLines.push("                if previous == 0 \{ store64(head, nextBlock) \} else \{ store64(previous, nextBlock) \}\n")
+    sourceLines.push("                if nextBlock != 0 \{ store64(runtimeFreeBackSlot(nextBlock), previous) \}\n")
     sourceLines.push("                return runtimeCarveFreeBlock(current, size, need)\n")
     sourceLines.push("            \}\n")
     sourceLines.push("            probes += 1\n")
@@ -13004,7 +13801,9 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        let listHead = runtimeFreeListHeads + need            // class need / 8, 8 bytes a head\n")
     sourceLines.push("        let block = load64(listHead)\n")
     sourceLines.push("        if block != 0 \{\n")
-    sourceLines.push("            store64(listHead, load64(block))\n")
+    sourceLines.push("            let blockNext = load64(block)\n")
+    sourceLines.push("            store64(listHead, blockNext)\n")
+    sourceLines.push("            if blockNext != 0 \{ store64(runtimeFreeBackSlot(blockNext), 0) \}\n")
     sourceLines.push("            store64(block - 8, need)                          // live again, flags cleared\n")
     sourceLines.push("            runtimeZeroMemory(block, need)\n")
     sourceLines.push("            store64(block - 24, 1)\n")
@@ -13012,12 +13811,180 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("            return block\n")
     sourceLines.push("        \}\n")
     sourceLines.push("    \}\n")
+    sourceLines.push("    if runtimeRegisteredThreadCount != 0 and runtimeThreadCacheSlot >= 0 and size > 0 and size <= 8 * runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("        // a thread's own exact-size lists: no lock unless they run dry\n")
+    sourceLines.push("        let need = (size + 7) & (0 - 8)\n")
+    sourceLines.push("        let cache = runtimeThreadCache()\n")
+    sourceLines.push("        var block = load64(cache + need)\n")
+    sourceLines.push("        if block == 0 \{\n")
+    sourceLines.push("            runtimeRefillThreadCache(cache, need)\n")
+    sourceLines.push("            block = load64(cache + need)\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        store64(cache + need, load64(block))\n")
+    sourceLines.push("        store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) - 1)\n")
+    sourceLines.push("        store64(block - 8, need)\n")
+    sourceLines.push("        runtimeZeroMemory(block, need)\n")
+    sourceLines.push("        store64(block - 24, 1)\n")
+    sourceLines.push("        store64(block - 16, descriptor)\n")
+    sourceLines.push("        return block\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("    runtimeLockHeap()\n")
     sourceLines.push("    let result = runtimeAllocateObjectPayload(size)\n")
     sourceLines.push("    store64(result - 24, 1)\n")
     sourceLines.push("    store64(result - 16, descriptor)\n")
     sourceLines.push("    runtimeUnlockHeap()\n")
     sourceLines.push("    return result\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// ---- per-thread allocation caches ----\n")
+    sourceLines.push("// Once threads exist, every thread allocates small blocks from its own\n")
+    sourceLines.push("// exact-size free lists and frees into them, so allocation-heavy parallel code\n")
+    sourceLines.push("// does not serialize on the heap lock. A cache refills a class in batches\n")
+    sourceLines.push("// under the lock and gives half back when a class grows long. Off-heap,\n")
+    sourceLines.push("// 8 KiB per thread:\n")
+    sourceLines.push("//   [0 .. 1032)    list heads, indexed by size (class * 8 == size)\n")
+    sourceLines.push("//   [1040 .. 2072) block count per class\n")
+    sourceLines.push("//   [4000] next cache in the registry   [4008] worklist   [4016] count   [4024] capacity\n")
+    sourceLines.push("//   [4032] 1 while a thread owns it\n")
+    sourceLines.push("// The collector only runs with no workers alive, and empties every cache first\n")
+    sourceLines.push("// (the sweep rebuilds the global lists from free-flagged blocks anyway).\n")
+    sourceLines.push("\n")
+    sourceLines.push("fn runtimeThreadCache() -> int \{\n")
+    sourceLines.push("    let cache = win(\"TlsGetValue\", runtimeThreadCacheSlot)\n")
+    sourceLines.push("    if cache != 0 \{ return cache \}\n")
+    sourceLines.push("    // a cache a finished thread gave up, else a new one\n")
+    sourceLines.push("    runtimeLockHeap()\n")
+    sourceLines.push("    var created = runtimeThreadCaches\n")
+    sourceLines.push("    while created != 0 and load64(created + 4032) != 0 \{ created = load64(created + 4000) \}\n")
+    sourceLines.push("    if created == 0 \{\n")
+    sourceLines.push("        created = win(\"VirtualAlloc\", 0, 8192, 12288, 4)\n")
+    sourceLines.push("        if created == 0 \{ runtimeFail(\"out of memory (thread cache)\") \}\n")
+    sourceLines.push("        store64(created + 4000, runtimeThreadCaches)\n")
+    sourceLines.push("        runtimeThreadCaches = created\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    store64(created + 4032, 1)                     // in use\n")
+    sourceLines.push("    runtimeUnlockHeap()\n")
+    sourceLines.push("    let tlsResult = win(\"TlsSetValue\", runtimeThreadCacheSlot, created)\n")
+    sourceLines.push("    return created\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// a batch of `need`-byte blocks for the cache, under the heap lock\n")
+    sourceLines.push("fn runtimeRefillThreadCache(cache: int, need: int) \{\n")
+    sourceLines.push("    var count = runtimeCacheBatchBytes / (need + runtimeObjectHeaderBytes)\n")
+    sourceLines.push("    if count < 4 \{ count = 4 \}\n")
+    sourceLines.push("    if count > 64 \{ count = 64 \}\n")
+    sourceLines.push("    runtimeLockHeap()\n")
+    sourceLines.push("    var index = 0\n")
+    sourceLines.push("    while index < count \{\n")
+    sourceLines.push("        let block = runtimeAllocateObjectPayload(need)\n")
+    sourceLines.push("        store64(block - 8, need)     // no FREE flag while cached (see runtimeCacheFreeBlock)\n")
+    sourceLines.push("        store64(block, load64(cache + need))\n")
+    sourceLines.push("        store64(cache + need, block)\n")
+    sourceLines.push("        index += 1\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) + count)\n")
+    sourceLines.push("    runtimeUnlockHeap()\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// a freed small block onto this thread's list; a long list gives half back\n")
+    sourceLines.push("fn runtimeCacheFreeBlock(cache: int, object: int, size: int) \{\n")
+    sourceLines.push("    // no FREE flag while cached: coalesce must not absorb a cached successor\n")
+    sourceLines.push("    // (it is not on the shared free lists, so its back-pointer slot is stale)\n")
+    sourceLines.push("    store64(object - 8, size)\n")
+    sourceLines.push("    store64(object, load64(cache + size))\n")
+    sourceLines.push("    store64(cache + size, object)\n")
+    sourceLines.push("    let count = load64(cache + runtimeCacheCountsOffset + size) + 1\n")
+    sourceLines.push("    store64(cache + runtimeCacheCountsOffset + size, count)\n")
+    sourceLines.push("    if count > runtimeCacheClassLimit \{\n")
+    sourceLines.push("        runtimeLockHeap()\n")
+    sourceLines.push("        var index = 0\n")
+    sourceLines.push("        while index < runtimeCacheClassLimit / 2 \{\n")
+    sourceLines.push("            let block = load64(cache + size)\n")
+    sourceLines.push("            store64(cache + size, load64(block))\n")
+    sourceLines.push("            store64(block - 8, size | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimePushFreeBlock(block, size)\n")
+    sourceLines.push("            index += 1\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        store64(cache + runtimeCacheCountsOffset + size, count - runtimeCacheClassLimit / 2)\n")
+    sourceLines.push("        runtimeUnlockHeap()\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("fn runtimeThreadWorklistPush(cache: int, object: int) \{\n")
+    sourceLines.push("    var count = load64(cache + 4016)\n")
+    sourceLines.push("    var capacity = load64(cache + 4024)\n")
+    sourceLines.push("    if count >= capacity \{\n")
+    sourceLines.push("        var grown = capacity * 2\n")
+    sourceLines.push("        if grown < 512 \{ grown = 512 \}\n")
+    sourceLines.push("        let list = win(\"VirtualAlloc\", 0, grown * 8, 12288, 4)\n")
+    sourceLines.push("        if list == 0 \{ runtimeFail(\"out of memory (release worklist)\") \}\n")
+    sourceLines.push("        let old = load64(cache + 4008)\n")
+    sourceLines.push("        if old != 0 \{\n")
+    sourceLines.push("            runtimeCopyMemory(list, old, count * 8)\n")
+    sourceLines.push("            let released = win(\"VirtualFree\", old, 0, 32768)\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        store64(cache + 4008, list)\n")
+    sourceLines.push("        store64(cache + 4024, grown)\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    store64(load64(cache + 4008) + count * 8, object)\n")
+    sourceLines.push("    store64(cache + 4016, count + 1)\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// runtimeReleaseObject once threads exist: this thread's worklist and cache, no lock for small blocks\n")
+    sourceLines.push("fn runtimeReleaseObjectThreaded(value: int) \{\n")
+    sourceLines.push("    let cache = runtimeThreadCache()\n")
+    sourceLines.push("    runtimeThreadWorklistPush(cache, value)\n")
+    sourceLines.push("    var count = load64(cache + 4016)\n")
+    sourceLines.push("    while count > 0 \{\n")
+    sourceLines.push("        count -= 1\n")
+    sourceLines.push("        store64(cache + 4016, count)\n")
+    sourceLines.push("        let object = load64(load64(cache + 4008) + count * 8)\n")
+    sourceLines.push("        let descriptor = load64(object - 16)\n")
+    sourceLines.push("        if descriptor != 0 \{ runtimeReleaseObjectChildren(object, descriptor) \}\n")
+    sourceLines.push("        let size = load64(object - 8) & (0 - 8)\n")
+    sourceLines.push("        if size > 0 and size <= 8 * runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("            runtimeCacheFreeBlock(cache, object, size)\n")
+    sourceLines.push("        \} else \{\n")
+    sourceLines.push("            runtimeLockHeap()\n")
+    sourceLines.push("            store64(object - 8, size | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimePushFreeBlock(object, size)\n")
+    sourceLines.push("            runtimeUnlockHeap()\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        count = load64(cache + 4016)\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// a finished thread's blocks go back to the global lists\n")
+    sourceLines.push("fn runtimeFlushThreadCache(cache: int) \{\n")
+    sourceLines.push("    runtimeLockHeap()\n")
+    sourceLines.push("    var size = 8\n")
+    sourceLines.push("    while size <= 8 * runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("        var block = load64(cache + size)\n")
+    sourceLines.push("        while block != 0 \{\n")
+    sourceLines.push("            let next = load64(block)\n")
+    sourceLines.push("            store64(block - 8, size | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimePushFreeBlock(block, size)\n")
+    sourceLines.push("            block = next\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        store64(cache + size, 0)\n")
+    sourceLines.push("        store64(cache + runtimeCacheCountsOffset + size, 0)\n")
+    sourceLines.push("        size += 8\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    runtimeUnlockHeap()\n")
+    sourceLines.push("\}\n")
+    sourceLines.push("\n")
+    sourceLines.push("// before a collection: the sweep rebuilds every free list, cached blocks included\n")
+    sourceLines.push("fn runtimeEmptyThreadCaches() \{\n")
+    sourceLines.push("    var cache = runtimeThreadCaches\n")
+    sourceLines.push("    while cache != 0 \{\n")
+    sourceLines.push("        var size = 8\n")
+    sourceLines.push("        while size <= 8 * runtimeSmallAllocationClassCount \{\n")
+    sourceLines.push("            store64(cache + size, 0)\n")
+    sourceLines.push("            store64(cache + runtimeCacheCountsOffset + size, 0)\n")
+    sourceLines.push("            size += 8\n")
+    sourceLines.push("        \}\n")
+    sourceLines.push("        cache = load64(cache + 4000)\n")
+    sourceLines.push("    \}\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
     sourceLines.push("fn runtimeAllocateObjectPayload(size: int) -> int \{\n")
@@ -14605,7 +15572,16 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    \}\n")
     sourceLines.push("    runtimePackedPush(listAddress, value, 1)\n")
     sourceLines.push("\}\n")
-    sourceLines.push("fn runtimeF32Push(listAddress: int, value: int) \{ runtimePackedPush(listAddress, value, 4) \}\n")
+    sourceLines.push("// with room, one 32-bit store: small enough for -O2 to inline at the push\n")
+    sourceLines.push("fn runtimeF32Push(listAddress: int, value: int) \{\n")
+    sourceLines.push("    let count = load64(listAddress)\n")
+    sourceLines.push("    if count < load64(listAddress + 8) \{\n")
+    sourceLines.push("        store32(load64(listAddress + 16) + count * 4, runtimeNarrowFloat32Bits(value))\n")
+    sourceLines.push("        store64(listAddress, count + 1)\n")
+    sourceLines.push("        return\n")
+    sourceLines.push("    \}\n")
+    sourceLines.push("    runtimePackedPush(listAddress, value, 4)\n")
+    sourceLines.push("\}\n")
     sourceLines.push("fn runtimeU8Pop(listAddress: int, site: str) -> int \{ return runtimePackedPop(listAddress, 1, site) \}\n")
     sourceLines.push("fn runtimeF32Pop(listAddress: int, site: str) -> int \{ return runtimePackedPop(listAddress, 4, site) \}\n")
     sourceLines.push("\n")
@@ -17250,6 +18226,13 @@ fn embeddedLibraryText10() -> str {
     sourceLines.push("    return processorCount\n")
     sourceLines.push("\}\n")
     sourceLines.push("\n")
+    sourceLines.push("// Freeze a structure that worker threads will share read-only: it and\n")
+    sourceLines.push("// everything reachable from it stop being reference counted (no atomic writes\n")
+    sourceLines.push("// to shared headers, so readers on many cores do not contend) and are never\n")
+    sourceLines.push("// freed by counting. Still safe to mutate; anything stored into it later is\n")
+    sourceLines.push("// counted normally. Use on long-lived shared state (tables, samplers, registries).\n")
+    sourceLines.push("fn freeze[T](value: T) \{ runtimeFreezeObject(addr(value)) \}\n")
+    sourceLines.push("\n")
     return sourceLines.join()
 }
 fn embeddedLibraryName(index: int) -> str {
@@ -17941,6 +18924,54 @@ fn writeElf64Bits(value: int) {
     }
 }
 
+fn writeElfProgramHeader(kind: int, flags: int, offset: int, address: int, fileSize: int, memorySize: int, alignment: int) {
+    writePe32Bits(kind)
+    writePe32Bits(flags)
+    writeElf64Bits(offset)
+    writeElf64Bits(address)
+    writeElf64Bits(address)
+    writeElf64Bits(fileSize)
+    writeElf64Bits(memorySize)
+    writeElf64Bits(alignment)
+}
+
+fn writeElfText(text: str) {
+    for i in 0..text.len() { writePeByte(text.byte(i)) }
+    writePeByte(0)
+}
+
+// The header-page loader tables of a dynamic image (layout: elfInterpreterOffset
+// and friends). Two GLOB_DAT relocations point the GOT at libc's dlopen and
+// dlsym; everything else is loaded at run time through them.
+fn writeElfDynamicTables(globalOffsetTableAddress: int) {
+    padPeOutput(elfInterpreterOffset)
+    writeElfText("/lib64/ld-linux-x86-64.so.2")
+    padPeOutput(elfDynamicStringOffset)
+    writePeByte(0)
+    writeElfText("libc.so.6")                       // 1
+    writeElfText("dlopen")                          // 11
+    writeElfText("dlsym")                           // 18
+    padPeOutput(elfDynamicSymbolOffset)
+    for i in 0..24 { writePeByte(0) }                // the null symbol
+    for nameOffset in [11, 18] {
+        writePe32Bits(nameOffset)
+        writePeByte(18)                             // STB_GLOBAL, STT_FUNC
+        writePeByte(0)
+        writePe16Bits(0)                            // SHN_UNDEF
+        writeElf64Bits(0)
+        writeElf64Bits(0)
+    }
+    padPeOutput(elfDynamicHashOffset)
+    for word in [1, 3, 0, 0, 0, 0] { writePe32Bits(word) }    // nbucket, nchain, bucket, chains
+    padPeOutput(elfDynamicRelocationOffset)
+    for slot in 0..2 {
+        writeElf64Bits(globalOffsetTableAddress + 8 * slot)
+        writeElf64Bits(((slot + 1) << 32) | 6)       // symbol, R_X86_64_GLOB_DAT
+        writeElf64Bits(0)
+    }
+    if peLength != elfDynamicTablesEnd { panic("writeElfDynamicTables: layout drifted") }
+}
+
 fn writeElf(path: str) {
     let entryOffset = textSectionLength
     currentAssemblySection = sectionText
@@ -17995,10 +19026,23 @@ fn writeElf(path: str) {
     writePe32Bits(0)
     writePe16Bits(64)                              // e_ehsize
     writePe16Bits(56)                              // e_phentsize
-    writePe16Bits(2)                               // e_phnum
+    if linuxDynamicLinking { writePe16Bits(elfDynamicHeaderCount) } else { writePe16Bits(2) }   // e_phnum
     writePe16Bits(64)
     writePe16Bits(0)
     writePe16Bits(0)
+
+    var dynamicTableAddress = 0
+    var globalOffsetTableAddress = 0
+    if linuxDynamicLinking {
+        let dynamicSymbol = assemblySymbols[internAssemblySymbol("__zdyndynamic")]
+        let globalOffsetTableSymbol = assemblySymbols[internAssemblySymbol("__zdyngot")]
+        dynamicTableAddress = elfBase + readOnlyDataRelativeAddress + dynamicSymbol.offset
+        globalOffsetTableAddress = elfBase + readOnlyDataRelativeAddress + globalOffsetTableSymbol.offset
+        // PT_PHDR (must precede the loads)
+        writeElfProgramHeader(6, 4, 64, elfBase + 64, 56 * elfDynamicHeaderCount, 56 * elfDynamicHeaderCount, 8)
+        // PT_INTERP
+        writeElfProgramHeader(3, 4, elfInterpreterOffset, elfBase + elfInterpreterOffset, 28, 28, 1)
+    }
 
     // PT_LOAD r-x: the headers and .text, mapped from file offset 0
     writePe32Bits(1)
@@ -18020,11 +19064,216 @@ fn writeElf(path: str) {
     writeElf64Bits(zeroDataRelativeAddress - readOnlyDataRelativeAddress + zeroSectionSize)
     writeElf64Bits(4096)
 
+    if linuxDynamicLinking {
+        // PT_DYNAMIC, then PT_GNU_STACK (a non-executable stack)
+        writeElfProgramHeader(2, 6, dynamicTableAddress - elfBase, dynamicTableAddress, 208, 208, 8)
+        writeElfProgramHeader(1685382481, 6, 0, 0, 0, 0, 16)
+        writeElfDynamicTables(globalOffsetTableAddress)
+    }
+
     padPeOutput(textRelativeAddress)
     writePeBytes(textSectionBytes, textSectionLength)
     padPeOutput(readOnlyDataRelativeAddress)
     writePeBytes(readOnlySectionBytes, readOnlySectionLength)
 
+    writeFile(path, peOutput)
+}
+
+// ---- --linux with an .o output: an ELF64 relocatable object ----
+// What gas makes of the .s output, without the text round trip: .text,
+// .rodata (the .rdata section; build scripts linking with gcc turn it read-only
+// too) and .bss, every label but .L ones as a local symbol (profilers and gdb
+// use them), zephyrMain global. Text-to-text references are resolved here;
+// the rest become R_X86_64_PC32 (code to data) and R_X86_64_64 (.quad label)
+// relocations against the section symbols.
+var elfObjectOutput = false
+
+fn writeObjectBytes(text: str) {
+    for i in 0..text.len() { writePeByte(text.byte(i)) }
+}
+
+fn writeObjectSectionHeader(nameOffset: int, sectionType: int, flags: int, offset: int, size: int, link: int, info: int, alignment: int, entrySize: int) {
+    writePe32Bits(nameOffset)
+    writePe32Bits(sectionType)
+    writePe64Bits(flags)
+    writePe64Bits(0)                               // sh_addr
+    writePe64Bits(offset)
+    writePe64Bits(size)
+    writePe32Bits(link)
+    writePe32Bits(info)
+    writePe64Bits(alignment)
+    writePe64Bits(entrySize)
+}
+
+fn writeElfObject(path: str) {
+    // relocations: [offset, symbol, type, addend] per entry
+    var textRelocations: [int] = []
+    var readOnlyRelocations: [int] = []
+    for i in 0..assemblyFixups.len() {
+        let fixup = assemblyFixups[i]
+        if fixup.kind == fixupImportAddress32 { assemblyFail("DLL imports are not available on --linux") }
+        let symbol = assemblySymbols[fixup.symbol]
+        if not symbol.defined { assemblyFail("undefined symbol {symbol.name}") }
+        if fixup.kind == fixupAbsolute64 {
+            if fixup.section != sectionReadOnlyData { assemblyFail("absolute address outside .rdata") }
+            readOnlyRelocations.push(fixup.offset)
+            readOnlyRelocations.push(1 + symbol.section)
+            readOnlyRelocations.push(1)            // R_X86_64_64
+            readOnlyRelocations.push(symbol.offset)
+        } else {
+            if fixup.section != sectionText { assemblyFail("relative fixup outside .text") }
+            if symbol.section == sectionText {
+                patch32Bits(textSectionBytes, fixup.offset, symbol.offset + fixup.addend - (fixup.offset + 4))
+            } else {
+                textRelocations.push(fixup.offset)
+                textRelocations.push(1 + symbol.section)
+                textRelocations.push(2)            // R_X86_64_PC32
+                textRelocations.push(symbol.offset + fixup.addend - 4)
+            }
+        }
+    }
+    // symbols: null, the three section symbols, local labels, then zephyrMain
+    var symbolIndices: [int] = []
+    var stringTableSize = 1
+    for i in 0..assemblySymbols.len() {
+        let symbol = assemblySymbols[i]
+        if not symbol.defined or symbol.name.len() == 0 or symbol.name == "zephyrMain" or textStartsWith(symbol.name, ".L") { continue }
+        symbolIndices.push(i)
+        stringTableSize += symbol.name.len() + 1
+    }
+    let mainSymbol = internAssemblySymbol("zephyrMain")
+    if not assemblySymbols[mainSymbol].defined { assemblyFail("undefined symbol zephyrMain") }
+    stringTableSize += 11
+    var symbolCount = 5 + symbolIndices.len()
+    if linuxDynamicLinking {
+        // the GOT slots (see generateProgram) become R_X86_64_64 relocations
+        // against undefined dlopen and dlsym, which the C link resolves from libc
+        let globalOffsetTableSymbol = assemblySymbols[internAssemblySymbol("__zdyngot")]
+        for slot in 0..2 {
+            readOnlyRelocations.push(globalOffsetTableSymbol.offset + 8 * slot)
+            readOnlyRelocations.push(symbolCount + slot)
+            readOnlyRelocations.push(1)            // R_X86_64_64
+            readOnlyRelocations.push(0)
+        }
+        symbolCount += 2
+        stringTableSize += 13
+    }
+    let sectionNames = "\0.text\0.rodata\0.bss\0.rela.text\0.rela.rodata\0.symtab\0.strtab\0.shstrtab\0"
+    let textOffset = 64
+    let readOnlyOffset = peAlign(textOffset + textSectionLength, 16)
+    let textRelocationOffset = peAlign(readOnlyOffset + readOnlySectionLength, 8)
+    let readOnlyRelocationOffset = textRelocationOffset + 6 * textRelocations.len()
+    let symbolTableOffset = readOnlyRelocationOffset + 6 * readOnlyRelocations.len()
+    let stringTableOffset = symbolTableOffset + 24 * symbolCount
+    let sectionNamesOffset = stringTableOffset + stringTableSize
+    let sectionHeadersOffset = peAlign(sectionNamesOffset + sectionNames.len(), 8)
+    peOutput = chr(0).repeat(sectionHeadersOffset + 64 * 9)
+    peLength = 0
+
+    writePeByte(127)
+    writePeByte(69)
+    writePeByte(76)
+    writePeByte(70)                               // \x7fELF
+    writePeByte(2)                                // 64-bit
+    writePeByte(1)                                // little-endian
+    writePeByte(1)                                // version
+    padPeOutput(16)
+    writePe16Bits(1)                               // ET_REL
+    writePe16Bits(62)                              // EM_X86_64
+    writePe32Bits(1)
+    writePe64Bits(0)                               // e_entry
+    writePe64Bits(0)                               // e_phoff
+    writePe64Bits(sectionHeadersOffset)
+    writePe32Bits(0)
+    writePe16Bits(64)                              // e_ehsize
+    writePe16Bits(0)
+    writePe16Bits(0)
+    writePe16Bits(64)                              // e_shentsize
+    writePe16Bits(9)                               // e_shnum
+    writePe16Bits(8)                               // e_shstrndx
+
+    padPeOutput(textOffset)
+    writePeBytes(textSectionBytes, textSectionLength)
+    padPeOutput(readOnlyOffset)
+    writePeBytes(readOnlySectionBytes, readOnlySectionLength)
+    padPeOutput(textRelocationOffset)
+    var r = 0
+    while r < textRelocations.len() {
+        writePe64Bits(textRelocations[r])
+        writePe64Bits((textRelocations[r + 1] << 32) | textRelocations[r + 2])
+        writePe64Bits(textRelocations[r + 3])
+        r += 4
+    }
+    r = 0
+    while r < readOnlyRelocations.len() {
+        writePe64Bits(readOnlyRelocations[r])
+        writePe64Bits((readOnlyRelocations[r + 1] << 32) | readOnlyRelocations[r + 2])
+        writePe64Bits(readOnlyRelocations[r + 3])
+        r += 4
+    }
+    // Elf64_Sym: name, info, other, shndx, value, size
+    padPeOutput(symbolTableOffset + 24)
+    for section in 1..4 {
+        writePe32Bits(0)
+        writePeByte(3)                            // STB_LOCAL, STT_SECTION
+        writePeByte(0)
+        writePe16Bits(section)
+        writePe64Bits(0)
+        writePe64Bits(0)
+    }
+    var nameOffset = 1
+    for i in symbolIndices {
+        let symbol = assemblySymbols[i]
+        writePe32Bits(nameOffset)
+        writePeByte(0)                            // STB_LOCAL, STT_NOTYPE
+        writePeByte(0)
+        writePe16Bits(1 + symbol.section)
+        writePe64Bits(symbol.offset)
+        writePe64Bits(0)
+        nameOffset += symbol.name.len() + 1
+    }
+    writePe32Bits(nameOffset)
+    writePeByte(18)                               // STB_GLOBAL, STT_FUNC
+    writePeByte(0)
+    writePe16Bits(1)
+    writePe64Bits(assemblySymbols[mainSymbol].offset)
+    writePe64Bits(0)
+    if linuxDynamicLinking {
+        for importName in ["dlopen", "dlsym"] {
+            nameOffset += if importName == "dlopen" { 11 } else { 7 }
+            writePe32Bits(nameOffset)
+            writePeByte(18)                       // STB_GLOBAL, STT_FUNC
+            writePeByte(0)
+            writePe16Bits(0)                      // SHN_UNDEF
+            writePe64Bits(0)
+            writePe64Bits(0)
+        }
+    }
+    padPeOutput(stringTableOffset + 1)
+    for i in symbolIndices {
+        writeObjectBytes(assemblySymbols[i].name)
+        writePeByte(0)
+    }
+    writeObjectBytes("zephyrMain")
+    writePeByte(0)
+    if linuxDynamicLinking {
+        writeObjectBytes("dlopen")
+        writePeByte(0)
+        writeObjectBytes("dlsym")
+        writePeByte(0)
+    }
+    writeObjectBytes(sectionNames)
+
+    padPeOutput(sectionHeadersOffset + 64)
+    // name offsets into sectionNames: .text 1, .rodata 7, .bss 15, .rela.text 20, .rela.rodata 31, .symtab 44, .strtab 52, .shstrtab 60
+    writeObjectSectionHeader(1, 1, 6, textOffset, textSectionLength, 0, 0, 16, 0)
+    writeObjectSectionHeader(7, 1, 2, readOnlyOffset, readOnlySectionLength, 0, 0, 16, 0)
+    writeObjectSectionHeader(15, 8, 3, readOnlyOffset + readOnlySectionLength, zeroSectionSize, 0, 0, 16, 0)
+    writeObjectSectionHeader(20, 4, 64, textRelocationOffset, 6 * textRelocations.len(), 6, 1, 8, 24)
+    writeObjectSectionHeader(31, 4, 64, readOnlyRelocationOffset, 6 * readOnlyRelocations.len(), 6, 2, 8, 24)
+    writeObjectSectionHeader(44, 2, 0, symbolTableOffset, 24 * symbolCount, 7, 4 + symbolIndices.len(), 8, 24)   // sh_info: zephyrMain, the first global
+    writeObjectSectionHeader(52, 3, 0, stringTableOffset, stringTableSize, 0, 0, 1, 0)
+    writeObjectSectionHeader(60, 3, 0, sectionNamesOffset, sectionNames.len(), 0, 0, 1, 0)
     writeFile(path, peOutput)
 }
 
@@ -19285,6 +20534,14 @@ fn emitWasmCall(expression: Node) {
         wasmFunctionBody.push(189)
         return
     }
+    if callKind == callKindRoundToSingle {
+        emitWasmExpression(expression.children[1])
+        wasmFunctionBody.push(191)
+        wasmFunctionBody.push(182)                         // f32.demote_f64
+        wasmFunctionBody.push(187)                         // f64.promote_f32
+        wasmFunctionBody.push(189)
+        return
+    }
     if callKind == callKindBits {        // identity: values are bits
         emitWasmExpression(expression.children[1])
         return
@@ -20002,7 +21259,8 @@ fn assembleAndLink(path: str) {
     for i in 0..assemblyLines.len() {
         assembleLine(assemblyLines[i])
     }
-    if linuxTargetEnabled { writeElf(path) } else { writePe(path) }
+    if elfObjectOutput { writeElfObject(path) }
+    else if linuxTargetEnabled { writeElf(path) } else { writePe(path) }
     if symbolMapEnabled and not linuxTargetEnabled { writeSymbolMap(path + ".map") }
     if debugEnabled and not linuxTargetEnabled { writeDebugSymbols(path + ".zdbg") }
 }
@@ -20039,6 +21297,7 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "--version" { showVersion = true }
     else if argument == "-g" or argument == "--debug" { debugEnabled = true }
     else if argument == "-O2" { optimizerEnabled = true }
+    else if argument == "-Oquick" { optimizerEnabled = false }
     else if argument == "--opt-report" { optimizerReport = true }
     else if argument == "--opt-dump" { optimizerDump = true }
     else if argument == "--callgraph-report" { callGraphReport = true }
@@ -20059,6 +21318,7 @@ while argumentIndex < commandLineArguments.len() {
 }
 if showVersion {
     print("zc 0.2 -- the Zephyr compiler, written in Zephyr")
+    print("features: elf-object linux-extern")      // --linux out.o writes an ELF relocatable; extern fn loads shared libraries (build scripts probe these)
 }
 if inputPath == "" and showVersion {
     // --version alone: nothing to compile
@@ -20159,6 +21419,9 @@ if inputPath == "" and showVersion {
     // -g only affects native exe output; keep .zloc markers out of .s (gcc path)
     mainSourceFile = inputPath
     if isAssemblyOutput { debugEnabled = false }
+    // --linux out.o: the object gas would make of out.s, assembled in process
+    elfObjectOutput = linuxTargetEnabled and outputPath.endsWith(".o")
+    if elfObjectOutput { debugEnabled = false }
     if wasmTargetEnabled {
         // wasm is not a register machine, so none of the x86 passes apply here
         generateWasmTwice(program)

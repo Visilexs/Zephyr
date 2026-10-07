@@ -1,0 +1,23 @@
+// Promoted int and float locals (rsi/rdi, xmm6+) must survive System V calls.
+// Run by tests/linux_extern.sh.
+extern fn cbrt(x: float) -> float from "libm.so.6"
+extern fn labs(x: int) -> int from "libc.so.6"
+
+fn work(n: int) -> float {
+    var a = 1.5
+    var b = 0.25
+    var c = 3.0
+    var s = 0
+    var t = 7
+    var u = 11
+    for i in 0..n {
+        a += cbrt(8.0)
+        b += 0.5
+        c *= 1.0
+        s += labs(0 - i)
+        t += 1
+        u += 2
+    }
+    return a + b + c + (s + t + u)
+}
+print(work(10))

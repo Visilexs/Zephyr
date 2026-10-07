@@ -1,6 +1,9 @@
 # Compiler seeds are retained; other binaries are build products.
 *.exe
 !zc.exe
+zc-linux
+zc.new
+zc.chk
 *.dll
 *.o
 *.obj

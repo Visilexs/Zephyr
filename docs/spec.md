@@ -802,10 +802,51 @@ the value.
 
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
 to the kernel shim `kernel32Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
-prefix (`user32!…`) is a compile error, and `extern fn … from` (which needs an
-import table) is unavailable. Additional builtins on those targets:
+prefix (`user32!…`) is a compile error. Additional builtins on those targets:
 `syscall(n, args…)` (raw Linux syscall, 1–7 args), and wasm-only `growMemory`,
-`hostWrite`, `hostExit`.
+`hostWrite`, `hostExit`. `extern fn … from` is unavailable on `--wasm`.
+
+**Shared libraries on Linux.** On `--linux`, `extern fn … from "libfoo.so.N"`
+loads a shared library with libc's `dlopen` (`RTLD_NOW | RTLD_GLOBAL`, once per
+library) and resolves the symbol with `dlsym` on first call, then calls it with
+the System V AMD64 convention:
+
+```zephyr
+extern fn SDL_Init(flags: int) -> bool from "libSDL3.so.0"
+extern fn SDL_CreateWindow(title: int, w: int, h: int, flags: int) -> int from "libSDL3.so.0"
+extern fn hypot(x: float, y: float) -> float from "libm.so.6"
+```
+
+Parameters may be `int` (integers, pointers, enums) or `float` (a C `double`,
+passed in an XMM register). The return may be `int`, `i32` (the low 32 bits,
+sign-extended), `bool` (the low byte, for C's `bool`), `float` (a C `double`),
+or nothing. A C `float` (single) argument or result is not supported; pass
+structs by pointer into off-heap or `Bytes` memory. The function's Zephyr name
+is the C symbol, so a symbol that clashes with a builtin (`abs`, `pow`) needs
+a C-side alias. A load or lookup failure panics with `dlerror`'s message.
+
+Using `extern fn` makes the output dynamic: the ELF gains an interpreter
+(`/lib64/ld-linux-x86-64.so.2`), a `DT_NEEDED` on `libc.so.6` and two
+relocated imports, `dlopen` and `dlsym`; every other library is loaded at run
+time. Programs without `extern fn` stay static and byte-for-byte unchanged.
+With an `.o` output the two imports become undefined `dlopen`/`dlsym`
+references, which the C link (`gcc … -o prog`) resolves from libc.
+
+The underlying builtins, which need `--linux`:
+
+| Builtin | Signature | Notes |
+|---------|-----------|-------|
+| `callSysV(addr, args…)` | int, (int or float)… → int | System V call to a code address: int arguments in `rdi rsi rdx rcx r8 r9`, float ones in `xmm0`–`xmm7`, the rest on the stack; `al` holds the XMM count, so variadic C functions work. Up to 16 arguments. |
+| `callSysVFloat(addr, args…)` | the same → float | Returns `xmm0`. |
+| `dynamicImport(n)` | literal 0 or 1 → int | Address of the GOT slot ld.so fills with `dlopen` (0) or `dlsym` (1); using it makes the output dynamic. |
+
+Native code runs on the calling thread, and C libraries assume glibc's
+per-thread state. Call them from the main thread (or threads they create
+themselves), not from `spawnThread` workers: those are raw `clone` threads
+that share the main thread's TLS. A Zephyr program exits with `exit_group`, so
+libc `atexit` handlers and stdio buffers are not flushed; shut libraries down
+explicitly (`SDL_Quit`). Native callbacks into Zephyr are not supported.
+`zc run` builds a Windows image, so it follows the Windows `extern` rules.
 
 All native interop requires the Zephyr runtime (`--rt`).
 
@@ -877,13 +918,14 @@ An additional native Apple Silicon macOS target uses the `zc` driver:
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
-| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*` |
+| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*`. A program with `extern fn` becomes a dynamic ELF importing only `dlopen`/`dlsym` from libc (§3.6) |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 | `./zc` driver | Apple Silicon macOS | ARM64 Mach-O | experimental; ARM64 instruction selection, including guarded integer AXPY/weighted-sum NEON kernels and wide array fills, followed by Apple Clang assembly/linking and a native Darwin OS runtime. See [macOS support](../README.md#apple-silicon-macos) |
 
 Not every feature reaches every target. WebAssembly currently omits file I/O,
 closures, interfaces and threads; native interop (§3.6) via `extern fn … from`
-is Windows-only, and non-kernel32 `win()` prefixes are Windows-only.
+is available on Windows (DLLs) and Linux (shared libraries, which makes the
+ELF dynamic), and non-kernel32 `win()` prefixes are Windows-only.
 Threads and synchronization primitives are available on both Windows and Linux
 x86-64 with `--rt` (§8).
 `tests/crosscheck-linux.ps1` and `tests/crosscheck-wasm.ps1` compile the same
@@ -913,7 +955,12 @@ zc.exe run [flags] input.zeph [program arguments...]
 
 The first non-flag argument is the input `.zeph`; the second is the output
 path. An output path ending in `.s` writes the generated assembly instead of a
-linked module. `run` compiles into memory and runs the program in the
+linked module. With `--linux`, an output path ending in `.o` writes an ELF64
+relocatable object instead: what GNU as makes of the `.s` (`.text`, `.rodata`,
+`.bss`, local symbols for every label but `.L` ones, `zephyrMain` global),
+assembled in process, for linking with C code (`gcc -no-pie prog.o main.c`,
+where `main` calls `zephyrMain`). `--version` lists `features: elf-object` so
+build scripts can probe for it. `run` compiles into memory and runs the program in the
 compiler's process; every argument after the program path goes to the program.
 
 ## 8. Concurrency

@@ -383,7 +383,7 @@ fn linuxFindStack() {
 fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: int) -> int {
     let threadRecord = linuxCurrentThread()
     if threadRecord != 0 {
-        store64(lowLimitAddress, load64(threadRecord + 8) + 4096)
+        store64(lowLimitAddress, load64(threadRecord + 8) + 8192)
         store64(highLimitAddress, load64(threadRecord + 40))
         return 0
     }
@@ -403,6 +403,8 @@ fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: i
 // Layout: tid32, gate32, mapping, entry, argument, next, stack high, active,
 // generation, then 512 TLS cells at offset 64. A guard precedes each stack.
 var linuxThreads = 0
+let linuxStackAlignment = 67108864              // worker stack mappings: aligned, at most this big
+let linuxStackMagic = 6510615555426900570       // first word of a worker's stack mapping
 var linuxNative = 0
 var linuxThreadLocalStorage = 0
 var linuxThreadLocalSlotCount = 0
@@ -523,12 +525,20 @@ fn linuxNativeInitialize() {
 // ponytail: linear range lookup; index ranges if many live records make TLS hot.
 fn linuxCurrentThread() -> int {
     let stackAddress = stackPointer()
+    if linuxThreads == 0 { return 0 }
+    // the main thread: its stack sits under its [stack] mapping's top, and no
+    // mmap (a worker stack) lands within 128 MiB of that (the kernel's mmap gap)
+    if linuxStackUpperBound == 0 { linuxFindStack() }
+    if stackAddress < linuxStackUpperBound and stackAddress >= linuxStackUpperBound - 67108864 { return 0 }
+    // a worker: its aligned mapping starts with the magic and its record
+    let mappingBase = stackAddress & (0 - linuxStackAlignment)
+    if load64(mappingBase) == linuxStackMagic { return load64(mappingBase + 8) }
     var threadRecord = linuxThreads
     while threadRecord != 0 {
         // An odd or changed generation belongs to another thread's reuse/close.
         // Our own live record cannot change until this thread exits and joins.
         let generation = load64(threadRecord + 56)
-        let stackLow = load64(threadRecord + 8) + 4096
+        let stackLow = load64(threadRecord + 8) + 8192
         let stackHigh = load64(threadRecord + 40)
         if (generation & 1) == 0 and generation == load64(threadRecord + 56) and stackAddress >= stackLow and stackAddress < stackHigh {
             return threadRecord
@@ -638,16 +648,28 @@ fn kernel32CreateThread(securityAddress: int, stackSize: int, entryAddress: int,
     if requestedSize < 16384 or requestedSize > 1073741824 { runtimeUnlockHeap()
         return 0
     }
-    let mappingSize = ((requestedSize + 4095) / 4096) * 4096 + 4096
-    let stackMapping = linuxMapMemory(0, mappingSize, memoryProtectionReadWrite, mapAnonymousPrivate)
-    if stackMapping == 0 { runtimeUnlockHeap()
+    // [control page: magic, record][guard page][stack], the mapping aligned to
+    // linuxStackAlignment so linuxCurrentThread finds the record from RSP alone
+    let mappingSize = ((requestedSize + 4095) / 4096) * 4096 + 8192
+    if mappingSize > linuxStackAlignment { runtimeUnlockHeap()
         return 0
     }
-    let guarded = syscall(systemCallProtectMemory, stackMapping, 4096, memoryProtectionNone)
+    let reservation = linuxMapMemory(0, mappingSize + linuxStackAlignment, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if reservation == 0 { runtimeUnlockHeap()
+        return 0
+    }
+    let stackMapping = (reservation + linuxStackAlignment - 1) & (0 - linuxStackAlignment)
+    if stackMapping > reservation { let headFreed = syscall(11, reservation, stackMapping - reservation) }
+    let tailStart = stackMapping + mappingSize
+    let tailEnd = reservation + mappingSize + linuxStackAlignment
+    if tailEnd > tailStart { let tailFreed = syscall(11, tailStart, tailEnd - tailStart) }
+    let guarded = syscall(systemCallProtectMemory, stackMapping + 4096, 4096, memoryProtectionNone)
     if guarded < 0 { let freed = syscall(11, stackMapping, mappingSize)
         runtimeUnlockHeap()
         return 0
     }
+    store64(stackMapping, linuxStackMagic)
+    store64(stackMapping + 8, threadRecord)
     store64(threadRecord + 56, load64(threadRecord + 56) + 1)
     store64(threadRecord, 0)
     store64(threadRecord + 8, stackMapping)

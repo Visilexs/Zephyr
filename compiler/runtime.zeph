@@ -542,6 +542,10 @@ fn runtimeRetainReference(value: int) -> int {
 // everything reachable from it; mutating a frozen structure stays safe.
 fn runtimeFreezeObject(value: int) {
     let frozenBit = 0 - 9223372036854775807 - 1
+    // already frozen: the bit is only ever set, so one unlocked read settles it
+    if value >= runtimeHeapBaseAddress and value < runtimeHeapBumpAddress and (load64(value - 24) & frozenBit) != 0 {
+        return
+    }
     runtimeLockHeap()
     runtimePushMarkWorklist(value)
     while runtimeWorklistCount > 0 {
@@ -838,19 +842,39 @@ fn runtimeGetScratchPage() -> int {
 // their exact-size class in O(1); large ones use first fit with splitting.
 fn runtimeTakeFreeBlock(need: int) -> int {
     let sizeClass = need >> 3
+    var bin = 0
     if sizeClass <= runtimeSmallAllocationClassCount {
         let head = load64(runtimeFreeListHeads + sizeClass * 8)
-        if head == 0 { return 0 }
-        let headNext = load64(head)
-        store64(runtimeFreeListHeads + sizeClass * 8, headNext)        // pop
-        if headNext != 0 { store64(runtimeFreeBackSlot(headNext), 0) }
-        store64(head - 8, need)                      // live again, flags cleared
-        runtimeZeroMemory(head, need)
-        return head
+        if head != 0 {
+            let headNext = load64(head)
+            store64(runtimeFreeListHeads + sizeClass * 8, headNext)        // pop
+            if headNext != 0 { store64(runtimeFreeBackSlot(headNext), 0) }
+            store64(head - 8, need)                      // live again, flags cleared
+            runtimeZeroMemory(head, need)
+            return head
+        }
+        // An empty class carves from the next non-empty larger class, then from
+        // a large block, before the heap bumps. Counting frees blocks into
+        // whatever class they were, and the sweep (and forward coalescing)
+        // merge dead neighbours into large blocks, so the class asked for is
+        // often empty while plenty of memory is free. Without this, every such
+        // allocation bumped past that free space: pi-desk reached a 1 GB extent
+        // in 53 s with 5 MB live, and hit "heap full" after 1h41m.
+        var stealClass = sizeClass + 1
+        while stealClass <= runtimeSmallAllocationClassCount {
+            let block = load64(runtimeFreeListHeads + stealClass * 8)
+            if block != 0 {
+                let blockNext = load64(block)
+                store64(runtimeFreeListHeads + stealClass * 8, blockNext)
+                if blockNext != 0 { store64(runtimeFreeBackSlot(blockNext), 0) }
+                return runtimeCarveFreeBlock(block, stealClass * 8, need)
+            }
+            stealClass += 1
+        }
+        bin = runtimeLargeBin(1024)
+    } else {
+        bin = runtimeLargeBin(need)                  // first fit over a few blocks of need's own bin, else the head of any higher one
     }
-    // first fit over a few blocks of need's own bin, else the head of any higher one
-    let needBin = runtimeLargeBin(need)
-    var bin = needBin
     while bin < runtimeLargeBinCount {
         let head = runtimeFreeListHeads + runtimeLargeBinsOffset + bin * 8
         var probes = 0

@@ -1,0 +1,7 @@
+strlen 12
+atoi -42
+cos 1 hypot 5 ldexp 24
+snprintf 22 1 2.50 3 4 5 6.125 7 8
+isatty false
+pid>0 true
+float kept 7.5

@@ -1,3 +1,23 @@
 #!/bin/sh
-# Native Apple Silicon compiler entry point; paths may contain spaces.
-exec python3 "$(dirname "$0")/scripts/macos.py" "$@"
+# Zephyr compiler entry point.
+#   - Apple Silicon macOS: drives scripts/macos.py (Apple Clang back end).
+#   - Linux x86-64: uses the native ./zc-linux; bootstraps it once via wine
+#     if missing, then rebuilds natively (scripts/linux-selfbuild.sh).
+# Paths may contain spaces.
+here="$(cd "$(dirname "$0")" && pwd)"
+os="$(uname -s)"
+
+if [ "$os" = "Darwin" ]; then
+    exec python3 "$here/scripts/macos.py" "$@"
+fi
+
+if [ "$os" = "Linux" ]; then
+    if [ ! -x "$here/zc-linux" ]; then
+        echo "bootstrapping native Linux compiler (one-time, needs wine)..." >&2
+        (cd "$here" && wine zc.exe --linux --rt compiler/zc.zeph zc-linux && chmod +x zc-linux)
+    fi
+    exec "$here/zc-linux" "$@"
+fi
+
+echo "zc: unsupported OS '$os' (use zc.exe on Windows, ./zc on macOS/Linux)" >&2
+exit 1

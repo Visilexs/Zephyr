@@ -1,0 +1,39 @@
+// extern fn on --linux: libc/libm through dlopen + System V calls (ints, floats,
+// stack arguments, varargs, i32/bool/float returns). Run by tests/linux_extern.sh.
+extern fn strlen(s: int) -> int from "libc.so.6"
+extern fn atoi(s: int) -> i32 from "libc.so.6"
+extern fn cos(x: float) -> float from "libm.so.6"
+extern fn hypot(x: float, y: float) -> float from "libm.so.6"
+extern fn ldexp(x: float, e: int) -> float from "libm.so.6"
+extern fn snprintf(buf: int, n: int, fmt: int, a: int, b: float, c: int, d: int, e: int, f: float, g: int, h: int) -> int from "libc.so.6"
+extern fn isatty(fd: int) -> bool from "libc.so.6"
+extern fn getpid() -> int from "libc.so.6"
+
+fn cstr(s: str) -> int {
+    let p = win("VirtualAlloc", 0, s.len() + 1, 12288, 4)
+    for i in 0..s.len() { store8(p + i, s.byte(i)) }
+    store8(p + s.len(), 0)
+    return p
+}
+fn fromC(p: int) -> str {
+    var parts: [str] = []
+    var i = 0
+    while load8(p + i) != 0 {
+        parts.push(chr(load8(p + i)))
+        i += 1
+    }
+    return parts.join()
+}
+
+let x = 2.5
+var total = 0.0
+for i in 0..3 { total += x * i }
+print("strlen", strlen(cstr("hello zephyr")))
+print("atoi", atoi(cstr("-42")))
+print("cos", cos(0.0), "hypot", hypot(3.0, 4.0), "ldexp", ldexp(1.5, 4))
+let buf = win("VirtualAlloc", 0, 256, 12288, 4)
+let n = snprintf(buf, 256, cstr("%ld %.2f %ld %ld %ld %.3f %ld %ld"), 1, 2.5, 3, 4, 5, 6.125, 7, 8)
+print("snprintf", n, fromC(buf))
+print("isatty", isatty(99))
+print("pid>0", getpid() > 0)
+print("float kept", total)

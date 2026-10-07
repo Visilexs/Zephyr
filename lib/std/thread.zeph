@@ -125,3 +125,10 @@ fn cpuCount() -> int {
     if processorCount < 1 { return 1 }
     return processorCount
 }
+
+// Freeze a structure that worker threads will share read-only: it and
+// everything reachable from it stop being reference counted (no atomic writes
+// to shared headers, so readers on many cores do not contend) and are never
+// freed by counting. Still safe to mutate; anything stored into it later is
+// counted normally. Use on long-lived shared state (tables, samplers, registries).
+fn freeze[T](value: T) { runtimeFreezeObject(addr(value)) }

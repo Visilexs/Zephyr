@@ -1,0 +1,117 @@
+%YAML 1.2
+---
+# Zephyr (docs/spec.md §1.1). Used by bat and Sublime Text.
+name: Zephyr
+file_extensions: [zeph]
+scope: source.zephyr
+
+variables:
+  ident: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - match: '\b(fn)\s+({{ident}})'
+      captures:
+        1: storage.type.function.zephyr
+        2: entity.name.function.zephyr
+    - match: '\b(struct|enum|interface|type)\s+({{ident}})'
+      captures:
+        1: storage.type.zephyr
+        2: entity.name.type.zephyr
+    - match: '\b(fn|let|var|const|struct|enum|impl|interface|type|private|extern)\b'
+      scope: storage.type.zephyr
+    - match: '\b(test|import|as|from)\b'
+      scope: keyword.other.zephyr
+    - match: '\b(if|else|match|while|for|in|step|break|continue|return|defer)\b'
+      scope: keyword.control.zephyr
+    - match: '\b(and|or|not)\b'
+      scope: keyword.operator.logical.zephyr
+    - match: '\b(true|false)\b'
+      scope: constant.language.boolean.zephyr
+    - match: '\bnone\b'
+      scope: constant.language.null.zephyr
+    - match: '\bself\b'
+      scope: variable.language.self.zephyr
+    - match: '\b(int|float|bool|str|void|i32|u8|f32|f64)\b'
+      scope: storage.type.primitive.zephyr
+    - match: '\b(print|panic|sqrt|emit|chr|bits|floatFromBits|args|readFile|writeFile|zeros|assert|abs|min|max|pow|syscall|addr|load8|load16|load32|load64|store8|store16|store32|store64|callPointer|callSysV|callSysVFloat|dynamicImport|stackPointer|spawnThread|parallelFor|cpuCount)\b(?=\s*\()'
+      scope: support.function.builtin.zephyr
+    - match: '\b[A-Z][A-Z0-9_]+\b'
+      scope: constant.other.zephyr
+    - match: '\b[A-Z][A-Za-z0-9_]*\b'
+      scope: entity.name.type.zephyr
+    - match: '\b[a-z_][A-Za-z0-9_]*(?=\s*\()'
+      scope: variable.function.zephyr
+    - match: "'(\\\\x[0-9A-Fa-f]{2}|\\\\.|[^\\\\'])'"
+      scope: constant.character.zephyr
+    - match: '\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+)\b'
+      scope: constant.numeric.integer.zephyr
+    - match: '\b[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\b|\b[0-9]+[eE][+-]?[0-9]+\b'
+      scope: constant.numeric.float.zephyr
+    - match: '\b[0-9][0-9_]*\b'
+      scope: constant.numeric.integer.zephyr
+    - match: '->|\.\.|\?'
+      scope: keyword.operator.zephyr
+    - match: '==|!=|<=|>=|<<=?|>>=?|[-+*/%&|^]=?|[<>=~]'
+      scope: keyword.operator.zephyr
+
+  comments:
+    - match: '//'
+      scope: punctuation.definition.comment.zephyr
+      push:
+        - meta_scope: comment.line.double-slash.zephyr
+        - match: $\n?
+          pop: true
+    - match: '/\*'
+      scope: punctuation.definition.comment.zephyr
+      push: block-comment
+
+  block-comment:
+    - meta_scope: comment.block.zephyr
+    - match: '/\*'
+      push: block-comment
+    - match: '\*/'
+      pop: true
+
+  strings:
+    - match: 'r"""'
+      push:
+        - meta_scope: string.quoted.triple.raw.zephyr
+        - match: '"""'
+          pop: true
+    - match: 'r"'
+      push:
+        - meta_scope: string.quoted.double.raw.zephyr
+        - match: '"'
+          pop: true
+        - match: $\n?
+          pop: true
+    - match: '"""'
+      push:
+        - meta_scope: string.quoted.triple.zephyr
+        - match: '"""'
+          pop: true
+        - include: string-content
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.zephyr
+        - match: '"'
+          pop: true
+        - match: $\n?
+          pop: true
+        - include: string-content
+
+  string-content:
+    - match: '\\(x[0-9A-Fa-f]{2}|[ntr0\\"''{}])'
+      scope: constant.character.escape.zephyr
+    - match: '\{'
+      scope: punctuation.section.interpolation.begin.zephyr
+      push:
+        - clear_scopes: 1
+        - meta_scope: meta.interpolation.zephyr
+        - match: '\}'
+          scope: punctuation.section.interpolation.end.zephyr
+          pop: true
+        - include: main

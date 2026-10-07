@@ -52,6 +52,19 @@ let irFloatDivide = 19
 let irFloatNegate = 20
 let irFloatCompare = 21         // immediate = condition; float operands -> 0/1
 let irFloatSquareRoot = 22
+let irFloatRoundToSingle = 74   // toSingle(): nearest IEEE single, widened back
+// Native single precision, introduced by selectSinglePrecision. A "single"
+// value is an IEEE single in the low 32 bits of an xmm register (class float);
+// only these opcodes read one, and irDoubleFromSingle widens it back.
+let irSingleFromDouble = 75     // cvtsd2ss of a value already exact as a single
+let irDoubleFromSingle = 76     // cvtss2sd
+let irSingleAdd = 77
+let irSingleSubtract = 78
+let irSingleMultiply = 79
+let irSingleDivide = 80
+let irSingleLoadIndexed = 81    // a [f32] element: the single at [a + b*4]
+let irSingleStoreIndexed = 82   // [a + b*4] = c, c a single
+let irSingleCopy = 83           // the operand's register contents, unchanged
 let irFloatMinimum = 23
 let irFloatMaximum = 24
 let irFloatAbsolute = 25
@@ -203,6 +216,16 @@ let defaultInlineDepthLimit = 3
 var inlineNodeLimit = defaultInlineNodeLimit
 var inlineDepthLimit = defaultInlineDepthLimit
 var inlineRefusedByLimit = false            // this lowering left a call that a larger limit would inline
+// Every inline decision of a lowering compares a node count with
+// inlineNodeLimit or an inline depth with inlineDepthLimit. These bounds
+// collect the limits under which each comparison would come out the same, so
+// the whole lowering (and everything compiled from it) is identical for any
+// node limit in [low, high) and depth limit in [low, high]: runInlineTrials
+// then skips a recompile that could only reproduce what it already has.
+var inlineValidNodeLow = 0
+var inlineValidNodeHigh = 1 << 62
+var inlineValidDepthLow = 0
+var inlineValidDepthHigh = 1 << 62
 var regionEstimatedCost = 0                 // static cost of one entry into the region (emitRegionCode)
 var functionEntryCosts: [int: int] = [:]    // function index -> regionEstimatedCost of its optimized code
 var callGraphStaticCosts: [int] = []        // call-graph node -> one entry's estimated cost, callees included
@@ -329,6 +352,10 @@ fn resetIr() {
     regionReturnTemporaryMark = 0
     inlinedCallCount = 0
     inlineRefusedByLimit = false
+    inlineValidNodeLow = 0
+    inlineValidNodeHigh = 1 << 62
+    inlineValidDepthLow = 0
+    inlineValidDepthHigh = 1 << 62
     var noInlinedFunctions: [int] = []
     regionInlinedFunctions = noInlinedFunctions
     var noInlines: [int] = []
@@ -381,8 +408,7 @@ fn newBlock() -> int {
     blockTerminated.push(false)
     blockLoopDepth.push(currentLoopDepth)
     blockProfileScales.push(currentProfileScale)
-    var definitions: [int] = []
-    for i in 0..variableClasses.len() { definitions.push(0 - 1) }
+    var definitions: [int] = []                // grown on demand by writeVariable
     currentDefinitions.push(definitions)
     var phis: [int] = []
     incompletePhis.push(phis)
@@ -392,6 +418,12 @@ fn newBlock() -> int {
 }
 
 // append an instruction to a block (before its terminator if it has one)
+fn blockHasTerminator(block: int) -> bool {
+    let instructions = blockInstructions[block]
+    if instructions.len() == 0 { return false }
+    return irOpcodes[instructions[instructions.len() - 1]] >= irJump
+}
+
 fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], immediate: int) -> int {
     irOpcodes.push(opcode)
     irClasses.push(valueClass)
@@ -414,12 +446,15 @@ fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], imm
         reordered.push(value)
         for i in position..instructions.len() { reordered.push(instructions[i]) }
         blockInstructions[block] = reordered
-    } else if blockTerminated[block] {
+    } else if blockHasTerminator(block) {
         let instructions = blockInstructions[block]
         let terminator = instructions.pop()
         instructions.push(value)
         instructions.push(terminator)
     } else {
+        // CFG rewrites can empty a block after its terminator was recorded.
+        // The instruction list is authoritative: this block is open again.
+        blockTerminated[block] = false
         blockInstructions[block].push(value)
     }
     return value
@@ -427,6 +462,9 @@ fn addInstruction(block: int, opcode: int, valueClass: int, operands: [int], imm
 
 // code after a return/break/panic: give it a block nobody reaches
 fn ensureOpenBlock() {
+    if blockTerminated[currentIrBlock] and not blockHasTerminator(currentIrBlock) {
+        blockTerminated[currentIrBlock] = false
+    }
     if blockTerminated[currentIrBlock] {
         currentIrBlock = newBlock()
         blockSealed[currentIrBlock] = true
@@ -456,7 +494,7 @@ fn addEdge(from: int, to: int) {
 }
 
 fn terminate(opcode: int, operands: [int], immediate: int, successors: [int]) {
-    if blockTerminated[currentIrBlock] { return }       // already left (break/return): nothing to add
+    if blockHasTerminator(currentIrBlock) { return }    // already left (break/return): nothing to add
     let terminator = addInstruction(currentIrBlock, opcode, classInteger, operands, immediate)
     blockTerminated[currentIrBlock] = true
     for successor in successors { addEdge(currentIrBlock, successor) }
@@ -488,7 +526,6 @@ fn variableForKey(key: str, kind: int, index: int, valueClass: int, isReference:
     variableOwnsValue.push(false)
     variableIsInlineResult.push(false)
     variableKnownClosure.push(0 - 1)
-    for block in 0..currentDefinitions.len() { currentDefinitions[block].push(0 - 1) }
     return number
 }
 
@@ -524,19 +561,24 @@ fn temporaryVariable(valueClass: int, isReference: bool) -> int {
 }
 
 fn writeVariable(variable: int, block: int, value: int) {
-    currentDefinitions[block][variable] = value
+    let definitions = currentDefinitions[block]
+    while definitions.len() <= variable { definitions.push(0 - 1) }
+    definitions[variable] = value
 }
 
 fn readVariable(variable: int, block: int) -> int {
-    let known = currentDefinitions[block][variable]
-    if known >= 0 { return known }
+    let definitions = currentDefinitions[block]
+    if variable < definitions.len() {
+        let known = definitions[variable]
+        if known >= 0 { return known }
+    }
     return readVariableRecursive(variable, block)
 }
 
 fn readVariableRecursive(variable: int, block: int) -> int {
     var value = 0
-    var noOperands: [int] = []
     if not blockSealed[block] {
+        var noOperands: [int] = []
         value = addInstruction(block, irPhi, variableClasses[variable], noOperands, 0)
         incompletePhis[block].push(value)
         incompletePhiVariables[block].push(variable)
@@ -545,6 +587,7 @@ fn readVariableRecursive(variable: int, block: int) -> int {
     } else if blockPredecessors[block].len() == 1 {
         value = readVariable(variable, blockPredecessors[block][0])
     } else {
+        var noOperands: [int] = []
         value = addInstruction(block, irPhi, variableClasses[variable], noOperands, 0)
         writeVariable(variable, block, value)
         addPhiOperands(variable, value)
@@ -1780,7 +1823,7 @@ fn callMayFree(node: Node) -> bool {
     if callKind == callKindUser { return functionMayFree(node.referenceIndex) }
     if callKind == callKindRuntimeCall { return not keepsHeapIntact(node.name) }
     if callKind == callKindInterfaceDispatch { return dispatchMayFree(node) }
-    return callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect or callKind == callKindWindows or callKind == callKindFunctionPointerCall
+    return callKind == callKindPush or callKind == callKindPop or callKind == callKindIndirect or callKind == callKindWindows or callKind == callKindFunctionPointerCall or callKind == callKindSystemVCall or callKind == callKindSystemVCallFloat
 }
 
 fn mayCallFreeingCode(node: Node) -> bool {
@@ -2165,6 +2208,7 @@ fn lowerFixedPanic(stringIndex: int) {
 fn lowerCall(expression: Node) -> int {
     let callKind = expression.auxiliary
     if callKind == callKindSquareRoot { return emitIr1(irFloatSquareRoot, classFloat, lowerExpression(expression.children[1]), 0) }
+    if callKind == callKindRoundToSingle { return emitIr1(irFloatRoundToSingle, classFloat, lowerExpression(expression.children[1]), 0) }
     if callKind == callKindAbsolute {
         let operand = lowerExpression(expression.children[1])
         if typeKinds[expression.typeIndex] == kindFloat { return emitIr1(irFloatAbsolute, classFloat, operand, 0) }
@@ -2341,6 +2385,29 @@ fn lowerCall(expression: Node) -> int {
         let lowerChecked = emitIr2(irBoundsCheck, classInteger, emitIr2(irAdd, classInteger, upper, integerConstant(1), 0), lower, invalid)   // 0 <= lower <= upper
         return ownedTemporary(lowerRuntimeCall("runtimeSubstringFromCheckedBounds", [text, lower, upper]))
     }
+    if callKind == callKindRuntimeCall and (expression.name == "runtimeF32Get" or expression.name == "runtimeF32Set") {
+        // [f32] elements: one movss, instead of the runtime's software widening
+        // and narrowing. A store rounds to the nearest single, which cvtsd2ss is.
+        // (The checker already saved a store's value in a local.)
+        let listNode = expression.children[0].children[0]
+        let indexNode = expression.children[1]
+        let isStore = expression.name == "runtimeF32Set"
+        var later: [Node] = [indexNode]
+        if isStore { later.push(expression.children[2]) }
+        let packedList = lowerContainer(listNode, later)
+        let packedIndex = lowerExpression(indexNode)
+        var stored = 0
+        if isStore { stored = lowerExpression(expression.children[2]) }
+        if optimizerBailed { return 0 }
+        let packedData = lowerElementAddress(packedList, packedIndex, expression)
+        if isStore {
+            let single = emitIr1(irSingleFromDouble, classFloat, stored, 0)
+            let store = emitIr(irSingleStoreIndexed, classFloat, [packedData, packedIndex, single], 0)
+            return integerConstant(0)
+        }
+        let loaded = emitIr2(irSingleLoadIndexed, classFloat, packedData, packedIndex, 0)
+        return emitIr1(irDoubleFromSingle, classFloat, loaded, 0)
+    }
     if callKind == callKindRuntimeCall {         // a method the runtime implements: every argument borrowed
         if not functionNameIndices.has(expression.name) {
             optimizerBail("no {expression.name}")
@@ -2491,18 +2558,40 @@ fn canInline(functionIndex: int) -> bool {
 // what an inlined call lowers: the expanded body, unless only its
 // pre-expansion one fit (see canInlineWithin)
 fn inlinedBody(functionIndex: int) -> Node {
-    if functionNodeCounts.has(functionIndex) and functionNodeCounts[functionIndex] > inlineNodeLimit { return preInlineBody(functionIndex) }
+    if functionNodeCounts.has(functionIndex) and not nodeCountWithinLimit(functionNodeCounts[functionIndex], inlineNodeLimit) { return preInlineBody(functionIndex) }
     return functionDefinitions[functionIndex].body
+}
+
+// count <= nodeLimit, recording the inlineNodeLimit values that agree. A
+// nodeLimit above inlineNodeLimit is max(floor, inlineNodeLimit).
+fn nodeCountWithinLimit(count: int, nodeLimit: int) -> bool {
+    var floor = 0
+    if nodeLimit > inlineNodeLimit { floor = nodeLimit }
+    let within = count <= nodeLimit
+    if count > floor {
+        if within {
+            if count > inlineValidNodeLow { inlineValidNodeLow = count }
+        } else if count < inlineValidNodeHigh { inlineValidNodeHigh = count }
+    }
+    return within
+}
+
+// the last lowering made the same decisions under these limits
+fn inlineDecisionsHoldAt(nodeLimit: int, depthLimit: int) -> bool {
+    return nodeLimit >= inlineValidNodeLow and nodeLimit < inlineValidNodeHigh and depthLimit >= inlineValidDepthLow and depthLimit <= inlineValidDepthHigh
 }
 
 fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
     if not inliningEnabled or functionIndex == regionFunctionIndex { return false }
-    if inlineStack.len() >= inlineDepthLimit {
+    let depth = inlineStack.len()
+    if depth >= inlineDepthLimit {
+        if depth < inlineValidDepthHigh { inlineValidDepthHigh = depth }
         inlineRefusedByLimit = true
         return false
     }
+    if depth + 1 > inlineValidDepthLow { inlineValidDepthLow = depth + 1 }
     let functionDefinition = functionDefinitions[functionIndex]
-    if functionDefinition.name == "runtimeCollectGarbage" { return false }
+    if functionDefinition.name == "runtimeCollectGarbage" or isNativeRuntimeCallee(functionDefinition.name) { return false }
     for active in inlineStack {
         if active == functionIndex { return false }
     }
@@ -2511,7 +2600,7 @@ fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
     // is user code: a runtime helper only in a user loop, where its fast path
     // is what matters (runtimeU8Push, say)
     if not functionNodeCounts.has(functionIndex) { functionNodeCounts[functionIndex] = countNodes(functionDefinition.body) }
-    if functionNodeCounts[functionIndex] <= nodeLimit { return true }
+    if nodeCountWithinLimit(functionNodeCounts[functionIndex], nodeLimit) { return true }
     let regionIsRuntime = regionFunctionIndex >= 0 and textStartsWith(functionDefinitions[regionFunctionIndex].name, "runtime")
     let calleeIsRuntime = textStartsWith(functionDefinition.name, "runtime")
     if regionIsRuntime or (calleeIsRuntime and currentLoopDepth == 0) {
@@ -2527,7 +2616,7 @@ fn canInlineWithin(functionIndex: int, nodeLimit: int) -> bool {
         return false
     }
     if not preInlineNodeCounts.has(functionIndex) { preInlineNodeCounts[functionIndex] = countNodes(preInlineBody(functionIndex)) }
-    if preInlineNodeCounts[functionIndex] <= nodeLimit { return true }
+    if nodeCountWithinLimit(preInlineNodeCounts[functionIndex], nodeLimit) { return true }
     inlineRefusedByLimit = true
     return false
 }
@@ -3253,7 +3342,7 @@ fn subtreeHasUserCallAt(node: Node) -> bool {
     if node.nodeKind != nodeCall { return false }
     let callKind = node.auxiliary
     if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" { return functionTouchesGlobals(node.referenceIndex) }
-    if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows { return true }
+    if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows or callKind == callKindSystemVCall or callKind == callKindSystemVCallFloat { return true }
     return callKind == callKindRuntimeCall and hasFunctionArgument(node)
 }
 
@@ -3261,7 +3350,7 @@ fn subtreeHasUserCall(node: Node) -> bool {
     if node.nodeKind == nodeCall {
         let callKind = node.auxiliary
         if callKind == callKindUser and functionDefinitions[node.referenceIndex].name != "runtimeFail" and functionTouchesGlobals(node.referenceIndex) { return true }
-        if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows { return true }
+        if callKind == callKindIndirect or callKind == callKindInterfaceDispatch or callKind == callKindFunctionPointerCall or callKind == callKindWindows or callKind == callKindSystemVCall or callKind == callKindSystemVCallFloat { return true }
         if callKind == callKindRuntimeCall and hasFunctionArgument(node) { return true }
     }
     for child in node.children {
@@ -3375,6 +3464,7 @@ fn isTerminatorOpcode(opcode: int) -> bool { return opcode >= irJump }
 fn isPureOpcode(opcode: int) -> bool {
     if opcode == irStore or opcode == irStoreIndexed or opcode == irStoreGlobal or opcode == irStoreFrame { return false }
     if opcode == irFloatStore or opcode == irFloatStoreIndexed or opcode == irFloatStoreGlobal or opcode == irFloatStoreFrame { return false }
+    if opcode == irSingleStoreIndexed { return false }
     if opcode == irBoundsCheck or opcode == irZeroCheck or opcode == irCall { return false }
     if opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 { return false }
     return not isTerminatorOpcode(opcode)
@@ -3507,6 +3597,10 @@ fn countUses() {
 fn isInlineRetain(instruction: int) -> bool {
     return heapBumpGlobalIndex >= 0 and heapBaseGlobalIndex >= 0 and isRuntimeCallTo(instruction, "runtimeRetainReference")
 }
+
+// a program that can start threads (it has std/thread's spawnThread) counts
+// atomically everywhere; one that cannot keeps the plain read-modify-write
+fn programMayThread() -> bool { return functionNameIndices.has("spawnThread") }
 
 fn isRuntimeCallTo(instruction: int, name: str) -> bool {
     return irOpcodes[instruction] == irCall and functionNameIndices.has(name) and irImmediates[instruction] == functionNameIndices[name]
@@ -4190,6 +4284,7 @@ fn coalescePhis() {
 fn isTwoAddressOpcode(opcode: int) -> bool {
     if opcode == irAdd or opcode == irSubtract or opcode == irMultiply or opcode == irBitAnd or opcode == irBitOr or opcode == irBitXor { return true }
     if opcode == irShiftLeft or opcode == irShiftRight or opcode == irNegate { return true }
+    if opcode == irSingleAdd or opcode == irSingleSubtract or opcode == irSingleMultiply or opcode == irSingleDivide { return true }
     return opcode == irFloatAdd or opcode == irFloatSubtract or opcode == irFloatMultiply or opcode == irFloatDivide or opcode == irFloatMinimum or opcode == irFloatMaximum
 }
 
@@ -4673,10 +4768,15 @@ fn blockLabelText(block: int) -> str { return ".L{blockLabels[jumpDestination(bl
 
 // where a jump to `block` really lands: past blocks holding nothing but a jump
 // whose phi moves are all no-ops (the allocator put both ends in one place)
+//
+// The chain is followed to its end, whatever its length: emission skips every
+// block whose destination is elsewhere, so a destination must never itself
+// forward (a hop limit here once left jumps aimed at skipped blocks). A cycle
+// of forwarding blocks resolves to its lowest-numbered block.
 fn jumpDestination(block: int) -> int {
     var current = block
-    var steps = 0
-    while steps < 8 {
+    var visited: [int] = []
+    while true {
         let instructions = blockInstructions[current]
         if instructions.len() != 1 or irOpcodes[instructions[0]] != irJump { return current }
         if current < preheaderLoadGroups.len() and preheaderLoadGroups[current].len() > 0 { return current }
@@ -4686,10 +4786,18 @@ fn jumpDestination(block: int) -> int {
         for instruction in blockInstructions[successor] {
             if irOpcodes[instruction] == irPhi and locationOf(irOperands[instruction][edgeIndex]) != locationOf(instruction) { return current }
         }
+        visited.push(current)
+        for k in 0..visited.len() {
+            if visited[k] == successor {
+                // a cycle visited[k..]: every block entering it resolves to
+                // the cycle's lowest block, which resolves to itself
+                var lowest = visited[k]
+                for j in k..visited.len() { lowest = min(lowest, visited[j]) }
+                return lowest
+            }
+        }
         current = successor
-        steps += 1
     }
-    return current
 }
 
 fn jumpUnlessNext(target: int) {
@@ -4901,6 +5009,26 @@ fn canFoldByteLoad(load: int, reader: int) -> bool {
 fn foldedLoadOperand(load: int) -> str {
     let base = integerIn(irOperands[load][0], "rcx")
     return "qword ptr {memoryAt(base, irImmediates[load])}"
+}
+
+// single-precision ops take registers only: a spill slot is written by movsd,
+// and a memory operand of an ...ss instruction would read 32 bits of it
+fn emitSingleBinary(value: int, mnemonic: str, commutative: bool) {
+    let first = floatIn(irOperands[value][0], "xmm0")
+    let second = floatIn(irOperands[value][1], "xmm1")
+    let target = resultRegister(value, "xmm0")
+    if target == second and target != first {
+        if commutative { emitOptimized("{mnemonic} {target}, {first}") }
+        else {
+            moveFloat("xmm0", first)
+            emitOptimized("{mnemonic} xmm0, {second}")
+            moveFloat(target, "xmm0")
+        }
+    } else {
+        moveFloat(target, first)
+        emitOptimized("{mnemonic} {target}, {second}")
+    }
+    finishResult(value, target)
 }
 
 fn emitFloatBinary(value: int, mnemonic: str, commutative: bool) {
@@ -5242,6 +5370,37 @@ fn emitInstructionFor(value: int) {
         finishResult(value, target)
         return
     }
+    if opcode == irFloatRoundToSingle {
+        let source = floatIn(operands[0], "xmm0")
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("cvtsd2ss {target}, {source}")
+        emitOptimized("cvtss2sd {target}, {target}")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irSingleCopy {
+        let source = floatIn(operands[0], "xmm0")
+        let target = resultRegister(value, "xmm0")
+        moveFloat(target, source)
+        finishResult(value, target)
+        return
+    }
+    if opcode == irSingleFromDouble or opcode == irDoubleFromSingle {
+        let source = floatIn(operands[0], "xmm0")
+        let target = resultRegister(value, "xmm0")
+        if opcode == irSingleFromDouble { emitOptimized("cvtsd2ss {target}, {source}") }
+        else { emitOptimized("cvtss2sd {target}, {source}") }
+        finishResult(value, target)
+        return
+    }
+    if opcode == irSingleAdd or opcode == irSingleSubtract or opcode == irSingleMultiply or opcode == irSingleDivide {
+        var mnemonic = "addss"
+        if opcode == irSingleSubtract { mnemonic = "subss" }
+        if opcode == irSingleMultiply { mnemonic = "mulss" }
+        if opcode == irSingleDivide { mnemonic = "divss" }
+        emitSingleBinary(value, mnemonic, opcode == irSingleAdd or opcode == irSingleMultiply)
+        return
+    }
     if opcode == irFloatCompare {
         emitFloatCompareValue(value)
         return
@@ -5373,6 +5532,21 @@ fn emitInstructionFor(value: int) {
         let base = integerIn(operands[0], "rcx")
         let stored = floatIn(operands[1], "xmm0")
         emitOptimized("movsd {memoryAt(base, immediate)}, {stored}")
+        return
+    }
+    if opcode == irSingleLoadIndexed {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        let target = resultRegister(value, "xmm0")
+        emitOptimized("movss {target}, dword ptr [{base} + {index}*4]")
+        finishResult(value, target)
+        return
+    }
+    if opcode == irSingleStoreIndexed {
+        let base = integerIn(operands[0], "rcx")
+        let index = integerIn(operands[1], "rdx")
+        let stored = floatIn(operands[2], "xmm0")
+        emitOptimized("movss dword ptr [{base} + {index}*4], {stored}")
         return
     }
     if opcode == irStoreIndexed or opcode == irFloatStoreIndexed {
@@ -5514,6 +5688,33 @@ fn emitInstructionFor(value: int) {
         emitOptimized("je .L{emitColdPanic(immediate)}")
         return
     }
+    if opcode == irCall and operands.len() == 1 and not macosTargetEnabled and (isRuntimeCallTo(value, "runtimeNarrowFloat32Bits") or isRuntimeCallTo(value, "runtimeWidenFloat32Bits")) {
+        emitOptimized("mov rax, {locationOf(operands[0])}")
+        emitOptimized("movq xmm0, rax")
+        if isRuntimeCallTo(value, "runtimeNarrowFloat32Bits") {
+            emitOptimized("cvtsd2ss xmm0, xmm0")
+            emitOptimized("movq rax, xmm0")
+            emitOptimized("shl rax, 32")
+            emitOptimized("shr rax, 32")
+        } else {
+            emitOptimized("cvtss2sd xmm0, xmm0")
+            emitOptimized("movq rax, xmm0")
+        }
+        finishResult(value, "rax")
+        return
+    }
+    if opcode == irCall and isRuntimeCallTo(value, "runtimeAtomicAdd") and operands.len() == 2 {
+        // in place: lock xadd [rcx], rax (raw bytes: the assembler has no lock prefix)
+        clearMoves()
+        addMove(locationOf(operands[0]), "rcx")
+        addMove(locationOf(operands[1]), "rax")
+        emitParallelMoves()
+        emitOptimized("mov rdx, rax")
+        emitOptimized(".byte 240,72,15,193,1")
+        emitOptimized("add rax, rdx")
+        finishResult(value, "rax")
+        return
+    }
     if opcode == irCall and isInlineRetain(value) {
         // runtimeRetainReference in place: count only what lives in the heap
         let skipLabel = allocateLabel()
@@ -5523,7 +5724,14 @@ fn emitInstructionFor(value: int) {
         emitOptimized("jb .L{skipLabel}")
         emitOptimized("cmp {target}, qword ptr [rip + __zephyr_globals + {8 * heapBumpGlobalIndex}]")
         emitOptimized("jae .L{skipLabel}")
-        emitOptimized("inc qword ptr [{target} - 24]")
+        if programMayThread() {
+            emitOptimized("cmp qword ptr [{target} - 24], 0")
+            emitOptimized("jl .L{skipLabel}")                 // frozen: no count, no shared write
+            emitOptimized("mov rcx, {target}")
+            emitOptimized(".byte 240,72,255,65,232")         // lock inc qword ptr [rcx - 24]
+        } else {
+            emitOptimized("inc qword ptr [{target} - 24]")
+        }
         optimizerLines.push(".L{skipLabel}:\n")
         finishResult(value, target)
         return
@@ -5537,6 +5745,21 @@ fn emitInstructionFor(value: int) {
         emitOptimized("jb .L{doneLabel}")
         emitOptimized("cmp rax, qword ptr [rip + __zephyr_globals + {8 * heapBumpGlobalIndex}]")
         emitOptimized("jae .L{doneLabel}")
+        if programMayThread() and functionNameIndices.has("runtimeReleaseLastReference") {
+            // one atomic decrement; whoever took the count from 1 to 0 frees
+            emitOptimized("cmp qword ptr [rax - 24], 0")
+            emitOptimized("jl .L{doneLabel}")                 // frozen
+            emitOptimized("mov rcx, -1")
+            emitOptimized(".byte 240,72,15,193,72,232")      // lock xadd qword ptr [rax - 24], rcx
+            emitOptimized("cmp rcx, 1")
+            emitOptimized("jne .L{doneLabel}")
+            let releaseIndex = irImmediates[value]
+            irImmediates[value] = functionNameIndices["runtimeReleaseLastReference"]
+            emitCallInstruction(value)
+            irImmediates[value] = releaseIndex
+            optimizerLines.push(".L{doneLabel}:\n")
+            return
+        }
         emitOptimized("cmp qword ptr [rax - 24], 1")
         emitOptimized("jle .L{callLabel}")
         emitOptimized("sub qword ptr [rax - 24], 1")
@@ -6036,6 +6259,7 @@ fn mergeStraightBlocks() {
             }
             var noInstructions: [int] = []
             blockInstructions[successor] = noInstructions
+            blockTerminated[successor] = false
             var noSuccessors: [int] = []
             blockSuccessors[successor] = noSuccessors
             var noPredecessors: [int] = []
@@ -6500,13 +6724,14 @@ fn isCommutativeOpcode(opcode: int) -> bool {
 // a load that is valid until memory changes: reusable within one memory epoch
 fn isMemoryLoad(value: int) -> bool {
     let opcode = irOpcodes[value]
+    if opcode == irSingleLoadIndexed { return true }
     return opcode == irListLength or opcode == irListData or opcode == irLoad or opcode == irFloatLoad or opcode == irLoadGlobal or opcode == irFloatLoadGlobal or opcode == irLoadIndexed or opcode == irFloatLoadIndexed
 }
 
 fn changesMemory(value: int) -> bool {
     let opcode = irOpcodes[value]
     if opcode == irCall { return isRuntimeCallTo(value, "runtimeFillWords") or not callKeepsHeapIntact(value) }
-    return opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 or opcode == irStore or opcode == irFloatStore or opcode == irStoreIndexed or opcode == irFloatStoreIndexed
+    return opcode == irStoreRaw64 or opcode == irStoreRaw32 or opcode == irStoreRaw8 or opcode == irStore or opcode == irFloatStore or opcode == irStoreIndexed or opcode == irFloatStoreIndexed or opcode == irSingleStoreIndexed
 }
 
 // global value numbering over the dominator tree: an expression computed in a
@@ -6729,7 +6954,7 @@ fn hoistLoopInvariants() {
                     if not (opcode == irCall and callOnlyReleases(instruction)) { loopResizesLists = true }
                 }
                 if opcode == irStoreGlobal or opcode == irFloatStoreGlobal { loopStoredGlobals.push(irImmediates[instruction]) }
-                if opcode == irStoreIndexed or opcode == irFloatStoreIndexed { loopStoresElements = true }
+                if opcode == irStoreIndexed or opcode == irFloatStoreIndexed or opcode == irSingleStoreIndexed { loopStoresElements = true }
                 if opcode == irStore or opcode == irFloatStore { loopFieldOffsets.push(irImmediates[instruction]) }
             }
         }
@@ -7252,7 +7477,221 @@ fn materializeBefore(user: int, allocation: int, fieldOffsets: [int], fieldValue
     irOperands[user][1] = object
 }
 
+// ---- native single precision ----
+//
+// toSingle(a op b) with a and b already exact as singles is the IEEE single
+// operation itself (the double result rounds once to the same single, since a
+// double holds more than twice a single's precision). Such roundings become
+// irSingleAdd & co. on single forms of the operands, followed by one widening;
+// the double operation and the round trip it needed go dead. Chains of float
+// arithmetic, as code ported from Java `float` is, then run on native single
+// instructions with conversions only at their ends.
+
+var singleRewritten: [bool] = []
+var singleFormOf: [int] = []
+var singleExactPhi: [bool] = []          // a float phi whose every input is single-exact
+
+fn isSingleExactValue(value: int) -> bool {
+    let opcode = irOpcodes[value]
+    if opcode == irFloatRoundToSingle or opcode == irDoubleFromSingle { return true }
+    if opcode == irPhi { return value < singleExactPhi.len() and singleExactPhi[value] }
+    if opcode == irFloatConstant {
+        let single = singleBitsIfExact(irImmediates[value])
+        return single >= 0
+    }
+    return false
+}
+
+// the IEEE single bits of a double constant that is exactly a single, else -1
+fn singleBitsIfExact(doubleBits: int) -> int {
+    let sign = (doubleBits >> 63) & 1
+    let exponent = (doubleBits >> 52) & 2047
+    let mantissa = doubleBits & 4503599627370495
+    if exponent == 0 and mantissa == 0 { return sign << 31 }
+    if exponent < 897 or exponent > 1150 { return 0 - 1 }        // subnormal singles, infinities, NaNs: left alone
+    if (mantissa & 536870911) != 0 { return 0 - 1 }
+    return (sign << 31) | ((exponent - 896) << 23) | (mantissa >> 29)
+}
+
+// keep the per-value tables as long as the value list
+fn growSingleTables() {
+    while singleFormOf.len() < irOpcodes.len() {
+        singleFormOf.push(0 - 1)
+        singleRewritten.push(false)
+    }
+}
+
+fn insertBeforeInstruction(anchor: int, opcode: int, operands: [int], immediate: int) -> int {
+    let block = irBlockOf[anchor]
+    let created = addLateInstruction(block, opcode, classFloat, operands, immediate)
+    growSingleTables()
+    var reordered: [int] = []
+    for instruction in blockInstructions[block] {
+        if instruction == created { continue }
+        if instruction == anchor { reordered.push(created) }
+        reordered.push(instruction)
+    }
+    blockInstructions[block] = reordered
+    return created
+}
+
+fn insertAfterDefinition(definition: int, opcode: int, operands: [int], immediate: int) -> int {
+    let block = irBlockOf[definition]
+    let created = addLateInstruction(block, opcode, classFloat, operands, immediate)
+    growSingleTables()
+    let definitionIsPhi = irOpcodes[definition] == irPhi
+    var reordered: [int] = []
+    var placed = false
+    let instructions = blockInstructions[block]
+    for position in 0..instructions.len() {
+        let instruction = instructions[position]
+        if instruction == created { continue }
+        reordered.push(instruction)
+        if placed { continue }
+        // after the definition; a phi's single form goes after every phi
+        if definitionIsPhi {
+            let next = if position + 1 < instructions.len() { instructions[position + 1] } else { 0 - 1 }
+            if irOpcodes[instruction] == irPhi and (next < 0 or irOpcodes[next] != irPhi) {
+                reordered.push(created)
+                placed = true
+            }
+        } else if instruction == definition {
+            reordered.push(created)
+            placed = true
+        }
+    }
+    blockInstructions[block] = reordered
+    return created
+}
+
+// the single form of a single-exact value, made where first needed
+fn singleForm(value: int, user: int) -> int {
+    if irOpcodes[value] == irDoubleFromSingle { return irOperands[value][0] }
+    if singleFormOf[value] >= 0 { return singleFormOf[value] }
+    var noOperands: [int] = []
+    if irOpcodes[value] == irFloatConstant {
+        // the single's bits in the low half; constants are cheap, so one per user
+        return insertBeforeInstruction(user, irFloatConstant, noOperands, singleBitsIfExact(irImmediates[value]))
+    }
+    if irOpcodes[value] == irPhi and singleExactPhi[value] {
+        // a parallel phi over the inputs' single forms; registered before its
+        // inputs are converted, since a loop's back edge leads back to it
+        let block = irBlockOf[value]
+        var placeholders: [int] = []
+        for input in irOperands[value] { placeholders.push(input) }
+        let created = addLateInstruction(block, irPhi, classFloat, placeholders, 0)
+        growSingleTables()
+        singleFormOf[value] = created
+        var singleInputs: [int] = []
+        for position in 0..irOperands[value].len() {
+            let input = resolveValue(irOperands[value][position])
+            if irOpcodes[input] == irFloatRoundToSingle { rewriteRoundToSingle(input) }
+            if irOpcodes[input] == irFloatConstant {
+                // made at the end of the incoming edge's block
+                let predecessor = blockPredecessors[block][position]
+                let constant = addLateInstruction(predecessor, irFloatConstant, classFloat, noOperands, singleBitsIfExact(irImmediates[input]))
+                growSingleTables()
+                singleInputs.push(constant)
+            } else {
+                singleInputs.push(singleForm(input, value))
+            }
+        }
+        irOperands[created] = singleInputs
+        return created
+    }
+    let created = insertAfterDefinition(value, irSingleFromDouble, [value], 0)
+    singleFormOf[value] = created
+    return created
+}
+
+// float phis whose inputs are all single-exact, found optimistically: assume
+// every float phi is, then drop any with an input that is not, until stable
+fn findSingleExactPhis() {
+    var noPhis: [bool] = []
+    singleExactPhi = noPhis
+    for value in 0..irOpcodes.len() {
+        singleExactPhi.push(irOpcodes[value] == irPhi and irClasses[value] == classFloat and not valueDead[value])
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for value in 0..irOpcodes.len() {
+            if not singleExactPhi[value] { continue }
+            for operand in irOperands[value] {
+                if not isSingleExactValue(resolveValue(operand)) {
+                    singleExactPhi[value] = false
+                    changed = true
+                    break
+                }
+            }
+        }
+    }
+}
+
+fn rewriteRoundToSingle(rounding: int) {
+    if singleRewritten[rounding] { return }
+    singleRewritten[rounding] = true
+    let operation = resolveValue(irOperands[rounding][0])
+    let opcode = irOpcodes[operation]
+    var singleOpcode = 0 - 1
+    if opcode == irFloatAdd { singleOpcode = irSingleAdd }
+    if opcode == irFloatSubtract { singleOpcode = irSingleSubtract }
+    if opcode == irFloatMultiply { singleOpcode = irSingleMultiply }
+    if opcode == irFloatDivide { singleOpcode = irSingleDivide }
+    if singleOpcode < 0 { return }
+    let left = resolveValue(irOperands[operation][0])
+    let right = resolveValue(irOperands[operation][1])
+    if irOpcodes[left] == irFloatRoundToSingle { rewriteRoundToSingle(left) }
+    if irOpcodes[right] == irFloatRoundToSingle { rewriteRoundToSingle(right) }
+    if not isSingleExactValue(left) or not isSingleExactValue(right) { return }
+    let singleLeft = singleForm(left, rounding)
+    let singleRight = singleForm(right, rounding)
+    let single = insertBeforeInstruction(rounding, singleOpcode, [singleLeft, singleRight], 0)
+    irOpcodes[rounding] = irDoubleFromSingle
+    irOperands[rounding] = [single]
+}
+
+fn anySingleFromDouble() -> bool {
+    for value in 0..irOpcodes.len() {
+        if irOpcodes[value] == irSingleFromDouble { return true }
+    }
+    return false
+}
+
+fn selectSinglePrecision() {
+    var noFlags: [bool] = []
+    singleRewritten = noFlags
+    var noForms: [int] = []
+    singleFormOf = noForms
+    let valueCount = irOpcodes.len()
+    var any = false
+    for value in 0..valueCount {
+        singleRewritten.push(false)
+        singleFormOf.push(0 - 1)
+        if irOpcodes[value] == irFloatRoundToSingle and not valueDead[value] { any = true }
+    }
+    if not any and not anySingleFromDouble() { return }
+    findSingleExactPhis()
+    for value in 0..valueCount {
+        if irOpcodes[value] == irFloatRoundToSingle and not valueDead[value] and resolveValue(value) == value {
+            rewriteRoundToSingle(value)
+        }
+    }
+    // narrowing a single-exact value is exact: reuse its single form
+    for value in 0..irOpcodes.len() {
+        if irOpcodes[value] != irSingleFromDouble or valueDead[value] { continue }
+        let source = resolveValue(irOperands[value][0])
+        if irOpcodes[source] == irDoubleFromSingle {
+            irOpcodes[value] = irSingleCopy
+            irOperands[value] = [irOperands[source][0]]
+        }
+    }
+}
+
 // run every pass after lowering; false (with optimizerBailReason) if any gives up
+var cheapTrial = false    // trial steps: skip regalloc + emit, use a cheap cost proxy
+var trialCostScale = 1.0  // full-cost-per-cheap-cost-unit, calibrated on the region's default compile
+
 fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     for block in 0..blockInstructions.len() {
         if not blockSealed[block] { optimizerBail("internal: unsealed block") }
@@ -7275,11 +7714,23 @@ fn compileRegion(label: str, parameterCount: int, registerCall: bool) -> bool {
     eliminateDeadCode()
     cancelCountPairs()
     replaceScalarAggregates()
+    selectSinglePrecision()
     optimizeLoops()
     foldAddressArithmetic()
     eliminateDeadCode()
     checkBorrows()
     if optimizerBailed { return false }
+    if cheapTrial {
+        // a trial only needs a cost to compare limits: the cheap region cost,
+        // scaled to this region's full cost (calibrated on the default compile),
+        // tracks the real model's direction without regalloc or emission
+        regionEstimatedCost = (trialCostScale * (cheapRegionCost() as float)) as int
+        regionHotInstructionCount = regionEstimatedCost
+        regionColdInstructionCount = 0
+        optimizerLines = []
+        optimizerColdLines = []
+        return true
+    }
     splitCriticalEdges()
     resetForwarding()
     computeBlockOrder()
@@ -7365,6 +7816,23 @@ let unknownCalleeCost = 40
 // A callee in the region's own recursive SCC counts its body only: its
 // measured cost already includes the calls that lead back here.
 let maximumCalleeCost = 1000000000
+
+// Cheap region cost for inline trials: the profile-weighted value count plus
+// the cost of every call the region still makes. Inlining removes a call's
+// cost (the callee body runs in place) while adding values, so this tracks
+// the real cost model's direction without register allocation or emission.
+fn cheapRegionCost() -> int {
+    var cost = 0
+    for block in 0..blockInstructions.len() {
+        let weight = profiledWeight(block)
+        var blockCost = blockInstructions[block].len()
+        for instruction in blockInstructions[block] {
+            if irOpcodes[instruction] == irCall { blockCost += estimatedCallCost(irImmediates[instruction]) }
+        }
+        cost += weight * blockCost
+    }
+    return cost
+}
 fn estimatedCallCost(callee: int) -> int {
     if callee < 0 or callee == indirectStackCall { return callOverheadCost + unknownCalleeCost }
     if regionFunctionIndex >= 0 and callee < callGraphSccs.len() and callGraphSccs[callee] == callGraphSccs[regionFunctionIndex] { return callOverheadCost + callGraphNodeSizes[callee] }
@@ -7393,7 +7861,10 @@ fn recompileTrialRegion() -> bool {
     return compileTrialRegion()
 }
 
+var trialCompileStringMark = 0          // dataStringLiterals before the latest compileTrialRegion
+
 fn compileTrialRegion() -> bool {
+    trialCompileStringMark = dataStringLiterals.len()
     lowerPreInlineBody = trialUsesPreInlineBody
     var compiled = false
     if trialIsLoop { compiled = lowerLoopRegion(trialLoopStatement, trialSlotCount, trialParameterCount, trialRegisterCall) and compileRegion(trialLabel, 0, false) }
@@ -7446,6 +7917,48 @@ fn expandsRecursiveFunction(node: Node) -> bool {
     return false
 }
 
+// What a successful trial compile leaves in the region globals that anything
+// after runInlineTrials reads, so the chosen attempt can be put back instead
+// of compiled once more. Each compile makes fresh lists (resetIr,
+// emitRegionCode), so holding them is enough.
+struct TrialResult {
+    lines: [str],
+    stringStart: int,
+    strings: [str],
+    estimatedCost: int,
+    hotInstructions: int,
+    coldInstructions: int,
+    spills: int,
+    opcodes: [int],
+    inlinedFunctions: [int],
+    entryReturn: bool,
+    inlinedCalls: int,
+    refusedByLimit: bool
+}
+
+fn saveTrialResult() -> TrialResult {
+    var strings: [str] = []
+    for i in trialCompileStringMark..dataStringLiterals.len() { strings.push(dataStringLiterals[i]) }
+    return TrialResult{lines: optimizerLines, stringStart: trialCompileStringMark, strings: strings, estimatedCost: regionEstimatedCost, hotInstructions: regionHotInstructionCount, coldInstructions: regionColdInstructionCount, spills: spillSlotCount, opcodes: irOpcodes, inlinedFunctions: regionInlinedFunctions, entryReturn: entryReturnEmitted, inlinedCalls: inlinedCallCount, refusedByLimit: inlineRefusedByLimit}
+}
+
+fn restoreTrialResult(result: TrialResult) {
+    while dataStringLiterals.len() > trialDataStringMark { let dropped = dataStringLiterals.pop() }
+    for text in result.strings { dataStringLiterals.push(text) }
+    optimizerLines = result.lines
+    regionEstimatedCost = result.estimatedCost
+    regionHotInstructionCount = result.hotInstructions
+    regionColdInstructionCount = result.coldInstructions
+    spillSlotCount = result.spills
+    irOpcodes = result.opcodes
+    regionInlinedFunctions = result.inlinedFunctions
+    entryReturnEmitted = result.entryReturn
+    inlinedCallCount = result.inlinedCalls
+    inlineRefusedByLimit = result.refusedByLimit
+    optimizerBailed = false
+    optimizerBailReason = ""
+}
+
 fn runInlineTrials(regionName: str, ownerName: str) -> bool {
     // ponytail: not the runtime, which is the same in every program; tune its limits offline
     if not inlineRefusedByLimit or textStartsWith(ownerName, "runtime") { return true }
@@ -7454,13 +7967,30 @@ fn runInlineTrials(regionName: str, ownerName: str) -> bool {
     var bestCost = regionEstimatedCost
     var bestStep = 0 - 1
     var trialLog = "{defaultInlineNodeLimit}/{defaultInlineDepthLimit} cost {regionEstimatedCost}"
+    // results[0] is the defaults' compile; stepResults[step] indexes the one a step produced
+    var results: [TrialResult] = [saveTrialResult()]
+    trialCostScale = (regionEstimatedCost as float) / (max(1, cheapRegionCost()) as float)   // calibrate the cheap proxy on the default compile
+    var stepResults: [int] = []
+    var current = 0                         // the result the region globals describe, -1 after a failure
     for step in 0..inlineTrialNodeLimits.len() {
         inlineNodeLimit = inlineTrialNodeLimits[step]
         inlineDepthLimit = inlineTrialDepthLimits[step]
-        if not recompileTrialRegion() {
-            trialLog = trialLog + ", {inlineNodeLimit}/{inlineDepthLimit} failed"
-            break
+        if inlineDecisionsHoldAt(inlineNodeLimit, inlineDepthLimit) {
+            // same decisions as the compile in hand: same region, same cost
+        } else {
+            cheapTrial = true
+            var trialOk = recompileTrialRegion()
+            cheapTrial = false
+            if not trialOk {
+                trialLog = trialLog + ", {inlineNodeLimit}/{inlineDepthLimit} failed"
+                current = 0 - 1
+                break
+            } else {
+                results.push(saveTrialResult())
+                current = results.len() - 1
+            }
         }
+        stepResults.push(current)
         trialLog = trialLog + ", {inlineNodeLimit}/{inlineDepthLimit} cost {regionEstimatedCost}"
         let withinBudget = regionHotInstructionCount <= min(8 * defaultHotInstructions + 200, inlineTrialMaximumInstructions)
         if withinBudget and regionEstimatedCost * 100 < bestCost * 97 {
@@ -7478,7 +8008,16 @@ fn runInlineTrials(regionName: str, ownerName: str) -> bool {
         inlineDepthLimit = defaultInlineDepthLimit
         optimizerNote("inline trials for {regionName}: {trialLog}; kept the defaults")
     }
-    let compiled = recompileTrialRegion()
+    // the chosen attempt compiled before: put it back (a recompile would repeat it)
+    var chosen = 0
+    if bestStep >= 0 { chosen = stepResults[bestStep] }
+    // (always: its strings go back in place of the last attempt's). Compile it
+    // again as before after a failed trial, whose lowering can leave the region
+    // compiling differently than it did the first time, or when the compile
+    // followed strings an earlier failed attempt left (a recompile drops those).
+    var compiled = true
+    if current >= 0 and results[chosen].stringStart == trialDataStringMark and results[chosen].lines.len() > 0 { restoreTrialResult(results[chosen]) }
+    else { compiled = recompileTrialRegion() }
     inlineNodeLimit = defaultInlineNodeLimit
     inlineDepthLimit = defaultInlineDepthLimit
     return compiled

@@ -1,0 +1,48 @@
+filetype: zephyr
+
+detect:
+    filename: "\\.zeph$"
+
+rules:
+    - identifier: "\\b[A-Z][A-Za-z0-9_]*\\b"
+    - constant: "\\b[A-Z][A-Z0-9_]+\\b"
+    - identifier.function: "\\b[a-z_][A-Za-z0-9_]*\\s*\\("
+    - statement: "\\b(fn|let|var|const|struct|enum|impl|interface|type|private|test|extern|import|as|from|if|else|match|while|for|in|step|break|continue|return|defer)\\b"
+    - symbol.operator: "\\b(and|or|not)\\b|->|\\.\\.|\\?"
+    - type: "\\b(int|float|bool|str|void|i32|u8|f32|f64)\\b"
+    - special: "\\b(self)\\b"
+    - preproc: "\\b(print|panic|sqrt|emit|chr|bits|floatFromBits|args|readFile|writeFile|zeros|assert|abs|min|max|pow|syscall|addr|load8|load16|load32|load64|store8|store16|store32|store64|callPointer|callSysV|callSysVFloat|dynamicImport|stackPointer|spawnThread|parallelFor|cpuCount)\\b"
+    - constant.bool: "\\b(true|false|none)\\b"
+    - constant.number: "\\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+|[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?)\\b"
+    - constant.string: "'(\\\\x[0-9A-Fa-f]{2}|\\\\.|[^\\\\'])'"
+    - constant.string:
+        start: "r\"\"\""
+        end: "\"\"\""
+        rules: []
+    - constant.string:
+        start: "\"\"\""
+        end: "\"\"\""
+        rules:
+            - constant.specialChar: "\\\\([ntr0\\\\\"'{}]|x[0-9A-Fa-f]{2})"
+            - special: "\\{[^}\"]*\\}"
+    - constant.string:
+        start: "r\""
+        end: "\""
+        rules: []
+    - constant.string:
+        start: "\""
+        end: "\""
+        skip: "\\\\."
+        rules:
+            - constant.specialChar: "\\\\([ntr0\\\\\"'{}]|x[0-9A-Fa-f]{2})"
+            - special: "\\{[^}\"]*\\}"
+    - comment:
+        start: "//"
+        end: "$"
+        rules:
+            - todo: "(TODO|FIXME|XXX|NOTE)"
+    - comment:
+        start: "/\\*"
+        end: "\\*/"
+        rules:
+            - todo: "(TODO|FIXME|XXX|NOTE)"

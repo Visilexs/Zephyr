@@ -282,6 +282,16 @@ class Arm64:
         if op=='cqo':self.emit('asr x11, x9, #63');return
         if op in ('div','idiv'):
             b=self.read(args[0]);self.emit(f'mov x2, {b}',f'{"sdiv" if op=="idiv" else "udiv"} x0, x9, x2','msub x11, x0, x2, x9','mov x9, x0');return
+        if op=='movss':
+            dst,src=args
+            if dst.startswith('xmm') and src.startswith('xmm'):self.emit(f'fmov s{dst[3:]}, s{src[3:]}')
+            elif dst.startswith('xmm'):
+                address=self.memory(src,32) or f'[{self.addr(src)}]'
+                self.emit(f'ldr s{dst[3:]}, {address}')
+            else:
+                address=self.memory(dst,32) or f'[{self.addr(dst)}]'
+                self.emit(f'str s{src[3:]}, {address}')
+            return
         if op in ('movsd','movapd','movq'):
             dst,src=args
             if src.startswith('xmm'):
@@ -306,6 +316,13 @@ class Arm64:
             self.emit('mrs x26, nzcv',f'fcmp {a}, {b}',f'fcsel {a}, {a}, {b}, {"gt" if op=="maxsd" else "mi"}','msr nzcv, x26');return
         if op=='sqrtsd':
             self.emit(f'fsqrt d{args[0][3:]}, d{args[1][3:]}');return
+        if op in ('cvtpd2ps','cvtsd2ss'):
+            self.emit(f'fcvt s{args[0][3:]}, d{args[1][3:]}');return
+        if op in ('cvtps2pd','cvtss2sd'):
+            self.emit(f'fcvt d{args[0][3:]}, s{args[1][3:]}');return
+        if op in ('addss','subss','mulss','divss'):
+            a='s'+args[0][3:]; b='s'+args[1][3:]
+            self.emit(f'f{op[:-2]} {a}, {a}, {b}');return
         if op in ('xorpd','xorps'):
             self.emit(f'eor v{args[0][3:]}.16b, v{args[0][3:]}.16b, v{args[1][3:]}.16b');return
         if op in ('ucomisd','comisd'):
@@ -359,6 +376,14 @@ class Arm64:
                 if line.startswith('.'):
                     if self.text and line.startswith('.byte '):
                         encoded=[int(x.strip()) for x in line[6:].split(',')]
+                        # The x86 back ends hand-encode the runtime's atomics
+                        # (lock xadd / lock inc). Native LSE equivalents:
+                        if encoded == [240,72,15,193,1]:          # lock xadd [rcx], rax
+                            self.emit('ldaddal x9, x9, [x10]');continue
+                        if encoded == [240,72,255,65,232]:        # lock inc qword ptr [rcx - 24]
+                            self.emit('sub x16, x10, #24');self.emit('mov x17, #1');self.emit('ldaddal x17, x17, [x16]');continue
+                        if encoded == [240,72,15,193,72,232]:     # lock xadd qword ptr [rax - 24], rcx
+                            self.emit('sub x16, x9, #24');self.emit('ldaddal x10, x10, [x16]');continue
                         if encoded == [243,72,171]:
                             # The optimizer's REP STOSQ is a fill operation in
                             # the IR. Select a native store loop, not x86 bytes.

@@ -252,6 +252,7 @@ Windows and Linux x86-64 workers receive an integer argument and require `--rt`.
 | `Thread.join()` | Wait for completion and release the worker's retained resources. |
 | `parallelFor(workerCount: int, workerFunction: fn(int))` | Spawn one worker for each index in [0, workerCount), then join all. |
 | `cpuCount() -> int` | Return the system processor count, falling back to one. |
+| `freeze[T](value: T)` | Freeze a structure that worker threads share read-only: it and everything reachable from it stop being reference counted (no atomic writes to shared headers) and are never freed by counting. Still safe to mutate; anything stored into it later is counted normally. Use on long-lived shared state (tables, samplers, registries). |
 
 Implementation helpers: `retainThreadBody(threadBody: fn(int)) -> int` reserves a rooted closure slot; `threadEntryThunk() -> int` obtains the native calling-convention adapter. Applications should use the operations above.
 

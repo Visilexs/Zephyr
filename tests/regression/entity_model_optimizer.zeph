@@ -1,0 +1,5 @@
+// Reproduces the O2 block-terminator failure from the adjacent zephyr-mc
+// entity-model port while keeping the program entry itself minimal.
+import "../../../zephyr-mc/src/render/model/pose.zeph"
+
+fn main() { print("entity model optimizer regression") }

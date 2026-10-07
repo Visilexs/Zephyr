@@ -31,6 +31,7 @@ On Windows, run these after `scripts/selfbuild.ps1`, in this order:
 | `run_parity.ps1` | executables and `zc run` give identical output |
 | `crosscheck-linux.ps1` | Windows and Linux (x86-64 WSL) output are byte-identical |
 | `crosscheck-wasm.ps1` | Windows and WebAssembly (Node.js) output are byte-identical |
+| `linux_extern.sh` | on Linux: `extern fn` through `dlopen`/`dlsym` (`tests/linux/`), baseline and `-O2`, as an executable and as an `.o` linked with gcc |
 
 `regression/tail_recursion.zeph` covers the `-O2` tail-recursion rewrite:
 - swapped parameters

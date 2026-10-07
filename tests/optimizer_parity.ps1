@@ -21,6 +21,7 @@ $programs += , @((Resolve-Path "tests\regression\global_store_exit.zeph").Path, 
 $programs += , @((Resolve-Path "tests\regression\accumulator_recursion.zeph").Path, "")
 $programs += , @((Resolve-Path "tests\regression\tail_recursion.zeph").Path, "")
 $programs += , @((Resolve-Path "tests\regression\entry_return.zeph").Path, "")
+$programs += , @((Resolve-Path "tests\regression\entity_model_optimizer.zeph").Path, "")
 $workloadArguments = @{ fib = "27"; matmul = "120"; mandel = "120"; sort = "20000"; strings = "20000"; hashmap = "20000"; cube = "200"; pi = "500"; liquid = "40";
                      shapes = "3000"; closures = "2000"; wordfreq = "30000"; nbody = "10"; lexer = "10000"; vectors = "20";
                      dispatch = "1000"; records = "1000"; strbuild = "1000"; bintrees = "8";

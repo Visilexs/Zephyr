@@ -5,7 +5,8 @@ The compiler is written in Zephyr and produces native code with its own
 assembler and linker for these targets:
 
 - Windows x86-64 (PE)
-- Linux x86-64 (static ELF, no libc)
+- Linux x86-64 (static ELF, no libc; `extern fn … from "libX.so.N"` loads
+  shared libraries at run time, making the ELF dynamic)
 - WebAssembly
 - Apple Silicon macOS (ARM64 Mach-O, assembled and linked by Apple Clang)
 
@@ -40,6 +41,7 @@ compiler seed.
 .\zc.exe run program.zeph arg1 arg2             # compile in memory and run
 .\zc.exe --test program.zeph program-tests.exe  # build the file's test blocks
 .\zc.exe --linux --rt program.zeph program      # static Linux ELF
+.\zc.exe --linux --rt program.zeph program.o    # ELF object to link with C (zephyrMain)
 .\zc.exe --wasm --rt program.zeph program.wasm  # run with: node scripts\wasm-run.js program.wasm
 ```
 
@@ -75,6 +77,13 @@ Every code-generation change must pass this fixpoint. The `>>>EMBED`
 section of `zc.zeph` is generated from `compiler/runtime.zeph` and
 `lib/std/*.zeph`; never edit it by hand.
 
+On Linux the native `./zc-linux` is kept at the same fixpoint without wine
+after one bootstrap (`wine zc.exe --linux --rt compiler/zc.zeph zc-linux`):
+
+```sh
+./scripts/linux-selfbuild.sh        # -O2 by default; OPT= for unoptimized
+```
+
 ### Checks
 
 After a self-build, run:
@@ -87,6 +96,13 @@ powershell -File tests\optimizer_parity.ps1
 powershell -File tests\run_parity.ps1
 powershell -File tests\crosscheck-linux.ps1   # needs x86-64 WSL
 powershell -File tests\crosscheck-wasm.ps1    # needs Node.js
+```
+
+On Linux, `extern fn … from "libX.so.N"` (shared libraries via dlopen/dlsym,
+described in [docs/spec.md](docs/spec.md) §3.6) is covered by:
+
+```sh
+./tests/linux_extern.sh            # needs ./zc-linux and gcc
 ```
 
 ## Apple Silicon macOS
@@ -127,3 +143,4 @@ temporary executable and runs it. On macOS:
 | `bootstrap/` | historical C seed and the native Darwin runtime |
 | `scripts/` | self-build, embedding, macOS back end, WebAssembly runner |
 | `tests/` | test runners, regressions, fixtures, macOS benchmarks |
+| `editors/` | syntax highlighting for vim, micro, nano, bat, Sublime Text, highlight.js (`editors/install.sh`) |
