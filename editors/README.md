@@ -12,6 +12,7 @@ built-in types and functions.
 | `micro/zephyr.yaml` | micro |
 | `nano/zephyr.nanorc` | nano (interpolation isn't coloured: nano can't scope a rule to strings) |
 | `sublime/Zephyr.sublime-syntax` | bat (and `less` through bat), Sublime Text |
+| `textmate/Zephyr.tmLanguage.json` | GitHub's highlighter (via a github-linguist PR) and any TextMate-based editor (VS Code) |
 | `highlightjs/zephyr.js` | highlight.js; `install.sh` adds it to pi's `/export` HTML |
 
 ```sh

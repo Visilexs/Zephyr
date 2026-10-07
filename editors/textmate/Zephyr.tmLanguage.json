@@ -1,0 +1,109 @@
+{
+  "name": "Zephyr",
+  "scopeName": "source.zephyr",
+  "fileTypes": ["zeph"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.function.zephyr" },
+        "2": { "name": "entity.name.function.zephyr" }
+      }
+    },
+    {
+      "match": "\\b(struct|enum|interface|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.zephyr" },
+        "2": { "name": "entity.name.type.zephyr" }
+      }
+    },
+    { "match": "\\b(fn|let|var|const|struct|enum|impl|interface|type|private|extern)\\b", "name": "storage.type.zephyr" },
+    { "match": "\\b(test|import|as|from)\\b", "name": "keyword.other.zephyr" },
+    { "match": "\\b(if|else|match|while|for|in|step|break|continue|return|defer)\\b", "name": "keyword.control.zephyr" },
+    { "match": "\\b(and|or|not)\\b", "name": "keyword.operator.logical.zephyr" },
+    { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.zephyr" },
+    { "match": "\\bnone\\b", "name": "constant.language.null.zephyr" },
+    { "match": "\\bself\\b", "name": "variable.language.self.zephyr" },
+    { "match": "\\b(int|float|bool|str|void|i32|u8|f32|f64)\\b", "name": "storage.type.primitive.zephyr" },
+    {
+      "match": "\\b(print|panic|sqrt|emit|chr|bits|floatFromBits|args|readFile|writeFile|zeros|assert|abs|min|max|pow|syscall|addr|load8|load16|load32|load64|store8|store16|store32|store64|callPointer|callSysV|callSysVFloat|dynamicImport|stackPointer|spawnThread|parallelFor|cpuCount)\\b(?=\\s*\\()",
+      "name": "support.function.builtin.zephyr"
+    },
+    { "match": "\\b[A-Z][A-Z0-9_]+\\b", "name": "constant.other.zephyr" },
+    { "match": "\\b[A-Z][A-Za-z0-9_]*\\b", "name": "entity.name.type.zephyr" },
+    { "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*\\()", "name": "variable.function.zephyr" },
+    { "match": "'(\\\\x[0-9A-Fa-f]{2}|\\\\.|[^\\\\'])'", "name": "constant.character.zephyr" },
+    { "match": "\\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+)\\b", "name": "constant.numeric.integer.zephyr" },
+    { "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b|\\b[0-9]+[eE][+-]?[0-9]+\\b", "name": "constant.numeric.float.zephyr" },
+    { "match": "\\b[0-9][0-9_]*\\b", "name": "constant.numeric.integer.zephyr" },
+    { "match": "->|\\.\\.|\\?", "name": "keyword.operator.zephyr" },
+    { "match": "==|!=|<=|>=|<<=?|>>=?|[-+*/%&|^]=?|[<>=~]", "name": "keyword.operator.zephyr" }
+  ],
+  "repository": {
+    "main": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "match": "\\b(fn|let|var|const|struct|enum|impl|interface|type|private|extern)\\b", "name": "storage.type.zephyr" },
+        { "match": "\\b(test|import|as|from)\\b", "name": "keyword.other.zephyr" },
+        { "match": "\\b(if|else|match|while|for|in|step|break|continue|return|defer)\\b", "name": "keyword.control.zephyr" },
+        { "match": "\\b(and|or|not)\\b", "name": "keyword.operator.logical.zephyr" },
+        { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.zephyr" },
+        { "match": "\\bnone\\b", "name": "constant.language.null.zephyr" },
+        { "match": "\\bself\\b", "name": "variable.language.self.zephyr" },
+        { "match": "\\b(int|float|bool|str|void|i32|u8|f32|f64)\\b", "name": "storage.type.primitive.zephyr" },
+        { "match": "\\b[A-Z][A-Za-z0-9_]*\\b", "name": "entity.name.type.zephyr" },
+        { "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*\\()", "name": "variable.function.zephyr" },
+        { "match": "\\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+)\\b", "name": "constant.numeric.integer.zephyr" },
+        { "match": "\\b[0-9][0-9_]*\\b", "name": "constant.numeric.integer.zephyr" },
+        { "match": "->|\\.\\.|\\?", "name": "keyword.operator.zephyr" },
+        { "match": "==|!=|<=|>=|<<=?|>>=?|[-+*/%&|^]=?|[<>=~]", "name": "keyword.operator.zephyr" }
+      ]
+    },
+    "comments": {
+      "patterns": [
+        { "begin": "//", "end": "(\\n|$)", "name": "comment.line.double-slash.zephyr" },
+        { "include": "#block-comment" }
+      ]
+    },
+    "block-comment": {
+      "begin": "/\\*",
+      "end": "\\*/",
+      "name": "comment.block.zephyr",
+      "patterns": [{ "include": "#block-comment" }]
+    },
+    "strings": {
+      "patterns": [
+        { "begin": "r\"\"\"", "end": "\"\"\"", "name": "string.quoted.triple.raw.zephyr" },
+        { "begin": "r\"", "end": "\"|\\n", "name": "string.quoted.double.raw.zephyr" },
+        {
+          "begin": "\"\"\"",
+          "end": "\"\"\"",
+          "name": "string.quoted.triple.zephyr",
+          "patterns": [{ "include": "#string-content" }]
+        },
+        {
+          "begin": "\"",
+          "end": "\"|\\n",
+          "name": "string.quoted.double.zephyr",
+          "patterns": [{ "include": "#string-content" }]
+        }
+      ]
+    },
+    "string-content": {
+      "patterns": [
+        { "match": "\\\\((x[0-9A-Fa-f]{2})|([ntr0\"'{}]))", "name": "constant.character.escape.zephyr" },
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.zephyr" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.zephyr" } },
+          "contentName": "meta.interpolation.zephyr",
+          "patterns": [{ "include": "#main" }]
+        }
+      ]
+    }
+  }
+}
