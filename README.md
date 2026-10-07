@@ -45,6 +45,20 @@ compiler seed.
 .\zc.exe --wasm --rt program.zeph program.wasm  # run with: node scripts\wasm-run.js program.wasm
 ```
 
+### On Linux
+
+The `./zc` driver runs the native `zc-linux`, bootstrapping it once via wine
+if it is missing:
+
+```sh
+./zc --linux --rt program.zeph program && chmod +x program   # static ELF
+./zc --linux --rt program.zeph program.o                     # link with C: gcc -no-pie program.o main.c
+```
+
+With `extern fn … from "libX.so.N"` the ELF becomes dynamic (dlopen/dlsym,
+spec §3.6); without it the output stays fully static. `zc-linux` is a build
+product, kept at the self-build fixpoint by `scripts/linux-selfbuild.sh`.
+
 ### Profile-guided builds
 
 ```powershell
@@ -132,6 +146,9 @@ temporary executable and runs it. On macOS:
 - Threads, Windows DLL interop, raw machine-code calls and general SIMD loop
   vectorization are not supported.
 
+GitHub Actions runs this suite on an Apple Silicon runner for every push and
+pull request (`.github/workflows/macos.yml`).
+
 ## Layout
 
 | path | contents |
@@ -141,6 +158,6 @@ temporary executable and runs it. On macOS:
 | `compiler/runtime.zeph` | memory management, strings, collections, maps, sorting, threads |
 | `lib/std/`, `lib/os/` | standard library; Linux and WebAssembly OS layers |
 | `bootstrap/` | historical C seed and the native Darwin runtime |
-| `scripts/` | self-build, embedding, macOS back end, WebAssembly runner |
+| `scripts/` | self-build (Windows and Linux), embedding, macOS back end, WebAssembly runner |
 | `tests/` | test runners, regressions, fixtures, macOS benchmarks |
 | `editors/` | syntax highlighting for vim, micro, nano, bat, Sublime Text, highlight.js (`editors/install.sh`) |
