@@ -149,6 +149,16 @@ temporary executable and runs it. On macOS:
 GitHub Actions runs this suite on an Apple Silicon runner for every push and
 pull request (`.github/workflows/macos.yml`).
 
+## Projects
+
+Things built with Zephyr:
+
+| project | what |
+|---|---|
+| [zui](https://github.com/Visilexs/zui) | a small React-style UI library; **pi-desk**, a native desktop window for the [pi](https://github.com/earendil-works/pi) coding agent, is built with it. Loads SDL3, FreeType and fontconfig at run time through `extern fn`, which needs the Linux dynamic-linking support above (`zc --version` lists `linux-extern`) |
+| `zephyr-mc` | a system-by-system port of Minecraft Java Edition, rendering with Vulkan |
+| `zephyr-wm` | an early Wayland tiling compositor for Linux |
+
 ## Layout
 
 | path | contents |
