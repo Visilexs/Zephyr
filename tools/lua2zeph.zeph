@@ -1,0 +1,2489 @@
+// tools/lua2zeph.zeph — luaU (Roblox/Luau) -> Zephyr transpiler
+//
+// Build: ./zc --linux --rt tools/lua2zeph.zeph build/lua2zeph && chmod +x build/lua2zeph
+// Use:   build/lua2zeph script.luau             # prints .zeph to stdout
+//        build/lua2zeph script.luau out.zeph    # writes a file
+//        ./zc --linux --rt out.zeph build/out && chmod +x build/out && build/out
+//
+// Model: every Lua value becomes the Value tagged union and every function
+// becomes LuaFn = fn([Value]) -> [Value]. The runtime preamble below is
+// spliced into every output file, so outputs are self-contained.
+//
+// Known limitations (documented, not bugs):
+//   - upvalue mutation (a closure assigning to an outer local) is unsupported
+//   - pcall never catches (Zephyr panics are fatal); it reports success
+//   - pairs() over hash-only tables yields at most one entry
+//   - table equality is structural, not identity
+//   - Roblox globals (game, workspace, ...) are plain nil globals: provide shims
+//   - math.random, coroutines, task.spawn are stubs that panic
+
+import "std/math.zeph"    // floor (number formatting)
+import "std/string.zeph" // parseFloat (lexer)
+import "std/io.zeph"     // printError, exit
+
+// ============================== lexer ==============================
+
+struct Tok { kind: int, text: str, line: int }
+// kind: 0 number, 1 string, 2 identifier/keyword, 3 punctuation, 9 eof
+
+fn isHexDigit(b: int) -> bool {
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 70) or (b >= 97 and b <= 102)
+}
+
+// i points at '['; returns (contentStart, contentEnd), or (-1, -1) if not a long bracket
+fn longBracket(src: str, i: int) -> (int, int) {
+    var k = 0
+    var j = i + 1
+    while j < src.len() and src.byte(j) == 61 {
+        k += 1
+        j += 1
+    }
+    if j >= src.len() or src.byte(j) != 91 { return (-1, -1) }
+    j += 1
+    var start = j
+    if j < src.len() and src.byte(j) == 10 { j += 1 }
+    while j < src.len() {
+        if src.byte(j) == 93 {
+            var m = j + 1
+            var q = 0
+            while m < src.len() and src.byte(m) == 61 {
+                q += 1
+                m += 1
+            }
+            if q == k and m < src.len() and src.byte(m) == 93 {
+                return (start, j)
+            }
+        }
+        j += 1
+    }
+    return (start, src.len())
+}
+
+fn countNewlines(s: str, from: int, to: int) -> int {
+    var c = 0
+    var i = from
+    while i < to and i < s.len() {
+        if s.byte(i) == 10 { c += 1 }
+        i += 1
+    }
+    return c
+}
+
+fn tokenize(src: str) -> [Tok] {
+    var toks: [Tok] = []
+    var i = 0
+    var line = 1
+    var n = src.len()
+    while i < n {
+        var c = src.byte(i)
+        if c == 10 {
+            line += 1
+            i += 1
+            continue
+        }
+        if c == 32 or c == 9 or c == 13 {
+            i += 1
+            continue
+        }
+        if c == 45 and i + 1 < n and src.byte(i + 1) == 45 {
+            if i + 2 < n and src.byte(i + 2) == 91 {
+                var lb = longBracket(src, i + 2)
+                if lb.0 >= 0 {
+                    line += countNewlines(src, i, lb.1)
+                    i = lb.1
+                    continue
+                }
+            }
+            while i < n and src.byte(i) != 10 { i += 1 }
+            continue
+        }
+        if (c >= 48 and c <= 57) or (c == 46 and i + 1 < n and src.byte(i + 1) >= 48 and src.byte(i + 1) <= 57) {
+            var j = i
+            if c == 48 and i + 1 < n and (src.byte(i + 1) == 120 or src.byte(i + 1) == 88) {
+                j = i + 2
+                while j < n and isHexDigit(src.byte(j)) { j += 1 }
+                toks.push(Tok{kind: 0, text: src.sub(i, j), line: line})
+                i = j
+                continue
+            }
+            while j < n and src.byte(j) >= 48 and src.byte(j) <= 57 { j += 1 }
+            if j < n and src.byte(j) == 46 {
+                j += 1
+                while j < n and src.byte(j) >= 48 and src.byte(j) <= 57 { j += 1 }
+            }
+            if j < n and (src.byte(j) == 101 or src.byte(j) == 69) {
+                j += 1
+                if j < n and (src.byte(j) == 43 or src.byte(j) == 45) { j += 1 }
+                while j < n and src.byte(j) >= 48 and src.byte(j) <= 57 { j += 1 }
+            }
+            toks.push(Tok{kind: 0, text: src.sub(i, j), line: line})
+            i = j
+            continue
+        }
+        if c == 34 or c == 39 {
+            var q = c
+            i += 1
+            var buf = ""
+            while true {
+                if i >= n { panic("line " + (line as str) + ": unterminated string") }
+                var d = src.byte(i)
+                if d == q {
+                    i += 1
+                    break
+                }
+                if d == 92 {
+                    i += 1
+                    if i >= n { panic("line " + (line as str) + ": bad escape") }
+                    var e2 = src.byte(i)
+                    if e2 == 97 { buf = buf + chr(7) }
+                    else if e2 == 98 { buf = buf + chr(8) }
+                    else if e2 == 102 { buf = buf + chr(12) }
+                    else if e2 == 110 { buf = buf + chr(10) }
+                    else if e2 == 114 { buf = buf + chr(13) }
+                    else if e2 == 116 { buf = buf + chr(9) }
+                    else if e2 == 118 { buf = buf + chr(11) }
+                    else if e2 == 92 { buf = buf + "\\" }
+                    else if e2 == 34 { buf = buf + "\"" }
+                    else if e2 == 39 { buf = buf + "'" }
+                    else if e2 >= 48 and e2 <= 57 {
+                        var num = ""
+                        while i < n and src.byte(i) >= 48 and src.byte(i) <= 57 and num.len() < 3 {
+                            num = num + chr(src.byte(i))
+                            i += 1
+                        }
+                        buf = buf + chr(parseInt(num).get())
+                        continue
+                    }
+                    else if e2 == 10 {
+                        i += 1
+                        while i < n {
+                            var w = src.byte(i)
+                            if w == 10 {
+                                line += 1
+                                i += 1
+                                break
+                            }
+                            if w == 32 or w == 9 or w == 13 {
+                                i += 1
+                                continue
+                            }
+                            break
+                        }
+                        continue
+                    }
+                    buf = buf + "\\" + chr(e2)
+                    i += 1
+                    continue
+                }
+                if d == 10 { line += 1 }
+                buf = buf + chr(d)
+                i += 1
+            }
+            toks.push(Tok{kind: 1, text: buf, line: line})
+            continue
+        }
+        if c == 91 {
+            var lb = longBracket(src, i)
+            if lb.0 >= 0 {
+                line += countNewlines(src, i, lb.1)
+                toks.push(Tok{kind: 1, text: src.sub(lb.0, lb.1), line: line})
+                i = lb.1
+                continue
+            }
+        }
+        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 {
+            var j = i + 1
+            while j < n and ((src.byte(j) >= 65 and src.byte(j) <= 90) or (src.byte(j) >= 97 and src.byte(j) <= 122) or (src.byte(j) >= 48 and src.byte(j) <= 57) or src.byte(j) == 95) {
+                j += 1
+            }
+            toks.push(Tok{kind: 2, text: src.sub(i, j), line: line})
+            i = j
+            continue
+        }
+        if c == 46 and i + 2 < n and src.byte(i + 1) == 46 and src.byte(i + 2) == 46 {
+            toks.push(Tok{kind: 2, text: "...", line: line})
+            i += 3
+            continue
+        }
+        if i + 1 < n {
+            var pair = chr(c) + chr(src.byte(i + 1))
+            if pair == "<=" or pair == ">=" or pair == "~=" or pair == "==" or pair == ".." or pair == "::" or pair == "<<" or pair == ">>" or pair == "->" {
+                toks.push(Tok{kind: 3, text: pair, line: line})
+                i += 2
+                continue
+            }
+        }
+        var ch = chr(c)
+        if ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%" or ch == "^" or ch == "#" or ch == "&" or ch == "|" or ch == "~" or ch == "<" or ch == ">" or ch == "=" or ch == "(" or ch == ")" or ch == "\{" or ch == "\}" or ch == "[" or ch == "]" or ch == ";" or ch == "," or ch == "." or ch == ":" {
+            toks.push(Tok{kind: 3, text: ch, line: line})
+            i += 1
+            continue
+        }
+        panic("line " + (line as str) + ": unexpected character " + ch)
+    }
+    return toks
+}
+
+fn parseNumText(s: str) -> float {
+    if s.len() > 2 and s.byte(0) == 48 and (s.byte(1) == 120 or s.byte(1) == 88) {
+        var acc = 0.0
+        var i = 2
+        while i < s.len() {
+            var b = s.byte(i)
+            var d = 0
+            if b >= 48 and b <= 57 { d = b - 48 }
+            else if b >= 97 and b <= 102 { d = b - 97 + 10 }
+            else { d = b - 65 + 10 }
+            acc = acc * 16.0 + d
+            i += 1
+        }
+        return acc
+    }
+    return parseFloat(s).get()
+}
+
+// ============================== AST ==============================
+
+struct FnLit { params: [str], vararg: bool, body: [Stmt] }
+struct TableLit { fields: [TField] }
+struct TField { k: Expr?, v: Expr }
+enum Expr {
+    Num(float),
+    Str(str),
+    BoolLit(bool),
+    NilLit,
+    Vararg,
+    Name(str),
+    Bin(str, Expr, Expr),
+    Un(str, Expr),
+    Call(Expr, [Expr]),
+    Index(Expr, Expr),
+    Field(Expr, str),
+    Table(TableLit),
+    Fn(FnLit)
+}
+struct IfBranch { cond: Expr, body: [Stmt] }
+struct ForNum { name: str, from: Expr, to: Expr, step: Expr, body: [Stmt] }
+struct ForGen { vars: [str], iter: Expr, initargs: [Expr], body: [Stmt] }
+struct LocalDecl { names: [str], vals: [Expr] }
+struct LocalFnD { name: str, lit: FnLit, inline: bool }
+struct NamedFnD { path: [str], method: str?, lit: FnLit, idx: int, inline: bool }
+enum Target {
+    TName(str),
+    TIndex(Expr, Expr),
+    TField(Expr, str)
+}
+enum Stmt {
+    Local(LocalDecl),
+    Assign([Target], [Expr]),
+    Call(Expr, [Expr]),
+    ExprStmt(Expr),
+    Do([Stmt]),
+    If([IfBranch], [Stmt]?),
+    While(Expr, [Stmt]),
+    Repeat([Stmt], Expr),
+    ForNum(ForNum),
+    ForGen(ForGen),
+    Return([Expr]),
+    Break,
+    Continue,
+    LocalFn(LocalFnD),
+    NamedFn(NamedFnD),
+    Compound(Target, str, Expr)
+}
+
+// ============================== parser ==============================
+
+struct P { toks: [Tok], pos: int }
+
+fn peek(p: P) -> Tok {
+    if p.pos < p.toks.len() { return p.toks[p.pos] }
+    return Tok{kind: 9, text: "<eof>", line: 0}
+}
+fn peek2(p: P) -> Tok {
+    if p.pos + 1 < p.toks.len() { return p.toks[p.pos + 1] }
+    return Tok{kind: 9, text: "<eof>", line: 0}
+}
+fn adv(p: P) { p.pos += 1 }
+fn at(p: P, s: str) -> bool {
+    var t = peek(p)
+    return t.kind == 3 and t.text == s
+}
+fn atId(p: P, s: str) -> bool {
+    var t = peek(p)
+    return t.kind == 2 and t.text == s
+}
+fn eat(p: P, s: str) -> bool {
+    if at(p, s) {
+        adv(p)
+        return true
+    }
+    return false
+}
+fn eatId(p: P, s: str) -> bool {
+    if atId(p, s) {
+        adv(p)
+        return true
+    }
+    return false
+}
+fn expect(p: P, s: str) {
+    if not eat(p, s) { panic("line " + (peek(p).line as str) + ": expected '" + s + "'") }
+}
+fn expectId(p: P, s: str) {
+    if not eatId(p, s) { panic("line " + (peek(p).line as str) + ": expected '" + s + "'") }
+}
+fn expectIdent(p: P) -> str {
+    var t = peek(p)
+    if t.kind != 2 { panic("line " + (t.line as str) + ": expected name, got '" + t.text + "'") }
+    adv(p)
+    return t.text
+}
+
+fn isKeyword(s: str) -> bool {
+    return s == "local" or s == "function" or s == "end" or s == "if" or s == "then" or s == "else" or s == "elseif" or s == "while" or s == "do" or s == "repeat" or s == "until" or s == "return" or s == "break" or s == "continue" or s == "and" or s == "or" or s == "not" or s == "nil" or s == "true" or s == "false" or s == "in"
+}
+
+// skip a Luau type annotation (types carry no runtime meaning)
+fn skipType(p: P) {
+    var depth = 0
+    while true {
+        var t = peek(p)
+        if t.kind == 9 { return }
+        if t.kind == 2 {
+            if isKeyword(t.text) { return }
+            adv(p)
+            continue
+        }
+        match t.text {
+            "(", "[", "\{", "<" {
+                depth += 1
+                adv(p)
+            }
+            ")", "]", "\}", ">" {
+                depth -= 1
+                adv(p)
+            }
+            ",", "|", "&", ".", ":", "?", "->" { adv(p) }
+            else { return }
+        }
+    }
+}
+
+fn binPrec(op: str) -> int {
+    return match op {
+        "or" { 1 }
+        "and" { 2 }
+        "|" { 3 }
+        "&" { 4 }
+        "<", ">", "<=", ">=", "==", "~=" { 5 }
+        ".." { 6 }
+        "+", "-" { 7 }
+        "*", "/", "%", "<<", ">>" { 8 }
+        "^" { 9 }
+        else { 0 }
+    }
+}
+
+fn parseChunk(p: P) -> [Stmt] {
+    return parseBlock(p)
+}
+
+fn parseBlock(p: P) -> [Stmt] {
+    var stmts: [Stmt] = []
+    while true {
+        eat(p, ";")
+        var t = peek(p)
+        if t.kind == 9 { break }
+        if t.kind == 2 and (t.text == "end" or t.text == "else" or t.text == "elseif" or t.text == "until") { break }
+        var s = parseStat(p)
+        stmts.push(s)
+        if s is Stmt.Return { break }
+    }
+    return stmts
+}
+
+fn parseStat(p: P) -> Stmt {
+    var t = peek(p)
+    if t.kind == 2 {
+        match t.text {
+            "local" { return parseLocal(p) }
+            "function" { return parseNamedFn(p) }
+            "if" {
+                adv(p)
+                var branches: [IfBranch] = []
+                var c = parseExp(p, 1)
+                expectId(p, "then")
+                var b = parseBlock(p)
+                branches.push(IfBranch{cond: c, body: b})
+                while eatId(p, "elseif") {
+                    c = parseExp(p, 1)
+                    expectId(p, "then")
+                    b = parseBlock(p)
+                    branches.push(IfBranch{cond: c, body: b})
+                }
+                var eb: [Stmt]? = none
+                if eatId(p, "else") {
+                    eb = parseBlock(p)
+                }
+                expectId(p, "end")
+                return Stmt.If(branches, eb)
+            }
+            "while" {
+                adv(p)
+                var c = parseExp(p, 1)
+                expectId(p, "do")
+                var b = parseBlock(p)
+                expectId(p, "end")
+                return Stmt.While(c, b)
+            }
+            "do" {
+                adv(p)
+                var b = parseBlock(p)
+                expectId(p, "end")
+                return Stmt.Do(b)
+            }
+            "repeat" {
+                adv(p)
+                var b = parseBlock(p)
+                expectId(p, "until")
+                var c = parseExp(p, 1)
+                return Stmt.Repeat(b, c)
+            }
+            "for" { return parseFor(p) }
+            "return" {
+                adv(p)
+                var vals: [Expr] = []
+                var nt = peek(p)
+                if not (nt.kind == 9 or (nt.kind == 2 and (nt.text == "end" or nt.text == "else" or nt.text == "elseif" or nt.text == "until")) or (nt.kind == 3 and nt.text == ";")) {
+                    vals = explist(p)
+                }
+                return Stmt.Return(vals)
+            }
+            "break" {
+                adv(p)
+                return Stmt.Break
+            }
+            "continue" {
+                adv(p)
+                return Stmt.Continue
+            }
+            else { return parseExprStat(p) }
+        }
+    }
+    return parseExprStat(p)
+}
+
+fn parseLocal(p: P) -> Stmt {
+    adv(p)
+    if atId(p, "function") {
+        adv(p)
+        var name = expectIdent(p)
+        var lit = parseFuncBody(p)
+        return Stmt.LocalFn(LocalFnD{name: name, lit: lit, inline: false})
+    }
+    var names: [str] = []
+    while true {
+        var nm = expectIdent(p)
+        if at(p, ":") or at(p, "::") {
+            adv(p)
+            skipType(p)
+        }
+        names.push(nm)
+        if eat(p, ",") { continue }
+        break
+    }
+    var vals: [Expr] = []
+    if eat(p, "=") { vals = explist(p) }
+    return Stmt.Local(LocalDecl{names: names, vals: vals})
+}
+
+fn parseNamedFn(p: P) -> Stmt {
+    adv(p)
+    var path: [str] = []
+    path.push(expectIdent(p))
+    while at(p, ".") {
+        adv(p)
+        path.push(expectIdent(p))
+    }
+    var method: str? = none
+    if at(p, ":") {
+        adv(p)
+        method = expectIdent(p)
+    }
+    var lit = parseFuncBody(p)
+    return Stmt.NamedFn(NamedFnD{path: path, method: method, lit: lit, idx: 0, inline: false})
+}
+
+fn parseFuncBody(p: P) -> FnLit {
+    expect(p, "(")
+    var params: [str] = []
+    var vararg = false
+    if not at(p, ")") {
+        while true {
+            if at(p, "...") {
+                vararg = true
+                adv(p)
+                break
+            }
+            var nm = expectIdent(p)
+            if at(p, ":") or at(p, "::") {
+                adv(p)
+                skipType(p)
+            }
+            params.push(nm)
+            if eat(p, ",") { continue }
+            break
+        }
+    }
+    expect(p, ")")
+    if eat(p, "->") { skipType(p) }
+    var body = parseBlock(p)
+    expectId(p, "end")
+    return FnLit{params: params, vararg: vararg, body: body}
+}
+
+fn parseFor(p: P) -> Stmt {
+    adv(p)
+    var name = expectIdent(p)
+    if at(p, ":") or at(p, "::") {
+        adv(p)
+        skipType(p)
+    }
+    if at(p, "=") {
+        adv(p)
+        var from = parseExp(p, 1)
+        var to = from
+        var step = Expr.Num(1.0)
+        if eat(p, ",") {
+            to = parseExp(p, 1)
+            if eat(p, ",") { step = parseExp(p, 1) }
+        }
+        expectId(p, "do")
+        var body = parseBlock(p)
+        expectId(p, "end")
+        return Stmt.ForNum(ForNum{name: name, from: from, to: to, step: step, body: body})
+    }
+    var vars: [str] = [name]
+    while eat(p, ",") {
+        var nm = expectIdent(p)
+        if at(p, ":") or at(p, "::") {
+            adv(p)
+            skipType(p)
+        }
+        vars.push(nm)
+    }
+    expectId(p, "in")
+    var initargs = explist(p)
+    expectId(p, "do")
+    var body = parseBlock(p)
+    expectId(p, "end")
+    return Stmt.ForGen(ForGen{vars: vars, iter: initargs[0], initargs: initargs, body: body})
+}
+
+fn isCompoundOp(s: str) -> bool {
+    return s == "+=" or s == "-=" or s == "*=" or s == "/=" or s == "%=" or s == "^=" or s == "&=" or s == "|=" or s == "<<=" or s == ">>=" or s == "~="
+}
+
+fn compoundBase(op: str) -> str {
+    return op.sub(0, op.len() - 1)
+}
+
+fn targetOf(x: Expr) -> Target {
+    match x {
+        Name(n) { return Target.TName(n) }
+        Index(t, k) { return Target.TIndex(t, k) }
+        Field(t, n) { return Target.TField(t, n) }
+        else { panic("invalid assignment target") }
+    }
+}
+
+fn parseExprStat(p: P) -> Stmt {
+    var chain = parsePrefixChain(p)
+    var pt = peek(p)
+    if pt.kind == 3 and isCompoundOp(pt.text) {
+        adv(p)
+        var rhs = parseExp(p, 1)
+        return Stmt.Compound(targetOf(chain), compoundBase(pt.text), rhs)
+    }
+    if at(p, "=") {
+        adv(p)
+        var targets: [Target] = [targetOf(chain)]
+        while eat(p, ",") {
+            targets.push(targetOf(parseVarOnly(p)))
+        }
+        var vals = explist(p)
+        return Stmt.Assign(targets, vals)
+    }
+    match chain {
+        Call(f, args) { return Stmt.Call(f, args) }
+        else { return Stmt.ExprStmt(chain) }
+    }
+}
+
+fn explist(p: P) -> [Expr] {
+    var xs: [Expr] = []
+    xs.push(parseExp(p, 1))
+    while eat(p, ",") {
+        var t = peek(p)
+        if t.kind == 9 or (t.kind == 3 and (t.text == ")" or t.text == "]" or t.text == "\}" or t.text == ";")) or (t.kind == 2 and (t.text == "end" or t.text == "else" or t.text == "elseif" or t.text == "until" or t.text == "do")) { break }
+        xs.push(parseExp(p, 1))
+    }
+    return xs
+}
+
+fn parseTableFields(p: P) -> [TField] {
+    var fields: [TField] = []
+    while true {
+        var t = peek(p)
+        if t.kind == 9 or (t.kind == 3 and t.text == "\}") { break }
+        if t.kind == 3 and (t.text == "[" or t.text == "\{") {
+            adv(p)
+            var k = parseExp(p, 1)
+            expect(p, "]")
+            expect(p, "=")
+            var v = parseExp(p, 1)
+            var kk: Expr? = k
+            fields.push(TField{k: kk, v: v})
+        } else if t.kind == 2 and peek2(p).kind == 3 and peek2(p).text == "=" {
+            var nm = expectIdent(p)
+            adv(p)
+            var v = parseExp(p, 1)
+            var kk: Expr? = Expr.Str(nm)
+            fields.push(TField{k: kk, v: v})
+        } else {
+            var v = parseExp(p, 1)
+            var nk: Expr? = none
+            fields.push(TField{k: nk, v: v})
+        }
+        if not eat(p, ",") { break }
+    }
+    return fields
+}
+
+fn callArgs(p: P) -> [Expr] {
+    if at(p, "\{") {
+        adv(p)
+        var fields = parseTableFields(p)
+        expect(p, "\}")
+        return [Expr.Table(TableLit{fields: fields})]
+    }
+    if peek(p).kind == 1 {
+        var s = peek(p).text
+        adv(p)
+        return [Expr.Str(s)]
+    }
+    adv(p)
+    if at(p, ")") {
+        adv(p)
+        return []
+    }
+    var xs = explist(p)
+    expect(p, ")")
+    return xs
+}
+
+fn parsePrimary(p: P) -> Expr {
+    var t = peek(p)
+    if t.kind == 0 {
+        adv(p)
+        return Expr.Num(parseNumText(t.text))
+    }
+    if t.kind == 1 {
+        adv(p)
+        return Expr.Str(t.text)
+    }
+    if t.kind == 3 and t.text == "\{" {
+        adv(p)
+        var fields = parseTableFields(p)
+        expect(p, "\}")
+        return Expr.Table(TableLit{fields: fields})
+    }
+    if t.kind == 3 and t.text == "(" {
+        adv(p)
+        var pe = parseExp(p, 1)
+        expect(p, ")")
+        return pe
+    }
+    if t.kind == 2 {
+        match t.text {
+            "true" {
+                adv(p)
+                return Expr.BoolLit(true)
+            }
+            "false" {
+                adv(p)
+                return Expr.BoolLit(false)
+            }
+            "nil" {
+                adv(p)
+                return Expr.NilLit
+            }
+            "..." {
+                adv(p)
+                return Expr.Vararg
+            }
+            "function" {
+                adv(p)
+                if peek(p).kind == 2 and not isKeyword(peek(p).text) { adv(p) }
+                var lit = parseFuncBody(p)
+                return Expr.Fn(lit)
+            }
+            else {
+                adv(p)
+                return Expr.Name(t.text)
+            }
+        }
+    }
+    if at(p, "(") {
+        adv(p)
+        var e = parseExp(p, 1)
+        while eat(p, ",") { parseExp(p, 1) }
+        expect(p, ")")
+        return e
+    }
+    panic("line " + (t.line as str) + ": unexpected token '" + t.text + "' in expression")
+}
+
+fn parseVarOnly(p: P) -> Expr {
+    var e = parsePrimary(p)
+    while true {
+        if at(p, ".") {
+            adv(p)
+            var nm = expectIdent(p)
+            e = Expr.Field(e, nm)
+        } else if at(p, "[") {
+            adv(p)
+            var k = parseExp(p, 1)
+            expect(p, "]")
+            e = Expr.Index(e, k)
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+fn parsePrefixChain(p: P) -> Expr {
+    var e = parsePrimary(p)
+    while true {
+        if at(p, ".") {
+            adv(p)
+            var nm = expectIdent(p)
+            e = Expr.Field(e, nm)
+        } else if at(p, "[") {
+            adv(p)
+            var k = parseExp(p, 1)
+            expect(p, "]")
+            e = Expr.Index(e, k)
+        } else if at(p, ":") {
+            adv(p)
+            var m = expectIdent(p)
+            var args = callArgs(p)
+            var full: [Expr] = [e]
+            for a in args { full.push(a) }
+            e = Expr.Call(Expr.Field(e, m), full)
+        } else if at(p, "(") or at(p, "\{") or peek(p).kind == 1 {
+            var args = callArgs(p)
+            e = Expr.Call(e, args)
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+fn parsePrefix(p: P) -> Expr {
+    var t = peek(p)
+    if t.kind == 3 and (t.text == "-" or t.text == "#" or t.text == "~") {
+        adv(p)
+        return Expr.Un(t.text, parseExp(p, 9))
+    }
+    if t.kind == 2 and t.text == "not" {
+        adv(p)
+        return Expr.Un("not", parseExp(p, 9))
+    }
+    return parsePrefixChain(p)
+}
+
+fn parseExp(p: P, minPrec: int) -> Expr {
+    var lhs = parsePrefix(p)
+    while true {
+        var t = peek(p)
+        var prec = binPrec(t.text)
+        if prec == 0 or prec < minPrec { break }
+        adv(p)
+        var rhsMin = prec
+        if t.text != "^" and t.text != ".." { rhsMin = prec + 1 }
+        var rhs = parseExp(p, rhsMin)
+        lhs = Expr.Bin(t.text, lhs, rhs)
+    }
+    return lhs
+}
+
+// ============================== emitter ==============================
+
+struct FnDeclInfo { idx: int, lit: FnLit, setInMain: bool, basePath: [str], key: str, method: bool }
+struct E {
+    lines: [str],
+    ind: int,
+    scopes: [[str: str]],
+    tmp: int,
+    usedG: [str],
+    fnIdx: int,
+    lfIdx: int,
+    fnDecls: [FnDeclInfo],
+    namedInit: [str: str],
+    lfGlobals: [(str, str)],
+    lfBind: [str: str],
+    curParams: int,
+    fnDepth: int,
+    topLocals: [str]
+}
+
+fn eline(st: E, s: str) {
+    var pad = ""
+    var i = 0
+    while i < st.ind {
+        pad = pad + "    "
+        i += 1
+    }
+    st.lines.push(pad + s)
+}
+
+fn etmp(st: E, prefix: str) -> str {
+    st.tmp += 1
+    return "__z_" + prefix + (st.tmp as str)
+}
+
+fn lstHas(xs: [str], x: str) -> bool {
+    for v in xs {
+        if v == x { return true }
+    }
+    return false
+}
+
+fn isZephKeyword(s: str) -> bool {
+    return s == "fn" or s == "let" or s == "var" or s == "const" or s == "if" or s == "else" or s == "while" or s == "for" or s == "in" or s == "return" or s == "struct" or s == "enum" or s == "impl" or s == "interface" or s == "import" or s == "private" or s == "type" or s == "extern" or s == "from" or s == "true" or s == "false" or s == "none" or s == "and" or s == "or" or s == "not" or s == "break" or s == "continue" or s == "match" or s == "defer" or s == "as" or s == "is" or s == "step"
+}
+
+fn sanitize(name: str) -> str {
+    if isZephKeyword(name) { return name + "_" }
+    return name
+}
+
+fn pushScope(st: E, names: [str]) {
+    var sc: [str: str] = [:]
+    for nm in names {
+        sc[nm] = sanitize(nm)
+    }
+    st.scopes.push(sc)
+}
+
+fn bindScope(st: E, name: str, zname: str) {
+    var sc: [str: str] = [:]
+    sc[name] = zname
+    st.scopes.push(sc)
+}
+
+fn popScope(st: E) {
+    st.scopes.pop()
+}
+
+fn resolv(st: E, name: str) -> str {
+    var i = st.scopes.len() - 1
+    while i >= 0 {
+        var sc = st.scopes[i]
+        if sc.has(name) { return sc[name] }
+        i -= 1
+    }
+    if st.lfBind.has(name) { return st.lfBind.get(name).or("g_" + name) }
+    if not lstHas(st.usedG, name) { st.usedG.push(name) }
+    return "g_" + name
+}
+
+// quote a Lua string literal for use inside generated Zephyr code
+fn zesc(s: str) -> str {
+    var o = ""
+    for b in s {
+        var c = b
+        if c == 92 { o = o + "\\\\" }
+        else if c == 34 { o = o + "\\\"" }
+        else if c == 123 { o = o + "\\\{" }
+        else if c == 125 { o = o + "\\}" }
+        else if c == 10 { o = o + "\\n" }
+        else if c == 9 { o = o + "\\t" }
+        else if c == 13 { o = o + "\\r" }
+        else if c < 32 { o = o + "\\" + (c as str) }
+        else { o = o + chr(c) }
+    }
+    return "\"" + o + "\""
+}
+
+fn fnum(x: float) -> str {
+    if x != x { return "0.0 / 0.0" }
+    if x == 1.0 / 0.0 { return "1.0 / 0.0" }
+    if x == -(1.0 / 0.0) { return "-1.0 / 0.0" }
+    if x == floor(x) and x >= -9007199254740992.0 and x <= 9007199254740992.0 {
+        var t = (x as int) as str
+        if not t.contains(".") { t = t + ".0" }
+        return t
+    }
+    return x as str
+}
+
+fn binHlp(op: str) -> str {
+    match op {
+        "+" { return "vadd" }
+        "-" { return "vsub" }
+        "*" { return "vmul" }
+        "/" { return "vdiv" }
+        "%" { return "vmod" }
+        "^" { return "vpow" }
+        ".." { return "vconcat" }
+        "<" { return "vlt" }
+        ">" { return "vgt" }
+        "<=" { return "vle" }
+        ">=" { return "vge" }
+        "==" { return "veq" }
+        "~=" { return "vne" }
+        "and" { return "vand" }
+        "or" { return "vor" }
+        "&" { return "vband" }
+        "|" { return "vbitor" }
+        "<<" { return "vshl" }
+        ">>" { return "vshr" }
+        else { panic("unknown operator " + op) }
+    }
+}
+
+fn unHlp(op: str) -> str {
+    match op {
+        "-" { return "vneg" }
+        "#" { return "vlen" }
+        "not" { return "vnot" }
+        "~" { return "vbneg" }
+        else { panic("unknown unary " + op) }
+    }
+}
+
+fn ex(st: E, x: Expr) -> str {
+    return match x {
+        Num(v) { "Value.N(" + fnum(v) + ")" }
+        Str(s) { "Value.S(" + zesc(s) + ")" }
+        BoolLit(b) { "Value.B(" + (if b { "true" } else { "false" }) + ")" }
+        NilLit { "Value.Nil" }
+        Vararg { "vrest(args, " + (st.curParams as str) + ")" }
+        Name(n) { resolv(st, n) }
+        Bin(op, l, r) { binHlp(op) + "(" + exv(st, l) + ", " + exv(st, r) + ")" }
+        Un(op, x2) { unHlp(op) + "(" + exv(st, x2) + ")" }
+        Call(f, args) { callExpr(st, f, args) }
+        Index(t, k) { "vindex(" + exv(st, t) + ", " + exv(st, k) + ")" }
+        Field(t, n) { "vindex(" + exv(st, t) + ", Value.S(" + zesc(n) + "))" }
+        Table(lit) { tableExpr(st, lit) }
+        Fn(lit) { closureExpr(st, lit) }
+    }
+}
+
+fn isStrMethodCall(x: Expr) -> bool {
+    match x {
+        Call(f, _) {
+            match f {
+                Field(recv, m) { return isStringExpr(recv) }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
+fn exv(st: E, x: Expr) -> str {
+    if x is Expr.Call and not isStrMethodCall(x) { return "vone(" + ex(st, x) + ")" }
+    if isBoolExpr(x) { return "Value.B(" + ex(st, x) + ")" }
+    return ex(st, x)
+}
+
+fn isStringExpr(x: Expr) -> bool {
+    match x {
+        Str(_) { return true }
+        Bin(op, _, _) { return op == ".." }
+        else { return false }
+    }
+}
+
+fn strMethodExpr(st: E, recv: Expr, m: str, args: [Expr]) -> str? {
+    if not isStringExpr(recv) { return none }
+    var s = "vpart_s(" + exv(st, recv) + ")"
+    match m {
+        "upper" { return "Value.S(" + s + ".upper())" }
+        "lower" { return "Value.S(" + s + ".lower())" }
+        "trim" { return "Value.S(" + s + ".trim())" }
+        "rep" {
+            var n = "1"
+            if args.len() > 0 { n = "vpart_n(" + exv(st, args[0]) + ") as int" }
+            return "Value.S(" + s + ".repeat(" + n + "))"
+        }
+        "len" { return "Value.N(" + s + ".len() as float)" }
+        "sub" {
+            var a = "Value.N(1.0)"
+            var b = "Value.N(-1.0)"
+            if args.len() > 0 { a = exv(st, args[0]) }
+            if args.len() > 1 { b = exv(st, args[1]) }
+            return "Value.S(sstrsub(" + s + ", " + a + ", " + b + "))"
+        }
+        "find" {
+            var pat = "Value.S(\"\")"
+            if args.len() > 0 { pat = exv(st, args[0]) }
+            return "ssfind(" + s + ", " + pat + ")"
+        }
+        "byte" {
+            var i = "1"
+            if args.len() > 0 { i = "vpart_n(" + exv(st, args[0]) + ") as int" }
+            return "Value.N((" + s + ".byte(" + i + ")) as float)"
+        }
+        else { return none }
+    }
+}
+
+fn callExpr(st: E, f: Expr, args: [Expr]) -> str {
+    match f {
+        Field(recv, m) {
+            if isStringExpr(recv) {
+                var sm = strMethodExpr(st, recv, m, args)
+                if sm.has() { return sm.get() }
+            }
+        }
+        else { }
+    }
+var base = exv(st, f)
+    var lastIsVararg = args.len() > 0 and args[args.len() - 1] is Expr.Vararg
+    var lastIsCall = args.len() > 0 and args[args.len() - 1] is Expr.Call
+    var limit = args.len()
+    if lastIsVararg or lastIsCall { limit = args.len() - 1 }
+    var parts: [str] = []
+    var i = 0
+    while i < limit {
+        parts.push(exv(st, args[i]))
+        i += 1
+    }
+    if not lastIsCall and not lastIsVararg {
+        return "vcalle(" + base + ", [" + parts.join(", ") + "])"
+    }
+    var al = etmp(st, "al")
+    eline(st, "var " + al + ": [Value] = [" + parts.join(", ") + "]")
+    if lastIsCall {
+        var r = etmp(st, "r")
+        eline(st, "var " + r + " = " + ex(st, args[args.len() - 1]))
+        eline(st, "for x in " + r + " \{ " + al + ".push(x) \}")
+    }
+    if lastIsVararg {
+        var rr = etmp(st, "rr")
+        eline(st, "var " + rr + " = vpart_t(vrest(args, " + (st.curParams as str) + "))")
+        eline(st, "for x in " + rr + ".arr \{ " + al + ".push(x) \}")
+    }
+    return "vcalle(" + base + ", " + al + ")"
+}
+
+fn tableExpr(st: E, lit: TableLit) -> str {
+    var t = etmp(st, "t")
+    eline(st, "var " + t + " = vtable()")
+    for f in lit.fields {
+        if f.k.has() {
+            eline(st, "vset(" + t + ", " + exv(st, f.k.get()) + ", " + exv(st, f.v) + ")")
+        } else {
+            if f.v is Expr.Vararg {
+                var r = etmp(st, "r")
+                eline(st, "var " + r + " = vpart_t(vrest(args, " + (st.curParams as str) + "))")
+                eline(st, "for x in " + r + ".arr \{ vpart_t(" + t + ").arr.push(x) \}")
+            } else {
+                eline(st, "vpart_t(" + t + ").arr.push(" + exv(st, f.v) + ")")
+            }
+        }
+    }
+    return t
+}
+
+fn emitFnLiteralBody(st: E, lit: FnLit, off: int) {
+    st.ind += 1
+    var saved = st.curParams
+    var np = 0
+    var i = 0
+    while i < lit.params.len() {
+        if lit.params[i] != "..." {
+            eline(st, "var " + sanitize(lit.params[i]) + " = args[" + ((off + np) as str) + "]")
+            np += 1
+        }
+        i += 1
+    }
+    st.curParams = off + np
+    pushScope(st, lit.params)
+    emitStmts(st, lit.body, false)
+    if not (lit.body.len() > 0 and lit.body[lit.body.len() - 1] is Stmt.Return) {
+        eline(st, "return []")
+    }
+    popScope(st)
+    st.curParams = saved
+    st.ind -= 1
+    eline(st, "\}")
+}
+
+fn closureExpr(st: E, lit: FnLit) -> str {
+    var c = etmp(st, "c")
+    eline(st, "var " + c + ": LuaFn = fn(args: [Value]) -> [Value] \{")
+    emitFnLiteralBody(st, lit, 0)
+    return "Value.F(" + c + ")"
+}
+
+// materialize a Lua multi-value expression into a [Value]; returns its temp name
+fn materialize(st: E, vals: [Expr]) -> str {
+    var r = etmp(st, "r")
+    var lastIsCall = vals.len() > 0 and vals[vals.len() - 1] is Expr.Call
+    var limit = vals.len()
+    if lastIsCall { limit = vals.len() - 1 }
+    var parts: [str] = []
+    var i = 0
+    while i < limit {
+        parts.push(exv(st, vals[i]))
+        i += 1
+    }
+    eline(st, "var " + r + ": [Value] = [" + parts.join(", ") + "]")
+    if lastIsCall {
+        var c = etmp(st, "c")
+        eline(st, "var " + c + " = " + ex(st, vals[vals.len() - 1]))
+        eline(st, "for v in " + c + " \{ " + r + ".push(v) \}")
+    }
+    return r
+}
+
+fn assignTo(st: E, t: Target, rhs: str) {
+    match t {
+        TName(n) { eline(st, resolv(st, n) + " = " + rhs) }
+        TIndex(te, k) { eline(st, "vset(" + exv(st, te) + ", " + exv(st, k) + ", " + rhs + ")") }
+        TField(te, n) { eline(st, "vset(" + exv(st, te) + ", Value.S(" + zesc(n) + "), " + rhs + ")") }
+    }
+}
+
+fn targetValue(st: E, t: Target) -> str {
+    return match t {
+        TName(n) { resolv(st, n) }
+        TIndex(te, k) { "vindex(" + exv(st, te) + ", " + exv(st, k) + ")" }
+        TField(te, n) { "vindex(" + exv(st, te) + ", Value.S(" + zesc(n) + "))" }
+    }
+}
+
+fn isBoolExpr(x: Expr) -> bool {
+    match x {
+        Bin(op, _, _) {
+            return op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "~="
+        }
+        else { return false }
+    }
+}
+
+fn condExpr(st: E, x: Expr) -> str {
+    if isBoolExpr(x) { return ex(st, x) }
+    return "vtruth(" + exv(st, x) + ")"
+}
+
+fn emitStmts(st: E, stmts: [Stmt], topLevel: bool) {
+    for s in stmts {
+        match s {
+            Local(d) {
+                if d.vals.len() == 0 {
+                    for nm in d.names {
+                        eline(st, "var " + sanitize(nm) + " = Value.Nil")
+                    }
+                } else if d.names.len() == 1 and d.vals.len() == 1 and not (d.vals[0] is Expr.Call) {
+                    eline(st, "var " + sanitize(d.names[0]) + " = " + exv(st, d.vals[0]))
+                } else {
+                    var r = materialize(st, d.vals)
+                    var i = 0
+                    while i < d.names.len() {
+                        eline(st, "var " + sanitize(d.names[i]) + " = if " + r + ".len() > " + (i as str) + " \{ " + r + "[" + (i as str) + "] \} else \{ Value.Nil \}")
+                        i += 1
+                    }
+                }
+                pushScope(st, d.names)
+            }
+            Assign(ts, vs) {
+                if ts.len() == 1 and vs.len() == 1 and not (vs[0] is Expr.Call) {
+                    assignTo(st, ts[0], exv(st, vs[0]))
+                } else {
+                    var r = materialize(st, vs)
+                    var i = 0
+                    while i < ts.len() {
+                        assignTo(st, ts[i], "if " + r + ".len() > " + (i as str) + " \{ " + r + "[" + (i as str) + "] \} else \{ Value.Nil \}")
+                        i += 1
+                    }
+                }
+            }
+            Call(f, args) { eline(st, callExpr(st, f, args)) }
+            ExprStmt(x) { eline(st, exv(st, x)) }
+            Do(body) {
+                eline(st, "\{")
+                st.ind += 1
+                emitStmts(st, body, false)
+                st.ind -= 1
+                eline(st, "\}")
+            }
+            If(branches, eb) {
+                var i = 0
+                while i < branches.len() {
+                    var br = branches[i]
+                    if i == 0 {
+                        eline(st, "if " + condExpr(st, br.cond) + " \{")
+                    } else {
+                        eline(st, "\} else if " + condExpr(st, br.cond) + " \{")
+                    }
+                    st.ind += 1
+                    emitStmts(st, br.body, false)
+                    st.ind -= 1
+                    i += 1
+                }
+                if eb.has() {
+                    eline(st, "\} else \{")
+                    st.ind += 1
+                    emitStmts(st, eb.get(), false)
+                    st.ind -= 1
+                    eline(st, "\}")
+                } else {
+                    eline(st, "\}")
+                }
+            }
+            While(c, body) {
+                eline(st, "while " + condExpr(st, c) + " \{")
+                st.ind += 1
+                emitStmts(st, body, false)
+                st.ind -= 1
+                eline(st, "\}")
+            }
+            Repeat(body, c) {
+                eline(st, "while true \{")
+                st.ind += 1
+                emitStmts(st, body, false)
+                eline(st, "if " + condExpr(st, c) + " \{ break \}")
+                st.ind -= 1
+                eline(st, "\}")
+            }
+            ForNum(f) {
+                var iv = etmp(st, "i")
+                var tv = etmp(st, "to")
+                var sv = etmp(st, "st")
+                eline(st, "var " + iv + " = " + exv(st, f.from))
+                eline(st, "var " + tv + " = " + exv(st, f.to))
+                eline(st, "var " + sv + " = " + exv(st, f.step))
+                bindScope(st, f.name, iv)
+                var fl = etmp(st, "fl")
+                eline(st, "var " + fl + " = true")
+                eline(st, "if vpart_n(" + sv + ") > 0.0 \{")
+                st.ind += 1
+                eline(st, "while true \{")
+                st.ind += 1
+                eline(st, "if " + fl + " \{ " + fl + " = false \} else \{ " + iv + " = vadd(" + iv + ", " + sv + ") \}")
+                eline(st, "if not (vpart_n(" + iv + ") <= vpart_n(" + tv + ")) \{ break \}")
+                emitStmts(st, f.body, false)
+                st.ind -= 1
+                eline(st, "\}")
+                st.ind -= 1
+                eline(st, "\} else \{")
+                st.ind += 1
+                eline(st, "while true \{")
+                st.ind += 1
+                eline(st, "if " + fl + " \{ " + fl + " = false \} else \{ " + iv + " = vadd(" + iv + ", " + sv + ") \}")
+                eline(st, "if not (vpart_n(" + iv + ") >= vpart_n(" + tv + ")) \{ break \}")
+                emitStmts(st, f.body, false)
+                st.ind -= 1
+                eline(st, "\}")
+                st.ind -= 1
+                eline(st, "\}")
+                popScope(st)
+            }
+            ForGen(g) {
+                var rs0 = etmp(st, "rs0")
+                var it = etmp(st, "it")
+                var stt = etmp(st, "st")
+                var sd = etmp(st, "sd")
+                var rs = etmp(st, "rs")
+                eline(st, "var " + rs0 + " = " + ex(st, g.iter))
+                eline(st, "var " + it + " = " + rs0 + "[0]")
+                eline(st, "var " + stt + " = if " + rs0 + ".len() > 1 \{ " + rs0 + "[1] \} else \{ Value.Nil \}")
+                eline(st, "var " + sd + " = if " + rs0 + ".len() > 2 \{ " + rs0 + "[2] \} else \{ Value.Nil \}")
+                var i = 0
+                while i < g.vars.len() {
+                    bindScope(st, g.vars[i], sanitize(g.vars[i]))
+                    i += 1
+                }
+                eline(st, "while true \{")
+                st.ind += 1
+                eline(st, "var " + rs + " = vcalle(" + it + ", [" + stt + ", " + sd + "])")
+                eline(st, "if " + rs + ".len() < 1 or not vtruth(" + rs + "[0]) \{ break \}")
+                eline(st, sd + " = " + rs + "[0]")
+                i = 0
+                while i < g.vars.len() {
+                    eline(st, "var " + sanitize(g.vars[i]) + " = if " + rs + ".len() > " + ((i + 1) as str) + " \{ " + rs + "[" + ((i + 1) as str) + "] \} else \{ Value.Nil \}")
+                    i += 1
+                }
+                emitStmts(st, g.body, false)
+                st.ind -= 1
+                eline(st, "\}")
+                var vn = g.vars.len()
+                while vn > 0 {
+                    popScope(st)
+                    vn -= 1
+                }
+            }
+            Return(vals) {
+                if topLevel {
+                    if vals.len() > 0 { materialize(st, vals) }
+                } else if vals.len() == 0 {
+                    eline(st, "return []")
+                } else {
+                    var r = materialize(st, vals)
+                    eline(st, "return " + r)
+                }
+            }
+            Break { eline(st, "break") }
+            Continue { eline(st, "continue") }
+            LocalFn(d) {
+                if d.inline {
+                    var nm = sanitize(d.name)
+                    eline(st, "var " + nm + ": LuaFn = fn(args: [Value]) -> [Value] \{")
+                    emitFnLiteralBody(st, d.lit, 0)
+                    bindScope(st, d.name, "Value.F(" + nm + ")")
+                } else {
+                    bindScope(st, d.name, st.lfBind.get(d.name).or("g_" + d.name))
+                }
+            }
+            NamedFn(d) {
+                if d.inline {
+                    var c = etmp(st, "cf")
+                    var off = 0
+                    if d.method.has() { off = 1 }
+                    eline(st, "var " + c + ": LuaFn = fn(args: [Value]) -> [Value] \{")
+                    emitFnLiteralBody(st, d.lit, off)
+                    var basePath: [str] = []
+                    if not d.method.has() {
+                        basePath = d.path
+                    } else {
+                        basePath = d.path
+                    }
+                    var base = ""
+                    if basePath.len() > 0 {
+                        base = resolv(st, basePath[0])
+                        var i = 1
+                        while i < basePath.len() {
+                            base = "vindex(" + base + ", Value.S(" + zesc(basePath[i]) + "))"
+                            i += 1
+                        }
+                    }
+                    var key = ""
+                    if d.method.has() {
+                        key = d.method.get()
+                    } else {
+                        key = d.path[d.path.len() - 1]
+                    }
+                    if basePath.len() > 0 {
+                        eline(st, "vset(" + base + ", Value.S(" + zesc(key) + "), Value.F(" + c + "))")
+                    } else {
+                        bindScope(st, d.path[0], "Value.F(" + c + ")")
+                    }
+                } else {
+                    var info = st.fnDecls[d.idx]
+                    if info.setInMain {
+                        eline(st, "vset(" + fnBaseExpr(st, info) + ", Value.S(" + zesc(info.key) + "), Value.F(__fn" + (info.idx as str) + "))")
+                    }
+                }
+            }
+            Compound(t, op, x) {
+                var tv = targetValue(st, t)
+                eline(st, tv + " = " + binHlp(op) + "(" + tv + ", " + exv(st, x) + ")")
+            }
+        }
+    }
+}
+
+fn emitFn(st: E, d: FnDeclInfo) {
+    eline(st, "fn __fn" + (d.idx as str) + "(args: [Value]) -> [Value] \{")
+    st.ind += 1
+    var saved = st.curParams
+    var off = 0
+    if d.method { off = 1 }
+    var np = 0
+    var i = 0
+    while i < d.lit.params.len() {
+        if d.lit.params[i] != "..." {
+            eline(st, "var " + sanitize(d.lit.params[i]) + " = args[" + ((off + np) as str) + "]")
+            np += 1
+        }
+        i += 1
+    }
+    st.curParams = off + np
+    pushScope(st, d.lit.params)
+    emitStmts(st, d.lit.body, false)
+    if not (d.lit.body.len() > 0 and d.lit.body[d.lit.body.len() - 1] is Stmt.Return) {
+        eline(st, "return []")
+    }
+    popScope(st)
+    st.curParams = saved
+    st.ind -= 1
+    eline(st, "\}")
+}
+
+// resolve the receiver path of `function a.b.m()` / `function a:m()`;
+// the head goes through scope resolution so local tables work
+fn fnBaseExpr(st: E, d: FnDeclInfo) -> str {
+    if d.basePath.len() == 0 { return "" }
+    var s = resolv(st, d.basePath[0])
+    var i = 1
+    while i < d.basePath.len() {
+        s = "vindex(" + s + ", Value.S(" + zesc(d.basePath[i]) + "))"
+        i += 1
+    }
+    return s
+}
+
+fn gatherTopLocals(st: E, stmts: [Stmt]) {
+    for s in stmts {
+        match s {
+            Local(d) {
+                for n in d.names {
+                    if not lstHas(st.topLocals, n) { st.topLocals.push(n) }
+                }
+            }
+            LocalFn(d) {
+                if not lstHas(st.topLocals, d.name) { st.topLocals.push(d.name) }
+            }
+            ForNum(f) {
+                if not lstHas(st.topLocals, f.name) { st.topLocals.push(f.name) }
+            }
+            ForGen(g) {
+                for v in g.vars {
+                    if not lstHas(st.topLocals, v) { st.topLocals.push(v) }
+                }
+            }
+            else { }
+        }
+    }
+}
+
+fn freeNames(lit: FnLit) -> [str] {
+    var all: [str] = []
+    collectExprNames2(all, lit.body)
+    var out: [str] = []
+    for n in all {
+        var isParam = false
+        for p2 in lit.params {
+            if n == p2 { isParam = true }
+        }
+        if not isParam and not lstHas(out, n) { out.push(n) }
+    }
+    return out
+}
+
+fn collectExprNames2(out: [str], stmts: [Stmt]) {
+    for s in stmts {
+        collectNamesOne2(out, s)
+    }
+}
+
+fn collectNamesOne2(out: [str], s: Stmt) {
+    match s {
+        Local(d) {
+            for v in d.vals {
+                collectExprNamesX(out, v)
+            }
+        }
+        Assign(ts, vs) {
+            for v in vs {
+                collectExprNamesX(out, v)
+            }
+        }
+        Call(f, as2) {
+            collectExprNamesX(out, f)
+            for a in as2 {
+                collectExprNamesX(out, a)
+            }
+        }
+        ExprStmt(x) { collectExprNamesX(out, x) }
+        Do(b) { collectExprNames2(out, b) }
+        If(brs, els) {
+            for br in brs {
+                collectExprNamesX(out, br.cond)
+                collectExprNames2(out, br.body)
+            }
+            if els.has() { collectExprNames2(out, els.get()) }
+        }
+        While(c, b) {
+            collectExprNamesX(out, c)
+            collectExprNames2(out, b)
+        }
+        Repeat(b, c) {
+            collectExprNames2(out, b)
+            collectExprNamesX(out, c)
+        }
+        ForNum(f) {
+            collectExprNamesX(out, f.from)
+            collectExprNamesX(out, f.to)
+            collectExprNamesX(out, f.step)
+            collectExprNames2(out, f.body)
+        }
+        ForGen(g) {
+            collectExprNamesX(out, g.iter)
+            for a in g.initargs {
+                collectExprNamesX(out, a)
+            }
+            collectExprNames2(out, g.body)
+        }
+        Return(vs) {
+            for v in vs {
+                collectExprNamesX(out, v)
+            }
+        }
+        Break { }
+        Continue { }
+        LocalFn(d) { collectExprNames2(out, d.lit.body) }
+        NamedFn(d) { collectExprNames2(out, d.lit.body) }
+        Compound(t, op, x) { collectExprNamesX(out, x) }
+    }
+}
+
+fn collectExprNamesX(out: [str], x: Expr) {
+    match x {
+        Name(n) {
+            if not lstHas(out, n) { out.push(n) }
+        }
+        Bin(op, l, r) {
+            collectExprNamesX(out, l)
+            collectExprNamesX(out, r)
+        }
+        Un(op, e) { collectExprNamesX(out, e) }
+        Call(f, as2) {
+            collectExprNamesX(out, f)
+            for a in as2 {
+                collectExprNamesX(out, a)
+            }
+        }
+        Index(t, k) {
+            collectExprNamesX(out, t)
+            collectExprNamesX(out, k)
+        }
+        Field(t, n) { collectExprNamesX(out, t) }
+        Table(l) {
+            for f in l.fields {
+                if f.k.has() { collectExprNamesX(out, f.k.get()) }
+                collectExprNamesX(out, f.v)
+            }
+        }
+        Fn(lit) { collectExprNames2(out, lit.body) }
+        Str(_) { }
+        Num(_) { }
+        BoolLit(_) { }
+        NilLit { }
+        Vararg { }
+    }
+}
+
+fn prepass(st: E, stmts: [Stmt]) {
+    for s in stmts {
+        prepassOne(st, s)
+    }
+}
+
+fn prepassOne(st: E, s: Stmt) {
+    match s {
+            NamedFn(d) {
+                var free = freeNames(d.lit)
+                var cap = false
+                for n in free {
+                    if lstHas(st.topLocals, n) { cap = true }
+                }
+                d.inline = cap
+                if cap {
+                    st.fnDepth += 1
+                    prepass(st, d.lit.body)
+                    st.fnDepth -= 1
+                    return
+                }
+                var idx = st.fnIdx
+                st.fnIdx += 1
+                d.idx = idx
+                var key = ""
+                var basePath: [str] = []
+                if not d.method.has() {
+                    key = d.path[d.path.len() - 1]
+                    var i = 0
+                    while i < d.path.len() - 1 {
+                        basePath.push(d.path[i])
+                        i += 1
+                    }
+                } else {
+                    basePath = d.path
+                    key = d.method.get()
+                }
+                st.fnDecls.push(FnDeclInfo{idx: idx, lit: d.lit, setInMain: basePath.len() > 0, basePath: basePath, key: key, method: d.method.has()})
+                if basePath.len() == 0 {
+                    st.namedInit[d.path[0]] = "Value.F(__fn" + (idx as str) + ")"
+                }
+                st.fnDepth += 1
+                prepass(st, d.lit.body)
+                st.fnDepth -= 1
+            }
+            LocalFn(d) {
+                if st.fnDepth == 0 {
+                    var idx = st.fnIdx
+                    st.fnIdx += 1
+                    st.fnDecls.push(FnDeclInfo{idx: idx, lit: d.lit, setInMain: false, basePath: [], key: "", method: false})
+                    var gname = "g_lf" + (idx as str)
+                    st.lfGlobals.push((gname, "Value.F(__fn" + (idx as str) + ")"))
+                    st.lfBind[d.name] = gname
+                } else {
+                    d.inline = true
+                }
+                st.fnDepth += 1
+                prepass(st, d.lit.body)
+                st.fnDepth -= 1
+            }
+            Do(b) { prepass(st, b) }
+            If(brs, els) {
+                for br in brs { prepass(st, br.body) }
+                if els.has() { prepass(st, els.get()) }
+            }
+            While(c, b) { prepass(st, b) }
+            Repeat(b, c) { prepass(st, b) }
+            else { }
+        }
+}
+
+fn collectNames(st: E, stmts: [Stmt]) {
+    for s in stmts {
+        collectNamesOne(st, s)
+    }
+}
+
+fn collectNamesOne(st: E, s: Stmt) {
+    match s {
+        Local(d) {
+            for v in d.vals {
+                collectExprNames(st, v)
+            }
+        }
+        Assign(ts, vs) {
+            for v in vs {
+                collectExprNames(st, v)
+            }
+        }
+        Call(f, as2) {
+            collectExprNames(st, f)
+            for a in as2 {
+                collectExprNames(st, a)
+            }
+        }
+        ExprStmt(x) { collectExprNames(st, x) }
+        Do(b) { collectNames(st, b) }
+        If(brs, els) {
+            for br in brs {
+                collectExprNames(st, br.cond)
+                collectNames(st, br.body)
+            }
+            if els.has() { collectNames(st, els.get()) }
+        }
+        While(c, b) {
+            collectExprNames(st, c)
+            collectNames(st, b)
+        }
+        Repeat(b, c) {
+            collectNames(st, b)
+            collectExprNames(st, c)
+        }
+        ForNum(f) {
+            collectExprNames(st, f.from)
+            collectExprNames(st, f.to)
+            collectExprNames(st, f.step)
+            collectNames(st, f.body)
+        }
+        ForGen(g) {
+            collectExprNames(st, g.iter)
+            for a in g.initargs {
+                collectExprNames(st, a)
+            }
+            collectNames(st, g.body)
+        }
+        Return(vs) {
+            for v in vs {
+                collectExprNames(st, v)
+            }
+        }
+        Break { }
+        Continue { }
+        LocalFn(d) { collectNames(st, d.lit.body) }
+        NamedFn(d) { collectNames(st, d.lit.body) }
+        Compound(t, op, x) { collectExprNames(st, x) }
+    }
+}
+
+fn collectExprNames(st: E, x: Expr) {
+    match x {
+        Name(n) {
+            if not lstHas(st.usedG, n) { st.usedG.push(n) }
+        }
+        Bin(op, l, r) {
+            collectExprNames(st, l)
+            collectExprNames(st, r)
+        }
+        Un(op, e) { collectExprNames(st, e) }
+        Call(f, as2) {
+            collectExprNames(st, f)
+            for a in as2 {
+                collectExprNames(st, a)
+            }
+        }
+        Index(t, k) {
+            collectExprNames(st, t)
+            collectExprNames(st, k)
+        }
+        Field(t, n) { collectExprNames(st, t) }
+        Table(l) {
+            for f in l.fields {
+                if f.k.has() { collectExprNames(st, f.k.get()) }
+                collectExprNames(st, f.v)
+            }
+        }
+        Fn(lit) { collectNames(st, lit.body) }
+        Str(_) { }
+        Num(_) { }
+        BoolLit(_) { }
+        NilLit { }
+        Vararg { }
+    }
+}
+
+fn knownInit(nm: str) -> str {
+    return match nm {
+        "print" { "Value.F(libprint)" }
+        "warn" { "Value.F(libwarn)" }
+        "tostring" { "Value.F(libtostring)" }
+        "tonumber" { "Value.F(libtonumber)" }
+        "type" { "Value.F(libtype)" }
+        "assert" { "Value.F(libassert)" }
+        "error" { "Value.F(liberror)" }
+        "select" { "Value.F(libselect)" }
+        "pcall" { "Value.F(libpcall)" }
+        "xpcall" { "Value.F(libpcall)" }
+        "unpack" { "Value.F(libunpack)" }
+        "collectgarbage" { "Value.F(libcollectgarbage)" }
+        "rawequal" { "Value.F(librawequal)" }
+        "rawget" { "Value.F(librawget)" }
+        "rawset" { "Value.F(librawset)" }
+        "setmetatable" { "Value.F(libsetmetatable)" }
+        "getmetatable" { "Value.F(libgetmetatable)" }
+        "next" { "Value.F(libnext)" }
+        "ipairs" { "Value.F(libipairs)" }
+        "pairs" { "Value.F(libpairs)" }
+        "math" { "libtable_math()" }
+        "string" { "libtable_string()" }
+        "table" { "libtable_table()" }
+        "os" { "libtable_os()" }
+        "coroutine" { "libtable_coroutine()" }
+        "task" { "libtable_task()" }
+        "bit32" { "libtable_bit32()" }
+        "_VERSION" { "Value.S(\"Lua 5.1\")" }
+        "_G" { "Value.Nil" }
+        "wait" { "Value.F(libwait)" }
+        "tick" { "Value.F(libtick)" }
+        else { "Value.Nil" }
+    }
+}
+
+fn sortedUnique(xs: [str]) -> [str] {
+    var out = xs
+    out.sort()
+    var res: [str] = []
+    for v in out {
+        if res.len() == 0 or res[res.len() - 1] != v { res.push(v) }
+    }
+    return res
+}
+
+// ============================== preamble ==============================
+// Runtime spliced into every generated file.
+
+fn preamble() -> [str] {
+    return [
+        "struct Table \{ arr: [Value], dict: [str: Value] \}",
+        "type LuaFn = fn([Value]) -> [Value]",
+        "enum Value \{ Nil, B(bool), N(float), S(str), T(Table), F(LuaFn) \}",
+        "",
+        "fn vtable() -> Value \{ return Value.T(Table\{arr: [], dict: [:]\}) \}",
+        "fn vtablefrom(xs: [Value]) -> Value \{",
+        "    var t = Table\{arr: [], dict: [:]\}",
+        "    for v in xs \{ t.arr.push(v) \}",
+        "    return Value.T(t)",
+        "\}",
+        "fn vtype(v: Value) -> str \{",
+        "    return match v \{",
+        "        Nil \{ \"nil\" \}",
+        "        B(_) \{ \"boolean\" \}",
+        "        N(_) \{ \"number\" \}",
+        "        S(_) \{ \"string\" \}",
+        "        T(_) \{ \"table\" \}",
+        "        F(_) \{ \"function\" \}",
+        "    \}",
+        "\}",
+        "fn vpart_t(v: Value) -> Table \{",
+        "    match v \{",
+        "        T(t) \{ return t \}",
+        "        else \{ panic(\"expected table, got \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vpart_s(v: Value) -> str \{",
+        "    match v \{",
+        "        S(s) \{ return s \}",
+        "        else \{ panic(\"expected string, got \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vpart_n(v: Value) -> float \{",
+        "    match v \{",
+        "        N(n) \{ return n \}",
+        "        else \{ panic(\"expected number, got \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vpart_b(v: Value) -> bool \{",
+        "    match v \{",
+        "        B(b) \{ return b \}",
+        "        else \{ panic(\"expected boolean, got \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vpart_f(v: Value) -> LuaFn \{",
+        "    match v \{",
+        "        F(f) \{ return f \}",
+        "        else \{ panic(\"expected function, got \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vtruth(v: Value) -> bool \{",
+        "    return match v \{",
+        "        B(b) \{ b \}",
+        "        Nil \{ false \}",
+        "        else \{ true \}",
+        "    \}",
+        "\}",
+        "fn vtostr(v: Value) -> str \{",
+        "    return match v \{",
+        "        Nil \{ \"nil\" \}",
+        "        B(b) \{ if b \{ \"true\" \} else \{ \"false\" \} \}",
+        "        N(n) \{ n as str \}",
+        "        S(s) \{ s \}",
+        "        T(_) \{ \"table\" \}",
+        "        F(_) \{ \"function\" \}",
+        "    \}",
+        "\}",
+        "fn vtonum(v: Value) -> Value \{",
+        "    match v \{",
+        "        N(_) \{ return v \}",
+        "        B(b) \{ return Value.N(if b \{ 1.0 \} else \{ 0.0 \}) \}",
+        "        S(s) \{",
+        "            var f = parseFloat(s.trim())",
+        "            if f.has() \{ return Value.N(f.get()) \}",
+        "            return Value.Nil",
+        "        \}",
+        "        else \{ return Value.Nil \}",
+        "    \}",
+        "\}",
+        "fn veq(a: Value, b: Value) -> bool \{",
+        "    match a \{",
+        "        Nil \{ return b is Value.Nil \}",
+        "        B(x) \{ return b is Value.B and vpart_b(b) == x \}",
+        "        N(x) \{ return b is Value.N and vpart_n(b) == x \}",
+        "        S(x) \{ return b is Value.S and vpart_s(b) == x \}",
+        "        T(x) \{",
+        "            if not (b is Value.T) \{ return false \}",
+        "            var y = vpart_t(b)",
+        "            if x.arr.len() != y.arr.len() \{ return false \}",
+        "            for i in 0..x.arr.len() \{",
+        "                if not veq(x.arr[i], y.arr[i]) \{ return false \}",
+        "            \}",
+        "            if x.dict.len() != y.dict.len() \{ return false \}",
+        "            for k in x.dict.keys() \{",
+        "                if not y.dict.has(k) \{ return false \}",
+        "                if not veq(x.dict[k], y.dict[k]) \{ return false \}",
+        "            \}",
+        "            return true",
+        "        \}",
+        "        F(_) \{ return b is Value.F \}",
+        "        else \{ return false \}",
+        "    \}",
+        "\}",
+        "fn vne(a: Value, b: Value) -> bool \{ return not veq(a, b) \}",
+        "fn vlt(a: Value, b: Value) -> bool \{",
+        "    match a \{",
+        "        N(x) \{",
+        "            match b \{",
+        "                N(y) \{ return x < y \}",
+        "                else \{ panic(\"compare number with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        S(x) \{",
+        "            match b \{",
+        "                S(y) \{ return x < y \}",
+        "                else \{ panic(\"compare string with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        else \{ panic(\"attempt to compare \" + vtype(a) + \" with \" + vtype(b)) \}",
+        "    \}",
+        "\}",
+        "fn vle(a: Value, b: Value) -> bool \{",
+        "    match a \{",
+        "        N(x) \{",
+        "            match b \{",
+        "                N(y) \{ return x <= y \}",
+        "                else \{ panic(\"compare number with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        S(x) \{",
+        "            match b \{",
+        "                S(y) \{ return x <= y \}",
+        "                else \{ panic(\"compare string with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        else \{ panic(\"attempt to compare \" + vtype(a) + \" with \" + vtype(b)) \}",
+        "    \}",
+        "\}",
+        "fn vgt(a: Value, b: Value) -> bool \{",
+        "    match a \{",
+        "        N(x) \{",
+        "            match b \{",
+        "                N(y) \{ return x > y \}",
+        "                else \{ panic(\"compare number with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        S(x) \{",
+        "            match b \{",
+        "                S(y) \{ return x > y \}",
+        "                else \{ panic(\"compare string with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        else \{ panic(\"attempt to compare \" + vtype(a) + \" with \" + vtype(b)) \}",
+        "    \}",
+        "\}",
+        "fn vge(a: Value, b: Value) -> bool \{",
+        "    match a \{",
+        "        N(x) \{",
+        "            match b \{",
+        "                N(y) \{ return x >= y \}",
+        "                else \{ panic(\"compare number with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        S(x) \{",
+        "            match b \{",
+        "                S(y) \{ return x >= y \}",
+        "                else \{ panic(\"compare string with \" + vtype(b)) \}",
+        "            \}",
+        "        \}",
+        "        else \{ panic(\"attempt to compare \" + vtype(a) + \" with \" + vtype(b)) \}",
+        "    \}",
+        "\}",
+        "fn vadd(a: Value, b: Value) -> Value \{ return Value.N(vpart_n(a) + vpart_n(b)) \}",
+        "fn vsub(a: Value, b: Value) -> Value \{ return Value.N(vpart_n(a) - vpart_n(b)) \}",
+        "fn vmul(a: Value, b: Value) -> Value \{ return Value.N(vpart_n(a) * vpart_n(b)) \}",
+        "fn vdiv(a: Value, b: Value) -> Value \{ return Value.N(vpart_n(a) / vpart_n(b)) \}",
+        "fn vmod(a: Value, b: Value) -> Value \{",
+        "    var x = vpart_n(a)",
+        "    var y = vpart_n(b)",
+        "    if y == 0.0 \{ panic(\"modulo by zero\") \}",
+        "    var r = x - y * floor(x / y)",
+        "    if r != 0.0 and ((r > 0.0 and y < 0.0) or (r < 0.0 and y > 0.0)) \{ r = r + y \}",
+        "    return Value.N(r)",
+        "\}",
+        "fn vpow(a: Value, b: Value) -> Value \{ return Value.N(powf(vpart_n(a), vpart_n(b))) \}",
+        "fn vconcat(a: Value, b: Value) -> Value \{ return Value.S(vtostr(a) + vtostr(b)) \}",
+        "fn vneg(a: Value) -> Value \{ return Value.N(-vpart_n(a)) \}",
+        "fn vband(a: Value, b: Value) -> Value \{ return Value.N((vpart_n(a) as int) & (vpart_n(b) as int)) \}",
+        "fn vbitor(a: Value, b: Value) -> Value \{ return Value.N((vpart_n(a) as int) | (vpart_n(b) as int)) \}",
+        "fn vbixor(a: Value, b: Value) -> Value \{ return Value.N((vpart_n(a) as int) ^ (vpart_n(b) as int)) \}",
+        "fn vbneg(a: Value) -> Value \{ return Value.N(~(vpart_n(a) as int)) \}",
+        "fn vshl(a: Value, b: Value) -> Value \{ return Value.N((vpart_n(a) as int) << (vpart_n(b) as int)) \}",
+        "fn vshr(a: Value, b: Value) -> Value \{ return Value.N((vpart_n(a) as int) >> (vpart_n(b) as int)) \}",
+        "fn vand(a: Value, b: Value) -> Value \{",
+        "    if vtruth(a) \{ return b \}",
+        "    return a",
+        "\}",
+        "fn vor(a: Value, b: Value) -> Value \{",
+        "    if vtruth(a) \{ return a \}",
+        "    return b",
+        "\}",
+        "fn vnot(a: Value) -> Value \{ return Value.B(not vtruth(a)) \}",
+        "fn vlen(v: Value) -> Value \{",
+        "    match v \{",
+        "        S(s) \{ return Value.N(s.len() as float) \}",
+        "        T(t) \{ return Value.N(t.arr.len() as float) \}",
+        "        else \{ panic(\"length of a \" + vtype(v)) \}",
+        "    \}",
+        "\}",
+        "fn vindex(t: Value, k: Value) -> Value \{",
+        "    var tb = vpart_t(t)",
+        "    match k \{",
+        "        N(n) \{",
+        "            var i = n as int",
+        "            if i >= 1 and i <= tb.arr.len() \{ return tb.arr[i - 1] \}",
+        "            return tb.dict.get(n as str).or(Value.Nil)",
+        "        \}",
+        "        S(s) \{ return tb.dict.get(s).or(Value.Nil) \}",
+        "        else \{ return Value.Nil \}",
+        "    \}",
+        "\}",
+        "fn vset(t: Value, k: Value, v: Value) \{",
+        "    var tb = vpart_t(t)",
+        "    match k \{",
+        "        N(n) \{",
+        "            var i = n as int",
+        "            if i >= 1 and i <= tb.arr.len() \{",
+        "                tb.arr[i - 1] = v",
+        "                return",
+        "            \}",
+        "            if i == tb.arr.len() + 1 \{",
+        "                tb.arr.push(v)",
+        "                return",
+        "            \}",
+        "            tb.dict[n as str] = v",
+        "        \}",
+        "        S(s) \{ tb.dict[s] = v \}",
+        "        else \{ \}",
+        "    \}",
+        "\}",
+        "fn vcalle(f: Value, args: [Value]) -> [Value] \{",
+        "    return vpart_f(f)(args)",
+        "\}",
+        "fn vone(rs: [Value]) -> Value \{",
+        "    if rs.len() == 0 \{ return Value.Nil \}",
+        "    return rs[0]",
+        "\}",
+        "fn vspread(base: [Value], extra: [Value]) -> [Value] \{",
+        "    var out: [Value] = []",
+        "    for v in base \{ out.push(v) \}",
+        "    for v in extra \{ out.push(v) \}",
+        "    return out",
+        "\}",
+        "fn vrest(args: [Value], n: int) -> Value \{",
+        "    var t = Table\{arr: [], dict: [:]\}",
+        "    var i = n",
+        "    while i < args.len() \{",
+        "        t.arr.push(args[i])",
+        "        i += 1",
+        "    \}",
+        "    return Value.T(t)",
+        "\}",
+        "fn libprint(args: [Value]) -> [Value] \{",
+        "    var s = \"\"",
+        "    for i in 0..args.len() \{",
+        "        if i > 0 \{ s = s + \"\\t\" \}",
+        "        s = s + vtostr(args[i])",
+        "    \}",
+        "    print(s)",
+        "    return []",
+        "\}",
+        "fn libwarn(args: [Value]) -> [Value] \{",
+        "    var s = \"\"",
+        "    for i in 0..args.len() \{",
+        "        if i > 0 \{ s = s + \"\\t\" \}",
+        "        s = s + vtostr(args[i])",
+        "    \}",
+        "    printError(s)",
+        "    return []",
+        "\}",
+        "fn libtostring(args: [Value]) -> [Value] \{ return [Value.S(vtostr(args[0]))] \}",
+        "fn libtonumber(args: [Value]) -> [Value] \{ return [vtonum(args[0])] \}",
+        "fn libtype(args: [Value]) -> [Value] \{ return [Value.S(vtype(args[0]))] \}",
+        "fn libassert(args: [Value]) -> [Value] \{",
+        "    if args.len() > 0 and not vtruth(args[0]) \{",
+        "        var msg = \"assertion failed!\"",
+        "        if args.len() > 1 \{ msg = vtostr(args[1]) \}",
+        "        panic(msg)",
+        "    \}",
+        "    if args.len() > 0 \{ return [args[0]] \}",
+        "    return []",
+        "\}",
+        "fn liberror(args: [Value]) -> [Value] \{",
+        "    panic(vtostr(args[0]))",
+        "\}",
+        "fn libselect(args: [Value]) -> [Value] \{",
+        "    var n = vpart_n(args[0]) as int",
+        "    if n < 0 \{ n = args.len() + 1 + n \}",
+        "    if n < 1 or n > args.len() \{ return [Value.Nil] \}",
+        "    return [args[n - 1]]",
+        "\}",
+        "fn libpcall(args: [Value]) -> [Value] \{",
+        "    if args.len() == 0 \{ return [Value.B(true), Value.Nil] \}",
+        "    var rest: [Value] = []",
+        "    for i in 1..args.len() \{ rest.push(args[i]) \}",
+        "    var rs = vcalle(args[0], rest)",
+        "    var out: [Value] = [Value.B(true)]",
+        "    for v in rs \{ out.push(v) \}",
+        "    return out",
+        "\}",
+        "fn libunpack(args: [Value]) -> [Value] \{ return [vtablefrom(args)] \}",
+        "fn libcollectgarbage(args: [Value]) -> [Value] \{ return [Value.Nil] \}",
+        "fn librawequal(args: [Value]) -> [Value] \{ return [Value.B(veq(args[0], args[1]))] \}",
+        "fn librawget(args: [Value]) -> [Value] \{ return [vindex(args[0], args[1])] \}",
+        "fn librawset(args: [Value]) -> [Value] \{",
+        "    vset(args[0], args[1], args[2])",
+        "    return [args[0]]",
+        "\}",
+        "fn libsetmetatable(args: [Value]) -> [Value] \{ return [args[0]] \}",
+        "fn libgetmetatable(args: [Value]) -> [Value] \{ return [Value.Nil] \}",
+        "fn libnext(args: [Value]) -> [Value] \{",
+        "    var tb = vpart_t(args[0])",
+        "    if tb.arr.len() > 0 \{ return [Value.N(1.0), tb.arr[0]] \}",
+        "    if tb.dict.len() > 0 \{",
+        "        var ks = tb.dict.keys()",
+        "        return [Value.S(ks[0]), tb.dict[ks[0]]]",
+        "    \}",
+        "    return [Value.Nil]",
+        "\}",
+        "fn ipairs_iter(args: [Value]) -> [Value] \{",
+        "    var tb = vpart_t(args[0])",
+        "    var i = vpart_n(args[1]) as int",
+        "    if i >= 1 and i <= tb.arr.len() \{ return [Value.N((i + 1) as float), Value.N(i as float), tb.arr[i - 1]] \}",
+        "    return [Value.Nil]",
+        "\}",
+        "fn libipairs(args: [Value]) -> [Value] \{",
+        "    return [Value.F(ipairs_iter), args[0], Value.N(1.0)]",
+        "\}",
+        "fn pairs_iter(args: [Value]) -> [Value] \{",
+        "    var t = args[0]",
+        "    var k = args[1]",
+        "    var tb = vpart_t(t)",
+        "    if k is Value.Nil \{",
+        "        if tb.arr.len() > 0 \{ return [t, Value.N(1.0), tb.arr[0]] \}",
+        "        if tb.dict.len() > 0 \{",
+        "            var ks = tb.dict.keys()",
+        "            return [t, Value.S(ks[0]), tb.dict[ks[0]]]",
+        "        \}",
+        "        return [Value.Nil]",
+        "    \}",
+        "    if k is Value.N \{",
+        "        var i = vpart_n(k) as int",
+        "        if i + 1 <= tb.arr.len() \{ return [t, Value.N((i + 1) as float), tb.arr[i]] \}",
+        "        if tb.dict.len() > 0 \{",
+        "            var ks = tb.dict.keys()",
+        "            return [t, Value.S(ks[0]), tb.dict[ks[0]]]",
+        "        \}",
+        "    \}",
+        "    return [Value.Nil]",
+        "\}",
+        "fn libpairs(args: [Value]) -> [Value] \{",
+        "    return [Value.F(pairs_iter), args[0], Value.Nil]",
+        "\}",
+        "fn libtableinsert(args: [Value]) -> [Value] \{",
+        "    var t = vpart_t(args[0])",
+        "    if args.len() > 2 \{",
+        "        vset(Value.T(t), args[1], args[2])",
+        "    \} else \{",
+        "        t.arr.push(args[1])",
+        "    \}",
+        "    return [args[0]]",
+        "\}",
+        "fn libtableremove(args: [Value]) -> [Value] \{",
+        "    var t = vpart_t(args[0])",
+        "    var pos = t.arr.len()",
+        "    if args.len() > 1 \{ pos = vpart_n(args[1]) as int \}",
+        "    if pos < 1 or pos > t.arr.len() \{ return [Value.Nil] \}",
+        "    var out = t.arr[pos - 1]",
+        "    for i in pos..t.arr.len() - 1 \{ t.arr[i - 1] = t.arr[i] \}",
+        "    t.arr.pop()",
+        "    return [out]",
+        "\}",
+        "fn libtableconcat(args: [Value]) -> [Value] \{",
+        "    var t = vpart_t(args[0])",
+        "    var sep = \"\"",
+        "    if args.len() > 1 \{ sep = vpart_s(args[1]) \}",
+        "    var s = \"\"",
+        "    for i in 0..t.arr.len() \{",
+        "        if i > 0 \{ s = s + sep \}",
+        "        s = s + vtostr(t.arr[i])",
+        "    \}",
+        "    return [Value.S(s)]",
+        "\}",
+        "fn libtablesort(args: [Value]) -> [Value] \{",
+        "    var t = vpart_t(args[0])",
+        "    for i in 1..t.arr.len() \{",
+        "        var cur = t.arr[i - 1]",
+        "        var j = i - 1",
+        "        while j >= 0 and vgt(t.arr[j], cur) \{",
+        "            t.arr[j + 1] = t.arr[j]",
+        "            j -= 1",
+        "        \}",
+        "        t.arr[j + 1] = cur",
+        "    \}",
+        "    return [args[0]]",
+        "\}",
+        "fn libstringupper(args: [Value]) -> [Value] \{ return [Value.S(vpart_s(args[0]).upper())] \}",
+        "fn libstringlower(args: [Value]) -> [Value] \{ return [Value.S(vpart_s(args[0]).lower())] \}",
+        "fn libstringtrim(args: [Value]) -> [Value] \{ return [Value.S(vpart_s(args[0]).trim())] \}",
+        "fn libstringrep(args: [Value]) -> [Value] \{",
+        "    var n = 1",
+        "    if args.len() > 1 \{ n = vpart_n(args[1]) as int \}",
+        "    return [Value.S(vpart_s(args[0]).repeat(n))]",
+        "\}",
+        "fn libstringlen(args: [Value]) -> [Value] \{ return [Value.N(vpart_s(args[0]).len() as float)] \}",
+        "fn sstrsub(s: str, i: Value, j: Value) -> str \{",
+        "    var n = s.len()",
+        "    var a = vpart_n(i) as int",
+        "    var b = vpart_n(j) as int",
+        "    if a < 0 \{ a = n + a + 1 \}",
+        "    if b < 0 \{ b = n + b + 1 \}",
+        "    if a < 1 \{ a = 1 \}",
+        "    if b > n \{ b = n \}",
+        "    if a > b \{ return \"\" \}",
+        "    return s.sub(a - 1, b)",
+        "\}",
+        "fn libstringsub(args: [Value]) -> [Value] \{",
+        "    var j = Value.N(-1.0)",
+        "    if args.len() > 2 \{ j = args[2] \}",
+        "    return [Value.S(sstrsub(vpart_s(args[0]), args[1], j))]",
+        "\}",
+        "fn ssfind(s: str, pat: Value) -> [Value] \{",
+        "    var p = s.indexOf(vpart_s(pat))",
+        "    if p < 0 \{ return [Value.Nil] \}",
+        "    return [Value.N(p as float + 1.0), Value.N(p as float + vpart_s(pat).len() as float)]",
+        "\}",
+        "fn libstringfind(args: [Value]) -> [Value] \{",
+        "    return ssfind(vpart_s(args[0]), args[1])",
+        "\}",
+        "fn libstringformat(args: [Value]) -> [Value] \{",
+        "    var fmt = vpart_s(args[0])",
+        "    var s = \"\"",
+        "    var ai = 1",
+        "    var i = 0",
+        "    while i < fmt.len() \{",
+        "        var b = fmt.byte(i)",
+        "        if b != 37 \{",
+        "            s = s + chr(b)",
+        "            i += 1",
+        "            continue",
+        "        \}",
+        "        i += 1",
+        "        if i >= fmt.len() \{",
+        "            s = s + \"%\"",
+        "            break",
+        "        \}",
+        "        var spec = fmt.byte(i)",
+        "        i += 1",
+        "        if spec == 37 \{",
+        "            s = s + \"%\"",
+        "        \} else if spec == 115 \{",
+        "            s = s + vtostr(args[ai])",
+        "            ai += 1",
+        "        \} else if spec == 100 \{",
+        "            s = s + (vpart_n(vtonum(args[ai])) as int) as str",
+        "            ai += 1",
+        "        \} else if spec == 102 \{",
+        "            s = s + vpart_n(vtonum(args[ai])) as str",
+        "            ai += 1",
+        "        \} else \{",
+        "            s = s + \"%\" + chr(spec)",
+        "        \}",
+        "    \}",
+        "    return [Value.S(s)]",
+        "\}",
+        "fn libstringbyte(args: [Value]) -> [Value] \{",
+        "    var i = 1",
+        "    if args.len() > 1 \{ i = vpart_n(args[1]) as int \}",
+        "    return [Value.N((vpart_s(args[0]).byte(i - 1)) as float)]",
+        "\}",
+        "fn libtable_string() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"upper\"), Value.F(libstringupper))",
+        "    vset(t, Value.S(\"lower\"), Value.F(libstringlower))",
+        "    vset(t, Value.S(\"trim\"), Value.F(libstringtrim))",
+        "    vset(t, Value.S(\"rep\"), Value.F(libstringrep))",
+        "    vset(t, Value.S(\"len\"), Value.F(libstringlen))",
+        "    vset(t, Value.S(\"sub\"), Value.F(libstringsub))",
+        "    vset(t, Value.S(\"find\"), Value.F(libstringfind))",
+        "    vset(t, Value.S(\"format\"), Value.F(libstringformat))",
+        "    vset(t, Value.S(\"byte\"), Value.F(libstringbyte))",
+        "    return t",
+        "\}",
+        "fn libtable_table() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"insert\"), Value.F(libtableinsert))",
+        "    vset(t, Value.S(\"remove\"), Value.F(libtableremove))",
+        "    vset(t, Value.S(\"concat\"), Value.F(libtableconcat))",
+        "    vset(t, Value.S(\"sort\"), Value.F(libtablesort))",
+        "    return t",
+        "\}",
+        "fn libmathfloor(args: [Value]) -> [Value] \{ return [Value.N(floor(vpart_n(args[0])))] \}",
+        "fn libmathceil(args: [Value]) -> [Value] \{ return [Value.N(ceil(vpart_n(args[0])))] \}",
+        "fn libmathabs(args: [Value]) -> [Value] \{ return [Value.N(abs(vpart_n(args[0])))] \}",
+        "fn libmathsqrt(args: [Value]) -> [Value] \{ return [Value.N(sqrt(vpart_n(args[0])))] \}",
+        "fn libmathsin(args: [Value]) -> [Value] \{ return [Value.N(fsin(vpart_n(args[0])))] \}",
+        "fn libmathcos(args: [Value]) -> [Value] \{ return [Value.N(fcos(vpart_n(args[0])))] \}",
+        "fn libmathtan(args: [Value]) -> [Value] \{ return [Value.N(ftan(vpart_n(args[0])))] \}",
+        "fn libmathatan(args: [Value]) -> [Value] \{",
+        "    if args.len() > 1 \{ return [Value.N(atan2(vpart_n(args[0]), vpart_n(args[1])))] \}",
+        "    return [Value.N(fatan(vpart_n(args[0])))]",
+        "\}",
+        "fn libmathlog(args: [Value]) -> [Value] \{",
+        "    var x = vpart_n(args[0])",
+        "    if args.len() > 1 \{ return [Value.N(ln(x) / ln(vpart_n(args[1])))] \}",
+        "    return [Value.N(ln(x))]",
+        "\}",
+        "fn libmathexp(args: [Value]) -> [Value] \{ return [Value.N(exp(vpart_n(args[0])))] \}",
+        "fn libmathpi(args: [Value]) -> [Value] \{ return [Value.N(pi)] \}",
+        "fn libmathhuge(args: [Value]) -> [Value] \{",
+        "    if args.len() > 0 and vtostr(args[0]) == \"-inf\" \{ return [Value.N(-1.0 / 0.0)] \}",
+        "    return [Value.N(1.0 / 0.0)]",
+        "\}",
+        "fn libmathmax(args: [Value]) -> [Value] \{",
+        "    var m = vpart_n(args[1])",
+        "    for i in 1..args.len() \{",
+        "        var v = vpart_n(args[i])",
+        "        if v > m \{ m = v \}",
+        "    \}",
+        "    return [Value.N(m)]",
+        "\}",
+        "fn libmathmin(args: [Value]) -> [Value] \{",
+        "    var m = vpart_n(args[1])",
+        "    for i in 1..args.len() \{",
+        "        var v = vpart_n(args[i])",
+        "        if v < m \{ m = v \}",
+        "    \}",
+        "    return [Value.N(m)]",
+        "\}",
+        "fn libmathrandom(args: [Value]) -> [Value] \{",
+        "    panic(\"lua2zeph: math.random is not supported\")",
+        "\}",
+        "fn libtable_math() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"floor\"), Value.F(libmathfloor))",
+        "    vset(t, Value.S(\"ceil\"), Value.F(libmathceil))",
+        "    vset(t, Value.S(\"abs\"), Value.F(libmathabs))",
+        "    vset(t, Value.S(\"sqrt\"), Value.F(libmathsqrt))",
+        "    vset(t, Value.S(\"sin\"), Value.F(libmathsin))",
+        "    vset(t, Value.S(\"cos\"), Value.F(libmathcos))",
+        "    vset(t, Value.S(\"tan\"), Value.F(libmathtan))",
+        "    vset(t, Value.S(\"atan\"), Value.F(libmathatan))",
+        "    vset(t, Value.S(\"log\"), Value.F(libmathlog))",
+        "    vset(t, Value.S(\"exp\"), Value.F(libmathexp))",
+        "    vset(t, Value.S(\"pi\"), Value.N(pi))",
+        "    vset(t, Value.S(\"huge\"), Value.F(libmathhuge))",
+        "    vset(t, Value.S(\"max\"), Value.F(libmathmax))",
+        "    vset(t, Value.S(\"min\"), Value.F(libmathmin))",
+        "    vset(t, Value.S(\"random\"), Value.F(libmathrandom))",
+        "    return t",
+        "\}",
+        "fn libostime(args: [Value]) -> [Value] \{ return [Value.N(nowMilliseconds() as float / 1000.0)] \}",
+        "fn libosclock(args: [Value]) -> [Value] \{ return [Value.N(nowMilliseconds() as float / 1000.0)] \}",
+        "fn libosdate(args: [Value]) -> [Value] \{ return [Value.S(nowMilliseconds() as str)] \}",
+        "fn libtable_os() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"time\"), Value.F(libostime))",
+        "    vset(t, Value.S(\"clock\"), Value.F(libosclock))",
+        "    vset(t, Value.S(\"date\"), Value.F(libosdate))",
+        "    return t",
+        "\}",
+        "fn libcoroutinecreate(args: [Value]) -> [Value] \{ panic(\"lua2zeph: coroutines are not supported\") \}",
+        "fn libcoroutineresume(args: [Value]) -> [Value] \{ panic(\"lua2zeph: coroutines are not supported\") \}",
+        "fn libcoroutineyield(args: [Value]) -> [Value] \{ panic(\"lua2zeph: coroutines are not supported\") \}",
+        "fn libcoroutinestatus(args: [Value]) -> [Value] \{ return [Value.S(\"suspended\")] \}",
+        "fn libtable_coroutine() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"create\"), Value.F(libcoroutinecreate))",
+        "    vset(t, Value.S(\"resume\"), Value.F(libcoroutineresume))",
+        "    vset(t, Value.S(\"yield\"), Value.F(libcoroutineyield))",
+        "    vset(t, Value.S(\"status\"), Value.F(libcoroutinestatus))",
+        "    return t",
+        "\}",
+        "fn libtaskdelay(args: [Value]) -> [Value] \{",
+        "    var ms = 0",
+        "    if args.len() > 1 \{ ms = vpart_n(args[1]) as int * 1000 \}",
+        "    sleepMilliseconds(ms)",
+        "    return [Value.Nil]",
+        "\}",
+        "fn libtaskspawn(args: [Value]) -> [Value] \{ panic(\"lua2zeph: task.spawn is not supported\") \}",
+        "fn libtaskdefer(args: [Value]) -> [Value] \{",
+        "    var rs = vcalle(args[0], [])",
+        "    return rs",
+        "\}",
+        "fn libtable_task() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"delay\"), Value.F(libtaskdelay))",
+        "    vset(t, Value.S(\"spawn\"), Value.F(libtaskspawn))",
+        "    vset(t, Value.S(\"defer\"), Value.F(libtaskdefer))",
+        "    return t",
+        "\}",
+        "fn libbit32and(args: [Value]) -> [Value] \{ return [Value.N((vpart_n(args[0]) as int) & (vpart_n(args[1]) as int))] \}",
+        "fn libbit32or(args: [Value]) -> [Value] \{ return [Value.N((vpart_n(args[0]) as int) | (vpart_n(args[1]) as int))] \}",
+        "fn libbit32xor(args: [Value]) -> [Value] \{ return [Value.N((vpart_n(args[0]) as int) ^ (vpart_n(args[1]) as int))] \}",
+        "fn libbit32not(args: [Value]) -> [Value] \{ return [Value.N(~(vpart_n(args[0]) as int))] \}",
+        "fn libbit32lshift(args: [Value]) -> [Value] \{ return [Value.N((vpart_n(args[0]) as int) << (vpart_n(args[1]) as int))] \}",
+        "fn libbit32rshift(args: [Value]) -> [Value] \{ return [Value.N((vpart_n(args[0]) as int) >> (vpart_n(args[1]) as int))] \}",
+        "fn libtable_bit32() -> Value \{",
+        "    var t = vtable()",
+        "    vset(t, Value.S(\"and\"), Value.F(libbit32and))",
+        "    vset(t, Value.S(\"or\"), Value.F(libbit32or))",
+        "    vset(t, Value.S(\"xor\"), Value.F(libbit32xor))",
+        "    vset(t, Value.S(\"not\"), Value.F(libbit32not))",
+        "    vset(t, Value.S(\"lshift\"), Value.F(libbit32lshift))",
+        "    vset(t, Value.S(\"rshift\"), Value.F(libbit32rshift))",
+        "    return t",
+        "\}",
+        "fn libwait(args: [Value]) -> [Value] \{",
+        "    var s = 0.0",
+        "    if args.len() > 0 \{ s = vpart_n(args[0]) \}",
+        "    sleepMilliseconds(s as int * 1000)",
+        "    return [Value.Nil]",
+        "\}",
+        "fn libtick(args: [Value]) -> [Value] \{ return [Value.N(nowMilliseconds() as float / 1000.0)] \}"
+    ]
+}
+
+// ============================== main ==============================
+
+fn main() {
+    var argv = args()
+    if argv.len() < 2 {
+        printError("usage: lua2zeph <input.luau> [output.zeph]")
+        exit(1)
+    }
+    var src = readFile(argv[1])
+    var toks = tokenize(src)
+    var p = P{toks: toks, pos: 0}
+    var chunk = parseChunk(p)
+    var st = E{lines: [], ind: 0, scopes: [], tmp: 0, usedG: [], fnIdx: 0, lfIdx: 0, fnDecls: [], namedInit: [:], lfGlobals: [], lfBind: [:], curParams: 0, fnDepth: 0, topLocals: []}
+    gatherTopLocals(st, chunk)
+    prepass(st, chunk)
+    collectNames(st, chunk)
+    eline(st, "// generated by lua2zeph (luaU -> Zephyr)")
+    eline(st, "// model: every Lua value is a Value; every function is LuaFn = fn([Value]) -> [Value]")
+    eline(st, "import \"std/math.zeph\"")
+    eline(st, "import \"std/io.zeph\"")
+    eline(st, "import \"std/string.zeph\"")
+    for l in preamble() {
+        eline(st, l)
+    }
+    eline(st, "")
+    for g in st.lfGlobals {
+        eline(st, "var " + g.0 + ": Value = " + g.1)
+    }
+    var names = sortedUnique(st.usedG)
+    for nm in names {
+        var init = knownInit(nm)
+        if st.namedInit.has(nm) { init = st.namedInit[nm] }
+        eline(st, "var g_" + nm + ": Value = " + init)
+    }
+    eline(st, "")
+    for d in st.fnDecls {
+        emitFn(st, d)
+    }
+    eline(st, "")
+    eline(st, "fn main() \{")
+    st.ind += 1
+    emitStmts(st, chunk, true)
+    st.ind -= 1
+    eline(st, "\}")
+    var text = st.lines.join("\n") + "\n"
+    if argv.len() > 2 {
+        writeFile(argv[2], text)
+    } else {
+        print(text)
+    }
+}

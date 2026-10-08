@@ -1,0 +1,2315 @@
+// zeph2lua.zeph — Zephyr (Luau dialect source) → Luau transpiler.
+// Usage: zeph2lua <input.zeph> [output.lua]
+// Produces self-contained Luau suitable for Roblox scripts.
+//
+// Coverage: functions, closures, structs, enums (plain + tagged unions),
+// tuples, optionals, lists, maps, match (value/range/member/payload arms),
+// for/while, if-let, defer, impl methods, string/list builtins, and
+// import aliasing for std/math, std/string, std/io, std/list.
+// Types are erased; Zephyr 0-based list indices are NOT shifted (documented).
+
+import "std/io.zeph"
+
+// ---------------------------------------------------------------- tokens
+
+struct Tok { kind: int = 0, text: str = "" }
+// kind: 0 num, 1 str-chunk, 2 ident, 3 punct, 4 newline, 5 raw-string, 9 eof
+
+// ---------------------------------------------------------------- AST
+
+struct Param { name: str = "", def: Expr = Expr{}, hasDef: bool = false }
+
+struct Expr {
+    k: int = 0      // 0 num 1 str 2 bool 3 none 4 name 5 bin 6 un 7 call 8 index 9 field
+                    // 10 list 11 map 12 structlit 13 closure 14 ifexpr 15 matchexpr 16 tuple 17 cast
+    a: str = ""     // num text / str chunk / name / op / struct name / cast type
+    b: str = ""     // field name
+    kids: [Expr] = []
+    parts: [Expr] = []
+    keys: [Expr] = []
+    params: [Param] = []
+    body: [Stmt] = []
+    arms: [Arm] = []
+}
+
+struct Arm {
+    pats: [Expr] = []
+    isRange: [bool] = []
+    hi: [Expr] = []
+    members: [str] = []
+    binds: [str] = []
+    isElse: bool = false
+    body: [Stmt] = []
+    ex: Expr = Expr{}
+}
+
+struct Stmt {
+    k: int = 0      // 0 decl 1 assign 2 if 3 while 4 for 5 match 6 defer 7 return
+                    // 8 break 9 continue 10 exprstmt 11 fndecl
+    names: [str] = []
+    opt: bool = false
+    tgtK: int = 0   // 0 id 1 field 2 index
+    tgtName: str = ""
+    tgtBase: Expr = Expr{}
+    tgtIdx: Expr = Expr{}
+    op: str = "="
+    e: Expr = Expr{}
+    letName: str = ""
+    thenB: [Stmt] = []
+    elseB: [Stmt] = []
+    label: str = ""
+    v1: str = ""
+    v2: str = ""
+    lo: Expr = Expr{}
+    hi: Expr = Expr{}
+    step: Expr = Expr{}
+    hasStep: bool = false
+    body: [Stmt] = []
+    arms: [Arm] = []
+    fnName: str = ""
+    params: [Param] = []
+}
+
+struct EMember { name: str = "", nvals: int = 0 }
+struct SDecl { name: str = "", fields: [str] = [] }
+struct IFn { name: str = "", params: [Param] = [], body: [Stmt] = [] }
+
+struct Top {
+    k: int = 0      // 0 import 1 fn 2 struct 3 enum 4 impl 5 interface 6 typealias 7 test 8 extern 9 stmt
+    path: str = ""
+    alias: str = ""
+    name: str = ""
+    params: [Param] = []
+    body: [Stmt] = []
+    sdecl: SDecl = SDecl{}
+    emembers: [EMember] = []
+    implFns: [IFn] = []
+    st: Stmt = Stmt{}
+}
+
+// ---------------------------------------------------------------- lexer
+
+struct Lex { src: str = "", i: int = 0, toks: [Tok] = [] }
+
+impl Lex {
+    fn push(self, kind: int, text: str) { self.toks.push(Tok{kind: kind, text: text}) }
+    fn cur(self) -> str {
+    if self.i >= self.src.len() { return "" }
+    return self.src.sub(self.i, self.i + 1)
+}
+    fn adv(self) -> str { var c = self.cur()
+ self.i += 1
+ return c }
+    fn peekCh(self, off: int) -> str {
+        var j = self.i + off
+        if j >= self.src.len() { return "" }
+        return self.src.sub(j, j + 1)
+    }
+
+    // Scan one full string literal starting at the opening quote.
+    // Normal strings emit: STR(chunk) (".." expr-tokens "..")* with "\{" "\}" puncts
+    // around interpolated expressions. Raw (r"...") and multiline (""") emit kind 5.
+    fn scanString(self) {
+        if self.peekCh(1) == "\"" and self.peekCh(2) == "\"" {
+            self.i += 3
+            var buf = ""
+            while true {
+                if self.cur() == "" { panic("unterminated string at " + (self.i as str)) }
+                if self.cur() == "\"" and self.peekCh(1) == "\"" and self.peekCh(2) == "\"" { self.i += 3
+ break }
+                buf += self.adv()
+            }
+            self.push(5, buf)
+            return
+        }
+        self.i += 1
+        var buf = ""
+        while true {
+            var c = self.cur()
+            if c == "" { panic("unterminated string") }
+            if c == "\"" { self.i += 1
+ self.push(1, buf)
+ return }
+            if c == "\\" {
+                var e = self.adv()
+                buf += "\\" + e
+                self.i += 1
+                continue
+            }
+            if c == "\{" {
+                self.push(1, buf)
+                self.push(3, "..")
+                self.push(3, "\{")
+                buf = ""
+                self.i += 1
+                // resume after this call site: caller continues in interp mode
+                return
+            }
+            buf += self.adv()
+        }
+    }
+
+    fn run(self) {
+        var mode = 0        // 0 normal, 1 string-chunk, 2 string-interp
+        var buf = ""
+        var strDepth = 0
+        var parenDepth = 0
+        while true {
+            var c = self.cur()
+            if c == "" { break }
+            if mode == 1 {
+                if c == "\"" { self.push(1, buf)
+ self.i += 1
+ buf = ""
+ mode = 0
+ continue }
+                if c == "\\" {
+                    var e = self.adv()
+                    buf += "\\" + e
+                    self.i += 1
+                    continue
+                }
+                if c == "\{" {
+                    self.push(1, buf)
+                    self.push(3, "..")
+                    self.push(3, "\{")
+                    buf = ""
+                    strDepth = 1
+                    mode = 2
+                    self.i += 1
+                    continue
+                }
+                buf += self.adv()
+                continue
+            }
+            if mode == 2 {
+                if c == "\"" {
+                    self.scanString()
+                    continue
+                }
+                if c == "\{" {
+                    strDepth += 1
+                    self.push(3, "\{")
+                    self.i += 1
+                    continue
+                }
+                if c == "\}" {
+                    strDepth -= 1
+                    self.push(3, "\}")
+                    self.i += 1
+                    if strDepth == 0 {
+                        self.push(3, "..")
+                        buf = ""
+                        mode = 1
+                        continue
+                    }
+                    continue
+                }
+                // fall through to normal tokenization for expression tokens
+            }
+            if c == "\n" {
+                self.i += 1
+                if mode == 0 and parenDepth == 0 {
+                    if self.toks.len() > 0 {
+                        var last = self.toks[self.toks.len() - 1]
+                        if last.kind != 4 { self.push(4, "\n") }
+                    }
+                }
+                continue
+            }
+            if c == " " or c == "\t" or c == "\r" { self.i += 1
+ continue }
+            if c == "/" and self.peekCh(1) == "/" {
+                while true { if self.cur() == "" { break }
+ if self.cur() == "\n" { break }
+ self.i += 1 }
+                continue
+            }
+            if c == "/" and self.peekCh(1) == "*" {
+                var d = 1
+                self.i += 2
+                while true {
+                    if self.cur() == "" { panic("unterminated comment") }
+                    if self.cur() == "/" and self.peekCh(1) == "*" { d += 1
+ self.i += 2
+ continue }
+                    if self.cur() == "*" and self.peekCh(1) == "/" { d -= 1
+ self.i += 2
+ if d == 0 { break }
+ continue }
+                    self.i += 1
+                }
+                continue
+            }
+            if c >= "0" and c <= "9" {
+                var start = self.i
+                if c == "0" and (self.peekCh(1) == "x" or self.peekCh(1) == "X") {
+                    self.i += 2
+                    while true { var ch = self.cur()
+ if (ch >= "0" and ch <= "9" or ch >= "a" and ch <= "f" or ch >= "A" and ch <= "F" or ch == "_") { self.i += 1 } else { break } }
+                } else if c == "0" and (self.peekCh(1) == "b" or self.peekCh(1) == "B") {
+                    self.i += 2
+                    while true { var ch = self.cur()
+ if ch == "0" or ch == "1" or ch == "_" { self.i += 1 } else { break } }
+                } else if c == "0" and (self.peekCh(1) == "o" or self.peekCh(1) == "O") {
+                    self.i += 2
+                    while true { var ch = self.cur()
+ if (ch >= "0" and ch <= "7" or ch == "_") { self.i += 1 } else { break } }
+                } else {
+                    while true { var ch = self.cur()
+ if (ch >= "0" and ch <= "9" or ch == "_") { self.i += 1 } else { break } }
+                    if self.cur() == "." and self.peekCh(1) >= "0" and self.peekCh(1) <= "9" {
+                        self.i += 1
+                        while true { var ch = self.cur()
+ if ch >= "0" and ch <= "9" { self.i += 1 } else { break } }
+                    }
+                    if self.cur() == "e" or self.cur() == "E" {
+                        var save = self.i
+                        self.i += 1
+                        if self.cur() == "+" or self.cur() == "-" { self.i += 1 }
+                        var ok = self.cur() >= "0" and self.cur() <= "9"
+                        while true { var ch = self.cur()
+ if ch >= "0" and ch <= "9" { self.i += 1 } else { break } }
+                        if not ok { self.i = save }
+                    }
+                }
+                self.push(0, self.src.sub(start, self.i))
+                continue
+            }
+            if c == "r" and self.peekCh(1) == "\"" {
+                self.i += 2
+                var start = self.i
+                while true { if self.cur() == "" { panic("unterminated raw string") }
+ if self.cur() == "\"" { break }
+ self.i += 1 }
+                self.push(5, self.src.sub(start, self.i))
+                self.i += 1
+                continue
+            }
+            if c == "\"" {
+                self.i += 1
+                buf = ""
+                mode = 1
+                continue
+            }
+            if c == "'" {
+                self.i += 1
+                var ch = self.cur()
+                if ch == "\\" {
+                    var e = self.adv()
+                    self.i += 1
+                    match e {
+                        "n" { self.push(0, "10")
+ continue }
+                        "t" { self.push(0, "9")
+ continue }
+                        "r" { self.push(0, "13")
+ continue }
+                        "0" { self.push(0, "0")
+ continue }
+                        else { self.push(0, e)
+ continue }
+                    }
+                }
+                self.i += 1
+                self.push(0, ch.byte(0) as str)
+                continue
+            }
+            if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_" or c == "$" {
+                var start = self.i
+                while true {
+                    var ch = self.cur()
+                    if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_" or ch == "$" { self.i += 1 } else { break }
+                }
+                self.push(2, self.src.sub(start, self.i))
+                continue
+            }
+            var two = c + self.peekCh(1)
+            match two {
+                "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "..", "->", "==", "!=" {
+                    self.push(3, two)
+                    self.i += 2
+                    continue
+                }
+                else { }
+            }
+            match c {
+                "+", "-", "*", "/", "%", "=", "<", ">", "!", "&", "|", "^", "~", "?", ".", ",", ":", "(", ")", "[", "]", "\{", "\}" {
+                    self.push(3, c)
+                    self.i += 1
+                    if c == "(" or c == "[" { parenDepth += 1 }
+                    if c == ")" or c == "]" { parenDepth -= 1 }
+                    continue
+                }
+                else { panic("unexpected character '" + c + "' at " + (self.i as str)) }
+            }
+        }
+        self.push(9, "")
+    }
+}
+
+// ---------------------------------------------------------------- parser
+
+struct P { toks: [Tok] = [], i: int = 0, inHeader: bool = false }
+
+impl P {
+    fn peek(self) -> Tok {
+        if self.i >= self.toks.len() { return Tok{kind: 9} }
+        return self.toks[self.i]
+    }
+    fn atOff(self, off: int) -> Tok {
+        var j = self.i + off
+        if j >= self.toks.len() { return Tok{kind: 9} }
+        return self.toks[j]
+    }
+    fn next(self) -> Tok { var t = self.peek()
+ if self.i < self.toks.len() { self.i += 1 }
+ return t }
+    fn at(self, text: str) -> bool { return self.peek().text == text }
+    fn atKw(self, text: str) -> bool { var t = self.peek()
+ return t.kind == 2 and t.text == text }
+    fn eat(self, text: str) -> bool { if self.at(text) { self.i += 1
+ return true }
+ return false }
+    fn expect(self, text: str) {
+        if not self.eat(text) { panic("expected '" + text + "' got '" + self.peek().text + "' near token " + (self.i as str)) }
+    }
+    fn skipNL(self) { while self.peek().kind == 4 { self.i += 1 } }
+
+    // Consume a type annotation, returning its text (we only care about a trailing '?').
+    fn parseTypeText(self) -> str {
+        var t = self.peek()
+        if t.kind == 3 and (t.text == "[" or t.text == "(") {
+            var depth = 0
+            var buf = ""
+            while true {
+                var c = self.next()
+                buf += c.text
+                if c.text == "[" or c.text == "(" { depth += 1 }
+                if c.text == "]" or c.text == ")" { depth -= 1
+ if depth == 0 { break } }
+            }
+            if self.eat("?") { buf += "?" }
+            return buf
+        }
+        if t.kind == 2 and t.text == "fn" {
+            self.next()
+            self.expect("(")
+            var depth = 1
+            while true {
+                if depth == 0 { break }
+                var c = self.next()
+                if c.text == "(" { depth += 1 }
+                if c.text == ")" { depth -= 1 }
+            }
+            var buf = "fn(...)"
+            if self.eat("->") { buf += " " + self.parseTypeText() }
+            return buf
+        }
+        if t.kind != 2 { panic("expected type, got '" + t.text + "'") }
+        var buf = self.next().text
+        if self.at("[") {
+            var depth = 0
+            while true {
+                var c = self.next()
+                buf += c.text
+                if c.text == "[" { depth += 1 }
+                if c.text == "]" { depth -= 1
+ if depth == 0 { break } }
+            }
+        }
+        if self.eat("?") { buf += "?" }
+        return buf
+    }
+
+    fn parseParams(self) -> [Param] {
+        var ps: [Param] = []
+        self.expect("(")
+        self.skipNL()
+        if not self.at(")") {
+            while true {
+                self.skipNL()
+                var n = self.next()
+                if n.kind != 2 { panic("expected param name, got '" + n.text + "'") }
+                var p = Param{name: n.text}
+                if self.eat(":") { self.parseTypeText() }
+                if self.eat("=") { p.def = self.parseExpr()
+ p.hasDef = true }
+                ps.push(p)
+                if self.eat(",") { continue }
+                break
+            }
+        }
+        self.expect(")")
+        self.skipNL()
+        return ps
+    }
+
+    fn parseBlock(self) -> [Stmt] {
+        self.expect("\{")
+        var ss: [Stmt] = []
+        self.skipNL()
+        while true {
+            if self.at("\}") { self.next()
+ break }
+            if self.peek().kind == 9 { panic("unterminated block") }
+            ss.push(self.parseStmt())
+            self.skipNL()
+        }
+        return ss
+    }
+
+    fn parseTop(self) -> Top {
+        var t = self.peek()
+        if t.kind == 2 {
+            match t.text {
+                "import" {
+                    self.next()
+                    var p = self.next()
+                    if p.kind != 1 and p.kind != 5 { panic("import path must be a string") }
+                    var top = Top{k: 0, path: p.text}
+                    if self.atKw("as") { self.next()
+ top.alias = self.next().text }
+                    return top
+                }
+                "fn" {
+                    self.next()
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    var ps = self.parseParams()
+                    if self.eat("->") { self.parseTypeText() }
+                    var body = self.parseBlock()
+                    return Top{k: 1, name: name, params: ps, body: body}
+                }
+                "struct" {
+                    self.next()
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    self.expect("\{")
+                    var sdecl = SDecl{name: name}
+                    self.skipNL()
+                    while true {
+                        self.skipNL()
+                        if self.at("\}") { self.next()
+ break }
+                        var f = self.next()
+                        sdecl.fields.push(f.text)
+                        self.expect(":")
+                        self.parseTypeText()
+                        if self.eat("=") { self.parseExpr() }
+                        self.eat(",")
+                    }
+                    return Top{k: 2, sdecl: sdecl}
+                }
+                "enum" {
+                    self.next()
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    self.expect("\{")
+                    var ems: [EMember] = []
+                    self.skipNL()
+                    while true {
+                        self.skipNL()
+                        if self.at("\}") { self.next()
+ break }
+                        var m = self.next()
+                        var nv = 0
+                        if self.at("(") {
+                            self.next()
+                            self.skipNL()
+                            nv = 1
+                            while true {
+                                self.next()
+                                if self.eat(",") {
+                                    self.skipNL()
+                                    nv += 1
+                                    continue
+                                }
+                                break
+                            }
+                            self.expect(")")
+                        }
+                        ems.push(EMember{name: m.text, nvals: nv})
+                        self.eat(",")
+                    }
+                    return Top{k: 3, name: name, emembers: ems}
+                }
+                "impl" {
+                    self.next()
+                    var tname = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    self.expect("\{")
+                    var fns: [IFn] = []
+                    self.skipNL()
+                    while true {
+                        self.skipNL()
+                        if self.at("\}") { self.next()
+ break }
+                        self.expect("fn")
+                        var fname = self.next().text
+                        if self.at("[") { self.skipBalanced("[", "]") }
+                        var ps = self.parseParams()
+                        if self.eat("->") { self.parseTypeText() }
+                        var body = self.parseBlock()
+                        fns.push(IFn{name: fname, params: ps, body: body})
+                        self.skipNL()
+                    }
+                    return Top{k: 4, name: tname, implFns: fns}
+                }
+                "interface" {
+                    self.next()
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    self.skipBalanced("\{", "\}")
+                    return Top{k: 5, name: name}
+                }
+                "type" {
+                    self.next()
+                    var name = self.next().text
+                    self.expect("=")
+                    self.parseTypeText()
+                    return Top{k: 6, name: name}
+                }
+                "private" {
+                    self.next()
+                    return self.parseTop()
+                }
+                "test" {
+                    self.next()
+                    var n = self.next()
+                    var name = n.text
+                    self.skipBalanced("\{", "\}")
+                    return Top{k: 7, name: name}
+                }
+                "extern" {
+                    self.next()
+                    self.expect("fn")
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    self.parseParams()
+                    if self.eat("->") { self.parseTypeText() }
+                    self.expect("from")
+                    self.next()
+                    return Top{k: 8, name: name}
+                }
+                else { }
+            }
+        }
+        var st = self.parseStmt()
+        return Top{k: 9, st: st}
+    }
+
+    fn skipBalanced(self, open: str, close: str) {
+        var depth = 0
+        while true {
+            var t = self.next()
+            if t.kind == 9 { panic("unterminated '" + open + "'") }
+            if t.text == open { depth += 1 }
+            if t.text == close { depth -= 1
+ if depth == 0 { return } }
+        }
+    }
+
+    fn parseProgram(self) -> [Top] {
+        var tops: [Top] = []
+        self.skipNL()
+        while true {
+            var t = self.peek()
+            if t.kind == 9 { break }
+            tops.push(self.parseTop())
+            self.skipNL()
+        }
+        return tops
+    }
+
+    fn parseIfStmt(self) -> Stmt {
+        self.expect("if")
+        var letName = ""
+        if self.atKw("let") {
+            self.next()
+            letName = self.next().text
+            self.expect("=")
+        }
+        self.inHeader = true
+        var cond = self.parseExpr()
+        self.inHeader = false
+        var tb = self.parseBlock()
+        var eb: [Stmt] = []
+        if self.eat("else") {
+            if self.atKw("if") { eb = [self.parseIfStmt()] } else { eb = self.parseBlock() }
+        }
+        return Stmt{k: 2, e: cond, letName: letName, thenB: tb, elseB: eb}
+    }
+
+    fn parsePattern(self, arm: Arm) {
+        var t = self.peek()
+        if t.kind == 2 and t.text == "_" {
+            self.next()
+            arm.pats.push(Expr{k: 4, a: "_"})
+            arm.isRange.push(false)
+            arm.hi.push(Expr{})
+            arm.members.push("")
+            return
+        }
+        if t.kind == 2 and self.atOff(1).text == "(" {
+            var mname = self.next().text
+            self.expect("(")
+            self.skipNL()
+            if not self.at(")") {
+                while true {
+                    var b = self.next()
+                    arm.binds.push(b.text)
+                    if self.eat(",") { self.skipNL()
+ continue }
+                    break
+                }
+            }
+            self.expect(")")
+            arm.pats.push(Expr{k: 4, a: mname})
+            arm.isRange.push(false)
+            arm.hi.push(Expr{})
+            arm.members.push(mname)
+            return
+        }
+        self.inHeader = true
+        var e = self.parseCmp()
+        if self.eat("..") {
+            var hi = self.parseCmp()
+            self.inHeader = false
+            arm.pats.push(e)
+            arm.isRange.push(true)
+            arm.hi.push(hi)
+            arm.members.push("")
+            return
+        }
+        self.inHeader = false
+        arm.pats.push(e)
+        arm.isRange.push(false)
+        arm.hi.push(Expr{})
+        if t.kind == 2 { arm.members.push(t.text) } else { arm.members.push("") }
+    }
+
+    fn parseMatchStmt(self) -> Stmt {
+        self.expect("match")
+        self.inHeader = true
+        var subj = self.parseExpr()
+        self.inHeader = false
+        self.expect("\{")
+        var arms: [Arm] = []
+        self.skipNL()
+        while true {
+            if self.at("\}") { self.next()
+ break }
+            if self.eat("else") {
+                var a = Arm{isElse: true}
+                a.body = self.parseBlock()
+                arms.push(a)
+                self.skipNL()
+                continue
+            }
+            var a = Arm{}
+            while true {
+                self.parsePattern(a)
+                if self.eat(",") { self.skipNL()
+ continue }
+                break
+            }
+            a.body = self.parseBlock()
+            arms.push(a)
+            self.skipNL()
+        }
+        return Stmt{k: 5, e: subj, arms: arms}
+    }
+
+    fn parseForStmt(self) -> Stmt {
+        var label = ""
+        if self.peek().kind == 2 and self.atOff(1).text == "for" { label = self.next().text }
+        self.expect("for")
+        var v1 = self.next().text
+        var v2 = ""
+        if self.eat(",") { v2 = self.next().text }
+        self.expect("in")
+        self.inHeader = true
+        var lo = self.parsePrimary()
+        var st = Stmt{k: 4, v1: v1, v2: v2, lo: lo, label: label}
+        if self.eat("..") {
+            st.hi = self.parsePrimary()
+            if self.atKw("step") {
+                self.next()
+                st.step = self.parsePrimary()
+                st.hasStep = true
+            }
+        }
+        self.inHeader = false
+        st.body = self.parseBlock()
+        return st
+    }
+
+    fn parseAssignTarget(self) -> Expr {
+        // Parse ID (.ID | [expr])* ; caller checks for an assignment operator.
+        var t = self.peek()
+        if t.kind != 2 { return Expr{} }
+        var e = Expr{k: 4, a: self.next().text}
+        while true {
+            if self.at(".") {
+                self.next()
+                var f = self.next()
+                e = Expr{k: 9, b: f.text, kids: [e]}
+                continue
+            }
+            if self.at("[") {
+                self.next()
+                var idx = self.parseExpr()
+                self.expect("]")
+                e = Expr{k: 8, kids: [e, idx]}
+                continue
+            }
+            break
+        }
+        return e
+    }
+
+    fn parseStmt(self) -> Stmt {
+        var t = self.peek()
+        if t.kind == 2 {
+            match t.text {
+                "let", "var", "const" {
+                    self.next()
+                    var names: [str] = []
+                    if self.at("(") {
+                        self.next()
+                        while true {
+                            var n = self.next()
+                            names.push(n.text)
+                            if self.eat(",") { continue }
+                            break
+                        }
+                        self.expect(")")
+                    } else {
+                        names.push(self.next().text)
+                    }
+                    var opt = false
+                    if self.eat(":") { var tt = self.parseTypeText()
+ if tt.endsWith("?") { opt = true } }
+                    self.expect("=")
+                    var init = self.parseExpr()
+                    return Stmt{k: 0, names: names, opt: opt, e: init}
+                }
+                "if" { return self.parseIfStmt() }
+                "while" {
+                    var label = ""
+                    if self.peek().kind == 2 and self.atOff(1).text == "while" { label = self.next().text }
+                    self.expect("while")
+                    self.inHeader = true
+                    var cond = self.parseExpr()
+                    self.inHeader = false
+                    var body = self.parseBlock()
+                    return Stmt{k: 3, e: cond, body: body, label: label}
+                }
+                "for" { return self.parseForStmt() }
+                "match" { return self.parseMatchStmt() }
+                "defer" {
+                    self.next()
+                    var st = Stmt{k: 6}
+                    if self.at("\{") { st.body = self.parseBlock() } else { st.body = [self.parseStmt()] }
+                    return st
+                }
+                "return" {
+                    self.next()
+                    var st = Stmt{k: 7}
+                    if not self.at("\}") and self.peek().kind != 4 { st.e = self.parseExpr() }
+                    return st
+                }
+                "break" {
+                    self.next()
+                    var st = Stmt{k: 8}
+                    if self.peek().kind == 2 and (self.atOff(1).kind == 4 or self.atOff(1).text == "\}" or self.atOff(1).kind == 9) { st.label = self.next().text }
+                    return st
+                }
+                "continue" {
+                    self.next()
+                    var st = Stmt{k: 9}
+                    if self.peek().kind == 2 and (self.atOff(1).kind == 4 or self.atOff(1).text == "\}" or self.atOff(1).kind == 9) { st.label = self.next().text }
+                    return st
+                }
+                "fn" {
+                    self.next()
+                    var name = self.next().text
+                    if self.at("[") { self.skipBalanced("[", "]") }
+                    var ps = self.parseParams()
+                    if self.eat("->") { self.parseTypeText() }
+                    var body = self.parseBlock()
+                    return Stmt{k: 11, fnName: name, params: ps, body: body}
+                }
+                else { }
+            }
+        }
+        var saved = self.i
+        var tgt = self.parseAssignTarget()
+        var op = ""
+        if tgt.k != 0 {
+            match self.peek().text {
+                "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" { op = self.next().text }
+                else { }
+            }
+        }
+        if op == "" { self.i = saved }
+        if op != "" {
+            var rhs = self.parseExpr()
+                var st = Stmt{k: 1, op: op, e: rhs}
+                match tgt.k {
+                    4 { st.tgtK = 0
+ st.tgtName = tgt.a }
+                    9 { st.tgtK = 1
+ st.tgtBase = tgt.kids[0]
+ st.tgtName = tgt.b }
+                    8 { st.tgtK = 2
+ st.tgtBase = tgt.kids[0]
+ st.tgtIdx = tgt.kids[1] }
+                    else { panic("bad assign target") }
+                }
+                return st
+        }
+        var e = self.parseExpr()
+        return Stmt{k: 10, e: e}
+    }
+
+    // ------------------------------------------------ expressions
+
+    fn parseExpr(self) -> Expr { return self.parseOr() }
+
+    fn parseOr(self) -> Expr {
+        var e = self.parseAnd()
+        while self.atKw("or") { self.next()
+ e = Expr{k: 5, a: "or", kids: [e, self.parseAnd()]} }
+        return e
+    }
+
+    fn parseAnd(self) -> Expr {
+        var e = self.parseCmp()
+        while self.atKw("and") { self.next()
+ e = Expr{k: 5, a: "and", kids: [e, self.parseCmp()]} }
+        return e
+    }
+
+    fn parseCmp(self) -> Expr {
+        var e = self.parsePipe()
+        var ops: [str] = []
+        var rhs: [Expr] = []
+        while true {
+            var t = self.peek()
+            var isCmp = false
+            if t.kind == 3 {
+                var tx = t.text
+                if tx == "<" or tx == "<=" or tx == ">" or tx == ">=" or tx == "==" or tx == "!=" { isCmp = true }
+            }
+            if t.kind == 2 and t.text == "is" { isCmp = true }
+            if not isCmp { break }
+            var op = self.next().text
+            var r = self.parsePipe()
+            ops.push(op)
+            rhs.push(r)
+        }
+        if ops.len() == 0 { return e }
+        var acc = Expr{k: 5, a: ops[0], kids: [e, rhs[0]]}
+        for i in 1..ops.len() {
+            acc = Expr{k: 5, a: "and", kids: [acc, Expr{k: 5, a: ops[i], kids: [rhs[i - 1], rhs[i]]}]}
+        }
+        return acc
+    }
+
+    fn parsePipe(self) -> Expr {
+        var e = self.parseAdd()
+        while true {
+            var t = self.peek()
+            if t.kind == 3 and (t.text == "|" or t.text == "^") {
+                var op = self.next().text
+                e = Expr{k: 5, a: op, kids: [e, self.parseAdd()]}
+                continue
+            }
+            break
+        }
+        return e
+    }
+
+    fn parseAdd(self) -> Expr {
+        var e = self.parseMul()
+        while true {
+            var t = self.peek()
+            if t.kind == 3 and (t.text == "+" or t.text == "-") {
+                var op = self.next().text
+                e = Expr{k: 5, a: op, kids: [e, self.parseMul()]}
+                continue
+            }
+            break
+        }
+        return e
+    }
+
+    fn parseMul(self) -> Expr {
+        var e = self.parseCast()
+        while true {
+            var t = self.peek()
+            if t.kind == 3 and (t.text == "*" or t.text == "/" or t.text == "%" or t.text == "&" or t.text == "<<" or t.text == ">>") {
+                var op = self.next().text
+                e = Expr{k: 5, a: op, kids: [e, self.parseCast()]}
+                continue
+            }
+            break
+        }
+        return e
+    }
+
+    fn parseCast(self) -> Expr {
+        var e = self.parseUnary()
+        while self.atKw("as") {
+            self.next()
+            var tt = self.parseTypeText()
+            e = Expr{k: 17, a: tt, kids: [e]}
+        }
+        return e
+    }
+
+    fn parseUnary(self) -> Expr {
+        var t = self.peek()
+        if t.kind == 3 and (t.text == "-" or t.text == "~") {
+            self.next()
+            return Expr{k: 6, a: t.text, kids: [self.parseUnary()]}
+        }
+        if t.kind == 2 and t.text == "not" {
+            self.next()
+            return Expr{k: 6, a: "not", kids: [self.parseUnary()]}
+        }
+        return self.parsePostfix()
+    }
+
+    fn parseArgs(self) -> [Expr] {
+        var args: [Expr] = []
+        self.skipNL()
+        if self.at(")") { self.next()
+ return args }
+        while true {
+            self.skipNL()
+            args.push(self.parseExpr())
+            if self.eat(",") {
+                self.skipNL()
+                if self.at(")") { break }
+                continue
+            }
+            break
+        }
+        self.expect(")")
+        self.skipNL()
+        return args
+    }
+
+    fn parsePostfix(self) -> Expr {
+        var e = self.parsePrimary()
+        while true {
+            if self.at("(") {
+                self.next()
+                var args = self.parseArgs()
+                var call = Expr{k: 7, kids: [e]}
+                call.parts = args
+                e = call
+                continue
+            }
+            if self.at("[") {
+                self.next()
+                var idx = self.parseExpr()
+                self.expect("]")
+                e = Expr{k: 8, kids: [e, idx]}
+                continue
+            }
+            if self.at(".") {
+                self.next()
+                var f = self.next()
+                e = Expr{k: 9, b: f.text, kids: [e]}
+                continue
+            }
+            break
+        }
+        return e
+    }
+
+    fn parsePrimary(self) -> Expr {
+        var t = self.peek()
+        if t.kind == 0 { self.next()
+ return Expr{k: 0, a: t.text} }
+        if t.kind == 1 {
+            var first = self.next()
+            var e = Expr{k: 1, a: first.text}
+            while self.at("..") {
+                self.next()
+                var inner = self.parseExpr()
+                self.expect("\}")
+                if inner.k == 1 { e = Expr{k: 5, a: "..", kids: [e, inner]} }
+                else { e = Expr{k: 5, a: "..", kids: [e, Expr{k: 18, a: "tostring", kids: [inner]}]} }
+            }
+            return e
+        }
+        if t.kind == 5 { self.next()
+ return Expr{k: 19, a: t.text} }
+        if t.kind == 2 {
+            match t.text {
+                "true" { self.next()
+ return Expr{k: 2, a: "true"} }
+                "false" { self.next()
+ return Expr{k: 2, a: "false"} }
+                "none" { self.next()
+ return Expr{k: 3} }
+                "if" {
+                    self.next()
+                    var cond = self.parseExpr()
+                    var tb = self.parseBlock()
+                    var te = Expr{}
+                    if tb.len() > 0 { te = tb[0].e }
+                    self.expect("else")
+                    var ee = Expr{}
+                    if self.at("\{") {
+                        var eb = self.parseBlock()
+                        if eb.len() > 0 { ee = eb[0].e }
+                    } else { ee = self.parsePrimary() }
+                    return Expr{k: 14, kids: [cond, te, ee]}
+                }
+                "match" {
+                    self.next()
+                    self.inHeader = true
+                    var subj = self.parseExpr()
+                    self.inHeader = false
+                    self.expect("\{")
+                    var arms: [Arm] = []
+                    self.skipNL()
+                    while true {
+                        if self.at("\}") { self.next()
+ break }
+                        if self.eat("else") {
+                            var a = Arm{isElse: true}
+                            var eb = self.parseBlock()
+                            if eb.len() > 0 { a.ex = eb[0].e }
+                            arms.push(a)
+                            self.skipNL()
+                            continue
+                        }
+                        var a = Arm{}
+                        while true {
+                            self.parsePattern(a)
+                            if self.eat(",") { self.skipNL()
+ continue }
+                            break
+                        }
+                        var ab = self.parseBlock()
+                        if ab.len() > 0 { a.ex = ab[0].e }
+                        arms.push(a)
+                        self.skipNL()
+                    }
+                    return Expr{k: 15, kids: [subj], arms: arms}
+                }
+                "fn" {
+                    self.next()
+                    var ps = self.parseParams()
+                    if self.eat("->") { self.parseTypeText() }
+                    var body = self.parseBlock()
+                    return Expr{k: 13, params: ps, body: body}
+                }
+                else { }
+            }
+            var name = self.next().text
+            if self.at("\{") and not self.inHeader {
+                self.next()
+                var e = Expr{k: 12, a: name}
+                self.skipNL()
+                if not self.at("\}") {
+                    while true {
+                        self.skipNL()
+                        var f = self.next()
+                        self.expect(":")
+                        e.keys.push(Expr{k: 4, a: f.text})
+                        e.parts.push(self.parseExpr())
+                        if self.eat(",") { continue }
+                        break
+                    }
+                }
+                self.expect("\}")
+                return e
+            }
+            return Expr{k: 4, a: name}
+        }
+        if t.kind == 3 {
+            match t.text {
+                "(" {
+                    self.next()
+                    self.skipNL()
+                    var e = self.parseExpr()
+                    if self.eat(",") {
+                        e.parts.push(e)
+                        while true {
+                            e.parts.push(self.parseExpr())
+                            if self.eat(",") { continue }
+                            break
+                        }
+                        self.expect(")")
+                        return Expr{k: 16, parts: e.parts}
+                    }
+                    self.expect(")")
+                    return e
+                }
+                "[" {
+                    self.next()
+                    self.skipNL()
+                    if self.at(":") { self.next()
+ self.expect("]")
+ return Expr{k: 11} }
+                    if self.at("]") { self.next()
+ return Expr{k: 10} }
+                    var first = self.parseExpr()
+                    if self.eat(":") {
+                        var e = Expr{k: 11}
+                        e.keys.push(first)
+                        e.parts.push(self.parseExpr())
+                        while true {
+                            if self.eat(",") {
+                                self.skipNL()
+                                if self.at("]") { break }
+                                e.keys.push(self.parseExpr())
+                                self.expect(":")
+                                e.parts.push(self.parseExpr())
+                                continue
+                            }
+                            break
+                        }
+                        self.expect("]")
+                        return e
+                    }
+                    var e2 = Expr{k: 10}
+                    e2.parts.push(first)
+                    while true {
+                        if self.eat(",") {
+                            self.skipNL()
+                            if self.at("]") { break }
+                            e2.parts.push(self.parseExpr())
+                            continue
+                        }
+                        break
+                    }
+                    self.expect("]")
+                    return e2
+                }
+                else { }
+            }
+        }
+        panic("unexpected token '" + t.text + "' in expression")
+    }
+}
+
+// ------------------------------------------------ generated Lua blocks
+
+var PREAMBLE_BLOCK = r"""
+local function zdiv(a, b)
+	if type(a) == "number" and type(b) == "number" and a % 1 == 0 and b % 1 == 0 then
+		local q = math.floor(a / b)
+		if q ~= 0 and (a < 0) ~= (b < 0) and q * b ~= a then q = q + 1 end
+		return q
+	end
+	return a / b
+end
+local function zmod(a, b)
+	if type(a) == "number" and type(b) == "number" and a % 1 == 0 and b % 1 == 0 then
+		local r = a - math.floor(a / b) * b
+		if r ~= 0 and ((r > 0) ~= (b > 0)) then r = r + b end
+		return r
+	end
+	return a % b
+end
+local function zfmt(n)
+	if type(n) ~= "number" then return tostring(n) end
+	if n % 1 == 0 and math.abs(n) < 1e18 then return string.format("%d", n) end
+	return string.format("%.15g", n)
+end
+local function zadd(a, b)
+	if type(a) == "string" or type(b) == "string" then
+		local function f(x)
+			if type(x) == "string" then return x end
+			return zfmt(x)
+		end
+		return f(a) .. f(b)
+	end
+	return a + b
+end
+local function ztrim(s) return (s:match("^%s*(.-)%s*$")) end
+local function zsplit(s, sep)
+	local out = {}
+	if sep == "" then
+		for i = 1, #s do out[#out + 1] = s:sub(i, i) end
+		return out
+	end
+	local start = 1
+	while true do
+		local idx = s:find(sep, start, true)
+		if idx == nil then out[#out + 1] = s:sub(start); break end
+		out[#out + 1] = s:sub(start, idx - 1)
+		start = idx + #sep
+	end
+	return out
+end
+local function zreplace(s, old, new)
+	local pat = old:gsub("(%W)", "%%%1")
+	return (s:gsub(pat, function() return new end))
+end
+local function zzeros(n)
+	local t = {}
+	for i = 1, n do t[i] = 0 end
+	return t
+end
+local function zkeys(m)
+	local t = {}
+	for k in pairs(m) do t[#t + 1] = k end
+	return t
+end
+local function zvals(m)
+	local t = {}
+	for _, v in pairs(m) do t[#t + 1] = v end
+	return t
+end
+local zargs = arg or {}
+"""
+
+var MATH_BLOCK = r"""
+-- std/math.zeph aliases
+local floor = math.floor
+local ceil = math.ceil
+local function trunc(x) return x >= 0 and math.floor(x) or math.ceil(x) end
+local round = math.round
+local exp = math.exp
+local ln = math.log
+local function log10(x) return math.log(x, 10) end
+local function log2(x) return math.log(x, 2) end
+local function powf(b, e) return b ^ e end
+local fmod = math.fmod
+local atan2 = math.atan
+local function hypot(x, y) return math.sqrt(x * x + y * y) end
+local cbrt = math.cbrt
+local function isInfinite(x) return x == math.huge or x == -math.huge end
+local function isNan(x) return x ~= x end
+local pi = math.pi
+local twoPi = 2 * math.pi
+local halfPi = math.pi / 2
+local ln2 = math.log(2)
+local nan = 0 / 0
+local infinity = math.huge
+local function clamp(x, lo, hi) return math.max(lo, math.min(hi, x)) end
+local clampInt = clamp
+"""
+
+var STRING_BLOCK = r"""
+-- std/string.zeph aliases
+local parseInt = tonumber
+local parseFloat = tonumber
+local function ord(s) return s:byte(1) end
+local function chars(s)
+	local t = {}
+	for i = 1, #s do t[#t + 1] = s:sub(i, i) end
+	return t
+end
+local function reverseString(s)
+	local t = {}
+	for i = #s, 1, -1 do t[#t + 1] = s:sub(i, i) end
+	return table.concat(t)
+end
+local function trimLeft(s) return (s:match("^%s*(.*)$")) end
+local function trimRight(s) return (s:match("^(.-)%s*$")) end
+local function joinWith(parts, sep) return table.concat(parts, sep) end
+local function padRight(s, w, f)
+	while #s < w and #f > 0 do s = s .. f:sub(1, 1) end
+	return s:sub(1, w)
+end
+local function padLeft(s, w, f)
+	while #s < w and #f > 0 do s = f:sub(1, 1) .. s end
+	return s:sub(#s - w + 1)
+end
+local function linesOf(s)
+	local t = {}
+	local rest = s
+	while rest ~= "" do
+		local i = rest:find("\n")
+		if i == nil then t[#t + 1] = rest; break end
+		t[#t + 1] = rest:sub(1, i - 1)
+		rest = rest:sub(i + 1)
+	end
+	return t
+end
+local lines = linesOf
+local function toHex(v) return string.format("%x", v) end
+local function toBinary(v)
+	if v == 0 then return "0" end
+	local t = {}
+	while v > 0 do t[#t + 1] = tostring(v % 2); v = math.floor(v / 2) end
+	local s = ""
+	for i = #t, 1, -1 do s = s .. t[i] end
+	return s
+end
+local function isDigit(b) return b >= 48 and b <= 57 end
+local function isUpper(b) return b >= 65 and b <= 90 end
+local function isLower(b) return b >= 97 and b <= 122 end
+local function isAlpha(b) return isUpper(b) or isLower(b) end
+local function isAlphanumeric(b) return isAlpha(b) or isDigit(b) end
+local function isWhitespace(b) return b == 32 or b == 9 or b == 10 or b == 13 end
+"""
+
+var IO_BLOCK = r"""
+-- std/io.zeph aliases (Roblox-aware: uses readfile/writefile when present)
+local function fileExists(p)
+	local f = io.open(p, "rb")
+	if f ~= nil then f:close(); return true end
+	return false
+end
+local function readFile(p)
+	if readfile ~= nil then
+		local d = readfile(p)
+		if d == nil then error("cannot read " .. p) end
+		return d
+	end
+	local f = assert(io.open(p, "rb"))
+	local d = f:read("a")
+	f:close()
+	return d
+end
+local function writeFile(p, d)
+	if writefile ~= nil then writefile(p, d); return end
+	local f = assert(io.open(p, "wb"))
+	f:write(d)
+	f:close()
+end
+local function appendFile(p, d)
+	local old = ""
+	if fileExists(p) then old = readFile(p) end
+	writeFile(p, old .. d)
+end
+local printError = function(t) print(t) end
+local function exit(c) os.exit(c, true) end
+local function deleteFile(p) return os.remove(p) == 0 end
+local function environmentVariable(n) return os.getenv(n) end
+local function nowMilliseconds() return math.floor(os.clock() * 1000) end
+local function sleepMilliseconds(ms)
+	local t0 = os.clock()
+	while os.clock() - t0 < ms / 1000 do end
+end
+local function run(cmd) os.execute(cmd); return 0 end
+local function readLine()
+	local l = io.read()
+	if l == nil then return nil end
+	return l
+end
+local function writeToHandle(h, d) io.write(d) end
+local function listDirectory(p) return {} end
+"""
+
+var LIST_BLOCK = r"""
+-- std/list.zeph aliases
+local function contains(items, t)
+	for _, v in ipairs(items) do if v == t then return true end end
+	return false
+end
+local function indexOf(items, t)
+	for i, v in ipairs(items) do if v == t then return i - 1 end end
+	return -1
+end
+local function reverse(items)
+	for i = 1, math.floor(#items / 2) do
+		items[i], items[#items - i + 1] = items[#items - i + 1], items[i]
+	end
+end
+local function slice(items, lo, hi)
+	local t = {}
+	for i = lo, hi - 1 do t[#t + 1] = items[i + 1] end
+	return t
+end
+local function first(items)
+	if #items == 0 then return nil end
+	return items[1]
+end
+local function last(items)
+	if #items == 0 then return nil end
+	return items[#items]
+end
+local function map(items, f)
+	local t = {}
+	for _, v in ipairs(items) do t[#t + 1] = f(v) end
+	return t
+end
+local function filter(items, f)
+	local t = {}
+	for _, v in ipairs(items) do if f(v) then t[#t + 1] = v end end
+	return t
+end
+local function fold(items, start, f)
+	local acc = start
+	for _, v in ipairs(items) do acc = f(acc, v) end
+	return acc
+end
+local function any(items, f)
+	for _, v in ipairs(items) do if f(v) then return true end end
+	return false
+end
+local function all(items, f)
+	for _, v in ipairs(items) do if not f(v) then return false end end
+	return true
+end
+local function count(items, t)
+	local n = 0
+	for _, v in ipairs(items) do if v == t then n = n + 1 end end
+	return n
+end
+local function sortBy(items, cmp)
+	table.sort(items, function(a, b) return cmp(a, b) < 0 end)
+end
+local function sum(items)
+	local s = 0
+	for _, v in ipairs(items) do s = s + v end
+	return s
+end
+local function minOf(items)
+	local m = items[1]
+	for _, v in ipairs(items) do if v < m then m = v end end
+	return m
+end
+local function maxOf(items)
+	local m = items[1]
+	for _, v in ipairs(items) do if v > m then m = v end end
+	return m
+end
+"""
+
+// ---------------------------------------------------------------- emitter
+
+import "std/string.zeph"
+
+fn pad4(n: int) -> str { return "    ".repeat(n) }
+
+struct Em {
+    lines: [str] = []
+    ind: int = 0
+    ren: [str: str]
+    memberEnum: [str: str]
+    memberPayload: [str: bool]
+    optScopes: [[str: bool]] = []
+    tmpc: int = 0
+    contLabel: str = ""
+    structNames: [str: bool]
+    memberRef: [str: str]
+}
+
+fn newEm() -> Em {
+    var ren: [str: str] = [:]
+    var me: [str: str] = [:]
+    var mp: [str: bool] = [:]
+    var sn: [str: bool] = [:]
+    var mr: [str: str] = [:]
+    return Em{lines: [], ind: 0, ren: ren, memberEnum: me, memberPayload: mp, optScopes: [], tmpc: 0, contLabel: "", structNames: sn, memberRef: mr}
+}
+
+fn ssHasCont(ss: [Stmt]) -> bool {
+    for s in ss {
+        match s.k {
+            9 { if s.label == "" { return true } }
+            2 {
+                if s.thenB.len() > 0 and ssHasCont(s.thenB) { return true }
+                if s.elseB.len() > 0 and ssHasCont(s.elseB) { return true }
+            }
+            3, 4 { if ssHasCont(s.body) { return true } }
+            5 {
+                for a in s.arms {
+                    if ssHasCont(a.body) { return true }
+                }
+            }
+            else { }
+        }
+    }
+    return false
+}
+
+impl Em {
+    fn line(self, s: str) { self.lines.push(pad4(self.ind) + s) }
+    fn blank(self) { self.lines.push("") }
+
+    fn initRen(self) {
+        var reserved = ["end", "function", "local", "if", "then", "do", "repeat", "until",
+                        "else", "elseif", "return", "in", "for", "while", "break", "continue",
+                        "and", "or", "nil", "true", "false"]
+        for w in reserved { self.ren[w] = "_z_" + w }
+    }
+
+    fn nm(self, name: str) -> str {
+        if self.ren.has(name) { return self.ren.get(name).or("") }
+        return name
+    }
+
+    fn openScope(self) {
+        var sc: [str: bool] = [:]
+        self.optScopes.push(sc)
+    }
+    fn closeScope(self) { if self.optScopes.len() > 0 { self.optScopes.pop() } }
+    fn declareOpt(self, names: [str], opt: bool) {
+        if self.optScopes.len() == 0 { return }
+        var sc = self.optScopes[self.optScopes.len() - 1]
+        for n in names { sc[n] = opt }
+    }
+    fn isOpt(self, name: str) -> bool {
+        for i in self.optScopes.len() - 1 .. 0 step -1 {
+            var sc = self.optScopes[i]
+            if sc.has(name) { return sc.get(name).or(false) }
+        }
+        return false
+    }
+
+    fn tmp(self, prefix: str) -> str { self.tmpc += 1
+ return prefix + (self.tmpc as str) }
+
+    fn runDefers(self, dfv: str) {
+        self.line("do local __i = #" + dfv + " while __i >= 1 do " + dfv + "[__i]() __i = __i - 1 end end")
+    }
+
+    // ------------------------------------------------ program
+
+    fn emitProgram(self, tops: [Top], srcPath: str) -> str {
+        self.initRen()
+        self.line("-- generated by zeph2lua from " + srcPath)
+        self.line("-- Luau output: types erased, lists stay 1-based (Zephyr 0-based indices are NOT shifted)")
+        self.blank()
+        self.emitPreamble()
+        var seenImp: [str: bool] = [:]
+        for t in tops {
+            if t.k == 0 and not seenImp.has(t.path) {
+                seenImp[t.path] = true
+                self.emitImport(t)
+            }
+        }
+        for t in tops { if t.k == 3 { self.emitEnum(t) } }
+        for t in tops {
+            if t.k == 2 {
+                self.line("-- struct " + t.sdecl.name + " \{ " + joinFields(t.sdecl.fields) + " \}")
+                self.line("local " + t.sdecl.name + " = \{\}")
+                self.structNames[t.sdecl.name] = true
+            }
+            if t.k == 6 { self.line("-- type " + t.name + " (alias, erased)") }
+            if t.k == 5 { self.line("-- interface " + t.name + " (erased)") }
+            if t.k == 7 { self.line("-- test \"" + t.name + "\" (skipped by zeph2lua)") }
+            if t.k == 8 { self.line("-- extern fn " + t.name + " (native interop: provide a Lua shim)") }
+        }
+        var hasMain = false
+        for t in tops {
+            if t.k == 1 {
+                self.emitTopFn(t)
+                if t.name == "main" { hasMain = true }
+            }
+        }
+        for t in tops {
+            if t.k == 4 {
+                for f in t.implFns { self.emitImplMethod(t.name, f) }
+            }
+        }
+        self.openScope()
+        for t in tops {
+            if t.k == 9 { self.emitStmt(t.st, "") }
+        }
+        self.closeScope()
+        if hasMain { self.line("main()") }
+        var out = ""
+        for l in self.lines { out += l + "\n" }
+        return out
+    }
+
+    fn emitTopFn(self, t: Top) {
+        self.line("function " + self.nm(t.name) + "(" + paramNames(t.params) + ")")
+        self.ind += 1
+        self.emitDefaults(t.params)
+        self.openScope()
+        self.emitBlock(t.body)
+        self.closeScope()
+        self.ind -= 1
+        self.line("end")
+        self.blank()
+    }
+
+    fn emitImplMethod(self, tname: str, f: IFn) {
+        self.line("function " + tname + "." + f.name + "(" + paramNames(f.params) + ")")
+        self.ind += 1
+        self.emitDefaults(f.params)
+        self.openScope()
+        self.emitBlock(f.body)
+        self.closeScope()
+        self.ind -= 1
+        self.line("end")
+        self.blank()
+    }
+
+    fn emitDefaults(self, ps: [Param]) {
+        for p in ps {
+            if p.hasDef {
+                self.line("if " + p.name + " == nil then " + p.name + " = " + self.emitExpr(p.def) + " end")
+            }
+        }
+    }
+
+    // ------------------------------------------------ blocks & statements
+
+    fn emitBlock(self, ss: [Stmt]) {
+        var hasDefer = false
+        for s in ss { if s.k == 6 { hasDefer = true } }
+        var dfv = ""
+        if hasDefer {
+            dfv = self.tmp("__df")
+            self.line("local " + dfv + " = \{\}")
+        }
+        self.openScope()
+        for s in ss {
+            if s.k == 6 {
+                self.line("table.insert(" + dfv + ", function()")
+                self.ind += 1
+                for d in s.body { self.emitStmt(d, "") }
+                self.ind -= 1
+                self.line("end)")
+                continue
+            }
+            self.emitStmt(s, dfv)
+        }
+        self.closeScope()
+        if hasDefer { self.runDefers(dfv) }
+    }
+
+    fn emitStmt(self, st: Stmt, dfv: str) {
+        match st.k {
+            0 {
+                if st.names.len() > 1 {
+                    var tt = self.tmp("__t")
+                    self.line("local " + tt + " = " + self.emitExpr(st.e))
+                    var assigns = ""
+                    for n in st.names { assigns += self.nm(n) + ", " }
+                    assigns = assigns.sub(0, assigns.len() - 2)
+                    var idxs = ""
+                    for i in 0..st.names.len() { idxs += tt + "[" + ((i + 1) as str) + "], " }
+                    idxs = idxs.sub(0, idxs.len() - 2)
+                    self.line("local " + assigns + " = " + idxs)
+                } else {
+                    self.line("local " + self.nm(st.names[0]) + " = " + self.emitExpr(st.e))
+                }
+                self.declareOpt(st.names, st.opt)
+            }
+            1 {
+                var base = ""
+                match st.tgtK {
+                    0 { base = self.nm(st.tgtName) }
+                    1 { base = self.emitExpr(st.tgtBase) + "." + st.tgtName }
+                    2 { base = self.emitExpr(st.tgtBase) + "[" + self.emitExpr(st.tgtIdx) + "]" }
+                    else { panic("bad target") }
+                }
+                var rhs = self.emitExpr(st.e)
+                match st.op {
+                    "=" { self.line(base + " = " + rhs) }
+                    "+=" { self.line(base + " = zadd(" + base + ", " + rhs + ")") }
+                    "-=" { self.line(base + " = " + base + " - " + rhs) }
+                    "*=" { self.line(base + " = " + base + " * " + rhs) }
+                    "/=" { self.line(base + " = zdiv(" + base + ", " + rhs + ")") }
+                    "%=" { self.line(base + " = zmod(" + base + ", " + rhs + ")") }
+                    "&=" { self.line(base + " = " + base + " & " + rhs) }
+                    "|=" { self.line(base + " = " + base + " | " + rhs) }
+                    "^=" { self.line(base + " = " + base + " ~ " + rhs) }
+                    "<<=" { self.line(base + " = " + base + " << " + rhs) }
+                    ">>=" { self.line(base + " = " + base + " >> " + rhs) }
+                    else { panic("bad op " + st.op) }
+                }
+            }
+            2 { self.emitIfChain(st, dfv) }
+            3 {
+                if st.label != "" { self.line("-- label " + st.label + " (labeled break not lowered; innermost only)") }
+                self.line("while " + self.emitExpr(st.e) + " do")
+                self.ind += 1
+                if ssHasCont(st.body) { self.contLabel = self.tmp("__c") }
+                self.emitBlock(st.body)
+                if self.contLabel != "" { self.line("::" + self.contLabel + "::")
+ self.contLabel = "" }
+                self.ind -= 1
+                self.line("end")
+            }
+            4 { self.emitFor(st) }
+            5 { self.emitMatch(st) }
+            7 {
+                if dfv != "" { self.runDefers(dfv) }
+                if st.e.k != 0 or st.e.a != "" { self.line("return " + self.emitExpr(st.e)) } else { self.line("return") }
+            }
+            8 {
+                if st.label != "" { self.line("-- labeled break " + st.label + " lowered to plain break") }
+                self.line("break")
+            }
+            9 {
+                if st.label != "" { self.line("-- labeled continue " + st.label + " lowered to plain continue") }
+                if self.contLabel != "" { self.line("goto " + self.contLabel) } else { self.line("continue") }
+            }
+            10 { self.line(self.emitExpr(st.e)) }
+            11 {
+                self.line("local function " + self.nm(st.fnName) + "(" + paramNames(st.params) + ")")
+                self.ind += 1
+                self.emitDefaults(st.params)
+                self.openScope()
+                self.emitBlock(st.body)
+                self.closeScope()
+                self.ind -= 1
+                self.line("end")
+            }
+            else { panic("unhandled stmt kind " + (st.k as str)) }
+        }
+    }
+
+    fn emitIfChain(self, st: Stmt, dfv: str) {
+        var head = st
+        if head.letName != "" {
+            self.line("if " + self.emitExpr(head.e) + " ~= nil then")
+            self.ind += 1
+            self.line("local " + self.nm(head.letName) + " = " + self.emitExpr(head.e))
+            self.emitBlock(head.thenB)
+            self.ind -= 1
+            self.line("end")
+            return
+        }
+        self.line("if " + self.emitExpr(head.e) + " then")
+        self.ind += 1
+        self.emitBlock(head.thenB)
+        self.ind -= 1
+        var cur = head
+        while cur.elseB.len() == 1 and cur.elseB[0].k == 2 and cur.elseB[0].letName == "" {
+            var nxt = cur.elseB[0]
+            self.line("elseif " + self.emitExpr(nxt.e) + " then")
+            self.ind += 1
+            self.emitBlock(nxt.thenB)
+            self.ind -= 1
+            cur = nxt
+        }
+        if cur.elseB.len() > 0 {
+            self.line("else")
+            self.ind += 1
+            self.emitBlock(cur.elseB)
+            self.ind -= 1
+        }
+        self.line("end")
+    }
+
+    fn emitFor(self, st: Stmt) {
+        var v1 = self.nm(st.v1)
+        if st.hi.k != 0 or st.hi.a != "" {
+            var loT = self.emitExpr(st.lo)
+            var hiT = self.emitExpr(st.hi)
+            if st.hasStep {
+                self.line("for " + v1 + " = " + loT + ", " + hiT + ", " + self.emitExpr(st.step) + " do")
+            } else {
+                self.line("for " + v1 + " = " + loT + ", " + hiT + " - 1 do")
+            }
+        } else {
+            var iterT = self.emitExpr(st.lo)
+            if st.v2 != "" {
+                if st.lo.k == 1 or st.lo.k == 19 {
+                    self.line("for __zi = 1, #" + iterT + " do")
+                    self.line("local " + v1 + " = __zi - 1")
+                    self.line("local " + self.nm(st.v2) + " = " + iterT + ":byte(__zi)")
+                } else {
+                    self.line("for __zi, " + self.nm(st.v2) + " in ipairs(" + iterT + ") do")
+                    self.line("local " + v1 + " = __zi - 1")
+                }
+            } else {
+                if st.lo.k == 1 or st.lo.k == 19 {
+                    self.line("for __zi = 1, #" + iterT + " do")
+                    self.line("local " + v1 + " = " + iterT + ":byte(__zi)")
+                } else {
+                    self.line("for _, " + v1 + " in ipairs(" + iterT + ") do")
+                }
+            }
+        }
+        self.ind += 1
+        if ssHasCont(st.body) { self.contLabel = self.tmp("__c") }
+        self.emitBlock(st.body)
+        if self.contLabel != "" { self.line("::" + self.contLabel + "::")
+ self.contLabel = "" }
+        self.ind -= 1
+        self.line("end")
+    }
+
+    fn armCond(self, m: str, a: Arm) -> str {
+        var conds = ""
+        for i in 0..a.pats.len() {
+            var c = ""
+            var mn = a.members[i]
+            if a.binds.len() > 0 and mn != "" {
+                c = m + " ~= nil and " + m + ".__e == \"" + mn + "\""
+            } else if mn != "" {
+                if self.memberRef.has(mn) {
+                    c = m + " == " + self.memberRef.get(mn).or(mn)
+                } else {
+                    c = m + " == " + mn
+                }
+            } else if a.isRange[i] {
+                c = m + " >= " + self.emitExpr(a.pats[i]) + " and " + m + " < " + self.emitExpr(a.hi[i])
+            } else {
+                c = m + " == " + self.emitExpr(a.pats[i])
+            }
+            if i > 0 { conds += " or " }
+            conds += c
+        }
+        return conds
+    }
+
+    fn emitMatch(self, st: Stmt) {
+        var m = self.tmp("__m")
+        self.line("local " + m + " = " + self.emitExpr(st.e))
+        var first = true
+        var hasElse = false
+        for a in st.arms {
+            if a.isElse { hasElse = true
+ continue }
+            if first { self.line("if " + self.armCond(m, a) + " then")
+ first = false }
+            else { self.line("elseif " + self.armCond(m, a) + " then") }
+            self.ind += 1
+            for j in 0..a.binds.len() {
+                self.line("local " + a.binds[j] + " = " + m + ".v[" + ((j + 1) as str) + "]")
+            }
+            self.emitBlock(a.body)
+            self.ind -= 1
+        }
+        if hasElse {
+            self.line("else")
+            self.ind += 1
+            var ea = st.arms[st.arms.len() - 1]
+            self.emitBlock(ea.body)
+            self.ind -= 1
+        } else {
+            self.line("else")
+            self.line("error(\"no matching arm\")")
+        }
+        self.line("end")
+    }
+
+    // ------------------------------------------------ expressions
+
+    fn emitExpr(self, e: Expr) -> str {
+        match e.k {
+            0 { return e.a }
+            1 { return luaStr(e.a) }
+            19 { return luaStrRaw(e.a) }
+            2 { return e.a }
+            3 { return "nil" }
+            4 { return self.nm(e.a) }
+            5 { return self.emitBin(e) }
+            6 {
+                var x = self.emitExpr(e.kids[0])
+                match e.a {
+                    "-" { return "-(" + x + ")" }
+                    "not" { return "not " + x }
+                    "~" { return "bxor(" + x + ", -1)" }
+                    else { panic("bad unary") }
+                }
+            }
+            7 { return self.emitCall(e) }
+            8 { return self.emitExpr(e.kids[0]) + "[" + self.emitExpr(e.kids[1]) + "]" }
+            9 {
+                var base = self.emitExpr(e.kids[0])
+                if isDigitStr(e.b) { return base + "[" + ((strIntVal(e.b) + 1) as str) + "]" }
+                return base + "." + e.b
+            }
+            10 {
+                var s = ""
+                for p in e.parts { if s != "" { s += ", " }
+ s += self.emitExpr(p) }
+                return "\{" + s + "\}"
+            }
+            11 {
+                var s = ""
+                for i in 0..e.keys.len() {
+                    if s != "" { s += ", " }
+                    s += "[" + self.emitExpr(e.keys[i]) + "] = " + self.emitExpr(e.parts[i])
+                }
+                return "\{" + s + "\}"
+            }
+            12 {
+                var s = ""
+                for i in 0..e.keys.len() {
+                    if s != "" { s += ", " }
+                    s += e.keys[i].a + " = " + self.emitExpr(e.parts[i])
+                }
+                if self.structNames.has(e.a) { return "setmetatable(\{" + s + "\}, \{__index = " + e.a + "\})" }
+                return "\{" + s + "\}"
+            }
+            13 { return self.emitClosure(e) }
+            14 {
+                var c = self.emitExpr(e.kids[0])
+                var t = self.emitExpr(e.kids[1])
+                var f = self.emitExpr(e.kids[2])
+                return ("(function()\n" + pad4(self.ind + 1) + "if " + c + " then return " + t + "\n"
+                    + pad4(self.ind + 1) + "else return " + f + "\n"
+                    + pad4(self.ind) + "end\n" + pad4(self.ind) + "end)()")
+            }
+            15 { return self.emitMatchExpr(e) }
+            16 {
+                var s = ""
+                for p in e.parts { if s != "" { s += ", " }
+ s += self.emitExpr(p) }
+                return "\{" + s + "\}"
+            }
+            17 { return self.emitExpr(e.kids[0]) }
+            18 { return "tostring(" + self.emitExpr(e.kids[0]) + ")" }
+            else { panic("unhandled expr kind " + (e.k as str)) }
+        }
+    }
+
+    fn dotOperand(self, x: Expr) -> str {
+        if x.k == 0 or x.k == 1 or x.k == 19 or x.k == 2 { return self.emitExpr(x) }
+        return "tostring(" + self.emitExpr(x) + ")"
+    }
+
+    fn emitBin(self, e: Expr) -> str {
+        var l = self.emitExpr(e.kids[0])
+        var r = self.emitExpr(e.kids[1])
+        match e.a {
+            "+" { return "zadd(" + l + ", " + r + ")" }
+            "-", "*" { return l + " " + e.a + " " + r }
+            "/" { return "zdiv(" + l + ", " + r + ")" }
+            "%" { return "zmod(" + l + ", " + r + ")" }
+            "==" { return l + " == " + r }
+            "!=" { return l + " ~= " + r }
+            "<", "<=", ">", ">=" { return l + " " + e.a + " " + r }
+            "&", "|", "<<", ">>" { return l + " " + e.a + " " + r }
+            "^" { return l + " ~ " + r }
+            "and", "or" { return l + " " + e.a + " " + r }
+            ".." { return self.dotOperand(e.kids[0]) + " .. " + self.dotOperand(e.kids[1]) }
+            "is" {
+                var rn = e.kids[1].a
+                if self.memberPayload.has(rn) {
+                    return l + " ~= nil and " + l + ".__e == \"" + rn + "\""
+                }
+                if self.memberRef.has(rn) {
+                    return l + " == " + self.memberRef.get(rn).or(rn)
+                }
+                return l + " == " + r
+            }
+            else { panic("bad binop " + e.a) }
+        }
+    }
+
+    fn emitCall(self, e: Expr) -> str {
+        var callee = e.kids[0]
+        var argsT = ""
+        for a in e.parts {
+            if argsT != "" { argsT += ", " }
+            argsT += self.emitExpr(a)
+        }
+        if callee.k == 9 {
+            var recvT = self.emitExpr(callee.kids[0])
+            var m = callee.b
+            var a0 = ""
+            var a1 = ""
+            if e.parts.len() > 0 { a0 = self.emitExpr(e.parts[0]) }
+            if e.parts.len() > 1 { a1 = self.emitExpr(e.parts[1]) }
+            var recvIsOptName = callee.kids[0].k == 4 and self.isOpt(callee.kids[0].a)
+            var isEnumCtor = false
+            if callee.k == 9 and callee.kids[0].k == 4 {
+                var baseN = callee.kids[0].a
+                var memN = callee.b
+                if self.memberPayload.has(memN) and self.memberEnum.has(memN) and self.memberEnum.get(memN).or("") == baseN + "_" + memN { isEnumCtor = true }
+            }
+            match m {
+                "len" { return "#" + recvT }
+                "push" { return "table.insert(" + recvT + ", " + a0 + ")" }
+                "pop" { return "table.remove(" + recvT + ")" }
+                "sort" { return "table.sort(" + recvT + ")" }
+                "join" {
+                    if e.parts.len() == 0 { return "table.concat(" + recvT + ")" }
+                    return "table.concat(" + recvT + ", " + a0 + ")"
+                }
+                "byte" { return recvT + ":byte(" + a0 + " + 1)" }
+                "sub" { return recvT + ":sub(" + a0 + " + 1, " + a1 + ")" }
+                "contains" { return recvT + ":find(" + a0 + ", nil, true) ~= nil" }
+                "indexOf" { return "((" + recvT + ":find(" + a0 + ", nil, true)) or 0) - 1" }
+                "startsWith" { return recvT + ":sub(1, #" + a0 + ") == " + a0 }
+                "endsWith" { return "(#" + a0 + " == 0) or " + recvT + ":sub(-#" + a0 + ") == " + a0 }
+                "split" { return "zsplit(" + recvT + ", " + a0 + ")" }
+                "replace" { return "zreplace(" + recvT + ", " + a0 + ", " + a1 + ")" }
+                "upper" { return recvT + ":upper()" }
+                "lower" { return recvT + ":lower()" }
+                "trim" { return "ztrim(" + recvT + ")" }
+                "repeat" { return recvT + ":rep(" + a0 + ")" }
+                "keys" { return "zkeys(" + recvT + ")" }
+                "values" { return "zvals(" + recvT + ")" }
+                "has" {
+                    if recvIsOptName { return "(" + recvT + " ~= nil)" }
+                    return "(" + recvT + "[" + a0 + "] ~= nil)"
+                }
+                "get" {
+                    if recvIsOptName and e.parts.len() == 0 { return recvT }
+                    return recvT + "[" + a0 + "]"
+                }
+                "or" {
+                    if recvIsOptName { return "(" + recvT + " or " + a0 + ")" }
+                    var inner = callee.kids[0]
+                    if inner.k == 7 and inner.kids[0].k == 9 and inner.kids[0].b == "get" {
+                        return "(" + recvT + " or " + a0 + ")"
+                    }
+                    return recvT + ":or(" + argsT + ")"
+                }
+                else {
+                    if isEnumCtor { return recvT + "." + m + "(" + argsT + ")" }
+                    return recvT + ":" + m + "(" + argsT + ")"
+                }
+            }
+        }
+        if callee.k == 4 {
+            match callee.a {
+                "print" { return "print(" + argsT + ")" }
+                "panic" { return "error(" + argsT + ")" }
+                "emit" { return "io.write(" + argsT + ")" }
+                "chr" { return "string.char(" + argsT + ")" }
+                "sqrt" { return "math.sqrt(" + argsT + ")" }
+                "abs" { return "math.abs(" + argsT + ")" }
+                "min" { return "math.min(" + argsT + ")" }
+                "max" { return "math.max(" + argsT + ")" }
+                "assert" { return "assert(" + argsT + ")" }
+                "zeros" { return "zzeros(" + argsT + ")" }
+                "args" { return "zargs" }
+                "pow" {
+                    var pb = self.emitExpr(e.parts[0])
+                    var pe = self.emitExpr(e.parts[1])
+                    return pb + " ^ " + pe
+                }
+                "bits", "floatFromBits" { return callee.a + "(" + argsT + ") -- stub: IEEE bit pattern not available in Lua" }
+                else { return self.nm(callee.a) + "(" + argsT + ")" }
+            }
+        }
+        return self.emitExpr(callee) + "(" + argsT + ")"
+    }
+
+    fn emitClosure(self, e: Expr) -> str {
+        var out = "function(" + paramNames(e.params) + ")\n"
+        for p in e.params {
+            if p.hasDef {
+                out += pad4(self.ind + 1) + "if " + p.name + " == nil then " + p.name + " = " + self.emitExpr(p.def) + " end\n"
+            }
+        }
+        var savedInd = self.ind
+        self.ind += 1
+        self.openScope()
+        var bodyLines: [str] = []
+        var savedLines = self.lines
+        self.lines = bodyLines
+        self.emitBlock(e.body)
+        self.lines = savedLines
+        self.closeScope()
+        self.ind = savedInd
+        for l in bodyLines { out += l + "\n" }
+        out += pad4(self.ind) + "end"
+        return out
+    }
+
+    fn emitMatchExpr(self, e: Expr) -> str {
+        var m = self.tmp("__m")
+        var subj = self.emitExpr(e.kids[0])
+        var out = "(function()\n"
+        out += pad4(self.ind + 1) + "local " + m + " = " + subj + "\n"
+        var first = true
+        var hasElse = false
+        for a in e.arms {
+            if a.isElse { hasElse = true
+ continue }
+            if first { out += pad4(self.ind + 1) + "if " + self.armCond(m, a) + " then return " + self.emitExpr(a.ex) + "\n"
+ first = false }
+            else { out += pad4(self.ind + 1) + "elseif " + self.armCond(m, a) + " then return " + self.emitExpr(a.ex) + "\n" }
+        }
+        if hasElse {
+            var ea = e.arms[e.arms.len() - 1]
+            out += pad4(self.ind + 1) + "else return " + self.emitExpr(ea.ex) + "\n"
+        } else {
+            out += pad4(self.ind + 1) + "else return error(\"no matching arm\")\n"
+        }
+        out += pad4(self.ind + 1) + "end\n"
+        out += pad4(self.ind) + "end)()"
+        return out
+    }
+
+    // ------------------------------------------------ enums & imports
+
+    fn emitEnum(self, t: Top) {
+        var payload = false
+        for m in t.emembers { if m.nvals > 0 { payload = true } }
+        if not payload {
+            var s = ""
+            for i in 0..t.emembers.len() {
+                var m = t.emembers[i]
+                if s != "" { s += ", " }
+                s += m.name + " = " + (i as str)
+                if not self.memberEnum.has(m.name) { self.memberEnum[m.name] = t.name }
+                self.memberPayload[m.name] = false
+                self.memberRef[m.name] = t.name + "." + m.name
+            }
+            s += ", count = " + (t.emembers.len() as str)
+            self.line("local " + t.name + " = \{ " + s + " \}")
+            return
+        }
+        for m in t.emembers {
+            if m.nvals > 0 {
+                var ps = ""
+                for j in 0..m.nvals { if j > 0 { ps += ", " }
+ ps += "v" + (j as str) }
+                var fields = ""
+                for j in 0..m.nvals { if j > 0 { fields += ", " }
+ fields += "v" + (j as str) }
+                self.line("local function " + t.name + "_" + m.name + "(" + ps + ")")
+                self.line("return \{ __e = \"" + m.name + "\", v = \{ " + fields + " \} \}")
+                self.line("end")
+            } else {
+                self.line("local " + t.name + "_" + m.name + " = \{ __e = \"" + m.name + "\" \}")
+            }
+            if not self.memberEnum.has(m.name) { self.memberEnum[m.name] = t.name + "_" + m.name }
+            self.memberPayload[m.name] = m.nvals > 0
+            self.memberRef[m.name] = t.name + "_" + m.name
+        }
+        var s = ""
+        for m in t.emembers {
+            if s != "" { s += ", " }
+            s += m.name + " = " + t.name + "_" + m.name
+        }
+        s += ", count = " + (t.emembers.len() as str)
+        self.line("local " + t.name + " = \{ " + s + " \}")
+    }
+
+    fn emitImport(self, t: Top) {
+        if t.alias != "" { self.line("-- import \"" + t.path + "\" as " + t.alias + " (namespacing not lowered; names spliced globally)") }
+        match t.path {
+            "std/math.zeph" { for l in lines(MATH_BLOCK) { self.line(l) } }
+            "std/string.zeph" { for l in lines(STRING_BLOCK) { self.line(l) } }
+            "std/io.zeph" { for l in lines(IO_BLOCK) { self.line(l) } }
+            "std/list.zeph" { for l in lines(LIST_BLOCK) { self.line(l) } }
+            else { self.line("-- import \"" + t.path + "\": splice manually (in Roblox use require())") }
+        }
+        self.blank()
+    }
+
+    fn emitPreamble(self) {
+        for l in lines(PREAMBLE_BLOCK) { self.line(l) }
+        self.blank()
+    }
+}
+
+// ------------------------------------------------ small helpers
+
+fn joinFields(fs: [str]) -> str {
+    var s = ""
+    for f in fs { if s != "" { s += ", " }
+ s += f }
+    return s
+}
+
+fn paramNames(ps: [Param]) -> str {
+    var s = ""
+    for p in ps { if s != "" { s += ", " }
+ s += p.name }
+    return s
+}
+
+fn isDigitStr(s: str) -> bool {
+    if s.len() == 0 { return false }
+    for c in s { if c < 48 or c > 57 { return false } }
+    return true
+}
+
+fn strIntVal(s: str) -> int {
+    var n = 0
+    for c in s { n = n * 10 + (c - 48) }
+    return n
+}
+
+// Unescape a Zephyr string chunk (escapes kept raw by the lexer) into a Lua string literal.
+fn luaStr(raw: str) -> str {
+    var out = "\""
+    var i = 0
+    while i < raw.len() {
+        var c = raw.sub(i, i + 1)
+        if c == "\\" {
+            var e = raw.sub(i + 1, i + 2)
+            match e {
+                "n" { out += "\\n" }
+                "t" { out += "\\t" }
+                "r" { out += "\\r" }
+                "0" { out += "\\0" }
+                "\\" { out += "\\\\" }
+                "\"" { out += "\"" }
+                "\{" { out += "\{" }
+                "\}" { out += "\}" }
+                "x" {
+                    out += "\\x" + raw.sub(i + 2, i + 4)
+                    i += 2
+                }
+                else { out += e }
+            }
+            i += 2
+            continue
+        }
+        if c == "\"" { out += "\\\""
+ i += 1
+ continue }
+        if c == "\n" { out += "\\n"
+ i += 1
+ continue }
+        if c == "\t" { out += "\\t"
+ i += 1
+ continue }
+        out += c
+        i += 1
+    }
+    out += "\""
+    return out
+}
+
+// Raw / multiline content: verbatim bytes, escape for Lua.
+fn luaStrRaw(raw: str) -> str {
+    var out = "\""
+    var i = 0
+    while i < raw.len() {
+        var c = raw.sub(i, i + 1)
+        if c == "\\" { out += "\\\\"
+ i += 1
+ continue }
+        if c == "\"" { out += "\\\""
+ i += 1
+ continue }
+        if c == "\n" { out += "\\n"
+ i += 1
+ continue }
+        if c == "\t" { out += "\\t"
+ i += 1
+ continue }
+        out += c
+        i += 1
+    }
+    out += "\""
+    return out
+}
+
+// ------------------------------------------------ main
+
+fn main() {
+    var argv = args()
+    if argv.len() < 2 {
+        printError("usage: zeph2lua <input.zeph> [output.lua]")
+        exit(1)
+    }
+    var srcPath = argv[1]
+    var src = readFile(srcPath)
+    var lex = Lex{src: src}
+    lex.run()
+    var p = P{toks: lex.toks}
+    var tops = p.parseProgram()
+    var em = newEm()
+    var out = em.emitProgram(tops, srcPath)
+    if argv.len() >= 3 {
+        writeFile(argv[2], out)
+        print("wrote " + argv[2])
+    } else {
+        print(out)
+    }
+}

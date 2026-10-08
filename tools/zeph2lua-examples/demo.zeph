@@ -1,0 +1,168 @@
+// demo.zeph — exercises zeph2lua coverage
+import "std/math.zeph"
+import "std/string.zeph"
+import "std/list.zeph"
+import "std/io.zeph"
+
+enum Color { Red, Green, Blue }
+
+enum Shape {
+    Circle(float)
+    Rect(float, float)
+    Empty
+}
+
+struct Point { x: float, y: float }
+
+impl Point {
+    fn dist(self, o: Point) -> float {
+        var dx = self.x - o.x
+        var dy = self.y - o.y
+        return sqrt(dx * dx + dy * dy)
+    }
+}
+
+type Vec2 = (float, float)
+
+fn greet(name: str, times: int = 1) -> str {
+    var s = ""
+    for i in 0..times { s += "hi " + name + " " }
+    return s
+}
+
+fn fib(n: int) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn divmod(a: int, b: int) -> (int, int) {
+    return (a / b, a % b)
+}
+
+fn area(s: Shape) -> float {
+    match s {
+        Circle(r) { return pi * r * r }
+        Rect(w, h) { return w * h }
+        Empty { return 0.0 }
+    }
+}
+
+fn classify(x: int) -> str {
+    return match x {
+        0 { "zero" }
+        1..5 { "small" }
+        else { "big" }
+    }
+}
+
+fn optDemo() {
+    var found: int? = none
+    if found.has() { print("found " + (found.get() as str)) } else { print("not found") }
+    var v = found.or(-1)
+    print("v = " + (v as str))
+    var named: str? = "ada"
+    if let s = named { print("named: " + s) }
+}
+
+fn shapeIs() {
+    var s = Shape.Circle(1.0)
+    if s is Circle { print("it is a circle") }
+    var e = Shape.Empty
+    if e is Empty { print("it is empty") }
+}
+
+fn loopsDemo() {
+    var total = 0
+    for i in 0..10 {
+        if i % 2 == 0 { continue }
+        total += i
+    }
+    print("odd sum 0..10 = " + (total as str))
+    var n = 0
+    while n < 5 {
+        n += 1
+        if n == 3 { break }
+    }
+    print("n stopped at " + (n as str))
+    var flags = 12 & 10
+    print("bitwise: " + (flags as str) + " xor " + ((flags ^ 6) as str))
+}
+
+fn listMapDemo() {
+    var nums = [3, 1, 2]
+    nums.sort()
+    var numStrs = map(nums, fn(x: int) -> str { return x as str })
+    print("sorted: " + numStrs.join(", "))
+    var doubled = map(nums, fn(x: int) -> int { return x * 2 })
+    var dblStrs = map(doubled, fn(x: int) -> str { return x as str })
+    print("doubled: " + dblStrs.join(", "))
+    var evens = filter(doubled, fn(x: int) -> bool { return x % 2 == 0 })
+    var evenStrs = map(evens, fn(x: int) -> str { return x as str })
+    print("evens: " + evenStrs.join(", "))
+    print("sum: " + (sum(nums) as str))
+    var m: [str: int] = [:]
+    m["alpha"] = 1
+    m["beta"] = 2
+    print("has alpha: " + (m.has("alpha") as str))
+    print("get gamma: " + (m.get("gamma").or(0) as str))
+}
+
+fn strDemo() {
+    var t = "  Hello, ZEPHYR  "
+    print(trimLeft(t))
+    print(t.trim().lower())
+    var parts = "a,b,c".split(",")
+    print(joinWith(parts, "-"))
+    print(toHex(255))
+    print(reverseString("abc"))
+}
+
+fn closureDemo() {
+    var makeAdder = fn(base: int) -> fn(int) -> int {
+        return fn(x: int) -> int { return base + x }
+    }
+    var add5 = makeAdder(5)
+    print("add5(3) = " + (add5(3) as str))
+}
+
+fn deferDemo() {
+    var label = "session"
+    defer print("closing " + label)
+    print("working in " + label)
+}
+
+fn main() {
+    print("fib(10) = " + (fib(10) as str))
+    var p = Point{x: 3.0, y: 4.0}
+    var q = Point{x: 6.0, y: 8.0}
+    print("dist = " + (p.dist(q) as str))
+    print(greet("roblox"))
+    print(greet("luau", 3))
+
+    var c = Color.Green
+    match c {
+        Green { print("lights: go") }
+        Red, Blue { print("lights: stop") }
+        else { }
+    }
+
+    var shapes = [Shape.Circle(2.0), Shape.Rect(3.0, 4.0), Shape.Empty]
+    for s in shapes { print("area = " + (area(s) as str)) }
+
+    print("classify(3) = " + classify(3))
+    print("classify(99) = " + classify(99))
+
+    optDemo()
+    shapeIs()
+    loopsDemo()
+    listMapDemo()
+    strDemo()
+    closureDemo()
+    deferDemo()
+
+    var (dq, dr) = divmod(17, 5)
+    print("divmod(17,5) = " + (dq as str) + "/" + (dr as str))
+
+    print("floor(2.7) = " + (floor(2.7) as str))
+    print("done")
+}
