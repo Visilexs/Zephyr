@@ -950,8 +950,7 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
         }
         store64(cache + need, load64(block))
         store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) - 1)
-        store64(block - 8, need)
-        runtimeZeroMemory(block, need)
+        runtimeZeroMemory(block, load64(block - 8))     // header already holds the real size, flags clear
         store64(block - 24, 1)
         store64(block - 16, descriptor)
         return block
@@ -1005,7 +1004,10 @@ fn runtimeRefillThreadCache(cache: int, need: int) {
     var index = 0
     while index < count {
         let block = runtimeAllocateObjectPayload(need)
-        store64(block - 8, need)     // no FREE flag while cached (see runtimeCacheFreeBlock)
+        // a carve too small to split hands back up to 24 slack bytes: the header
+        // keeps the real size (a block in class `need` may be larger), or a
+        // forward coalesce would read the slack as the next block's header
+        store64(block - 8, load64(block - 8) & (0 - 8))     // no FREE flag while cached (see runtimeCacheFreeBlock)
         store64(block, load64(cache + need))
         store64(cache + need, block)
         index += 1
@@ -1029,8 +1031,9 @@ fn runtimeCacheFreeBlock(cache: int, object: int, size: int) {
         while index < runtimeCacheClassLimit / 2 {
             let block = load64(cache + size)
             store64(cache + size, load64(block))
-            store64(block - 8, size | runtimeHeapFlagFree)
-            runtimePushFreeBlock(block, size)
+            let blockSize = load64(block - 8)
+            store64(block - 8, blockSize | runtimeHeapFlagFree)
+            runtimePushFreeBlock(block, blockSize)
             index += 1
         }
         store64(cache + runtimeCacheCountsOffset + size, count - runtimeCacheClassLimit / 2)
@@ -1090,8 +1093,9 @@ fn runtimeFlushThreadCache(cache: int) {
         var block = load64(cache + size)
         while block != 0 {
             let next = load64(block)
-            store64(block - 8, size | runtimeHeapFlagFree)
-            runtimePushFreeBlock(block, size)
+            let blockSize = load64(block - 8)
+            store64(block - 8, blockSize | runtimeHeapFlagFree)
+            runtimePushFreeBlock(block, blockSize)
             block = next
         }
         store64(cache + size, 0)

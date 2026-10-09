@@ -16,26 +16,27 @@ let wasmStackTop = 24
 
 // Reserving address space is free on Windows and Linux. On wasm it is not:
 // memory.grow only extends the end, so a committed region ABOVE a sparse one
-// forces every page in between to exist. runtimeInitializeHeap reserves the 1 GiB heap
-// first and its bitmaps second, which would mean 1 GiB of linear memory the
-// moment a bitmap page is touched.
+// forces every page in between to exist. runtimeInitializeHeap reserves the heap
+// first and its bitmaps, free-back table and mark worklist second.
 //
 // Two adjustments, both confined to this file:
-//   - every reserve is SCALED DOWN. The bitmap sizes the runtime derives from
-//     runtimeHeapReserve scale by the same factor, so the arithmetic stays consistent
-//     -- a 64 MiB heap needs exactly the 1 MiB bitmap that 16 MiB >> 4 gives.
-//   - the first (largest) reserve is placed ABOVE a window kept for the later,
-//     smaller ones, so the heap is the topmost region and nothing sparse sits
-//     underneath a committed one.
+//   - every reserve is SCALED DOWN by 1/256. The bitmap sizes the runtime derives
+//     from runtimeHeapReserve scale by the same factor, so the arithmetic stays
+//     consistent -- a 64 MiB heap needs exactly the 1 MiB bitmap that 64 MiB >> 6 gives.
+//     (ponytail: the physical heap is capped at 64 MiB, not the 16 GiB logical reserve;
+//     lower wasmRegionShift if a wasm program ever needs more.)
+//   - the reserves are PACKED TIGHTLY: a window sized for the later, smaller reserves,
+//     then the heap directly above it, so nothing sparse sits underneath a committed one.
 // A commit that runs past its own region returns 0, which the runtime reports
 // as "out of memory (commit)" rather than silently scribbling on the bitmaps.
 let wasmOutsideHeap = 4194304            // 4 MiB for committed off-heap blocks
-let wasmRegionShift = 4                   // reserves are scaled by 1/16
+let wasmRegionShift = 8                   // reserves are scaled by 1/256
 let wasmMaximumRegions = 8
 
 var wasmSmallAllocationPointer = 0                    // small committed blocks, grows up
-var wasmSmallAllocationBase = 0                  // window for the post-heap reserves
-var wasmReservedHeap = 0                    // the heap region, above that window
+var wasmSmallAllocationBase = 0                  // cursor packing the reserve window
+var wasmHeapRegionStart = 0                 // where the heap region begins; the window's ceiling
+var wasmReservedHeap = 0                    // end of the heap region (0 until reserved)
 var wasmMemoryEnd = 0                    // first address past what memory.grow gave us
 var wasmRegionTable = 0                    // wasmMaximumRegions entries of (base, end)
 var wasmRegionCount = 0
@@ -88,17 +89,21 @@ fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgumen
     if wantReserve and not wantCommit {
         let want = byteCount >> wasmRegionShift
         if wasmReservedHeap == 0 {
-            // the first reserve is the heap: park it above a window sized for
-            // the bitmaps and worklist that runtimeInitializeHeap asks for next
-            wasmSmallAllocationBase = load64(wasmHeap) + wasmOutsideHeap
-            wasmReservedHeap = wasmSmallAllocationBase + (want >> 3)
-            let allocationAddress = wasmReservedHeap
-            wasmReservedHeap = wasmReservedHeap + want
+            // the first reserve is the heap: park it above a window sized for every
+            // later reserve (the two bitmaps, the free-back table and the mark
+            // worklist -- exactly the sizes runtimeInitializeHeap derives), so the
+            // heap is the topmost region and nothing sparse sits underneath it
+            let base = load64(wasmHeap) + wasmOutsideHeap
+            let window = (((byteCount >> 6) >> wasmRegionShift) * 2 + want + ((byteCount >> 3) >> wasmRegionShift) + 65535) & (0 - 65536)
+            wasmSmallAllocationBase = base
+            wasmHeapRegionStart = base + window
+            wasmReservedHeap = wasmHeapRegionStart + want
+            let allocationAddress = wasmHeapRegionStart
             wasmRegionAdd(allocationAddress, want)
             return allocationAddress
         }
         let allocationAddress = wasmSmallAllocationBase
-        if allocationAddress + want > load64(wasmHeap) + wasmOutsideHeap + (wasmReservedHeap - wasmSmallAllocationBase) { return 0 }
+        if allocationAddress + want > wasmHeapRegionStart { return 0 }
         wasmSmallAllocationBase = wasmSmallAllocationBase + want
         wasmRegionAdd(allocationAddress, want)
         return allocationAddress
@@ -114,6 +119,11 @@ fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgumen
     wasmSmallAllocationPointer = wasmSmallAllocationPointer + byteCount
     if not wasmEnsure(allocationAddress + byteCount) { return 0 }
     return allocationAddress
+}
+
+fn kernel32VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
+    // ponytail: nothing to release; linear memory only grows
+    return 1
 }
 
 // ---- console ----

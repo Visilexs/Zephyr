@@ -13822,8 +13822,7 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        \}\n")
     sourceLines.push("        store64(cache + need, load64(block))\n")
     sourceLines.push("        store64(cache + runtimeCacheCountsOffset + need, load64(cache + runtimeCacheCountsOffset + need) - 1)\n")
-    sourceLines.push("        store64(block - 8, need)\n")
-    sourceLines.push("        runtimeZeroMemory(block, need)\n")
+    sourceLines.push("        runtimeZeroMemory(block, load64(block - 8))     // header already holds the real size, flags clear\n")
     sourceLines.push("        store64(block - 24, 1)\n")
     sourceLines.push("        store64(block - 16, descriptor)\n")
     sourceLines.push("        return block\n")
@@ -13877,7 +13876,10 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("    var index = 0\n")
     sourceLines.push("    while index < count \{\n")
     sourceLines.push("        let block = runtimeAllocateObjectPayload(need)\n")
-    sourceLines.push("        store64(block - 8, need)     // no FREE flag while cached (see runtimeCacheFreeBlock)\n")
+    sourceLines.push("        // a carve too small to split hands back up to 24 slack bytes: the header\n")
+    sourceLines.push("        // keeps the real size (a block in class `need` may be larger), or a\n")
+    sourceLines.push("        // forward coalesce would read the slack as the next block's header\n")
+    sourceLines.push("        store64(block - 8, load64(block - 8) & (0 - 8))     // no FREE flag while cached (see runtimeCacheFreeBlock)\n")
     sourceLines.push("        store64(block, load64(cache + need))\n")
     sourceLines.push("        store64(cache + need, block)\n")
     sourceLines.push("        index += 1\n")
@@ -13901,8 +13903,9 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        while index < runtimeCacheClassLimit / 2 \{\n")
     sourceLines.push("            let block = load64(cache + size)\n")
     sourceLines.push("            store64(cache + size, load64(block))\n")
-    sourceLines.push("            store64(block - 8, size | runtimeHeapFlagFree)\n")
-    sourceLines.push("            runtimePushFreeBlock(block, size)\n")
+    sourceLines.push("            let blockSize = load64(block - 8)\n")
+    sourceLines.push("            store64(block - 8, blockSize | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimePushFreeBlock(block, blockSize)\n")
     sourceLines.push("            index += 1\n")
     sourceLines.push("        \}\n")
     sourceLines.push("        store64(cache + runtimeCacheCountsOffset + size, count - runtimeCacheClassLimit / 2)\n")
@@ -13962,8 +13965,9 @@ fn embeddedRuntimeText() -> str {
     sourceLines.push("        var block = load64(cache + size)\n")
     sourceLines.push("        while block != 0 \{\n")
     sourceLines.push("            let next = load64(block)\n")
-    sourceLines.push("            store64(block - 8, size | runtimeHeapFlagFree)\n")
-    sourceLines.push("            runtimePushFreeBlock(block, size)\n")
+    sourceLines.push("            let blockSize = load64(block - 8)\n")
+    sourceLines.push("            store64(block - 8, blockSize | runtimeHeapFlagFree)\n")
+    sourceLines.push("            runtimePushFreeBlock(block, blockSize)\n")
     sourceLines.push("            block = next\n")
     sourceLines.push("        \}\n")
     sourceLines.push("        store64(cache + size, 0)\n")
@@ -19439,6 +19443,8 @@ var wasmFramePointerLocal = 0                                // wasm local index
 var wasmFrameSize = 0
 var wasmSlotCount = 0
 var wasmParameterCount = 0
+var wasmGuardTopLevelInit = 0                     // wrap zephyrMain's top-level initializers in a one-shot guard
+var wasmGuardStatementCount = -1                  // how many of those statements go inside the guard (-1 = all)
 
 fn newWasmByteBuffer() -> [int] {
     var bytes: [int] = []
@@ -20851,7 +20857,32 @@ fn emitWasmFunctionBody(slotCount: int, parameterCount: int, statements: [Node])
     wasmFunctionBody.push(55)
     writeUnsignedLeb128(wasmFunctionBody, 3)
     writeUnsignedLeb128(wasmFunctionBody, wasmEnvironmentOffset())
-    for statement in statements { emitWasmStatement(statement) }
+    if wasmGuardTopLevelInit != 0 and statements.len() > 0 {
+        // The host can call main() repeatedly, but a program's top-level
+        // initializers run once, at start -- like on native. Re-running them
+        // per call would reset every global (the runtime's heap state included).
+        // The flag is a wasm global, so only instantiation resets it.
+        // Only the initializers are guarded: the synthesized entry call to the
+        // user's main() must still run on every call.
+        var guardLimit = statements.len()
+        if wasmGuardStatementCount >= 0 { guardLimit = wasmGuardStatementCount }
+        if guardLimit > 0 {
+            wasmFunctionBody.push(35)                            // global.get 2 (__initDone)
+            wasmFunctionBody.push(2)
+            wasmFunctionBody.push(69)                            // i32.eqz
+            wasmFunctionBody.push(4)                             // if
+            wasmFunctionBody.push(64)                            //   void block
+            for i in 0..guardLimit { emitWasmStatement(statements[i]) }
+            wasmFunctionBody.push(65)                            // i32.const
+            writeUnsignedLeb128(wasmFunctionBody, 1)
+            wasmFunctionBody.push(36)                            // global.set 2
+            wasmFunctionBody.push(2)
+            wasmFunctionBody.push(11)                            // end
+        }
+        for i in guardLimit..statements.len() { emitWasmStatement(statements[i]) }
+    } else {
+        for statement in statements { emitWasmStatement(statement) }
+    }
     restoreWasmStack()
     emitWasmInteger(0)
     wasmFunctionBody.push(11)                              // end
@@ -21036,7 +21067,18 @@ fn generateWasm(program: Node) {
     for topLevelNode in program.children {
         if topLevelNode.nodeKind != nodeFunction and topLevelNode.nodeKind != nodeStructDefinition and topLevelNode.nodeKind != nodeEnumDefinition and topLevelNode.nodeKind != nodeInterface { topLevelStatements.push(topLevelNode) }
     }
+    // Guard everything except a trailing synthesized `main()` entry call:
+    // initializers run once, the entry point runs on every host call.
+    var guardCount = topLevelStatements.len()
+    if guardCount > 0 {
+        let last = topLevelStatements[guardCount - 1]
+        if last.nodeKind == nodeExpressionStatement and last.children[0].nodeKind == nodeCall and last.children[0].children[0].nodeKind == nodeIdentifier and last.children[0].children[0].name == "main" { guardCount -= 1 }
+    }
+    wasmGuardTopLevelInit = 1
+    wasmGuardStatementCount = guardCount
     emitWasmFunctionBody(topLevelSlotCount, 0, topLevelStatements)
+    wasmGuardTopLevelInit = 0
+    wasmGuardStatementCount = -1
     writeUnsignedLeb128(wasmCodeBytes, wasmFunctionBody.len())
     appendWasmBytes(wasmCodeBytes, wasmFunctionBody)
     bodyCount += 1
@@ -21166,7 +21208,7 @@ fn writeWasm(path: str) {
     writeWasmSection(5, memorySection)
 
     var globalSection: [int] = []
-    writeUnsignedLeb128(globalSection, 2)
+    writeUnsignedLeb128(globalSection, 3)
     globalSection.push(127)                           // 0: i32 __sp
     globalSection.push(1)                             // mutable
     writeWasmInteger32(globalSection, wasmStackTop)
@@ -21175,6 +21217,11 @@ fn writeWasm(path: str) {
     globalSection.push(1)
     globalSection.push(66)
     writeSignedLeb128(globalSection, 0)
+    globalSection.push(11)
+    globalSection.push(127)                           // 2: i32 __initDone, one-shot top-level initializer guard
+    globalSection.push(1)
+    globalSection.push(65)
+    writeUnsignedLeb128(globalSection, 0)
     globalSection.push(11)
     writeWasmSection(6, globalSection)
 
