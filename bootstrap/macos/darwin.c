@@ -133,6 +133,8 @@ U darwin_GetThreadContext(U thread,U context) { (void)thread;(void)context; unsu
 U darwin_CreateThread(U security,U size,U entry,U argument,U flags,U id) { (void)security;(void)size;(void)entry;(void)argument;(void)flags;(void)id; unsupported("threads"); return 0; }
 U darwin_GetSystemInfo(U buffer) { memset((void*)buffer,0,48); *(uint32_t*)(buffer+32)=(uint32_t)sysconf(_SC_NPROCESSORS_ONLN); return 0; }
 U darwin_VirtualFree(U address,U size,U kind) { (void)address;(void)size;(void)kind; unsupported("VirtualFree"); return 0; }
+// the runtime hands large free heap spans back with this; keeping them resident is always safe
+U darwin_DiscardVirtualMemory(U address,U size) { (void)address;(void)size; return 0; }
 U darwin_SetLastError(U code) { last_error=code; return 0; }
 U darwin_GetLastError(void) { return last_error; }
 U darwin_DeleteFileA(U path) { return unlink((char*)path)==0; }

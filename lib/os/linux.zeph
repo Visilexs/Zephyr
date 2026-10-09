@@ -59,6 +59,13 @@ fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgumen
 }
 
 // Release a committed allocation returned by VirtualAlloc above.
+// The runtime hands large free spans back with DiscardVirtualMemory: the pages
+// stay mapped and writable, their contents become zero (MADV_DONTNEED).
+fn kernel32DiscardVirtualMemory(memoryAddress: int, byteCount: int) -> int {
+    if syscall(28, memoryAddress, byteCount, 4) != 0 { return 1 }
+    return 0
+}
+
 fn kernel32VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {
     if memoryAddress == 0 or freeFlags != 32768 { return 0 }
     let mappingAddress = memoryAddress - 4096

@@ -872,6 +872,16 @@ object is freed; the timing is an implementation property, not a language rule.
 The heap is non-moving. An object keeps its address for its whole life, which is
 what makes `addr()` (§3.6) usable.
 
+Freed memory is reused before the heap grows: freed blocks merge with a free
+successor, and a free block at the top of the heap is handed back to the bump
+pointer, so a long-running program's heap stays close to its live size instead
+of creeping. Very large free spans go back to the OS when the collector finds
+them; others stay resident, since a program that frees and reallocates in a
+loop would otherwise fault the same pages back in every round. A program that
+knows it has gone quiet (an interactive app after a burst of work) can call
+`runtimeTrimMemory()` to hand every free page back, dropping its resident
+memory to about its live set.
+
 Counting cannot reclaim a cycle: a struct reachable from itself keeps its own
 count above zero. A conservative mark-sweep collector stays linked underneath,
 scanning the machine stack and the globals array for anything that looks like a

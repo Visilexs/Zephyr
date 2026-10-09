@@ -17,7 +17,7 @@ let wasmStackTop = 24
 // Reserving address space is free on Windows and Linux. On wasm it is not:
 // memory.grow only extends the end, so a committed region ABOVE a sparse one
 // forces every page in between to exist. runtimeInitializeHeap reserves the heap
-// first and its bitmaps, free-back table and mark worklist second.
+// first and its bitmaps and mark worklist second.
 //
 // Two adjustments, both confined to this file:
 //   - every reserve is SCALED DOWN by 1/256. The bitmap sizes the runtime derives
@@ -90,11 +90,11 @@ fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgumen
         let want = byteCount >> wasmRegionShift
         if wasmReservedHeap == 0 {
             // the first reserve is the heap: park it above a window sized for every
-            // later reserve (the two bitmaps, the free-back table and the mark
-            // worklist -- exactly the sizes runtimeInitializeHeap derives), so the
+            // later reserve (the two bitmaps and the mark worklist -- exactly
+            // the sizes runtimeInitializeHeap derives), so the
             // heap is the topmost region and nothing sparse sits underneath it
             let base = load64(wasmHeap) + wasmOutsideHeap
-            let window = (((byteCount >> 6) >> wasmRegionShift) * 2 + want + ((byteCount >> 3) >> wasmRegionShift) + 65535) & (0 - 65536)
+            let window = (((byteCount >> 6) >> wasmRegionShift) * 2 + ((byteCount >> 3) >> wasmRegionShift) + 65535) & (0 - 65536)
             wasmSmallAllocationBase = base
             wasmHeapRegionStart = base + window
             wasmReservedHeap = wasmHeapRegionStart + want
@@ -119,6 +119,11 @@ fn kernel32VirtualAlloc(base: int, byteCount: int, flags: int, protectionArgumen
     wasmSmallAllocationPointer = wasmSmallAllocationPointer + byteCount
     if not wasmEnsure(allocationAddress + byteCount) { return 0 }
     return allocationAddress
+}
+
+fn kernel32DiscardVirtualMemory(memoryAddress: int, byteCount: int) -> int {
+    // ponytail: linear memory cannot give pages back
+    return 0
 }
 
 fn kernel32VirtualFree(memoryAddress: int, byteCount: int, freeFlags: int) -> int {

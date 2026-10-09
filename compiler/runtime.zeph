@@ -25,7 +25,7 @@ let runtimeHeapFlagFree = 2
 let runtimeObjectHeaderBytes = 24                        // header bytes before every payload
 
 var runtimeHeapBaseAddress = 0      // heap base
-var runtimeHeapBumpAddress = 0      // next never-yet-used address
+var runtimeHeapBumpAddress = 0      // end of the used heap: bump allocation starts here
 var runtimeHeapCommittedEnd = 0    // committed end
 var runtimeObjectStartBitmap = 0     // start bitmap
 var runtimeObjectMarkBitmap = 0      // mark bitmap
@@ -39,8 +39,14 @@ var runtimeFreeListHeads = 0         // array of runtimeSmallAllocationClassCoun
 // Free lists are doubly linked; the back pointer lives in an off-heap table
 // (one slot per 8-byte heap word) because a block's payload may be too short
 // to hold it (an 8-byte payload would overflow into the next header).
-var runtimeFreeBackTable = 0
-var runtimeFreeBackTableCommittedBytes = 0
+// Free blocks keep their list links inside themselves: payload [0] is the next
+// block in the list and the header's descriptor word [-16], unused while a
+// block is free, is the previous one ([-24], the count, stays 0). There used to
+// be a back-pointer table here with one word per heap word: it doubled the
+// committed footprint, and with transparent huge pages one touched word kept a
+// whole 2 MiB of it resident.
+var runtimeHeapDirtyEnd = 0         // [bump, dirty end) may hold dead objects: zero before reuse
+let runtimeDiscardBytes = 2097152   // free spans this large go back to the OS (DiscardVirtualMemory)
 // Blocks larger than 1 KiB sit in power-of-two bins (bin k: sizes 2^k up to
 // 2^(k+1)), whose heads follow the small classes' in the same off-heap page.
 // Any block in a higher bin fits, so a large allocation never walks more
@@ -53,6 +59,63 @@ fn runtimeLargeBin(size: int) -> int {
     var bin = 10
     while bin < 62 and (size >> (bin + 1)) != 0 { bin += 1 }
     return bin
+}
+
+// Which lists are non-empty: one bit per list head, indexed by the head's word
+// offset (small classes 0..128, large bins 130 + bin), kept in the heads page
+// at [2048, 2080). An empty class used to cost a walk over every larger class
+// head before the heap could bump: with a well-coalesced heap most lists are
+// empty, and a churn benchmark spent 2.2 billion loads there.
+let runtimeListBitsOffset = 2048
+let runtimeLastSmallList = 128
+let runtimeFirstBinList = 130                   // runtimeLargeBinsOffset / 8
+let runtimeLastBinList = 193
+
+fn runtimeMarkListFilled(headAddress: int) {
+    let index = (headAddress - runtimeFreeListHeads) >> 3
+    let word = runtimeFreeListHeads + runtimeListBitsOffset + ((index >> 6) << 3)
+    store64(word, load64(word) | (1 << (index & 63)))
+}
+
+fn runtimeMarkListEmpty(headAddress: int) {
+    let index = (headAddress - runtimeFreeListHeads) >> 3
+    let word = runtimeFreeListHeads + runtimeListBitsOffset + ((index >> 6) << 3)
+    store64(word, load64(word) & (0 - 1 - (1 << (index & 63))))
+}
+
+// the first non-empty list index in [from, last], else -1
+fn runtimeNextFilledList(from: int, last: int) -> int {
+    var index = from
+    while index <= last {
+        let shift = index & 63
+        var bits = load64(runtimeFreeListHeads + runtimeListBitsOffset + ((index >> 6) << 3))
+        if shift > 0 { bits = (bits >> shift) & ((1 << (64 - shift)) - 1) }
+        if bits != 0 {
+            let found = index + runtimeLowestBit(bits)
+            if found <= last { return found }
+            return 0 - 1
+        }
+        index = (index | 63) + 1
+    }
+    return 0 - 1
+}
+
+// position of the lowest set bit of a non-zero word
+fn runtimeLowestBit(word: int) -> int {
+    var bit = word & (0 - word)
+    var position = 0
+    if (bit & 4294967295) == 0 { position += 32
+        bit = bit >> 32 }
+    if (bit & 65535) == 0 { position += 16
+        bit = bit >> 16 }
+    if (bit & 255) == 0 { position += 8
+        bit = bit >> 8 }
+    if (bit & 15) == 0 { position += 4
+        bit = bit >> 4 }
+    if (bit & 3) == 0 { position += 2
+        bit = bit >> 2 }
+    if (bit & 1) == 0 { position += 1 }
+    return position
 }
 var runtimeNextCollectionAddress = 8388608    // collect once the bump pointer reaches this absolute address
 var runtimeLiveHeapBytes = 0       // bytes surviving the last collection
@@ -89,29 +152,46 @@ fn runtimeCommitMemory(base: int, byteCount: int) {
 }
 
 fn runtimePushFreeBlock(object: int, size: int) {
-    // Forward coalesce: absorb the address-adjacent successor if it is free. The
-    // mark-sweep is deferred while worker threads are alive (Linux cannot suspend
-    // stacks), so without this the free pool stays shredded into slivers between
-    // collections and the bump pointer advances past reusable space until the
-    // reservation is full -- a radius-32 scene OOM'd at 4 GiB committed with only
-    // ~300 MiB live. The successor is unlinked from its list first, so no stale
-    // entries are left behind.
-    let next = object + runtimeObjectHeaderBytes + size
+    // Forward coalesce: absorb the address-adjacent successor if it is free.
+    // (Not the predecessor: merging backwards turns a freed run of same-size
+    // objects into one big block, so the exact-size lists that serve the next
+    // round stay empty and every allocation carves -- binary trees ran 8x
+    // slower.) The mark-sweep is deferred while worker
+    // threads are alive (Linux cannot suspend stacks), so without this the free
+    // pool stays shredded into slivers between collections and the bump pointer
+    // advances past reusable space -- a radius-32 scene OOM'd at 4 GiB committed
+    // with only ~300 MiB live. Absorbed neighbours are unlinked first, so no
+    // stale entries are left behind.
+    var block = object
     var mergedSize = size
     // The sweep walks the heap in address order and re-reads size words after
     // pushing a run, so coalescing there would extend a word the walk has
     // already consumed and make it jump over live objects.
-    if runtimeSweepInProgress == 0 and next < runtimeHeapBumpAddress {
-        let nextWord = load64(next - 8)
-        if (nextWord & runtimeHeapFlagFree) != 0 {
-            let nextSize = nextWord & (0 - 8)
-            runtimeUnlinkFreeBlock(next, nextSize)
-            mergedSize = size + runtimeObjectHeaderBytes + nextSize
-            store64(object - 8, mergedSize | runtimeHeapFlagFree)
-            runtimeClearBitmapBit(runtimeObjectStartBitmap, (next - runtimeHeapBaseAddress) >> 3)
+    if runtimeSweepInProgress == 0 {
+        let next = block + runtimeObjectHeaderBytes + mergedSize
+        if next < runtimeHeapBumpAddress {
+            let nextWord = load64(next - 8)
+            if (nextWord & runtimeHeapFlagFree) != 0 {
+                let nextSize = nextWord & (0 - 8)
+                runtimeUnlinkFreeBlock(next, nextSize)
+                mergedSize = mergedSize + runtimeObjectHeaderBytes + nextSize
+                runtimeClearBitmapBit(runtimeObjectStartBitmap, (next - runtimeHeapBaseAddress) >> 3)
+            }
         }
+        store64(block - 8, mergedSize | runtimeHeapFlagFree)
+        // the heap's last block: hand it back to the bump pointer
+        if block + mergedSize == runtimeHeapBumpAddress {
+            runtimeClearBitmapBit(runtimeObjectStartBitmap, (block - runtimeHeapBaseAddress) >> 3)
+            runtimeLowerBump(block - runtimeObjectHeaderBytes)
+            return
+        }
+    } else if mergedSize >= runtimeDiscardBytes {
+        // a big dead run found by the collector: its pages go back to the OS
+        // (keeping payload [0], the list link). Frees on the allocation path
+        // don't do this: a block that keeps growing as its neighbours die would
+        // be discarded again on every merge.
+        runtimeDiscardSpan(block + 8, block + mergedSize, 65536)
     }
-    // doubly linked: payload [0] = next, [8] = back
     let sizeClass = mergedSize >> 3
     var headAddress = 0
     if sizeClass <= runtimeSmallAllocationClassCount {
@@ -120,10 +200,96 @@ fn runtimePushFreeBlock(object: int, size: int) {
         headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(mergedSize) * 8
     }
     let oldHead = load64(headAddress)
-    store64(object, oldHead)
-    store64(runtimeFreeBackSlot(object), 0)
-    if oldHead != 0 { store64(runtimeFreeBackSlot(oldHead), object) }
-    store64(headAddress, object)
+    store64(block, oldHead)
+    store64(block - 16, 0)
+    if oldHead != 0 { store64(oldHead - 16, block) } else {
+        let listIndex = (headAddress - runtimeFreeListHeads) >> 3
+        let listWord = runtimeFreeListHeads + runtimeListBitsOffset + ((listIndex >> 6) << 3)
+        store64(listWord, load64(listWord) | (1 << (listIndex & 63)))
+    }
+    store64(headAddress, block)
+}
+
+// The tail of a free block just carved: its predecessor is the block handed
+// out, so only the next block can merge with it (it may have died since, if
+// the backward search couldn't reach this block's start).
+fn runtimePushRemainder(block: int, size: int) {
+    var mergedSize = size
+    let next = block + runtimeObjectHeaderBytes + size
+    if next < runtimeHeapBumpAddress {
+        let nextWord = load64(next - 8)
+        if (nextWord & runtimeHeapFlagFree) != 0 {
+            let nextSize = nextWord & (0 - 8)
+            runtimeUnlinkFreeBlock(next, nextSize)
+            mergedSize = mergedSize + runtimeObjectHeaderBytes + nextSize
+            runtimeClearBitmapBit(runtimeObjectStartBitmap, (next - runtimeHeapBaseAddress) >> 3)
+            store64(block - 8, mergedSize | runtimeHeapFlagFree)
+        }
+    }
+    if block + mergedSize == runtimeHeapBumpAddress {
+        runtimeClearBitmapBit(runtimeObjectStartBitmap, (block - runtimeHeapBaseAddress) >> 3)
+        runtimeLowerBump(block - runtimeObjectHeaderBytes)
+        return
+    }
+    let sizeClass = mergedSize >> 3
+    var headAddress = 0
+    if sizeClass <= runtimeSmallAllocationClassCount {
+        headAddress = runtimeFreeListHeads + sizeClass * 8
+    } else {
+        headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(mergedSize) * 8
+    }
+    let oldHead = load64(headAddress)
+    store64(block, oldHead)
+    store64(block - 16, 0)
+    if oldHead != 0 { store64(oldHead - 16, block) } else {
+        let listIndex = (headAddress - runtimeFreeListHeads) >> 3
+        let listWord = runtimeFreeListHeads + runtimeListBitsOffset + ((listIndex >> 6) << 3)
+        store64(listWord, load64(listWord) | (1 << (listIndex & 63)))
+    }
+    store64(headAddress, block)
+}
+
+// Lower the bump pointer to `newBump` (the end of the last block still in
+// use). The memory above it may hold dead objects, and bump allocation
+// assumes zeroed memory, so it is marked dirty. It is not discarded here: a
+// temporary at the top of the heap is often freed and reallocated in a loop,
+// and discarding would make every round trip fault its pages back in
+// (runtimeTrimMemory and the collector give it back).
+fn runtimeLowerBump(newBump: int) {
+    if runtimeHeapBumpAddress > runtimeHeapDirtyEnd { runtimeHeapDirtyEnd = runtimeHeapBumpAddress }
+    runtimeHeapBumpAddress = newBump
+}
+
+// Hand every large free span (and the dirty tail above the bump pointer) back
+// to the OS. Freeing a span over runtimeDiscardBytes does this at once; smaller
+// ones are left resident because a churning program would reuse and re-fault
+// them every frame. A program that knows it has gone idle (a UI after a burst
+// of work) can call this to drop its resident memory to about its live size.
+fn runtimeTrimMemory() {
+    if runtimeHeapInitialized == 0 { return }
+    runtimeLockHeap()
+    var bin = 0
+    while bin < runtimeLargeBinCount {
+        var block = load64(runtimeFreeListHeads + runtimeLargeBinsOffset + bin * 8)
+        while block != 0 {
+            runtimeDiscardSpan(block + 8, block + (load64(block - 8) & (0 - 8)), 4096)
+            block = load64(block)
+        }
+        bin += 1
+    }
+    if runtimeHeapDirtyEnd > runtimeHeapBumpAddress { runtimeDiscardSpan(runtimeHeapBumpAddress, runtimeHeapDirtyEnd, 4096) }
+    runtimeUnlockHeap()
+}
+
+// Give the whole pages inside [lower, upper) back to the OS. Their contents
+// become undefined (zero on Linux), which is fine: free-list allocation zeroes
+// what it hands out, and the bump path zeroes anything below the dirty end.
+// Spans under `minimum` bytes are kept: on the allocation path a syscall and
+// the page faults that follow cost more than a few resident pages.
+fn runtimeDiscardSpan(lower: int, upper: int, minimum: int) {
+    let first = (lower + 4095) & (0 - 4096)
+    let last = upper & (0 - 4096)
+    if last - first >= minimum { let ignored = win("DiscardVirtualMemory", first, last - first) }
 }
 
 // remove a free block from its list (O(1) through the back-pointer table); used
@@ -136,15 +302,18 @@ fn runtimeUnlinkFreeBlock(block: int, size: int) {
     } else {
         headAddress = runtimeFreeListHeads + runtimeLargeBinsOffset + runtimeLargeBin(size) * 8
     }
-    let backSlot = runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)
-    let back = load64(backSlot)
+    let back = load64(block - 16)
     let forward = load64(block)
-    if back != 0 { store64(back, forward) } else { store64(headAddress, forward) }
-    if forward != 0 { store64(runtimeFreeBackTable + (((forward - runtimeHeapBaseAddress) >> 3) << 3), back) }
+    if back != 0 { store64(back, forward) } else {
+        store64(headAddress, forward)
+        if forward == 0 { runtimeMarkListEmpty(headAddress) }
+    }
+    if forward != 0 { store64(forward - 16, back) }
 }
 
+// where a free block keeps its previous-in-list link
 fn runtimeFreeBackSlot(block: int) -> int {
-    return runtimeFreeBackTable + (((block - runtimeHeapBaseAddress) >> 3) << 3)
+    return block - 16
 }
 
 fn runtimeInitializeHeap() {
@@ -158,8 +327,6 @@ fn runtimeInitializeHeap() {
     runtimeNextCollectionAddress = runtimeHeapBaseAddress + 8388608                   // first collection after 8 MiB of growth
     runtimeObjectStartBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word
     runtimeObjectMarkBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)
-    runtimeFreeBackTable = runtimeReserveMemory(runtimeHeapReserve)          // back pointer per 8-byte word (same span as the heap)
-    runtimeFreeBackTableCommittedBytes = 0
     runtimeBitmapCommittedBytes = 0
     runtimeMarkWorklist = runtimeReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to 16M pending objects
     runtimeWorklistCommittedBytes = 0                         // (reserve is address space only -- free)
@@ -180,10 +347,6 @@ fn runtimeGrowHeap(endAddress: int) {
         runtimeCommitMemory(runtimeObjectStartBitmap, bitmapBytesNeeded)
         runtimeCommitMemory(runtimeObjectMarkBitmap, bitmapBytesNeeded)
         runtimeBitmapCommittedBytes = bitmapBytesNeeded
-    }
-    if want > runtimeFreeBackTableCommittedBytes {
-        runtimeCommitMemory(runtimeFreeBackTable, want)
-        runtimeFreeBackTableCommittedBytes = want
     }
 }
 
@@ -457,6 +620,11 @@ fn runtimeCollectGarbage() {
         store64(runtimeFreeListHeads + runtimeLargeBinsOffset + bin * 8, 0)
         bin += 1
     }
+    var bitsWord = 0
+    while bitsWord < 4 {
+        store64(runtimeFreeListHeads + runtimeListBitsOffset + bitsWord * 8, 0)
+        bitsWord += 1
+    }
     runtimeLiveHeapBytes = 0
     runtimeUnreleasedObjectCount = 0
     // The sweep coalesces. It already walks the heap in address order, so a
@@ -510,11 +678,13 @@ fn runtimeCollectGarbage() {
         }
         object = object + runtimeObjectHeaderBytes + size
     }
-    if runStart != 0 {
-        store64(runStart - 8, runSize | runtimeHeapFlagFree)
-        runtimePushFreeBlock(runStart, runSize)
-    }
     runtimeSweepInProgress = 0
+    if runStart != 0 {
+        // the heap's tail is dead: give it back to the bump pointer
+        runtimeClearBitmapBit(runtimeObjectStartBitmap, (runStart - runtimeHeapBaseAddress) >> 3)
+        runtimeLowerBump(runStart - runtimeObjectHeaderBytes)
+        if runtimeHeapDirtyEnd - runtimeHeapBumpAddress >= runtimeDiscardBytes { runtimeDiscardSpan(runtimeHeapBumpAddress, runtimeHeapDirtyEnd, 65536) }
+    }
 }
 
 // ---- reference counting ----
@@ -848,7 +1018,9 @@ fn runtimeTakeFreeBlock(need: int) -> int {
         if head != 0 {
             let headNext = load64(head)
             store64(runtimeFreeListHeads + sizeClass * 8, headNext)        // pop
-            if headNext != 0 { store64(runtimeFreeBackSlot(headNext), 0) }
+            if headNext != 0 { store64(headNext - 16, 0) } else { let listIndex = ((runtimeFreeListHeads + sizeClass * 8) - runtimeFreeListHeads) >> 3
+            let listWord = runtimeFreeListHeads + runtimeListBitsOffset + ((listIndex >> 6) << 3)
+            store64(listWord, load64(listWord) & (0 - 1 - (1 << (listIndex & 63)))) }
             store64(head - 8, need)                      // live again, flags cleared
             runtimeZeroMemory(head, need)
             return head
@@ -860,22 +1032,30 @@ fn runtimeTakeFreeBlock(need: int) -> int {
         // often empty while plenty of memory is free. Without this, every such
         // allocation bumped past that free space: pi-desk reached a 1 GB extent
         // in 53 s with 5 MB live, and hit "heap full" after 1h41m.
+        // the next few classes directly (sizes cluster), then the bitmap
         var stealClass = sizeClass + 1
-        while stealClass <= runtimeSmallAllocationClassCount {
-            let block = load64(runtimeFreeListHeads + stealClass * 8)
-            if block != 0 {
-                let blockNext = load64(block)
-                store64(runtimeFreeListHeads + stealClass * 8, blockNext)
-                if blockNext != 0 { store64(runtimeFreeBackSlot(blockNext), 0) }
-                return runtimeCarveFreeBlock(block, stealClass * 8, need)
+        while stealClass <= sizeClass + 4 and stealClass <= runtimeLastSmallList and load64(runtimeFreeListHeads + stealClass * 8) == 0 { stealClass += 1 }
+        if stealClass > sizeClass + 4 or stealClass > runtimeLastSmallList { stealClass = runtimeNextFilledList(stealClass, runtimeLastSmallList) }
+        if stealClass > 0 {
+            let stealHead = runtimeFreeListHeads + stealClass * 8
+            let block = load64(stealHead)
+            let blockNext = load64(block)
+            store64(stealHead, blockNext)
+            if blockNext != 0 { store64(blockNext - 16, 0) } else {
+                let listIndex = stealClass
+                let listWord = runtimeFreeListHeads + runtimeListBitsOffset + ((listIndex >> 6) << 3)
+                store64(listWord, load64(listWord) & (0 - 1 - (1 << (listIndex & 63))))
             }
-            stealClass += 1
+            return runtimeCarveFreeBlock(block, stealClass * 8, need)
         }
         bin = runtimeLargeBin(1024)
     } else {
         bin = runtimeLargeBin(need)                  // first fit over a few blocks of need's own bin, else the head of any higher one
     }
     while bin < runtimeLargeBinCount {
+        let filled = runtimeNextFilledList(runtimeFirstBinList + bin, runtimeLastBinList)
+        if filled < 0 { return 0 }
+        bin = filled - runtimeFirstBinList
         let head = runtimeFreeListHeads + runtimeLargeBinsOffset + bin * 8
         var probes = 0
         var previous = 0
@@ -886,6 +1066,7 @@ fn runtimeTakeFreeBlock(need: int) -> int {
             if size >= need {
                 if previous == 0 { store64(head, nextBlock) } else { store64(previous, nextBlock) }
                 if nextBlock != 0 { store64(runtimeFreeBackSlot(nextBlock), previous) }
+                if previous == 0 and nextBlock == 0 { runtimeMarkListEmpty(head) }
                 return runtimeCarveFreeBlock(current, size, need)
             }
             probes += 1
@@ -905,7 +1086,7 @@ fn runtimeCarveFreeBlock(current: int, size: int, need: int) -> int {
         let remainderAddress = current + need + runtimeObjectHeaderBytes            // payload of the remainder
         store64(remainderAddress - 8, remainderSize | runtimeHeapFlagFree)
         runtimeSetBitmapBit(runtimeObjectStartBitmap, (remainderAddress - runtimeHeapBaseAddress) >> 3)
-        runtimePushFreeBlock(remainderAddress, remainderSize)
+        runtimePushRemainder(remainderAddress, remainderSize)
     } else {
         store64(current - 8, size)
     }
@@ -931,7 +1112,9 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
         if block != 0 {
             let blockNext = load64(block)
             store64(listHead, blockNext)
-            if blockNext != 0 { store64(runtimeFreeBackSlot(blockNext), 0) }
+            if blockNext != 0 { store64(blockNext - 16, 0) } else { let listIndex = (listHead - runtimeFreeListHeads) >> 3
+            let listWord = runtimeFreeListHeads + runtimeListBitsOffset + ((listIndex >> 6) << 3)
+            store64(listWord, load64(listWord) & (0 - 1 - (1 << (listIndex & 63)))) }
             store64(block - 8, need)                          // live again, flags cleared
             runtimeZeroMemory(block, need)
             store64(block - 24, 1)
@@ -1166,10 +1349,16 @@ fn runtimeAllocateObjectPayload(size: int) -> int {
     // bump
     runtimeGrowHeap(runtimeHeapBumpAddress + runtimeObjectHeaderBytes + need)
     let object = runtimeHeapBumpAddress + runtimeObjectHeaderBytes
+    if object < runtimeHeapDirtyEnd {
+        // reusing memory a lowered bump pointer gave up: it may hold dead objects
+        let end = object + need
+        runtimeZeroMemory(object, (if end < runtimeHeapDirtyEnd { end } else { runtimeHeapDirtyEnd }) - object)
+        if end >= runtimeHeapDirtyEnd { runtimeHeapDirtyEnd = 0 }
+    }
     store64(object - 8, need)
     runtimeHeapBumpAddress = object + need
     runtimeSetBitmapBit(runtimeObjectStartBitmap, (object - runtimeHeapBaseAddress) >> 3)
-    return object                                       // committed pages start zeroed
+    return object                                       // committed pages start zeroed (or were zeroed above)
 }
 
 fn runtimeZeroMemory(address: int, byteCount: int) {
