@@ -552,6 +552,10 @@ is `INT_MAX`, `-1e300 as int` is `INT_MIN`), and NaN converts to 0.
 
 ### 3.3 Operators
 
+An expression may nest at most 2000 levels deep (operators, parentheses,
+calls and literals each count; a flat `a + b + c + ...` chain nests once per
+operator). Deeper expressions are a compile error.
+
 Expressions evaluate left to right: binary operands, call arguments, literal
 elements and fields (including map keys before their values), and the container
 before the index in `xs[i]`. Each read happens at its position in that order;

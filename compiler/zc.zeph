@@ -2053,7 +2053,21 @@ fn binaryPrecedence(tokenKind: int) -> int {
     return 0
 }
 
+// Expression nesting limit: see checkExpressionNesting.
+let maximumExpressionNesting = 2000
+var parseExpressionNesting = 0
+
 fn parseExpression(minimumPrecedence: int) -> Node {
+    parseExpressionNesting += 1                  // parentheses, calls, literals and precedence levels recurse
+    if parseExpressionNesting > maximumExpressionNesting {
+        failCompilation(peek().line, "expression nested too deeply (more than {maximumExpressionNesting} levels); split it into several statements")
+    }
+    let parsed = parseExpressionNested(minimumPrecedence)
+    parseExpressionNesting -= 1
+    return parsed
+}
+
+fn parseExpressionNested(minimumPrecedence: int) -> Node {
     var leftHandSide = parseUnary()
     var lastComparison = makeNode(nodeNone, 0)   // the comparison just parsed, for chaining
     var going = true
@@ -2469,7 +2483,34 @@ fn parse(tokens: [Token]) -> Node {
         else { pushStatement(program, parseStatement()) }
         terminator()
     }
+    checkExpressionNesting(program)
     return program
+}
+
+// Every pass walks expressions recursively, so a tree nested deeper than this
+// would overflow the compiler's stack (left-assoc chains such as a + b + ...
+// need no parser recursion to get deep). Statement nesting (else-if chains,
+// blocks) costs little stack and is not counted. Iterative, so the check
+// itself cannot overflow.
+
+fn checkExpressionNesting(root: Node) {
+    var nodes: [Node] = [root]
+    var depths: [int] = [0]
+    while nodes.len() > 0 {
+        let node = nodes.pop()
+        var depth = depths.pop()
+        let kind = node.nodeKind
+        if kind != nodeProgram and kind != nodeIf and kind != nodeOptionalBinding and kind != nodeFunction and kind != nodeImpl {
+            depth += 1
+            if depth > maximumExpressionNesting {
+                failCompilation(node.line, "expression nested too deeply (more than {maximumExpressionNesting} levels); split it into several statements")
+            }
+        }
+        for child in node.children {
+            nodes.push(child)
+            depths.push(depth)
+        }
+    }
 }
 
 // ---------------- types ----------------
@@ -7119,6 +7160,11 @@ fn nodeBecome(expression: Node, source: Node) {
     expression.children = source.children
 }
 
+fn foldLeaf(expression: Node) -> bool {
+    let kind = expression.nodeKind
+    return kind == nodeInteger or kind == nodeFloat or kind == nodeBoolean or kind == nodeIdentifier
+}
+
 fn foldConstants(expression: Node) {
     for i in 0..expression.children.len() { foldConstants(expression.children[i]) }
     // `and`/`or` with a literal side: true-and-X is X, X-and-true is X (X is
@@ -7138,6 +7184,11 @@ fn foldConstants(expression: Node) {
         }
     }
     if expression.nodeKind != nodeBinary and expression.nodeKind != nodeNegate and expression.nodeKind != nodeCast and expression.nodeKind != nodeNot { return }
+    // The children are folded already: an operand that is still an operator
+    // node did not fold, so neither can this one. Checking that here keeps the
+    // pass linear (constantFoldEval re-walks the whole subtree).
+    if expression.children.len() > 0 and not foldLeaf(expression.children[0]) { return }
+    if expression.nodeKind == nodeBinary and not foldLeaf(expression.children[1]) { return }
     let folded = constantFoldEval(expression)
     if folded.nodeKind != nodeInteger and folded.nodeKind != nodeFloat and folded.nodeKind != nodeBoolean { return }
     expression.nodeKind = folded.nodeKind
