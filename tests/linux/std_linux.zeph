@@ -28,12 +28,18 @@ let commandLine = readAll(fd)
 closeFd(fd)
 if commandLine.len() > 0 { print("readall ok") } else { print("readall fail") }
 
-// monotonicNanoseconds must never go backwards: on rejected calls it returns the
-// last good value instead of a fresh (possibly clobbered) reading.
-var first = monotonicNanoseconds()
-var spins = 0
-while spins < 1000 {
-    spins += 1
+// monotonicNanoseconds is a real clock: positive, never backwards, and it
+// moves across a 2 ms sleep (nanosleep, syscall 35)
+let first = monotonicNanoseconds()
+var previous = first
+var backwards = false
+for i in 0..1000 {
+    let now = monotonicNanoseconds()
+    if now < previous { backwards = true }
+    previous = now
 }
+let sleepRequest = Bytes.new(16)
+sleepRequest.put64(8, 2000000)
+assert(syscall(35, sleepRequest.addr(), 0) == 0)
 let second = monotonicNanoseconds()
-if second >= first { print("ns monotonic true") } else { print("ns monotonic false") }
+print("ns monotonic", first > 0 and not backwards and second - first >= 2000000 and second - first < 10000000000)

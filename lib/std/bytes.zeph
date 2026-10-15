@@ -15,13 +15,21 @@ struct Bytes {
     size: int          // usable size in bytes
 }
 
+// The one bounds check: `width` bytes at `offset` lie inside the buffer.
+// Written so that no sum can overflow: a huge offset or width panics instead
+// of wrapping around to a small, "valid" address.
+private fn check(buffer: Bytes, offset: int, width: int) {
+    if offset < 0 or width < 0 or width > buffer.size - offset {
+        panic("Bytes: {width} bytes at offset {offset} out of range for size {buffer.size}")
+    }
+}
+
 impl Bytes {
     // n zero-filled bytes, aligned to 16 so any C struct laid at offset 0 is aligned
     fn new(size: int) -> Bytes {
-        assert(size >= 0, "Bytes.new: negative size")
+        assert(size >= 0 and size < 1 << 56, "Bytes.new: bad size")
         var memory = zeros(size / 8 + 4)                 // slack for the alignment bump
-        let base = load64(addr(memory) + 16)          // list layout: [0]len [8]cap [16]data
-        let address = (base + 15) & (0 - 16)
+        let address = (dataAddr(memory) + 15) & (0 - 16)
         return Bytes{memory: memory, address: address, size: size}
     }
 
@@ -30,7 +38,7 @@ impl Bytes {
 
     // address of byte `off`, for passing an interior pointer to a foreign call
     fn at(self, offset: int) -> int {
-        assert(offset >= 0 and offset <= self.size, "Bytes.at: offset out of range")
+        check(self, offset, 0)
         return self.address + offset
     }
 
@@ -41,70 +49,102 @@ impl Bytes {
         return self.address + offset
     }
 
+    // `length` bytes at `offset` as a Bytes of their own. Both views share the
+    // same memory (writes through one show in the other) and keep it alive.
+    fn slice(self, offset: int, length: int) -> Bytes {
+        check(self, offset, length)
+        return Bytes{memory: self.memory, address: self.address + offset, size: length}
+    }
+
+    // copy `length` bytes from `source` at `sourceOffset` to `offset`; the
+    // ranges may overlap (memmove)
+    fn copyFrom(self, offset: int, source: Bytes, sourceOffset: int, length: int) {
+        check(self, offset, length)
+        check(source, sourceOffset, length)
+        copyMemory(self.address + offset, source.address + sourceOffset, length)
+    }
+
+    // set `length` bytes at `offset` to `value & 255`
+    fn fill(self, offset: int, length: int, value: int) {
+        check(self, offset, length)
+        fillMemory(self.address + offset, value, length)
+    }
+
     fn put8(self, offset: int, value: int) {
-        assert(offset >= 0 and offset + 1 <= self.size, "Bytes.put8: out of range")
+        check(self, offset, 1)
         store8(self.address + offset, value)
     }
     fn get8(self, offset: int) -> int {
-        assert(offset >= 0 and offset + 1 <= self.size, "Bytes.get8: out of range")
+        check(self, offset, 1)
         return load8(self.address + offset)
     }
 
     fn put16(self, offset: int, value: int) {
-        assert(offset >= 0 and offset + 2 <= self.size, "Bytes.put16: out of range")
-        store8(self.address + offset, value & 255)
-        store8(self.address + offset + 1, (value >> 8) & 255)
+        check(self, offset, 2)
+        store16(self.address + offset, value)
     }
     fn get16(self, offset: int) -> int {
-        assert(offset >= 0 and offset + 2 <= self.size, "Bytes.get16: out of range")
-        return load8(self.address + offset) + load8(self.address + offset + 1) * 256
+        check(self, offset, 2)
+        return load16(self.address + offset)
     }
 
     fn put32(self, offset: int, value: int) {
-        assert(offset >= 0 and offset + 4 <= self.size, "Bytes.put32: out of range")
+        check(self, offset, 4)
         store32(self.address + offset, value)
     }
     // zero-extends: Vulkan's 32-bit fields are enums, flags and counts
     fn get32(self, offset: int) -> int {
-        assert(offset >= 0 and offset + 4 <= self.size, "Bytes.get32: out of range")
-        let lowHalf = load8(self.address + offset) + load8(self.address + offset + 1) * 256
-        return lowHalf + load8(self.address + offset + 2) * 65536 + load8(self.address + offset + 3) * 16777216
+        check(self, offset, 4)
+        return load32(self.address + offset)
     }
 
     fn put64(self, offset: int, value: int) {
-        assert(offset >= 0 and offset + 8 <= self.size, "Bytes.put64: out of range")
+        check(self, offset, 8)
         store64(self.address + offset, value)
     }
     fn get64(self, offset: int) -> int {
-        assert(offset >= 0 and offset + 8 <= self.size, "Bytes.get64: out of range")
+        check(self, offset, 8)
         return load64(self.address + offset)
     }
 
-    fn putFloat32(self, offset: int, value: float) { self.put32(offset, float32Bits(value)) }
-    fn getFloat32(self, offset: int) -> float { return float32FromBits(self.get32(offset)) }
+    // an IEEE single: rounded to nearest on the way in, widened exactly on the way out
+    fn putFloat32(self, offset: int, value: float) {
+        check(self, offset, 4)
+        storeF32(self.address + offset, value)
+    }
+    fn getFloat32(self, offset: int) -> float {
+        check(self, offset, 4)
+        return loadF32(self.address + offset)
+    }
 
-    fn putFloat64(self, offset: int, value: float) { self.put64(offset, bits(value)) }
-    fn getFloat64(self, offset: int) -> float { return floatFromBits(self.get64(offset)) }
+    fn putFloat64(self, offset: int, value: float) {
+        check(self, offset, 8)
+        storeF64(self.address + offset, value)
+    }
+    fn getFloat64(self, offset: int) -> float {
+        check(self, offset, 8)
+        return loadF64(self.address + offset)
+    }
 
     // copy a Zephyr string in and NUL-terminate it -- a C `const char*`
     fn putCString(self, offset: int, text: str) {
-        assert(offset >= 0 and offset + text.len() + 1 <= self.size, "Bytes.putCString: out of range")
-        for i in 0..text.len() { store8(self.address + offset + i, text.byte(i)) }
+        check(self, offset, text.len() + 1)
+        copyMemory(self.address + offset, dataAddr(text), text.len())
         store8(self.address + offset + text.len(), 0)
     }
 
     // copy raw bytes of a str (e.g. a .spv file read with readFile) in
     fn putString(self, offset: int, text: str) {
-        assert(offset >= 0 and offset + text.len() <= self.size, "Bytes.putString: out of range")
-        for i in 0..text.len() { store8(self.address + offset + i, text.byte(i)) }
+        check(self, offset, text.len())
+        copyMemory(self.address + offset, dataAddr(text), text.len())
     }
 
     // read `n` bytes back out as a str
     fn getString(self, offset: int, length: int) -> str {
-        assert(offset >= 0 and offset + length <= self.size, "Bytes.getString: out of range")
-        var parts: [str] = []
-        for i in 0..length { parts.push(chr(load8(self.address + offset + i))) }
-        return parts.join()
+        check(self, offset, length)
+        let text = " ".repeat(length)                // a fresh string, filled in place
+        copyMemory(dataAddr(text), self.address + offset, length)
+        return text
     }
 }
 
@@ -138,7 +178,7 @@ fn pack(items: [Bytes]) -> Bytes {
     let stride = items[0].len()
     var packed = Bytes.new(stride * items.len() + 8)
     for i in 0..items.len() {
-        for j in 0..stride { packed.put8(i * stride + j, items[i].get8(j)) }
+        packed.copyFrom(i * stride, items[i], 0, stride)
     }
     return packed
 }

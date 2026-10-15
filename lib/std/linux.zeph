@@ -45,12 +45,14 @@ fn memOpen(pid: int) -> int {
 // Reads up to `length` bytes from `address` in the process backing `fd`
 // (from memOpen) into `buffer`. Returns the byte count, or a negative errno.
 fn memRead(fd: int, address: int, buffer: Bytes, length: int) -> int {
+    assert(length >= 0 and length <= buffer.len(), "memRead: {length} bytes do not fit a Bytes of {buffer.len()}")
     return syscall(17, fd, buffer.addr(), length, address)
 }
 
 // Writes up to `length` bytes from `buffer` to `address` in the process
 // backing `fd` (from memOpen). Returns the byte count, or a negative errno.
 fn memWrite(fd: int, address: int, buffer: Bytes, length: int) -> int {
+    assert(length >= 0 and length <= buffer.len(), "memWrite: {length} bytes do not fit a Bytes of {buffer.len()}")
     return syscall(18, fd, buffer.addr(), length, address)
 }
 
@@ -115,36 +117,9 @@ fn closeFd(fd: int) {
 // ---- nanosecond clock ----
 
 // CLOCK_MONOTONIC in nanoseconds, for latency measurement and input jitter;
-// nowMilliseconds is too coarse.
-// Raw clock_gettime64 (299) into a red-zone window below rsp -- every Zephyr
-// allocation (lists, structs, Bytes) lives in mmap'd off-heap memory, which
-// recent kernels reject for this syscall, and the 32-bit clock_gettime (232)
-// is broken outright on them. Patched kernels also fail the first clock
-// syscall of a process (lazy per-task init), hence the single retry. The
-// red-zone window can be clobbered by caller frames, so the result is
-// sanity-checked (bounded fields, non-decreasing); when the kernel rejects
-// the call or the read looks wrong, the last good value is returned instead
-// of garbage (the timestamp stalls rather than jumping). Rarely the kernel
-// blocks the call for a while during a quirk window; that shows up as a
-// stall, not a wrong value.
-// ponytail: stall ceiling; a C shim calling libc clock_gettime (vDSO fast
-// path) gives true ns precision everywhere.
-var lastClockNanoseconds = 0
-
+// nowMilliseconds is too coarse. clock_gettime (228) into a 16-byte timespec.
 fn monotonicNanoseconds() -> int {
-    let base = stackPointer() & (0 - 16) - 48
-    var result = syscall(299, 1, base)
-    if result != 0 { result = syscall(299, 1, base) }
-    if result == 0 {
-        let seconds = load64(base)
-        let nanos = load64(base + 8)
-        if seconds >= 0 and seconds < 1000000000 and nanos >= 0 and nanos < 1000000000 {
-            let value = seconds * 1000000000 + nanos
-            if value >= lastClockNanoseconds {
-                lastClockNanoseconds = value
-                return value
-            }
-        }
-    }
-    return lastClockNanoseconds
+    let timespec = Bytes.new(16)
+    assert(syscall(228, 1, timespec.addr()) == 0, "monotonicNanoseconds: clock_gettime failed")
+    return timespec.get64(0) * 1000000000 + timespec.get64(8)
 }

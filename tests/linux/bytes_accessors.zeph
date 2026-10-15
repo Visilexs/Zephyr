@@ -1,0 +1,37 @@
+// std/bytes accessors on the raw builtins, plus copyFrom, fill and slice
+import "std/bytes.zeph"
+
+fn main() {
+    let b = Bytes.new(64)
+    b.put8(0, 300)
+    b.put16(2, 0xBEEF)
+    b.put32(4, 0xDEADBEEF)
+    b.put64(8, 0 - 2)
+    print(b.get8(0), b.get16(2), b.get32(4), b.get64(8))   // 44 48879 3735928559 -2
+    print(b.get8(2), b.get8(3))                             // 239 190 (little-endian)
+    b.putFloat32(16, 0.1)
+    b.putFloat64(24, 0.1)
+    print(b.getFloat32(16), b.getFloat64(24), b.get32(16) == float32Bits(0.1))
+    b.putFloat32(16, 0 - 1e40)
+    print(b.getFloat32(16))                                 // -inf
+    b.putCString(32, "hi")
+    print(b.get8(34), b.getString(32, 2), b.getString(0, 0).len())
+    b.putString(40, "zephyr")
+    print(b.getString(40, 6))
+
+    // fill, copyFrom (overlapping too), slice views
+    b.fill(48, 16, 0x41)
+    print(b.getString(48, 16))
+    b.copyFrom(49, b, 40, 6)
+    print(b.getString(48, 8))                               // AzephyrA
+    b.copyFrom(48, b, 49, 6)
+    print(b.getString(48, 8))                               // zephyrrA
+    let view = b.slice(40, 6)
+    view.put8(0, 90)                                        // 'Z', seen through b
+    print(view.len(), view.getString(0, 6), b.get8(40))
+    let other = Bytes.new(6)
+    other.copyFrom(0, view, 0, 6)
+    print(other.getString(0, 6), pack([other, other]).getString(0, 12))
+    print(b.at(64) - b.addr(), b.slice(64, 0).len())
+    print(cString("abc").getString(0, 4).len(), uint32Array([1, 2]).get32(4))
+}

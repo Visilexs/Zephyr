@@ -56,6 +56,8 @@ declare -A EXPECT_EXIT=(
     [str_int_overflow]=1
     [cstruct_array_length]=1
     [cstruct_bytes_range]=1
+    [bytes_huge_offset]=1
+    [bytes_huge_length]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }

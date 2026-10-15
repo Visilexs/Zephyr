@@ -276,6 +276,9 @@ let callKindRoundToSingle = 42    // toSingle(x): round a double to the nearest 
 let callKindSystemVCall = 43       // Linux: System V AMD64 call through a raw code address (dlsym)
 let callKindSystemVCallFloat = 44  // the same, returning xmm0
 let callKindDynamicImport = 45     // Linux: address of a GOT slot ld.so fills (dlopen, dlsym)
+let callKindStore16 = 46
+let callKindSingleBits = 47        // float -> bits of the nearest IEEE single (storeF32)
+let callKindFloatFromSingleBits = 48   // bits of an IEEE single -> the float, widened exactly (loadF32)
 // cast kinds
 let castKindNoOperation = 0
 let castKindTruncate = 1
@@ -3468,6 +3471,8 @@ fn isBuiltinName(name: str) -> bool {
     if name == "abs" or name == "min" or name == "max" or name == "pow" { return true }
     if name == "load64" or name == "load32" or name == "load16" or name == "load8" or name == "store64" or name == "store32" or name == "store8" { return true }
     if name == "stackPointer" or name == "win" or name == "addr" { return true }
+    if name == "store16" or name == "loadI8" or name == "loadI16" or name == "loadI32" or name == "dataAddr" { return true }
+    if name == "loadF32" or name == "storeF32" or name == "loadF64" or name == "storeF64" or name == "copyMemory" or name == "fillMemory" { return true }
     return false
 }
 
@@ -4930,7 +4935,33 @@ fn checkIndirect(expression: Node, valueType: int) -> int {
 }
 
 var checkCallBuiltinNames: [str: bool] = [:]       // every name checkCall handles itself, ahead of user functions
-for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV", "callSysVFloat", "chr", "dynamicImport", "emit", "floatFromBits", "growMemory", "hostExit", "hostWrite", "load16", "load32", "load64", "load8", "max", "min", "panic", "pow", "print", "readFile", "sqrt", "stackPointer", "store32", "store64", "store8", "syscall", "toSingle", "win", "writeFile", "zeros"] { checkCallBuiltinNames[name] = true }
+for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV", "callSysVFloat", "chr", "copyMemory", "dataAddr", "dynamicImport", "fillMemory", "loadF32", "loadF64", "loadI16", "loadI32", "loadI8", "store16", "storeF32", "storeF64", "emit", "floatFromBits", "growMemory", "hostExit", "hostWrite", "load16", "load32", "load64", "load8", "max", "min", "panic", "pow", "print", "readFile", "sqrt", "stackPointer", "store32", "store64", "store8", "syscall", "toSingle", "win", "writeFile", "zeros"] { checkCallBuiltinNames[name] = true }
+
+// an already-checked builtin call node, for rewrites in the checker
+fn rawCallNode(line: int, name: str, callKind: int, typeIndex: int, arguments: [Node]) -> Node {
+    var callee = makeNode(nodeIdentifier, line)
+    callee.name = name
+    var call = makeNode(nodeCall, line)
+    call.children.push(callee)
+    for argument in arguments { call.children.push(argument) }
+    call.auxiliary = callKind
+    call.typeIndex = typeIndex
+    return call
+}
+
+// an already-checked `left OP constant` on ints
+fn integerBinaryNode(line: int, operator: int, left: Node, constant: int) -> Node {
+    var right = makeNode(nodeInteger, line)
+    right.integerValue = constant
+    right.typeIndex = typeIdInteger
+    var binary = makeNode(nodeBinary, line)
+    binary.operator = operator
+    binary.children.push(left)
+    binary.children.push(right)
+    binary.auxiliary = binaryCategoryInteger
+    binary.typeIndex = typeIdInteger
+    return binary
+}
 
 fn checkCall(expression: Node) -> int {
     let callee = expression.children[0]
@@ -5111,6 +5142,84 @@ fn checkCall(expression: Node) -> int {
         else if callee.name == "store32" { expression.auxiliary = callKindStore32 }
         else { expression.auxiliary = callKindStore8 }
         return typeIdVoid
+    }
+    if callee.name == "store16" or callee.name == "storeF32" or callee.name == "storeF64" {
+        if argumentCount != 2 { failCompilation(expression.line, "{callee.name}(addr, value) takes two arguments") }
+        if typeKinds[checkExpression(expression.children[1])] != kindInteger { failCompilation(expression.line, "{callee.name} address must be int") }
+        let valueKind = typeKinds[checkExpression(expression.children[2])]
+        if callee.name == "store16" {
+            if valueKind != kindInteger { failCompilation(expression.line, "store16 value must be int") }
+            expression.auxiliary = callKindStore16
+            return typeIdVoid
+        }
+        if valueKind != kindInteger and valueKind != kindFloat { failCompilation(expression.line, "{callee.name} value must be float") }
+        let value = coerce(expression.children[2], typeIdFloat, callee.name)
+        // storeF64(a, v) is store64(a, bits(v)); storeF32 stores the rounded single's bits
+        if callee.name == "storeF64" {
+            expression.children[2] = rawCallNode(expression.line, "bits", callKindBits, typeIdInteger, [value])
+            callee.name = "store64"
+            expression.auxiliary = callKindStore64
+        } else {
+            expression.children[2] = rawCallNode(expression.line, "__singleBits", callKindSingleBits, typeIdInteger, [value])
+            callee.name = "store32"
+            expression.auxiliary = callKindStore32
+        }
+        return typeIdVoid
+    }
+    if callee.name == "loadI8" or callee.name == "loadI16" or callee.name == "loadI32" or callee.name == "loadF32" or callee.name == "loadF64" {
+        if argumentCount != 1 { failCompilation(expression.line, "{callee.name}(addr) takes one int argument") }
+        if typeKinds[checkExpression(expression.children[1])] != kindInteger { failCompilation(expression.line, "{callee.name} argument must be int") }
+        let address = expression.children[1]
+        if callee.name == "loadF64" {             // floatFromBits(load64(a))
+            expression.children[1] = rawCallNode(expression.line, "load64", callKindLoad64, typeIdInteger, [address])
+            callee.name = "floatFromBits"
+            expression.auxiliary = callKindBits
+            return typeIdFloat
+        }
+        if callee.name == "loadF32" {             // the single at a, widened exactly
+            expression.children[1] = rawCallNode(expression.line, "load32", callKindLoad32, typeIdInteger, [address])
+            callee.name = "__floatFromSingleBits"
+            expression.auxiliary = callKindFloatFromSingleBits
+            return typeIdFloat
+        }
+        // sign extension: (loadN(a) << (64 - N)) >> (64 - N), >> being arithmetic
+        var loadName = "load8"
+        var loadKind = callKindLoad8
+        var shift = 56
+        if callee.name == "loadI16" {
+            loadName = "load16"
+            loadKind = callKindLoad16
+            shift = 48
+        } else if callee.name == "loadI32" {
+            loadName = "load32"
+            loadKind = callKindLoad32
+            shift = 32
+        }
+        let loaded = rawCallNode(expression.line, loadName, loadKind, typeIdInteger, [address])
+        let shifted = integerBinaryNode(expression.line, tokenShiftLeft, loaded, shift)
+        nodeBecome(expression, integerBinaryNode(expression.line, tokenShiftRight, shifted, shift))
+        return typeIdInteger
+    }
+    if callee.name == "dataAddr" {
+        // address of element 0: a str's bytes follow its length word; a list
+        // (also [u8] and [f32]) points at a separate element array
+        if argumentCount != 1 { failCompilation(expression.line, "dataAddr(x) takes one argument") }
+        let typeIndex = checkExpression(expression.children[1])
+        if typeKinds[typeIndex] != kindString and typeKinds[typeIndex] != kindList { failCompilation(expression.line, "dataAddr() needs a str or list, got {describeType(typeIndex)}") }
+        let reference = rawCallNode(expression.line, "addr", callKindBits, typeIdInteger, [expression.children[1]])
+        if typeKinds[typeIndex] == kindString {
+            nodeBecome(expression, integerBinaryNode(expression.line, tokenPlus, reference, 8))
+            return typeIdInteger
+        }
+        expression.children[1] = integerBinaryNode(expression.line, tokenPlus, reference, 16)
+        callee.name = "load64"
+        expression.auxiliary = callKindLoad64
+        return typeIdInteger
+    }
+    if callee.name == "copyMemory" or callee.name == "fillMemory" {
+        // plain calls into the runtime (memmove and memset), checked as such below
+        if argumentCount != 3 { failCompilation(expression.line, "{callee.name} takes three int arguments") }
+        if callee.name == "copyMemory" { callee.name = "runtimeMoveMemory" } else { callee.name = "runtimeFillMemory" }
     }
     if callee.name == "stackPointer" {
         if argumentCount != 0 { failCompilation(expression.line, "stackPointer() takes no arguments") }
@@ -6572,6 +6681,8 @@ let externalResolverPrefix = "fn __xresolve"     // generated extern resolvers: 
 // their target lazily and cache it: one LoadLibraryA per DLL, one
 // GetProcAddress per symbol, then callPointer (which already does the full Win64
 // marshalling). Generated as source text and parsed, so this adds no codegen.
+var externWrapperNames: [str: bool] = [:]     // functions the extern desugaring generated for extern fns
+
 fn desugarExtern(program: Node) {
     var libraries: [str] = []
     var externs: [Node] = []
@@ -6599,6 +6710,7 @@ fn desugarExtern(program: Node) {
     source.push("    return v\n\}\n")
     for j in 0..externs.len() {
         let externNode = externs[j]
+        externWrapperNames[externNode.name] = true
         let parameters = externNode.children[0]
         let returnType = externNode.children[1]
         let libraryName = externNode.children[2].name
@@ -6706,6 +6818,7 @@ fn desugarExternLinux(output: [Node], externs: [Node]) {
     source.push("    return \": \" + parts.join()\n\}\n")
     for j in 0..externs.len() {
         let externNode = externs[j]
+        externWrapperNames[externNode.name] = true
         let parameters = externNode.children[0]
         let returnType = externNode.children[1]
         let libraryName = externNode.children[2].name
@@ -7330,15 +7443,92 @@ fn retainRax() {
     emitInstruction("mov rcx, rax")
     emitInstruction("call " + functionCodeLabel("runtimeRetainReference"))           // returns its argument: rax survives
 }
+// ---- keeping a foreign call's argument temporaries alive ----
+// `syscall(2, cString(path).addr(), 0)`: the Bytes from cString is a temporary
+// that would normally die as soon as .addr() returns, before the kernel reads
+// it. While the arguments of a foreign call (syscall, callSysV, callPointer,
+// win, an extern wrapper or a kernel32 shim) are generated, every temporary
+// release is parked in a frame "keep slot" instead, and the slots are released
+// once the call returns (C++ full-expression semantics). The slots are zeroed
+// at the start of the call through placeholder lines filled in afterwards, so
+// a release on a path not taken frees nothing.
+var keepAliveDepth = 0
+var keepAliveNext = 0                 // next free keep slot
+var keepAliveMaximum = 0              // keep slots this function needs
+var keepAliveBase = 0                 // frame slot index of keep slot 0
+var keepAliveStarts: [int] = []
+var keepAlivePlaceholders: [int] = []
+var keepAlivePlaceholderCounts: [int] = []
+
+fn keepAliveSlot(index: int) -> str { return "[rbp - {16 + 8 * (keepAliveBase + index)}]" }
+
+// rcx holds an owned temporary that has to go
+fn emitReleaseRcx() {
+    if keepAliveDepth > 0 {
+        emitInstruction("mov qword ptr {keepAliveSlot(keepAliveNext)}, rcx")
+        keepAliveNext += 1
+        if keepAliveNext > keepAliveMaximum { keepAliveMaximum = keepAliveNext }
+        return
+    }
+    emitRuntimeCall(functionCodeLabel("runtimeReleaseReference"))
+}
+
+fn keepAliveBound(expression: Node) -> int {
+    var count = 1
+    for child in expression.children { count += keepAliveBound(child) }
+    return count
+}
+
+// before generating the arguments of `expression`, a foreign call
+fn beginKeepAlive(expression: Node) {
+    var bound = 0
+    for i in 1..expression.children.len() {
+        if expression.children[i].nodeKind != nodeInteger and expression.children[i].nodeKind != nodeIdentifier { bound += keepAliveBound(expression.children[i]) }
+    }
+    if expression.operator == 1 and expression.children.len() > 0 and expression.children[0].children.len() > 0 { bound += keepAliveBound(expression.children[0].children[0]) }
+    keepAliveStarts.push(keepAliveNext)
+    keepAlivePlaceholders.push(assemblyLines.len())
+    keepAlivePlaceholderCounts.push(2 * bound)
+    for i in 0..2 * bound { assemblyLines.push("") }
+    keepAliveDepth += 1
+}
+
+// after the call: rax (its result) survives
+fn endKeepAlive() {
+    keepAliveDepth -= 1
+    let start = keepAliveStarts.pop()
+    let placeholder = keepAlivePlaceholders.pop()
+    let bound = keepAlivePlaceholderCounts.pop()
+    let used = keepAliveNext - start
+    if used > bound { panic("internal: keep-alive placeholder overflow") }
+    for k in 0..used { assemblyLines[placeholder + k] = "  mov qword ptr {keepAliveSlot(start + k)}, 0\n" }
+    if keepAliveDepth > 0 { return }      // nested: the enclosing foreign call releases them
+    if used > 0 {
+        emitInstruction("push rax")
+        for k in 0..used {
+            emitInstruction("mov rcx, {keepAliveSlot(start + k)}")
+            emitReleaseRcx()
+        }
+        emitInstruction("pop rax")
+    }
+    keepAliveNext = start
+}
+
+fn isForeignWrapperCall(expression: Node) -> bool {
+    if expression.nodeKind != nodeCall or expression.auxiliary != callKindUser { return false }
+    let name = functionDefinitions[expression.referenceIndex].name
+    return textStartsWith(name, "kernel32") or externWrapperNames.has(name)
+}
+
 fn dropRax() {
     emitInstruction("mov rcx, rax")
-    emitRuntimeCall(functionCodeLabel("runtimeReleaseReference"))
+    emitReleaseRcx()
 }
 fn holdTemporary(ownsTemporary: bool) { if ownsTemporary { emitInstruction("push rax") } }
 fn releaseTemporary(ownsTemporary: bool) {
     if ownsTemporary {
         emitInstruction("pop rcx")
-        emitRuntimeCall(functionCodeLabel("runtimeReleaseReference"))
+        emitReleaseRcx()
     }
 }
 // the temp at [rsp] goes; rax (a result) stays
@@ -7346,7 +7536,7 @@ fn releaseTemporaryKeepResult(ownsTemporary: bool) {
     if ownsTemporary {
         emitInstruction("mov rcx, [rsp]")
         emitInstruction("mov [rsp], rax")
-        emitRuntimeCall(functionCodeLabel("runtimeReleaseReference"))
+        emitReleaseRcx()
         emitInstruction("pop rax")
     }
 }
@@ -7367,7 +7557,7 @@ fn dropTemporaries(owned: [bool]) {
         for i in 0..temporaryCount {
             if owned[i] {
                 emitInstruction("mov rcx, [rsp + {8 + 8 * (temporaryCount - 1 - i)}]")
-                emitRuntimeCall(functionCodeLabel("runtimeReleaseReference"))
+                emitReleaseRcx()
             }
         }
         emitInstruction("pop rax")
@@ -9022,7 +9212,7 @@ fn inlinePass(program: Node) {
         // ponytail: a name list; shrink-wrapping the saves would cover every function
         // runtimeAtomicAdd's body is the threadless fallback: every x86 call site becomes `lock xadd`
         let callOnly = functionDefinition.name == "runtimeFail" or functionDefinition.name == "runtimeReleaseObject" or isNativeRuntimeCallee(functionDefinition.name)
-        functionDefinition.inlinable = not functionDefinition.hasEnvironment and functionDefinition.typeParameters.len() == 0 and nodeCount(functionDefinition.body) <= 128 and not textStartsWith(functionDefinition.name, "__xresolve") and not callOnly
+        functionDefinition.inlinable = not functionDefinition.hasEnvironment and functionDefinition.typeParameters.len() == 0 and nodeCount(functionDefinition.body) <= 128 and not textStartsWith(functionDefinition.name, "__xresolve") and not callOnly and not externWrapperNames.has(functionDefinition.name) and not textStartsWith(functionDefinition.name, "kernel32")
         if functionDefinition.inlinable {
             functionDefinition.pristine = functionDefinition.body
             functionDefinition.pristineSlotCount = functionDefinition.slotCount
@@ -9187,6 +9377,7 @@ fn isInlineCallKind(callKind: int) -> bool {
     if callKind == callKindSquareRoot or callKind == callKindRoundToSingle or callKind == callKindLength or callKind == callKindBits { return true }
     if callKind == callKindLoad64 or callKind == callKindLoad32 or callKind == callKindLoad16 or callKind == callKindLoad8 { return true }
     if callKind == callKindStore64 or callKind == callKindStore32 or callKind == callKindStore8 { return true }
+    if callKind == callKindStore16 or callKind == callKindSingleBits or callKind == callKindFloatFromSingleBits { return true }
     if callKind == callKindStackPointer or callKind == callKindAbsolute or callKind == callKindMin or callKind == callKindMax { return true }
     return false
 }
@@ -10869,6 +11060,17 @@ fn generateLeaf(register: str, expression: Node) {
 
 fn generateCall(expression: Node) {
     let callKind = expression.auxiliary
+    if callKind == callKindSyscall or callKind == callKindSystemVCall or callKind == callKindSystemVCallFloat or callKind == callKindWindows or callKind == callKindFunctionPointerCall or isForeignWrapperCall(expression) {
+        beginKeepAlive(expression)
+        generateCallKinds(expression)
+        endKeepAlive()
+        return
+    }
+    generateCallKinds(expression)
+}
+
+fn generateCallKinds(expression: Node) {
+    let callKind = expression.auxiliary
     if callKind == callKindPrint {
         let ownsTemporary = generateTemporary(expression.children[1], true)
         holdTemporary(ownsTemporary)
@@ -11174,6 +11376,31 @@ fn generateCall(expression: Node) {
         generateStoreRaw(expression, "al")
         return
     }
+    if callKind == callKindStore16 {            // two byte stores: the assembler has no 16-bit registers
+        generateExpression(expression.children[1])
+        emitInstruction("push rax")
+        generateExpression(expression.children[2])
+        emitInstruction("pop rcx")
+        emitInstruction("mov [rcx], al")
+        emitInstruction("shr rax, 8")
+        emitInstruction("mov [rcx + 1], al")
+        return
+    }
+    if callKind == callKindSingleBits {
+        generateExpression(expression.children[1])
+        emitInstruction("movq xmm0, rax")
+        emitInstruction("cvtsd2ss xmm0, xmm0")
+        emitInstruction("movq rax, xmm0")
+        emitInstruction("mov eax, eax")
+        return
+    }
+    if callKind == callKindFloatFromSingleBits {
+        generateExpression(expression.children[1])
+        emitInstruction("movq xmm0, rax")
+        emitInstruction("cvtss2sd xmm0, xmm0")
+        emitInstruction("movq rax, xmm0")
+        return
+    }
     if callKind == callKindStackPointer {
         emitInstruction("mov rax, rsp")
         return
@@ -11300,6 +11527,10 @@ fn generateCall(expression: Node) {
         for i in 1..syscallOperandCount {
             emitInstruction("mov {systemCallRegisters[i - 1]}, [rsp + {8 * (syscallOperandCount - 1 - i)}]")
         }
+        // The kernel reads all six registers for some calls (process_vm_readv's
+        // flags, mmap's offset), so the ones the caller left out are zero, not
+        // whatever the surrounding code had in them.
+        for i in syscallOperandCount..7 { emitInstruction("xor {systemCallRegisters[i - 1]}, {systemCallRegisters[i - 1]}") }
         emitInstruction("syscall")
         emitInstruction("add rsp, {8 * syscallOperandCount}")
         emitInstruction("pop rsi")
@@ -12693,7 +12924,12 @@ fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, stateme
     // "push r12" occupies. If it turns out we can skip that push, the space
     // still has to be reserved -- Windows x64 has no red zone, so a slot below
     // rsp would be clobbered by any call or interrupt.
+    let frameLineIndex = assemblyLines.len()
     emitInstruction("sub rsp, {8 * (frameSlotCount + 1)}")
+    keepAliveBase = frameSlotCount
+    keepAliveNext = 0
+    keepAliveMaximum = 0
+    keepAliveDepth = 0
     for k in 0..spillCount { emitInstruction("mov [rbp - {16 + 8 * (spillSlotBase + k)}], {collectorSpillRegisters[k]}") }
     for k in 0..registerPromotionCount { emitInstruction("mov [rbp - {16 + 8 * (registerSaveBase + k)}], {promotionRegisters[k]}") }
     for k in 0..floatPromotionCount { emitInstruction("movsd [rbp - {16 + 8 * (floatSaveBase + k)}], {floatPromotionRegisters[k]}") }
@@ -12744,6 +12980,7 @@ fn generateFunctionBody(label: str, slotCount: int, parameterCount: int, stateme
         emitRuntimeCall("runtimeSetGlobalRoots")
     }
     emitLabel(returnLabel)
+    if keepAliveMaximum > 0 { assemblyLines[frameLineIndex] = "  sub rsp, {8 * (frameSlotCount + ((keepAliveMaximum + 1) & (0 - 2)) + 1)}\n" }
     if dropCount > 0 {                    // the locals go; the result in rax stays
         emitInstruction("push rax")
         if dropCount > 1 {

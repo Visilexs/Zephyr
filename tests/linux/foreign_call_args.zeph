@@ -1,0 +1,40 @@
+// Foreign calls: argument temporaries live until the call returns, and a
+// syscall's unused argument registers are zero.
+import "std/bytes.zeph"
+extern fn labs(x: int) -> int from "libc.so.6"
+
+var seen = 0
+fn note(address: int) -> int {
+    seen = address
+    return address
+}
+// allocates and scribbles over blocks the size of the temporary, then reads it back
+fn churn() -> int {
+    for i in 0..50 {
+        let b = Bytes.new(8)
+        for j in 0..8 { b.put8(j, 88) }
+    }
+    return load8(seen)
+}
+
+fn main() {
+    // the temporary is still alive while the later argument churns the heap
+    print(syscall(1, 1, note(cString("written\n").addr()), 8 + churn() * 0))
+    print(labs(note(cString("abcdefg").addr()) * 0 - churn()))           // 97
+
+    // process_vm_readv on ourselves with flags left out: the kernel reads r9
+    // as flags, so it must be 0 rather than leftover garbage
+    let source = Bytes.new(16)
+    source.putString(0, "process memory!!")
+    let target = Bytes.new(16)
+    let localIov = Bytes.new(16)
+    localIov.put64(0, target.addr())
+    localIov.put64(8, 16)
+    let remoteIov = Bytes.new(16)
+    remoteIov.put64(0, source.addr())
+    remoteIov.put64(8, 16)
+    for i in 0..3 {
+        let copied = syscall(310, syscall(39), localIov.addr(), 1, remoteIov.addr(), 1)
+        print(copied, target.getString(0, 16))
+    }
+}

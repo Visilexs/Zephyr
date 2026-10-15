@@ -1,0 +1,5 @@
+// A huge offset must panic, not wrap past the bounds check and segfault
+import "std/bytes.zeph"
+let b = Bytes.new(16)
+print(b.get64(8))
+print(b.get64(9223372036854775807 - 3))
