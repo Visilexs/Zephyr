@@ -79,7 +79,7 @@ generator.shuffle(cards)
 import "std/io.zeph"
 ```
 
-Typed kernel32 wrappers use the Linux syscall shim under `--linux`. All functions below work on Windows. Linux supports everything except `environmentVariable` and `run`, which panic with clear "not supported on linux" messages. Linux output was compiled, but execution requires a Linux host. Paths and environment names reject embedded NUL bytes.
+Typed kernel32 wrappers; under `--linux` they go through the syscall shims in `lib/os/linux.zeph`, and everything below works on both targets. Paths and environment names reject embedded NUL bytes.
 
 | Signature | Description |
 | --- | --- |
@@ -94,11 +94,20 @@ Typed kernel32 wrappers use the Linux syscall shim under `--linux`. All function
 | `nowMilliseconds() -> int` | Monotonic milliseconds with an unspecified origin. |
 | `nowNanoseconds() -> int` | Monotonic nanoseconds, using QueryPerformanceCounter on Windows; precision depends on the clock. |
 | `sleepMilliseconds(milliseconds: int)` | Sleep for 0 <= milliseconds < 4294967295; panic outside that range. |
-| `run(command: str) -> int` | Run a Windows command line, wait, and return its exit code; panic if launch fails. |
+| `run(command: str) -> int` | Run a command, wait, and return its exit code; panic if launch fails. |
+| `tryReadFile(path: str) -> Result[str, str]` | The whole file (read to EOF, so `/proc` files and FIFOs work), or `Err("open PATH: no such file or directory")`-style text. Never panics on I/O. |
+| `tryWriteFile(path: str, data: str) -> Result[int, str]` | Create or truncate and write; `Ok(byte count)` or `Err` text. |
+| `ioErrorText(code: int) -> str` | Text for a `GetLastError` code (Linux errno values are tagged `0x20000000` by the shim). |
 
-Commands are raw Windows command lines; invoke `cmd.exe /c` explicitly for shell syntax. Directory ordering is unspecified. Relative paths resolve from the process working directory.
+`run` on Windows takes a raw command line (invoke `cmd.exe /c` for shell syntax). On Linux it runs `/bin/sh -c COMMAND` with the process's environment and inherited stdin/stdout/stderr; a command killed by signal N returns 128 + N, and 127 means the shell could not start the command. For pipes, see `process.zeph`. `environmentVariable` on Linux reads `/proc/self/environ` (the environment the process started with). Directory ordering is unspecified. Relative paths resolve from the process working directory.
 
-The test suite includes a Linux compile-only check that validates the generated ELF header and references all I/O wrappers. It does not execute Linux binaries; Linux runtime behavior remains unverified in this Windows environment.
+```zeph
+match tryReadFile("config.json") {
+    Ok(text) { print(text.len()) }
+    Err(message) { print(message) }    // open config.json: no such file or directory
+}
+print(run("test -d /tmp"), environmentVariable("HOME").or("?"))
+```
 
 Implementation helpers are callable because Zephyr has no private functions:
 
@@ -420,4 +429,200 @@ Dependent libraries use this module to retain their original imported API withou
 ```zeph
 print(fexp(1.0))
 print(fln(2.0))
+```
+
+## utf8.zeph
+
+```zeph
+import "std/utf8.zeph"
+```
+
+Strings stay byte strings; these functions read them as UTF-8. Invalid input never panics: a byte that does not start a valid sequence decodes as U+FFFD (65533) and advances one byte, so every byte belongs to exactly one rune. Widths follow terminal columns (a table-free approximation of `wcwidth`).
+
+| Signature | Description |
+| --- | --- |
+| `utf8DecodeAt(text: str, index: int) -> (int, int)` | (codepoint, byte length) at byte `index`; invalid, truncated, overlong or surrogate sequences give (65533, 1). Panics only when `index` is outside the string. |
+| `utf8Encode(codepoint: int) -> str` | The encoding of one codepoint; out-of-range values and surrogates encode U+FFFD. |
+| `utf8FromCodepoints(codepoints: [int]) -> str` | The string of these codepoints. |
+| `utf8Codepoints(text: str) -> [int]` | Every codepoint, in order. |
+| `utf8RuneCount(text: str) -> int` | Number of runes (each invalid byte counts one). |
+| `utf8IsValid(text: str) -> bool` | Well-formed UTF-8 throughout. |
+| `utf8RuneOffset(text: str, runeIndex: int) -> int` | Byte offset where rune `runeIndex` starts (the byte length past the end). |
+| `utf8Sub(text: str, start: int, end: int) -> str` | Runes [start, end), bounds clamped. |
+| `utf8Truncate(text: str, count: int) -> str` | The first `count` runes; never splits a sequence. |
+| `utf8TruncateBytes(text: str, maxBytes: int) -> str` | Longest prefix of at most `maxBytes` bytes that ends on a rune boundary. |
+| `utf8RuneWidth(cp: int) -> int` | Terminal columns of one codepoint: 0 (controls, combining marks, ZWJ), 2 (East Asian wide, most emoji) or 1. |
+| `utf8DisplayWidth(text: str) -> int` | Columns of the whole string. |
+| `utf8TruncateWidth(text: str, columns: int) -> str` | Longest prefix that fits in `columns`. |
+| `utf8PadRight(text: str, columns: int) -> str` / `utf8PadLeft(...)` | Pad with spaces to `columns`; wider text is returned unchanged. |
+| `utf8Fit(text: str, columns: int) -> str` | Exactly `columns` wide: truncated with "…" or padded. For table cells. |
+
+```zeph
+let text = "héllo, 世界"
+print(text.len(), utf8RuneCount(text), utf8DisplayWidth(text))   // 14 9 11
+print(utf8Truncate(text, 4), utf8Fit("世界世界", 5) + "|")        // héll 世界…|
+```
+
+## json.zeph
+
+```zeph
+import "std/json.zeph"
+```
+
+`enum Json { Null, Bool(bool), Number(float), Text(str), Array([Json]), Object([str], [Json]) }`. Parsing never panics: malformed input gives `Err` with the byte offset. Objects keep keys in source order (duplicates are kept; lookups find the first). Numbers are floats; `asInt` truncates.
+
+Building:
+
+| Signature | Description |
+| --- | --- |
+| `jsonObject() -> Json` / `jsonArray() -> Json` | Empty object / array. |
+| `jsonText(s)`, `jsonNumber(x)`, `jsonInt(n)`, `jsonBool(b)`, `jsonTextList(items: [str])` | Leaf values; `Json.Null` for null. |
+| `j.set(key: str, value: Json) -> Json` | Object: set or replace, return self (chains). Panics on a non-object. |
+| `j.add(value: Json) -> Json` | Array: append, return self. Panics on a non-array. |
+
+Reading:
+
+| Signature | Description |
+| --- | --- |
+| `j.get(key) -> Json?` / `j.at(index) -> Json?` / `j.has(key) -> bool` | Member / element access; none on a missing member or the wrong kind. |
+| `j.path(path: str) -> Json?` | Dig by path: `"choices[0].delta.content"`, `"[2]"`, `"a.b"`. |
+| `j.asStr() -> str?`, `j.asFloat() -> float?`, `j.asInt() -> int?`, `j.asBool() -> bool?`, `j.isNull() -> bool` | Typed views; none for another kind. |
+| `j.items() -> [Json]`, `j.keys() -> [str]`, `j.len() -> int`, `j.kind() -> str` | Elements, keys in order, count, and `"null"`/`"bool"`/`"number"`/`"string"`/`"array"`/`"object"`. |
+| `jsonGetStr(j, path) -> str?`, `jsonGetFloat`, `jsonGetInt`, `jsonGetBool` | `j.path(path)` plus the typed view. |
+
+Parsing and writing:
+
+| Signature | Description |
+| --- | --- |
+| `jsonParse(text: str) -> Result[Json, str]` | One RFC 8259 document; `Err("... at byte N")` otherwise. |
+| `jsonTryParse(text: str) -> Json?` | Same, without the message. |
+| `jsonParsePartial(text: str) -> Json?` | A prefix of a document still streaming in, with every open string/array/object closed: `{"a": [1, 2` gives `{"a":[1,2]}`. Members whose value has not started, and numbers or literals that may still grow, are left out. none when the prefix can never become valid. |
+| `jsonPartialFields(src: str) -> [JsonPartialField]` | String-valued members of a prefix at any depth (`key`, `value`, `complete`), for showing tool-call arguments while a model writes them. |
+| `jsonPartialString(src: str, key: str) -> str?` | The (possibly partial) value of the first string member `key`. |
+| `jsonStringify(j) -> str` / `jsonStringifyAscii(j)` | Compact text; the Ascii form escapes non-ASCII as `\uXXXX`. |
+| `jsonPretty(j, indent: int) -> str` | Indented text. |
+| `jsonQuote(s) -> str` / `jsonQuoteAscii(s)` | A JSON string literal. |
+| `jsonFormatNumber(x: float) -> str` | Shortest round-tripping decimal (JavaScript layout); NaN/infinity become `null`. |
+
+```zeph
+match jsonParse("\{\"choices\": [\{\"delta\": \{\"content\": \"Hi\"}}]}") {
+    Ok(value) { print(jsonGetStr(value, "choices[0].delta.content").or("")) }   // Hi
+    Err(message) { print(message) }
+}
+let reply = jsonObject().set("ok", jsonBool(true)).set("n", jsonInt(3))
+print(jsonStringify(reply))                                        // {"ok":true,"n":3}
+print(jsonPartialString("\{\"path\": \"src/ma", "path").or(""))     // src/ma
+```
+
+## process.zeph (Linux)
+
+```zeph
+import "std/process.zeph"
+```
+
+Child processes with stdin/stdout/stderr pipes, built on raw syscalls (`pipe2`, `fork`, `dup2`, `execve`, `poll`, `wait4`). `argv[0]` is looked up on `PATH` unless it contains `/`. Spawn failures (not found, permission denied, bad directory) are `Err`, never panics. `spawn` ignores `SIGPIPE`, so writing to a child that has exited returns false instead of killing the program.
+
+| Signature | Description |
+| --- | --- |
+| `struct SpawnOptions { environment: [str: str]?, clearEnvironment = false, directory = "", mergeStderr = false }` | `environment` sets variables on top of the inherited ones (or on an empty environment with `clearEnvironment`); `directory` is the child's working directory; `mergeStderr` sends stderr into the stdout pipe. `SpawnOptions{}` for defaults. |
+| `spawn(argv: [str], options: SpawnOptions) -> Result[Process, str]` | Start the program. |
+| `p.write(text: str) -> bool` | Write all of it to stdin (blocks while the pipe is full). False after the child closed stdin. |
+| `p.closeStdin()` | Send EOF. |
+| `p.readAvailable(timeoutMilliseconds: int = 0) -> str` | What stdout holds now, waiting at most the timeout (-1: until data or EOF). `""` when nothing came; `p.stdoutOpen` turns false at EOF. Ready stderr is appended to `p.stderrText`. |
+| `p.readAll() -> str` | Stdout to EOF, collecting stderr into `p.stderrText` at the same time (no deadlock on a chatty stderr). |
+| `p.wait() -> int` | Close stdin, wait, return the exit code (128 + N if killed by signal N). |
+| `p.tryWait() -> int?` | The exit code if the child has exited, else none; never blocks. |
+| `p.kill(signal: int = 15) -> bool` | Send a signal; false once reaped. |
+| `p.close()` | Close every pipe still open. |
+| `runCapture(argv: [str]) -> Result[ProcessOutput, str]` | Run to completion with stdin closed: `ProcessOutput{code, stdout, stderr}`. |
+| `runCaptureWith(argv, options, input: str) -> Result[ProcessOutput, str]` | Same, with options and stdin text. |
+| `currentEnvironment() -> [str]` | This process's `NAME=value` entries. |
+
+Writing a large input with `write` before reading can deadlock if the child fills its stdout pipe first; for big inputs interleave `write` with `readAvailable`.
+
+```zeph
+match spawn(["sh", "-c", "read x; echo got $x"], SpawnOptions{}) {
+    Ok(child) {
+        let sent = child.write("hi\n")
+        child.closeStdin()
+        print(child.readAll().trim(), child.wait())      // got hi 0
+    }
+    Err(message) { print(message) }
+}
+let listing = runCapture(["ls", "/nope"]).unwrap()
+print(listing.code, listing.stderr.len() > 0)            // 2 true
+```
+
+## net.zeph (Linux)
+
+```zeph
+import "std/net.zeph"
+```
+
+TCP client sockets and host resolution on raw syscalls. Nothing panics on network errors: every call returns a `Result` or optional. Sockets are non-blocking underneath; `send`/`recv` wait at most `conn.timeoutMilliseconds` (set from the connect timeout, changeable), then give `Err("recv HOST:PORT: timed out")`.
+
+Resolution order: IP literals, `/etc/hosts`, then one UDP DNS A-record query (retried once) to the first IPv4 `nameserver` in `/etc/resolv.conf`. IPv6 works for literals (`::1`, `[::1]`) and `/etc/hosts` entries; DNS asks only for A records.
+
+| Signature | Description |
+| --- | --- |
+| `tcpConnect(host: str, port: int, timeoutMilliseconds: int = 30000) -> Result[TcpConnection, str]` | Resolve and connect to the first address that accepts; `Err("connect HOST:PORT: connection refused")` and the like. |
+| `conn.send(data: str) -> Result[int, str]` | Send everything (MSG_NOSIGNAL). |
+| `conn.recv(maxBytes: int = 65536) -> Result[str, str]` | What arrives first, up to maxBytes; `Ok("")` when the peer closed. |
+| `conn.recvAll() -> Result[str, str]` | Everything until the peer closes. |
+| `conn.shutdownWrite()` / `conn.close()` | Half-close / close. |
+| `resolveHost(host: str, timeoutMilliseconds: int = 5000) -> Result[[IpAddress], str]` | All addresses found (`/etc/hosts` IPv4 entries first). |
+| `dnsQueryA(host, server: IpAddress, port: int, timeoutMilliseconds: int) -> Result[[IpAddress], str]` | One A query to a given server; `Ok([])` for NXDOMAIN. |
+| `hostsLookup(host) -> [IpAddress]`, `systemNameserver() -> IpAddress?` | The two resolution sources. |
+| `parseIpv4(text) -> IpAddress?`, `parseIpv6(text)`, `parseIp(text)` | Address literals; `addr.text()` formats one, `addr.family` is 4 or 6. |
+
+```zeph
+match tcpConnect("127.0.0.1", 8000, 2000) {
+    Ok(conn) {
+        let sent = conn.send("GET / HTTP/1.0\r\n\r\n")
+        print(conn.recvAll().unwrapOr("").len())
+        conn.close()
+    }
+    Err(message) { print(message) }
+}
+```
+
+## http.zeph (Linux)
+
+```zeph
+import "std/http.zeph"
+```
+
+An HTTP/1.1 client. `http://` URLs go over `net.zeph`; `https://` URLs go through libcurl (`libcurl.so.4`, loaded with `dlopen` on first use; any distro's libcurl package). Without libcurl, an https request is `Err("https: libcurl.so.4 is not available (install libcurl to use https:// URLs)")`. Importing this module makes the executable dynamically linked (it imports `dlopen`/`dlsym`), whether or not https is used.
+
+Network errors, timeouts and malformed responses are `Err(text)`; an HTTP error status is still `Ok` (check `status`). Bodies may be Content-Length, chunked or close-delimited. Requests send `Connection: close` (one request per connection) and redirects are not followed. `Host`, `User-Agent`, `Accept` and `Content-Length` are added unless the headers map sets them. Response header names are lowercased; repeats are joined with `", "`.
+
+| Signature | Description |
+| --- | --- |
+| `request(method, url, headers: [str: str], body: str) -> Result[Response, str]` | One request with default options; the body is collected. |
+| `requestWith(method, url, headers, body, options: HttpOptions) -> Result[Response, str]` | Same, with options. |
+| `get(url) -> Result[Response, str]`, `postJson(url, json: str, headers) -> Result[Response, str]` | Shorthands; `postJson` sets `Content-Type: application/json`. |
+| `requestStream(method, url, headers, body, options, onChunk: fn(str) -> bool) -> Result[Response, str]` | Calls `onChunk` with each piece of decoded body as it arrives; returning false stops and closes. The Response's body is `""`. |
+| `requestEvents(method, url, headers, body, options, onEvent: fn(SseEvent) -> bool) -> Result[Response, str]` | Server-Sent Events: `onEvent` per complete event; false stops. Adds `Accept: text/event-stream` unless set. |
+| `struct HttpOptions { timeoutMilliseconds = 60000, useCurl = false, caFile = "", insecure = false }` | Timeout for connect and each read (libcurl: the whole transfer); `useCurl` sends http:// through libcurl too; `caFile` trusts a PEM bundle; `insecure` skips certificate checks. |
+| `struct Response { status, reason, headers: [str: str], body }` | `r.header(name) -> str?` (any case), `r.isSuccess()` (2xx). |
+| `struct SseEvent { event, data, id }` | `event` defaults to `"message"`; multi-line `data:` fields are joined with `"\n"`; `id` is the last id seen. |
+| `SseParser{}` / `parser.feed(chunk: str) -> [SseEvent]` | The incremental event-stream parser, for bytes from elsewhere. Handles any split, LF/CRLF/CR line ends and `:` comments. |
+| `parseUrl(url) -> Result[Url, str]`, `parseResponseHead(head) -> Result[Response, str]` | Helpers: `Url{scheme, host, port, path}`. |
+
+With libcurl the body is decoded by curl, and the status and headers are known when the transfer ends: the streaming callbacks still run as data arrives.
+
+```zeph
+var headers: [str: str] = [:]
+headers["Authorization"] = "Bearer " + environmentVariable("API_KEY").or("")   // std/io
+headers["Content-Type"] = "application/json"
+let body = "\{\"model\": \"m\", \"stream\": true, \"messages\": []}"
+let result = requestEvents("POST", "https://api.example.com/v1/chat", headers, body, HttpOptions{},
+    fn(event: SseEvent) -> bool {
+        if event.data == "[DONE]" { return false }
+        if let delta = jsonTryParse(event.data) {                                   // std/json
+            print(jsonGetStr(delta, "choices[0].delta.content").or(""))
+        }
+        return true
+    })
+if let message = result.error() { print(message) }
 ```
