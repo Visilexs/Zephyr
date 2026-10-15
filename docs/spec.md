@@ -702,10 +702,10 @@ running it.
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
 | `l.join(sep)` | [str], str → str | concatenation with `sep` between elements |
-| `args()`   | → [str] | process arguments, `args()[0]` is the program |
-| `readFile(p)` | str → str | whole file; panics if unreadable |
+| `args()`   | → [str] | process arguments, `args()[0]` is the program; each argument exactly as passed (on Linux, argv: empty arguments, spaces and quotes survive) |
+| `readFile(p)` | str → str | whole file, read until end of file (so `/proc` files and pipes work); panics if unreadable |
 | `writeFile(p, d)` | str, str → void | create/overwrite; panics on failure |
-| `zeros(n)` | int → [int] | preallocated list of `n` zeros |
+| `zeros(n)` | int → [int] | preallocated list of `n` zeros (panics when `n < 0`, "out of memory" when it cannot fit) |
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |
@@ -908,8 +908,12 @@ or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 A panic prints `panic: <file>:<line>: <message>` to stderr (the source
 location of the panicking operation) and terminates the process with exit
 code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
-(int), `.pop()` on an empty list, failed `as int`/`as float` parse, and heap
-exhaustion. Panics are not catchable.
+(int), `.pop()` on an empty list, failed `as int`/`as float` parse, a negative
+length (`zeros(n)`), stack overflow (on Linux, `panic: stack overflow` with no
+location: a SIGSEGV handler on an alternate signal stack reports it), and heap exhaustion (`out of memory`, also for a size too
+large to represent). Printing a panic never allocates, so it works when memory
+is what ran out. Under an address-space limit the runtime reserves less address
+space for its heap rather than failing at startup. Panics are not catchable.
 
 ## 7. Programs and linkage
 
@@ -928,7 +932,7 @@ An additional native Apple Silicon macOS target uses the `zc` driver:
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
-| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*`. A program with `extern fn` becomes a dynamic ELF importing only `dlopen`/`dlsym` from libc (§3.6) |
+| `--linux` | Linux x86-64 | static ELF64 (written with mode 0755 when the compiler runs on Linux) | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*`. A program with `extern fn` becomes a dynamic ELF importing only `dlopen`/`dlsym` from libc (§3.6) |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 | `./zc` driver | Apple Silicon macOS | ARM64 Mach-O | experimental; ARM64 instruction selection, including guarded integer AXPY/weighted-sum NEON kernels and wide array fills, followed by Apple Clang assembly/linking and a native Darwin OS runtime. See [macOS support](../README.md#apple-silicon-macos) |
 
@@ -1007,10 +1011,17 @@ string interpolation uses a per-thread builder on both native targets.
 On Windows the backstop collector remains stop-the-world: it suspends every
 other registered thread and scans its register context and stack. Linux cannot
 suspend threads without signal handlers, so collection is deferred while any
-worker remains unjoined, including a worker requesting collection itself.
-Reference counting continues to reclaim acyclic objects; cyclic garbage may grow
-until the workers are joined and a later collection runs. Join every worker. Threads
-are not available on `--wasm`.
+worker is still running its body, including a worker requesting collection
+itself. A worker stops counting once its body returns, whether or not it is ever
+joined, and a collection deferred while workers ran is run by the `join` that
+finds none left running. Reference counting continues to reclaim acyclic
+objects meanwhile; only cyclic garbage waits. Threads are not available on
+`--wasm`.
+
+There is no fixed limit on live threads: the runtime's thread registry and
+the table that keeps thread bodies alive grow as needed (off-heap, under the
+heap lock), and threads may spawn and join threads. A finished worker's string
+builder and allocation cache go back to the runtime when its body returns.
 
 ## 9. Proposals (draft)
 

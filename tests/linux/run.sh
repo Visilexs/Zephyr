@@ -41,18 +41,15 @@ zc="${ZC:-$root/zc-linux}"
 declare -A KNOWN_FAIL=(
     [macos_loops:base]="codegen: tryReduce weighted-reduction fast path runs on maps"
     [macos_loops:O2]="codegen: tryReduce weighted-reduction fast path runs on maps"
-    [leaks/replace:base]="rc/runtime: runtimeStringReplace leaks intermediate strings"
-    [leaks/replace:O2]="rc/runtime: runtimeStringReplace leaks intermediate strings"
     [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"
-    [leaks/readfile:base]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/readfile:O2]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/args:base]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/args:O2]="runtime: readFile/writeFile/args leak temporaries"
-    [py:argument_tests]="frontend: Linux args() splits on spaces, drops empty args, truncates at 4 KB"
 )
 # Tests that are expected to exit nonzero (an intentional panic).
 declare -A EXPECT_EXIT=(
     [fill_loops]=1
+    [negative_zeros]=1
+    [huge_repeat]=1
+    [stack_overflow]=1
+    [thread_stack_overflow]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
@@ -138,7 +135,18 @@ run_extern() {
     verdict "sh:linux_extern" "$reason" >"$work/res/sh__linux_extern"
 }
 
-export -f run_tier verdict run_test run_python run_extern no_parity
+# The compiler writes Linux executables with mode 0755 (no chmod needed).
+run_mode() {
+    local reason=ok exe="$work/out/mode_check"
+    if ! timeout 300 "$work/zc-linux" --linux --rt "$root/tests/fixtures/basics/arguments.zeph" "$exe" >/dev/null 2>&1; then
+        reason="compile failed"
+    elif [ "$(stat -c %a "$exe")" != 755 ]; then
+        reason="output mode $(stat -c %a "$exe"), want 755"
+    fi
+    verdict "sh:elf_mode" "$reason" >"$work/res/sh__elf_mode"
+}
+
+export -f run_tier verdict run_test run_python run_extern no_parity run_mode
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -150,6 +158,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
+    matches "sh:elf_mode" && echo "run_mode"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'
 
 pass=0 fail=0 xfail=0 xpass=0

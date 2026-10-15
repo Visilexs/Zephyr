@@ -1,0 +1,12 @@
+// Under an address-space limit the runtime's 16 GiB heap reservation fails.
+// It used to recurse forever in runtimeFail (which allocated on the heap that
+// failed to exist); now the reservation halves until it fits. The limit is
+// set with setrlimit(RLIMIT_AS) before the first heap allocation.
+let limit = win("VirtualAlloc", 0, 16, 12288, 4)
+store64(limit, 268435456)              // 256 MiB, soft and hard
+store64(limit + 8, 268435456)
+let status = syscall(160, 9, limit)
+print("limit", status)
+var parts: [str] = []
+for i in 0..20000 { parts.push("item {i}") }
+print(parts.len(), parts[19999])

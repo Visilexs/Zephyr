@@ -52,6 +52,7 @@ def main():
         ("spaces", ["two words", " leading and trailing "]),
         ("empty", ["before", "", "after", ""]),
         ("tabs", ["tab\tseparated", "\t"]),
+        ("quotes", ['q"x', '"', 'back\\', 'b\\"c', '\\\\"', 'a\\b']),
     ]
     for size in (2047, 2048, 2049, 4095, 4096, 4097, 12000):
         cases.append((f"length-{size}", ["x" * size]))

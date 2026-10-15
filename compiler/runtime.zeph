@@ -18,7 +18,7 @@
 // anything the compiler's dup/drop insertion misses: a start bit marks each
 // payload address, which is how a conservatively-scanned word is recognised
 // as a real object pointer. Roots are the machine stack and the globals array.
-let runtimeHeapReserve = 17179869184     // 16 GiB of address space (reserved, not committed)
+var runtimeHeapReserve = 17179869184     // 16 GiB of address space (reserved, not committed); halved until it fits (runtimeInitializeHeap)
 let runtimeCommitStep = 4194304           // commit 4 MiB at a time
 let runtimeHeapFlagMarked = 1
 let runtimeHeapFlagFree = 2
@@ -145,6 +145,9 @@ fn runtimeReserveMemory(byteCount: int) -> int {
     let reservedAddress = win("VirtualAlloc", 0, byteCount, 8192, 4)
     if reservedAddress == 0 { runtimeFail("out of memory (reserve)") }
     return reservedAddress
+}
+fn runtimeTryReserveMemory(byteCount: int) -> int {
+    return win("VirtualAlloc", 0, byteCount, 8192, 4)
 }
 fn runtimeCommitMemory(base: int, byteCount: int) {
     // VirtualAlloc(base, n, MEM_COMMIT, PAGE_READWRITE)
@@ -321,14 +324,31 @@ fn runtimeInitializeHeap() {
     runtimeFreeListHeads = win("VirtualAlloc", 0, 4096, 12288, 4)     // (runtimeSmallAllocationClassCount+1) heads, off-heap
     if runtimeFreeListHeads == 0 { runtimeFail("out of memory") }
     runtimeInitializeShapeDescriptors()
-    runtimeHeapBaseAddress = runtimeReserveMemory(runtimeHeapReserve)
+    // Under an address-space limit (ulimit -v) the full reserve fails: halve
+    // it until the heap fits, then until its bitmaps and worklist fit too. A
+    // reservation that worked is kept even when a later one fails (address
+    // space only); the heap just uses less of it.
+    runtimeHeapBaseAddress = runtimeTryReserveMemory(runtimeHeapReserve)
+    while runtimeHeapBaseAddress == 0 and runtimeHeapReserve > 16777216 {
+        runtimeHeapReserve = runtimeHeapReserve >> 1
+        runtimeHeapBaseAddress = runtimeTryReserveMemory(runtimeHeapReserve)
+    }
+    if runtimeHeapBaseAddress == 0 { runtimeFail("out of memory (reserve)") }
+    var reservedSideTables = false
+    while not reservedSideTables {
+        runtimeObjectStartBitmap = runtimeTryReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word
+        runtimeObjectMarkBitmap = runtimeTryReserveMemory(runtimeHeapReserve >> 6)
+        runtimeMarkWorklist = runtimeTryReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to reserve/64 pending objects
+        reservedSideTables = runtimeObjectStartBitmap != 0 and runtimeObjectMarkBitmap != 0 and runtimeMarkWorklist != 0
+        if not reservedSideTables {
+            if runtimeHeapReserve <= 16777216 { runtimeFail("out of memory (reserve)") }
+            runtimeHeapReserve = runtimeHeapReserve >> 1
+        }
+    }
     runtimeHeapBumpAddress = runtimeHeapBaseAddress
     runtimeHeapCommittedEnd = runtimeHeapBaseAddress
     runtimeNextCollectionAddress = runtimeHeapBaseAddress + 8388608                   // first collection after 8 MiB of growth
-    runtimeObjectStartBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)     // 1 bit per 8-byte word
-    runtimeObjectMarkBitmap = runtimeReserveMemory(runtimeHeapReserve >> 6)
     runtimeBitmapCommittedBytes = 0
-    runtimeMarkWorklist = runtimeReserveMemory(runtimeHeapReserve >> 3)   // mark worklist: up to 16M pending objects
     runtimeWorklistCommittedBytes = 0                         // (reserve is address space only -- free)
     runtimeInitializeStringBuilders()                           // before any formatting can happen
     runtimeHeapInitialized = 1
@@ -420,15 +440,24 @@ let runtimeCacheBatchBytes = 16384
 let runtimeCacheClassLimit = 512
 var runtimeThreadCacheSlot = 0 - 1      // TLS index, set when the first thread is registered
 var runtimeThreadCaches = 0             // registry: every cache, linked through [4000]
-let runtimeMaximumThreadCount = 64
+var runtimeThreadRecordCapacity = 64    // registry slots; doubles (off-heap, under the lock) when full
 var runtimeThreadRecords = 0
+// Thread bodies (closures) waiting to be joined. Their only other holder is
+// an off-heap record the OS hands the new thread, so this table keeps them
+// counted and is scanned as a root. Off-heap and changed only under the heap
+// lock: spawning happens on workers too.
+var runtimeThreadBodyTable = 0
+var runtimeThreadBodyCapacity = 0
+var runtimeCollectionDeferred = 0         // a collection was skipped while workers ran
+var runtimeThreadExitedSlot = 0 - 1      // TLS: 1 once a Linux worker has left the unsuspendable count
 var runtimeCollectorScratchAddress = 0        // collector's own scratch: runtimeGetScratchPage() is shared
 var runtimeRegisteredThreadCount = 0
 var runtimeHeapLockAddress = 0
 var runtimeThreadContextAddress = 0
-var runtimeUnsuspendableThreadCount = 0   // Linux workers not yet joined (under runtimeLockHeap)
+var runtimeUnsuspendableThreadCount = 0   // Linux workers still running (under runtimeLockHeap)
 
-// Linux calls this under runtimeLockHeap when a native worker is created or joined.
+// Linux calls this under runtimeLockHeap when a native worker is created, when
+// it finishes (runtimeMarkThreadDone) and when one that never reached that is joined.
 fn runtimeAdjustUnsuspendableThreads(threadDelta: int) {
     runtimeUnsuspendableThreadCount += threadDelta
 }
@@ -437,7 +466,8 @@ fn runtimeInitializeThreadRegistry() {
     if runtimeHeapLockAddress != 0 { return }
     runtimeHeapLockAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
     let initializationResult = win("InitializeCriticalSection", runtimeHeapLockAddress)
-    runtimeThreadRecords = win("VirtualAlloc", 0, runtimeMaximumThreadCount * 32, 12288, 4)
+    runtimeThreadRecords = win("VirtualAlloc", 0, runtimeThreadRecordCapacity * 32, 12288, 4)
+    if runtimeThreadRecords == 0 { runtimeFail("out of memory (thread registry)") }
     runtimeThreadContextAddress = win("VirtualAlloc", 0, 4096, 12288, 4)      // CONTEXT, page-aligned
     runtimeCollectorScratchAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
 }
@@ -484,9 +514,17 @@ fn runtimeRegisterThread(handle: int, threadId: int) -> int {
         }
     }
     if slotIndex < 0 {
-        if runtimeRegisteredThreadCount >= runtimeMaximumThreadCount {
-            let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
-            panic("thread: more than 64 live threads")
+        if runtimeRegisteredThreadCount >= runtimeThreadRecordCapacity {
+            // every reader of the registry holds the lock, so the old copy can go at once
+            let grown = win("VirtualAlloc", 0, runtimeThreadRecordCapacity * 64, 12288, 4)
+            if grown == 0 {
+                let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+                runtimeFail("out of memory (thread registry)")
+            }
+            runtimeCopyMemory(grown, runtimeThreadRecords, runtimeThreadRecordCapacity * 32)
+            let released = win("VirtualFree", runtimeThreadRecords, 0, 32768)
+            runtimeThreadRecords = grown
+            runtimeThreadRecordCapacity = runtimeThreadRecordCapacity * 2
         }
         slotIndex = runtimeRegisteredThreadCount
         runtimeRegisteredThreadCount += 1
@@ -497,6 +535,52 @@ fn runtimeRegisterThread(handle: int, threadId: int) -> int {
     store64(slot + 16, threadId)
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
     return slotIndex
+}
+
+fn runtimeExitedThreadSlot() -> int { return runtimeThreadExitedSlot }
+
+// Keep a thread body alive (and seen by the collector) until its worker is
+// joined. Returns the table index runtimeReleaseThreadBody takes.
+fn runtimeRetainThreadBody(body: int) -> int {
+    runtimeInitializeThreadRegistry()
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    var index = 0
+    while index < runtimeThreadBodyCapacity and load64(runtimeThreadBodyTable + index * 8) != 0 { index += 1 }
+    if index == runtimeThreadBodyCapacity {
+        var capacity = runtimeThreadBodyCapacity * 2
+        if capacity == 0 { capacity = 64 }
+        let grown = win("VirtualAlloc", 0, capacity * 8, 12288, 4)
+        if grown == 0 {
+            let failUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+            runtimeFail("out of memory (thread bodies)")
+        }
+        if runtimeThreadBodyTable != 0 {
+            runtimeCopyMemory(grown, runtimeThreadBodyTable, runtimeThreadBodyCapacity * 8)
+            let released = win("VirtualFree", runtimeThreadBodyTable, 0, 32768)
+        }
+        runtimeThreadBodyTable = grown
+        runtimeThreadBodyCapacity = capacity
+    }
+    store64(runtimeThreadBodyTable + index * 8, runtimeRetainReference(body))
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+    return index
+}
+
+fn runtimeReleaseThreadBody(index: int) {
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    let body = load64(runtimeThreadBodyTable + index * 8)
+    store64(runtimeThreadBodyTable + index * 8, 0)
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+    runtimeReleaseReference(body)
+}
+
+// Run a collection that was skipped while Linux workers were running, once
+// they have all finished. join calls this.
+fn runtimeRunDeferredCollection() {
+    if runtimeCollectionDeferred == 0 { return }
+    runtimeLockHeap()
+    if runtimeCollectionDeferred != 0 and runtimeUnsuspendableThreadCount == 0 { runtimeCollectGarbage() }
+    runtimeUnlockHeap()
 }
 
 // called by the new thread as its first act: publish where its stack lives
@@ -516,6 +600,7 @@ fn runtimeMarkThreadReady() {
 }
 
 fn runtimeMarkThreadDone() {
+    runtimeFreeThreadStringBuilder()
     if runtimeThreadCacheSlot >= 0 {
         // give the blocks back and the cache up: the thread only returns from here on
         let cache = win("TlsGetValue", runtimeThreadCacheSlot)
@@ -534,6 +619,14 @@ fn runtimeMarkThreadDone() {
             store64(runtimeThreadRecords + index * 32, 0)         // no handle: the slot is reusable
         }
         index += 1
+    }
+    // A Linux worker stops counting as unsuspendable here rather than at
+    // join, so a thread nobody joins does not turn the collector off for good.
+    // It touches no heap object from here on. Windows never counts its threads.
+    if runtimeUnsuspendableThreadCount > 0 {
+        if runtimeThreadExitedSlot < 0 { runtimeThreadExitedSlot = win("TlsAlloc") }
+        runtimeUnsuspendableThreadCount -= 1
+        let exitedResult = win("TlsSetValue", runtimeThreadExitedSlot, 1)
     }
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
@@ -582,7 +675,11 @@ fn runtimeCollectGarbage() {
     // ponytail: Linux cannot suspend stacks yet, including the unregistered
     // main thread. Defer cyclic garbage until all workers are joined; add signal
     // safepoints if long-lived workers need bounded cyclic-heap growth.
-    if runtimeUnsuspendableThreadCount != 0 { return }
+    if runtimeUnsuspendableThreadCount != 0 {
+        runtimeCollectionDeferred = 1      // runtimeRunDeferredCollection (join) runs it later
+        return
+    }
+    runtimeCollectionDeferred = 0
     runtimeEmptyThreadCaches()
     // clear marks
     var index = 0
@@ -593,6 +690,7 @@ fn runtimeCollectGarbage() {
     runtimeWorklistCount = 0
     // roots: globals, then the machine stack (current rsp .. stack base)
     if runtimeGlobalRootCount > 0 { runtimeScanRootRange(runtimeGlobalRootsAddress, runtimeGlobalRootsAddress + runtimeGlobalRootCount * 8) }
+    if runtimeThreadBodyCapacity > 0 { runtimeScanRootRange(runtimeThreadBodyTable, runtimeThreadBodyTable + runtimeThreadBodyCapacity * 8) }
     let lowLimitAddress = runtimeCollectorScratchAddress
     let highLimitAddress = lowLimitAddress + 8
     let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)   // returns VOID
@@ -1163,6 +1261,9 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
         store64(block - 16, descriptor)
         return block
     }
+    // a negative or wrapped size would round to a tiny block (or run past the
+    // reserve) and the caller would write over its neighbours' headers
+    if size < 0 or size > runtimeHeapReserve { runtimeFail("out of memory") }
     runtimeLockHeap()
     let result = runtimeAllocateObjectPayload(size)
     store64(result - 24, 1)
@@ -1339,6 +1440,8 @@ fn runtimeAllocateObjectPayload(size: int) -> int {
     // halves peak memory as is.
     if runtimeHeapBumpAddress >= runtimeNextCollectionAddress {
         runtimeCollectGarbage()
+    }
+    if runtimeHeapBumpAddress >= runtimeNextCollectionAddress and runtimeCollectionDeferred == 0 {
         // Proportional trigger (Go-style): allow the bump pointer to advance by
         // another `live` bytes before the next collection, so the heap peaks at
         // ~2x the live set. The target is measured from the CURRENT bump, i.e.
@@ -1715,27 +1818,51 @@ fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
     runtimeListPush(output, runtimeSubstringValue(stringAddress, start, stringLength))
     return output
 }
+// One pass to count the matches, one allocation, one pass to copy. An empty
+// search returns the input itself, so it hands out a count of its own.
 fn runtimeStringReplace(stringAddress: int, searchText: int, replacement: int) -> int {
     let stringLength = load64(stringAddress)
     let searchLength = load64(searchText)
-    if searchLength == 0 { return stringAddress }
-    var output = runtimeAllocateString(0)
-    var start = 0
+    if searchLength == 0 or searchLength > stringLength { return runtimeRetainReference(stringAddress) }
+    let replacementLength = load64(replacement)
+    let firstByte = load8(searchText + 8)
+    var matchCount = 0
     var index = 0
     while index + searchLength <= stringLength {
-        var matchedByteCount = 0
-        while matchedByteCount < searchLength and load8(stringAddress + 8 + index + matchedByteCount) == load8(searchText + 8 + matchedByteCount) { matchedByteCount += 1 }
-        if matchedByteCount == searchLength {
-            output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, index))
-            output = runtimeConcatenateStrings(output, replacement)
+        if load8(stringAddress + 8 + index) == firstByte and runtimeBytesMatch(stringAddress + 8 + index, searchText + 8, searchLength) == 1 {
+            matchCount += 1
+            index += searchLength
+        } else {
+            index += 1
+        }
+    }
+    if matchCount == 0 { return runtimeRetainReference(stringAddress) }
+    let output = runtimeAllocateString(stringLength + matchCount * (replacementLength - searchLength))
+    var outputIndex = output + 8
+    var start = 0
+    index = 0
+    while index + searchLength <= stringLength {
+        if load8(stringAddress + 8 + index) == firstByte and runtimeBytesMatch(stringAddress + 8 + index, searchText + 8, searchLength) == 1 {
+            runtimeCopyMemory(outputIndex, stringAddress + 8 + start, index - start)
+            outputIndex += index - start
+            runtimeCopyMemory(outputIndex, replacement + 8, replacementLength)
+            outputIndex += replacementLength
             index += searchLength
             start = index
         } else {
             index += 1
         }
     }
-    output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, stringLength))
+    runtimeCopyMemory(outputIndex, stringAddress + 8 + start, stringLength - start)
     return output
+}
+fn runtimeBytesMatch(left: int, right: int, byteCount: int) -> int {
+    var index = 0
+    while index < byteCount {
+        if load8(left + index) != load8(right + index) { return 0 }
+        index += 1
+    }
+    return 1
 }
 fn runtimeUppercaseString(stringAddress: int) -> int {
     let stringLength = load64(stringAddress)
@@ -1777,6 +1904,7 @@ fn runtimeStringRepeat(stringAddress: int, repetitionCount: int) -> int {
     let textLength = load64(stringAddress)
     var effectiveCount = repetitionCount
     if effectiveCount < 0 { effectiveCount = 0 }
+    if textLength > 0 and effectiveCount > runtimeHeapReserve / textLength { runtimeFail("out of memory") }
     let result = runtimeAllocateString(textLength * effectiveCount)
     var index = 0
     while index < effectiveCount {
@@ -2760,6 +2888,8 @@ fn runtimeListNew(initialLength: int) -> int {
 fn runtimeNewDescribedList(initialLength: int, descriptor: int) -> int {
     var shapeDescriptor = descriptor
     if shapeDescriptor == 0 { shapeDescriptor = runtimeValueListDescriptor }    // the data buffer still has to go when the list does
+    if initialLength < 0 { runtimeFail("negative list length") }
+    if initialLength > runtimeHeapReserve >> 3 { runtimeFail("out of memory") }
     let listAddress = runtimeAllocateDescribedObject(24, shapeDescriptor)
     var capacity = initialLength
     if capacity < 4 { capacity = 4 }
@@ -2798,6 +2928,8 @@ fn runtimeListPop(listAddress: int) -> int {
 // stored as its 32-bit pattern and enters Zephyr as a float (a double):
 // runtimeWidenFloat32Bits on the way out, runtimeNarrowFloat32Bits (round to nearest even) on the way in.
 fn runtimeNewPackedList(elementCount: int, width: int) -> int {
+    if elementCount < 0 { runtimeFail("negative list length") }
+    if elementCount > runtimeHeapReserve / width { runtimeFail("out of memory") }
     let listAddress = runtimeAllocateDescribedObject(24, runtimeValueListDescriptor)
     var capacity = elementCount
     if capacity < 4 { capacity = 4 }
@@ -2976,9 +3108,24 @@ fn runtimeU8ToString(listAddress: int) -> int {
 var runtimeOutputScratchAddress = 0
 var runtimeStandardOutputHandle = 0
 
+// An off-heap word for the byte counts WriteFile/ReadFile report. Off-heap so
+// runtimeFail can print without allocating: under an address-space limit the
+// heap itself may be what failed. Each thread gets its own.
+fn runtimeScratchWord() -> int {
+    if runtimeRegisteredThreadCount == 0 or runtimeThreadCacheSlot < 0 {
+        if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = win("VirtualAlloc", 0, 16, 12288, 4) }
+        return runtimeOutputScratchAddress
+    }
+    let cache = win("TlsGetValue", runtimeThreadCacheSlot)
+    if cache == 0 {
+        if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = win("VirtualAlloc", 0, 16, 12288, 4) }
+        return runtimeOutputScratchAddress
+    }
+    return cache + 4040                                       // spare words in the thread's cache page
+}
+
 fn runtimeWriteOutputBytes(fileHandle: int, bytesAddress: int, byteCount: int) {
-    if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
-    let result = win("WriteFile", fileHandle, bytesAddress, byteCount, runtimeOutputScratchAddress, 0)
+    let result = win("WriteFile", fileHandle, bytesAddress, byteCount, runtimeScratchWord(), 0)
 }
 
 fn runtimeGetStandardOutputHandle() -> int {
@@ -3051,6 +3198,17 @@ fn runtimeGetStringBuilder() -> int {
     return builderAddress
 }
 
+// runtimeMarkThreadDone: a finished worker's builder (state block and buffer,
+// both off-heap) goes back to the OS.
+fn runtimeFreeThreadStringBuilder() {
+    if runtimeMainStringBuilder == 0 { return }
+    let builderAddress = win("TlsGetValue", runtimeStringBuilderThreadLocalIndex)
+    if builderAddress == 0 or builderAddress == runtimeMainStringBuilder { return }
+    let tlsBuilderResult = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, 0)
+    let bufferReleased = win("VirtualFree", load64(builderAddress), 0, 32768)
+    let stateReleased = win("VirtualFree", builderAddress, 0, 32768)
+}
+
 fn runtimeEnsureStringBuilderCapacity(builderAddress: int, extra: int) {
     let usedLength = load64(builderAddress + 8)
     let capacity = load64(builderAddress + 16)
@@ -3061,7 +3219,9 @@ fn runtimeEnsureStringBuilderCapacity(builderAddress: int, extra: int) {
     // VirtualAlloc, not runtimeAllocateObject: the builder must not itself allocate on the
     // GC heap, or formatting could trigger a collection mid-interpolation.
     let newBuffer = win("VirtualAlloc", 0, newCapacity, 12288, 4)
+    if newBuffer == 0 { runtimeFail("out of memory (string builder)") }
     runtimeCopyMemory(newBuffer, load64(builderAddress), usedLength)
+    let oldReleased = win("VirtualFree", load64(builderAddress), 0, 32768)
     store64(builderAddress, newBuffer)
     store64(builderAddress + 16, newCapacity)
 }
@@ -3441,6 +3601,10 @@ fn runtimeEndStringInterpolation(mark: int) -> int {
 }
 
 // Parse the OS command line using one scratch buffer large enough for any argument.
+// Splits the command line by the Windows rules (CommandLineToArgv): blanks
+// separate arguments outside quotes; 2n backslashes before a quote give n and
+// the quote toggles quoting, 2n+1 give n and a literal quote; "" inside quotes
+// is a literal quote; other backslashes are literal.
 fn runtimeArguments() -> int {
     let commandLine = win("GetCommandLineA")       // LPSTR
     if commandLine == 0 { runtimeFail("cannot read command line") }
@@ -3461,9 +3625,35 @@ fn runtimeArguments() -> int {
             while scanning {
                 let character = load8(commandLine + index)
                 if character == 0 { scanning = false }
-                else if character == 34 {
-                    if quoted { quoted = false } else { quoted = true }
-                    index += 1
+                else if character == 92 {
+                    var backslashes = 0
+                    while load8(commandLine + index) == 92 {
+                        backslashes += 1
+                        index += 1
+                    }
+                    let beforeQuote = load8(commandLine + index) == 34
+                    var kept = backslashes
+                    if beforeQuote { kept = backslashes / 2 }
+                    var fill = 0
+                    while fill < kept {
+                        store8(buffer + argumentLength, 92)
+                        argumentLength += 1
+                        fill += 1
+                    }
+                    if beforeQuote and backslashes % 2 == 1 {
+                        store8(buffer + argumentLength, 34)          // an escaped, literal quote
+                        argumentLength += 1
+                        index += 1
+                    }
+                } else if character == 34 {
+                    if quoted and load8(commandLine + index + 1) == 34 {
+                        store8(buffer + argumentLength, 34)      // "" inside quotes
+                        argumentLength += 1
+                        index += 2
+                    } else {
+                        if quoted { quoted = false } else { quoted = true }
+                        index += 1
+                    }
                 } else if (character == 32 or character == 9) and not quoted {
                     scanning = false
                 } else {
@@ -3477,6 +3667,7 @@ fn runtimeArguments() -> int {
             runtimeListPush(argumentList, argument)
         }
     }
+    runtimeReleaseReference(buffer)
     return argumentList
 }
 
@@ -3489,23 +3680,38 @@ fn runtimeAllocateCString(stringAddress: int) -> int {
     return cStringAddress
 }
 
-// runtimeReadFile(path) -> str with the whole file
+// runtimeReadFile(path) -> str with the whole file. The size is only a first
+// guess: /proc files and pipes report 0, and a file can grow, so it reads
+// until a read returns nothing, growing the string as it goes.
 fn runtimeReadFile(path: int) -> int {
     let cStringPointer = runtimeAllocateCString(path)
     // CreateFileA(name, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0)
     let handle = win("CreateFileA", cStringPointer, 2147483648, 1, 0, 3, 0, 0)
+    runtimeReleaseReference(cStringPointer)
     if handle == 0 - 1 { runtimeFail("cannot read file") }
     let size = win("GetFileSize", handle, 0)
-    let text = runtimeAllocateString(size)
-    if runtimeOutputScratchAddress == 0 { runtimeOutputScratchAddress = runtimeAllocateObject(16) }
+    var capacity = size + 1                  // room to see EOF without growing
+    if capacity < 4096 { capacity = 4096 }
+    var text = runtimeAllocateString(capacity)
+    let countAddress = runtimeScratchWord()
     var bytesRead = 0
-    while bytesRead < size {
-        let result = win("ReadFile", handle, text + 8 + bytesRead, size - bytesRead, runtimeOutputScratchAddress, 0)
-        let chunkByteCount = load64(runtimeOutputScratchAddress) & 4294967295
-        if result == 0 or chunkByteCount == 0 { bytesRead = size }
+    var going = true
+    while going {
+        if bytesRead == capacity {
+            let grown = runtimeAllocateString(capacity * 2)
+            runtimeCopyMemory(grown + 8, text + 8, bytesRead)
+            runtimeReleaseReference(text)
+            text = grown
+            capacity = capacity * 2
+        }
+        store64(countAddress, 0)
+        let result = win("ReadFile", handle, text + 8 + bytesRead, capacity - bytesRead, countAddress, 0)
+        let chunkByteCount = load64(countAddress) & 4294967295
+        if result == 0 or chunkByteCount == 0 { going = false }
         else { bytesRead += chunkByteCount }
     }
     let closeResult = win("CloseHandle", handle)
+    store64(text, bytesRead)
     return text
 }
 
@@ -3513,6 +3719,7 @@ fn runtimeWriteFile(path: int, data: int) {
     let cStringPointer = runtimeAllocateCString(path)
     // CreateFileA(name, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0)
     let handle = win("CreateFileA", cStringPointer, 1073741824, 0, 0, 2, 0, 0)
+    runtimeReleaseReference(cStringPointer)
     if handle == 0 - 1 { runtimeFail("cannot write file") }
     runtimeWriteOutputBytes(handle, data + 8, load64(data))
     let closeResult = win("CloseHandle", handle)

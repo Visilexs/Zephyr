@@ -1,0 +1,6 @@
+// A repeat whose byte count overflows used to wrap to a small block and write
+// past it; it panics with "out of memory" now (exit 1).
+print("start")
+let piece = "ab"
+let big = piece.repeat(4611686018427387904)
+print("unreachable", big.len())

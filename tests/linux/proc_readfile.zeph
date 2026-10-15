@@ -1,0 +1,6 @@
+// readFile used to trust the size the file reports, so /proc files (size 0)
+// and pipes read as "". It reads until EOF now.
+let status = readFile("/proc/self/status")
+print(status.len() > 100, status.contains("Name:"), status.contains("VmPeak"))
+let maps = readFile("/proc/self/maps")
+print(maps.split("\n").len() > 5)

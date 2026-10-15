@@ -1,0 +1,17 @@
+// str.replace: an empty or absent search hands back the input with its own
+// count (it used to return it uncounted: a use-after-free once the input died),
+// and the result is built in one pass.
+fn shout(i: int) -> str {
+    let source = "item-{i}"
+    return source.replace("", "!")          // source dies here; the result must not
+}
+var kept: [str] = []
+for i in 0..50 { kept.push(shout(i)) }
+for i in 0..50 { let filler = "filler {i} {i}" }
+print(kept[0], kept[49])
+print("a-b-c".replace("-", "+++"), "aaaa".replace("aa", "b"), "[" + "abc".replace("abc", "") + "]", "xabcx".replace("b", ""))
+print("abc".replace("zz", "q"), "ab".replace("abc", "q"), "x.y.z".replace(".", ".."))
+var long = ""
+for i in 0..2000 { long = long + "ab" }
+let swapped = long.replace("ab", "c")
+print(swapped.len(), long.replace("b", "").len())
