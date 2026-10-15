@@ -6695,6 +6695,7 @@ fn cloneInlineNode(node: Node, parameterBase: int, localBase: int, resultSlot: i
     copy.auxiliary = node.auxiliary
     copy.referenceIndex = node.referenceIndex
     copy.isMutable = node.isMutable
+    copy.file = node.file    // panic sites keep the inlined callee's file
     if node.nodeKind == nodeIdentifier and node.auxiliary == identifierKindParameter and node.slot < inlineSubstitutions.len() and inlineSubstitutions[node.slot].nodeKind != nodeNone {
         return cloneNode(inlineSubstitutions[node.slot])      // argument substituted in place
     }

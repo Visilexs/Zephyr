@@ -3,7 +3,8 @@
 #
 # Builds every self-checking test at baseline and -O2 with zc-linux, runs it
 # with a timeout, and checks the exit code, the .expected file next to the
-# source (when one exists) and that both tiers print the same thing. Also runs
+# source (when one exists), the lines of a .stderr file (each must appear in
+# stderr) and that both tiers print the same thing. Also runs
 # the leak checks (tests/leaks), the python checks that work on Linux and
 # tests/linux_extern.sh (when gcc is available).
 #
@@ -51,6 +52,7 @@ declare -A KNOWN_FAIL=(
 # Tests that are expected to exit nonzero (an intentional panic).
 declare -A EXPECT_EXIT=(
     [fill_loops]=1
+    [inline_panic_file]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
@@ -87,6 +89,13 @@ run_tier() {
     if [ "$code" != "$want" ]; then echo "exit $code (want $want)"; return; fi
     local expected="$root/tests/$name.expected"
     if [ -f "$expected" ] && ! cmp -s "$exe.out" "$expected"; then echo "output differs from .expected"; return; fi
+    # <test>.stderr: every line must appear in what the program wrote to stderr
+    local stderr_expected="$root/tests/$name.stderr" line
+    if [ -f "$stderr_expected" ]; then
+        while IFS= read -r line; do
+            grep -qF -- "$line" "$log" || { echo "stderr lacks: $line"; return; }
+        done <"$stderr_expected"
+    fi
     echo ok
 }
 

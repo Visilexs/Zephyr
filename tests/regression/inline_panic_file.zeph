@@ -1,0 +1,8 @@
+// A panic inside an inlined imported function must name the imported file,
+// on both tiers (cloneInlineNode used to drop the node's file).
+import "inputs/panic_helper.zeph"
+
+fn main() {
+    print(pick([1, 2, 3], 1))
+    fail()
+}

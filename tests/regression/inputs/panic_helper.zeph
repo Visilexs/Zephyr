@@ -1,0 +1,5 @@
+// Imported by inline_panic_file.zeph: tiny functions the front end inlines.
+fn pick(values: [int], index: int) -> int {
+    return values[index]
+}
+fn fail() { panic("custom") }
