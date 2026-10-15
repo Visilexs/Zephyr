@@ -89,7 +89,9 @@ print(size, total)
 | `T?` | `none`, or any T | optional |
 | `(A, B)` | `(1, "x")` | tuple, read with `.0`, `.1` |
 | `fn(A) -> R` | `fn(x: int) -> int { return x }` | function value / closure |
-| `[u8]`, `[f32]` | `"abc" as [u8]` | packed numeric buffers |
+| `[u8]`, `[f32]` | `"abc" as [u8]` | packed numeric buffers (elements read as int / float) |
+| `i8 i16 i32 u8 u16 u32 u64` | `let b: u8 = 255` | sized ints: wrap at their width, never mix with `int` |
+| `f32` | `let h: f32 = 0.5` | single precision; `i64` = `int`, `f64` = `float` |
 
 ```zephyr
 let xs: [int] = []                 // empty literals need a type
@@ -103,6 +105,27 @@ let t = (1, "one")
 let (num, word) = t                // destructuring
 print(xs.len(), n, f, s, num, word, t.1)
 ```
+
+## Sized scalars
+
+```zephyr
+var b: u8 = 250
+b += 10                          // wraps at 8 bits: 4
+let n = b as int + 1000          // no implicit widening: convert with `as`
+let small = 300 as u8            // int -> u8 truncates: 44
+let big: u64 = 0xFFFFFFFFFFFFFFFF   // u64 literals above int's range: hex
+print(b, n, small, big, big / 3, big > 1)   // u64 compares, divides, shifts unsigned
+let x: f32 = 0.1                 // rounded to single after every operation
+print(x * 3, x as float, 2.9 as u8, -1.0 as u32)   // float -> int saturates: 2 0
+let words: [u16] = [1, 2, 65535] // literals adopt the expected type (a range error otherwise)
+print(words, -(128 as i8))
+```
+
+- `u8 + int` is a compile error: both operands must have the same type
+  (literals adapt). A sized value passed where an `int` is expected needs
+  `as int`. `abs/min/max/pow/sqrt` take only int/float.
+- `[u8]` written as a type is the packed list; its elements still read as
+  `int`. `for v in bytes { total += v as u32 }`.
 
 ## Structs, enums, methods, interfaces
 
@@ -372,7 +395,8 @@ structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
 | `len(xs)`, `xs.length` | `xs.len()` |
 | `str(x)`, `x.toString()` | `x as str` or `"{x}"` |
 | `int("4")` | `"4" as int`, or `parseInt("4")` (std/string) for an `int?` |
-| `string`, `i64`, `double` | `str`, `int`, `float` |
+| `string`, `long`, `double` | `str`, `int` (= `i64`), `float` (= `f64`) |
+| `let x: u8 = 3; x + y` with `y: int` | `x + (y as u8)` or `(x as int) + y` |
 | `cond ? a : b` | `if cond { a } else { b }` |
 | `match x { 1 => ... }` | `match x { 1 { ... } else { ... } }` |
 | `for (i = 0; i < n; i++)` | `for i in 0..n { ... }` |

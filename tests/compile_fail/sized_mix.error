@@ -1,0 +1,2 @@
+'+' mixes u8 and int
+hint: sized scalars do not mix

@@ -96,7 +96,9 @@ private    = "private" ( fndecl | structdecl | enumdecl | ifacedecl | typealias 
 test       = "test" STRING block ;                           (* run by zc --test *)
 
 type       = basetype [ "?" ] ;                              (* T? optional *)
-basetype   = "int" | "i32" | "float" | "bool" | "str"
+basetype   = "int" | "float" | "bool" | "str"
+           | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+           | "f32" | "f64"                                   (* sized scalars, §3.0.0.4 *)
            | ID [ "[" type { "," type } "]" ]                (* Box[int]: generic struct *)
            | "[" type "]"                                    (* list *)
            | "[" ( "u8" | "f32" ) "]"                        (* packed list *)
@@ -166,9 +168,8 @@ at the top level.
 map), and named struct and enum types. `void` is the type of no value; it
 cannot be named in source.
 
-`i32` (listed in the grammar above) is a 32-bit signed integer that exists only as an `extern fn` return type
-(§3.6): the low 32 bits of the return register, sign-extended to a Zephyr `int`.
-It is not a general-purpose type — locals, fields and arithmetic all use `int`.
+The sized scalars `i8 i16 i32 u8 u16 u32 u64 f32` (and the aliases `i64` =
+`int`, `f64` = `float`) are value types like `int` and `float`; see §3.0.0.4.
 
 Two types are equal structurally, except structs and enums, which are equal
 only if they are the same declaration. There is no null and no implicit
@@ -261,12 +262,13 @@ map keys when their elements can (§3.0.1).
     var weights: [f32] = [0.1, 2.5]
     let doubles = weights as [float] // [0.100000001490116, 2.5]
 
-`[u8]` stores one byte per element and `[f32]` four (an IEEE single). They
-are the only places `u8` and `f32` appear: there are no `u8` or `f32`
-values, variables or fields. Reading an element gives an `int` (0 to 255) or
-a `float` (the single widened exactly); storing one keeps the low 8 bits of
-the int, or rounds the float to the nearest single (to infinity when too
-large).
+`[u8]` stores one byte per element and `[f32]` four (an IEEE single).
+Written as a type, `[u8]` and `[f32]` always mean these packed lists. For
+compatibility their elements read as `int` (0 to 255) and `float` (the single
+widened exactly), not as the `u8`/`f32` scalars of §3.0.0.4; storing one
+keeps the low 8 bits of the int, or rounds the float to the nearest single
+(to infinity when too large). A list literal of `u8` or `f32` *values*
+(`[a, b]` with `a: u8`) is an ordinary list; `as [u8]` / `as [f32]` packs it.
 
 A packed list has `.len()`, `.push(v)`, `.pop()`, indexing, `for` (including
 `for i, x in`), `==`, printing, and `[u8]` can be a map key. Anything else
@@ -277,6 +279,70 @@ convert with `as`. The conversions are `[int] as [u8]`, `[u8] as [int]`,
 converted element by element. Packed lists are for large numeric buffers
 (images, audio, meshes); they use an eighth or a half of a plain list's
 memory, at the cost of a runtime call per element access.
+
+### 3.0.0.4 Sized scalars
+
+    let flags: u16 = 0x8001
+    var counter: u8 = 250
+    counter += 10                    // wraps: 4
+    let wide = counter as int + 1000 // conversions are explicit
+    let half: f32 = 0.5
+
+| Type | Range | Notes |
+|------|-------|-------|
+| `i8` `i16` `i32` | two's complement, 8/16/32 bits | |
+| `i64` | the same type as `int` | |
+| `u8` `u16` `u32` `u64` | 0 to 2^n - 1 | |
+| `f32` | IEEE single | |
+| `f64` | the same type as `float` | |
+
+They are value types usable everywhere `int` and `float` are: locals, globals,
+consts, parameters, returns, struct fields, list elements, map keys (not
+`f32`), optionals, tuples and generic type arguments.
+
+**Representation.** Every value still occupies one 64-bit word. An integer of
+width n is kept *canonical*: sign-extended (`i*`) or zero-extended (`u*`)
+from its low n bits, so `==`, hashing and the runtime see an ordinary int.
+`u64` is the raw 64 bits. An `f32` is a `float` whose value is exactly a
+single, rounded (to nearest even) after every operation.
+
+**Arithmetic.** Both operands of a binary operator must have the same type;
+the result has that type (comparisons give `bool`). There is no implicit
+conversion between sized types, or between a sized type and `int`/`float`;
+mixing them is a compile error with a hint to use `as`. Integer arithmetic
+wraps at the type's width (`+ - * << unary -`, and `/` for `MIN / -1`): the
+result is computed on 64 bits, then truncated and re-extended. `/` and `%`
+truncate toward zero and panic on zero, as for `int`. `~x` flips the type's
+n bits. The shift count may have any integer type and, as for `int`, uses
+its low 6 bits (`x << 8` on a `u8` is 0, a shift by 64 is a shift by 0).
+`>>` is arithmetic on signed types and logical on unsigned ones. `u64`
+compares, divides and shifts right unsigned. `f32` has `+ - * /` (each
+rounded to single), comparisons and unary `-`, not `%` or bit operators.
+`abs`, `min`, `max`, `pow` and `sqrt` take `int`/`float` only: convert first.
+
+**Literals.** An integer literal (also negated, also `'a'`) where a sized
+integer is expected takes that type if its value is in range, otherwise it
+is a compile error: `let b: u8 = 256` fails. A literal is "expected" to have
+a type as an initializer or assignment of that type, an argument, a return
+value, a struct field, a list or map literal element under an annotation, or
+the other operand of a binary operator (`b + 1`). `u64` accepts any literal
+that is not negated, so values above `int`'s range are written in hex
+(`0xFFFFFFFFFFFFFFFF`). Integer and float literals adopt `f32`, rounded. A
+list literal containing a sized value (`[b, 1, 2]`) is a list of that type.
+
+**Conversions** with `as` (any numeric type to any numeric type):
+
+| From \ to | sized/plain integer | `float` | `f32` |
+|-----------|-----------------|---------|-------|
+| integer | wraps to the target width (truncate, then sign/zero-extend); exact when the value fits | exact up to 2^53, else rounded; `u64` as unsigned | rounded to single |
+| `float`/`f32` | truncates toward zero, saturating at the target's range; NaN gives 0 | exact | rounded to single |
+
+`x as str` gives the decimal text; `str as u8` is not a conversion (parse to
+`int` first). `as int` on a `u64` reinterprets the bits.
+
+**Printing.** Integers print in decimal (`u64` as unsigned). `f32` prints with
+7 significant digits (C's `%.7g`), `float` with 15: `0.1 as f32` prints `0.1`
+and `(0.1 as f32) as float` prints `0.100000001490116`.
 
 ### 3.0.1 Maps
 
@@ -539,7 +605,8 @@ A value of type `S` *fits* type `T` if `S = T`, or `S = int` and `T = float`
 arguments, returns, list elements, struct fields, and mixed arithmetic or
 comparison (the int operand widens).
 
-All other conversions are explicit via `expr as type`:
+Sized scalars (§3.0.0.4) never widen implicitly. All other conversions are
+explicit via `expr as type`:
 
 | from \ to | int | float | str | bool |
 |-----------|-----|-------|-----|------|

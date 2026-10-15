@@ -206,6 +206,26 @@ let typeIdVoid = 4
 let typeIdNone = 5
 let typeIdByte = 6
 let typeIdFloat32 = 7
+// Sized scalars (spec 3.0.0.4): int types whose typeDefinitionIds is a width
+// code (i8 1, i16 2, i32 3, u8 4, u16 5, u32 6, u64 7; 0 is int), and f32, the
+// float type with code 1. They share int's and float's kind, so the back ends
+// treat them as int/float words; the checker keeps them canonical.
+for sizedCode in 1..8 {
+    typeKinds.push(kindInteger)
+    typeElementIds.push(0)
+    typeDefinitionIds.push(sizedCode)
+}
+typeKinds.push(kindFloat)
+typeElementIds.push(0)
+typeDefinitionIds.push(1)
+let typeIdI8 = 8
+let typeIdI16 = 9
+let typeIdI32 = 10
+let typeIdU8 = 11
+let typeIdU16 = 12
+let typeIdU32 = 13
+let typeIdU64 = 14
+let typeIdF32 = 15
 
 // call kinds
 let callKindUser = 0
@@ -2754,6 +2774,7 @@ fn typeEquals(leftType: int, rightType: int) -> bool {
     if typeKinds[leftType] == kindStruct { return typeDefinitionIds[leftType] == typeDefinitionIds[rightType] }
     if typeKinds[leftType] == kindEnum { return typeDefinitionIds[leftType] == typeDefinitionIds[rightType] }
     if typeKinds[leftType] == kindInterface { return typeDefinitionIds[leftType] == typeDefinitionIds[rightType] }
+    if typeKinds[leftType] == kindInteger or typeKinds[leftType] == kindFloat { return typeDefinitionIds[leftType] == typeDefinitionIds[rightType] }   // sized scalars
     if typeKinds[leftType] == kindFunction {
         let leftSignature = functionSignatures[typeDefinitionIds[leftType]]
         let rightSignature = functionSignatures[typeDefinitionIds[rightType]]
@@ -2821,6 +2842,11 @@ fn isPacked(typeIndex: int) -> bool {
 fn packedValueType(typeIndex: int) -> int {
     if typeKinds[typeElementIds[typeIndex]] == kindByte { return typeIdInteger }
     return typeIdFloat
+}
+// the sized scalar a packed list's element is stored as (u8 / f32)
+fn packedScalarType(typeIndex: int) -> int {
+    if typeKinds[typeElementIds[typeIndex]] == kindByte { return typeIdU8 }
+    return typeIdF32
 }
 fn packedFamily(typeIndex: int) -> str { return describeType(typeElementIds[typeIndex]) }
 // "U8" or "F32": the family part of the runtime's packed-list functions (runtimeU8Get, runtimeF32Push, ...)
@@ -3232,6 +3258,7 @@ fn mapGetterFunction(typeIndex: int) -> str { return "runtimeMapGet" }
 
 fn describeType(typeIndex: int) -> str {
     let typeKind = typeKinds[typeIndex]
+    if isSizedType(typeIndex) { return sizedName(typeIndex) }
     if typeKind == kindInteger { return "int" }
     if typeKind == kindFloat { return "float" }
     if typeKind == kindBoolean { return "bool" }
@@ -3278,7 +3305,7 @@ fn fits(wantedType: int, actualType: int) -> bool {
     if typeKinds[wantedType] == kindInterface and typeKinds[actualType] == kindStruct {   // struct implementing it
         return structImplements(typeDefinitionIds[actualType], typeDefinitionIds[wantedType])
     }
-    return typeKinds[wantedType] == kindFloat and typeKinds[actualType] == kindInteger
+    return wantedType == typeIdFloat and typeKinds[actualType] == kindInteger and typeDefinitionIds[actualType] == 0   // int widens; sized scalars convert with `as`
 }
 
 fn findStruct(name: str) -> int {
@@ -3454,7 +3481,8 @@ fn resolveTypeHere(typeExpression: Node) -> int {
     if typeName == "bool" { return typeIdBoolean }
     if typeName == "str" { return typeIdString }
     if typeName == "void" { failCompilation(typeExpression.line, "'void' is not a usable type") }
-    if typeName == "u8" or typeName == "f32" { failCompilation(typeExpression.line, "'{typeName}' exists only as a packed list element: [{typeName}]") }
+    let sizedType = sizedTypeNamed(typeName)
+    if sizedType >= 0 { return sizedType }
     var bindingIndex = typeBindingNames.len() - 1          // innermost binding wins
     while bindingIndex >= 0 {
         if typeBindingNames[bindingIndex] == typeName { return typeBindingTypes[bindingIndex] }
@@ -3532,6 +3560,8 @@ fn environmentAdd(name: str, typeIndex: int, mutable: bool, kind: int, index: in
 
 // ---------------- checker ----------------
 fn coerce(expression: Node, wantedType: int, contextDescription: str) -> Node {
+    if typeKinds[wantedType] == kindOptional { let adoptedInOptional = adoptLiteral(expression, typeElementIds[wantedType]) }
+    else { let adopted = adoptLiteral(expression, wantedType) }
     if typeEquals(wantedType, expression.typeIndex) { return expression }
     if typeKinds[wantedType] == kindOptional {
         if typeKinds[expression.typeIndex] == kindNone {            // `none` is the null pointer already
@@ -3546,7 +3576,7 @@ fn coerce(expression: Node, wantedType: int, contextDescription: str) -> Node {
             return optionalNode
         }
     }
-    if typeKinds[wantedType] == kindFloat and typeKinds[expression.typeIndex] == kindInteger {
+    if wantedType == typeIdFloat and typeKinds[expression.typeIndex] == kindInteger and typeDefinitionIds[expression.typeIndex] == 0 {
         var castNode = makeNode(nodeCast, expression.line)
         castNode.children.push(expression)
         castNode.children.push(makeNode(nodeNone, expression.line))
@@ -3567,6 +3597,9 @@ fn coerce(expression: Node, wantedType: int, contextDescription: str) -> Node {
         interfaceBoxNode.typeIndex = wantedType
         return interfaceBoxNode
     }
+    if (isSizedType(wantedType) or isSizedType(expression.typeIndex)) and isNumericType(wantedType) and isNumericType(expression.typeIndex) {
+        diagnosticHint = "sized scalars convert only explicitly: write `value as {describeType(wantedType)}`"
+    }
     failCompilation(expression.line, "{contextDescription}: expected {describeType(wantedType)}, got {describeType(expression.typeIndex)}")
     return expression
 }
@@ -3577,6 +3610,7 @@ fn checkBinary(expression: Node) -> int {
     let checkedRightType = checkExpression(expression.children[1])
     let leftType = expression.children[0].typeIndex
     let rightType = expression.children[1].typeIndex
+    if isSizedType(leftType) or isSizedType(rightType) { return checkSizedBinary(expression, leftType, rightType) }
     if operator == tokenAnd or operator == tokenOr {
         if typeKinds[leftType] != kindBoolean or typeKinds[rightType] != kindBoolean {
             failCompilation(expression.line, "'{tokenNames[operator]}' needs bool operands, got {describeType(leftType)} and {describeType(rightType)}")
@@ -3655,6 +3689,331 @@ fn checkBinary(expression: Node) -> int {
     }
     expression.auxiliary = binaryCategoryInteger
     return typeIdInteger
+}
+
+// ---------------- sized scalars (spec 3.0.0.4) ----------------
+// i8..u64 are int words kept canonical: sign- (i*) or zero-extended (u*) from
+// their width after every operation that can leave it, so == < and the
+// runtime see plain ints. u64 is the raw 64 bits; its comparisons, / % >> and
+// float conversions are unsigned. f32 is a float rounded to single precision
+// after every operation. The checker lowers all of it to int/float nodes, so
+// no back end knows about sized types.
+fn isSizedType(typeIndex: int) -> bool {
+    return (typeKinds[typeIndex] == kindInteger or typeKinds[typeIndex] == kindFloat) and typeDefinitionIds[typeIndex] != 0
+}
+// a scalar's type-descriptor kind: its type kind, except u64 (12) and f32 (13), which print differently
+fn sizedDescriptorKind(typeIndex: int) -> int {
+    if typeIndex == typeIdU64 { return 12 }
+    if typeIndex == typeIdF32 { return 13 }
+    return typeKinds[typeIndex]
+}
+fn isSizedInteger(typeIndex: int) -> bool { return typeKinds[typeIndex] == kindInteger and typeDefinitionIds[typeIndex] != 0 }
+fn sizedName(typeIndex: int) -> str {
+    if typeKinds[typeIndex] == kindFloat { return "f32" }
+    return ["int", "i8", "i16", "i32", "u8", "u16", "u32", "u64"][typeDefinitionIds[typeIndex]]
+}
+// bit width of an int type (int: 64)
+fn sizedBits(typeIndex: int) -> int { return [64, 8, 16, 32, 8, 16, 32, 64][typeDefinitionIds[typeIndex]] }
+fn sizedSigned(typeIndex: int) -> bool { return typeDefinitionIds[typeIndex] <= 3 }
+fn sizedTypeNamed(name: str) -> int {
+    if name == "i8" { return typeIdI8 }
+    if name == "i16" { return typeIdI16 }
+    if name == "i32" { return typeIdI32 }
+    if name == "i64" { return typeIdInteger }
+    if name == "u8" { return typeIdU8 }
+    if name == "u16" { return typeIdU16 }
+    if name == "u32" { return typeIdU32 }
+    if name == "u64" { return typeIdU64 }
+    if name == "f32" { return typeIdF32 }
+    if name == "f64" { return typeIdFloat }
+    return -1
+}
+fn sizedMinimum(typeIndex: int) -> int {
+    if not sizedSigned(typeIndex) { return 0 }
+    if sizedBits(typeIndex) == 64 { return 0 - 9223372036854775807 - 1 }
+    return 0 - (1 << (sizedBits(typeIndex) - 1))
+}
+fn sizedMaximum(typeIndex: int) -> int {
+    if sizedBits(typeIndex) == 64 { return 9223372036854775807 }
+    if sizedSigned(typeIndex) { return (1 << (sizedBits(typeIndex) - 1)) - 1 }
+    return (1 << sizedBits(typeIndex)) - 1
+}
+fn sizedIntegerLiteral(value: int, typeIndex: int, line: int) -> Node {
+    var literal = makeNode(nodeInteger, line)
+    literal.integerValue = value
+    literal.typeIndex = typeIndex
+    return literal
+}
+fn sizedBinaryNode(operator: int, left: Node, right: Node, typeIndex: int) -> Node {
+    var binary = makeNode(nodeBinary, left.line)
+    binary.operator = operator
+    binary.children.push(left)
+    binary.children.push(right)
+    binary.auxiliary = binaryCategoryInteger
+    if typeKinds[typeIndex] == kindFloat { binary.auxiliary = binaryCategoryFloat }
+    binary.typeIndex = typeIndex
+    return binary
+}
+fn sizedCastNode(value: Node, castKind: int, typeIndex: int) -> Node {
+    var castNode = makeNode(nodeCast, value.line)
+    castNode.children.push(value)
+    castNode.children.push(makeNode(nodeNone, value.line))
+    castNode.auxiliary = castKind
+    castNode.typeIndex = typeIndex
+    return castNode
+}
+
+// An int or float literal (or a negated one) still typed int/float takes the
+// sized type it meets, if its value fits. Returns whether it did.
+fn adoptLiteral(expression: Node, wantedType: int) -> bool {
+    if not isSizedType(wantedType) { return false }
+    var literal = expression
+    var negated = false
+    if expression.nodeKind == nodeNegate and expression.children.len() == 1 and (expression.children[0].nodeKind == nodeInteger or expression.children[0].nodeKind == nodeFloat) {
+        literal = expression.children[0]
+        negated = true
+    }
+    if literal.nodeKind == nodeInteger and literal.typeIndex == typeIdInteger and (not negated or expression.typeIndex == typeIdInteger) {
+        var value = literal.integerValue
+        if negated { value = 0 - value }
+        if typeKinds[wantedType] == kindFloat {
+            var floatLiteral = makeNode(nodeFloat, expression.line)
+            floatLiteral.floatValue = toSingle(value as float)
+            floatLiteral.typeIndex = wantedType
+            nodeBecome(expression, floatLiteral)
+            return true
+        }
+        // a u64 takes any bit pattern a literal can spell (0xFFFFFFFFFFFFFFFF is -1)
+        let hexPattern = wantedType == typeIdU64 and not negated
+        if not hexPattern and (value < sizedMinimum(wantedType) or value > sizedMaximum(wantedType)) {
+            if wantedType == typeIdU64 { failCompilation(expression.line, "literal {value} does not fit in u64 (0 to 18446744073709551615; write values above 9223372036854775807 in hex)") }
+            failCompilation(expression.line, "literal {value} does not fit in {describeType(wantedType)} ({sizedMinimum(wantedType)} to {sizedMaximum(wantedType)})")
+        }
+        nodeBecome(expression, sizedIntegerLiteral(value, wantedType, expression.line))
+        return true
+    }
+    if literal.nodeKind == nodeFloat and literal.typeIndex == typeIdFloat and wantedType == typeIdF32 and (not negated or expression.typeIndex == typeIdFloat) {
+        var value = literal.floatValue
+        if negated { value = 0.0 - value }
+        var floatLiteral = makeNode(nodeFloat, expression.line)
+        floatLiteral.floatValue = toSingle(value)
+        floatLiteral.typeIndex = wantedType
+        nodeBecome(expression, floatLiteral)
+        return true
+    }
+    return false
+}
+
+// Wrap an int (float) word computed at full width back into the sized type:
+// truncate to the width and extend again (round to single for f32).
+fn sizedWrap(value: Node, typeIndex: int) -> Node {
+    if typeKinds[typeIndex] == kindFloat {
+        value.typeIndex = typeIdFloat
+        var rounding = makeNode(nodeCall, value.line)
+        var callee = makeNode(nodeIdentifier, value.line)
+        callee.name = "toSingle"
+        rounding.children.push(callee)
+        rounding.children.push(value)
+        rounding.auxiliary = callKindRoundToSingle
+        rounding.typeIndex = typeIndex
+        return rounding
+    }
+    let bitCount = sizedBits(typeIndex)
+    if bitCount == 64 {
+        value.typeIndex = typeIndex
+        return value
+    }
+    value.typeIndex = typeIdInteger
+    if sizedSigned(typeIndex) {
+        let shift = 64 - bitCount
+        let shifted = sizedBinaryNode(tokenShiftLeft, value, sizedIntegerLiteral(shift, typeIdInteger, value.line), typeIdInteger)
+        return sizedBinaryNode(tokenShiftRight, shifted, sizedIntegerLiteral(shift, typeIdInteger, value.line), typeIndex)
+    }
+    return sizedBinaryNode(tokenAmpersand, value, sizedIntegerLiteral((1 << bitCount) - 1, typeIdInteger, value.line), typeIndex)
+}
+
+// a copy of `expression` (same kind, operator and children) as an int/float word
+fn sizedRawCopy(expression: Node, typeIndex: int) -> Node {
+    var raw = makeNode(expression.nodeKind, expression.line)
+    raw.operator = expression.operator
+    raw.auxiliary = expression.auxiliary
+    raw.children = expression.children
+    raw.typeIndex = typeIndex
+    return raw
+}
+
+// u64 order: flip the sign bit of both sides, then compare signed
+fn sizedFlipSign(value: Node) -> Node {
+    return sizedBinaryNode(tokenCaret, value, sizedIntegerLiteral(0 - 9223372036854775807 - 1, typeIdInteger, value.line), typeIdInteger)
+}
+
+fn sizedMixError(expression: Node, leftType: int, rightType: int) {
+    diagnosticHint = "sized scalars do not mix: convert one side with `as`, e.g. `x as {describeType(rightType)}` or `y as {describeType(leftType)}`"
+    failCompilation(expression.line, "'{tokenNames[expression.operator]}' mixes {describeType(leftType)} and {describeType(rightType)}")
+}
+
+fn checkSizedBinary(expression: Node, leftType: int, rightType: int) -> int {
+    let operator = expression.operator
+    if operator == tokenAnd or operator == tokenOr {
+        failCompilation(expression.line, "'{tokenNames[operator]}' needs bool operands, got {describeType(leftType)} and {describeType(rightType)}")
+    }
+    if not isNumericType(leftType) or not isNumericType(rightType) {
+        failCompilation(expression.line, "'{tokenNames[operator]}' is not defined for {describeType(leftType)} and {describeType(rightType)}")
+    }
+    if operator == tokenShiftLeft or operator == tokenShiftRight {
+        // the count may be any int type; the result has the left operand's type
+        if typeKinds[leftType] != kindInteger or typeKinds[rightType] != kindInteger {
+            failCompilation(expression.line, "'{tokenNames[operator]}' needs int operands, got {describeType(leftType)} and {describeType(rightType)}")
+        }
+        expression.auxiliary = binaryCategoryInteger
+        if not isSizedInteger(leftType) { return typeIdInteger }
+        if operator == tokenShiftRight {
+            if leftType != typeIdU64 { return leftType }          // canonical words: >> is already right
+            var countArgument: [Node] = []
+            countArgument.push(expression.children[1])
+            return runtimeCall(expression, "runtimeUnsignedShiftRight", expression.children[0], countArgument, typeIdU64)
+        }
+        nodeBecome(expression, sizedWrap(sizedRawCopy(expression, typeIdInteger), leftType))
+        return leftType
+    }
+    // ~x on an unsigned type is x ^ -1: the -1 is the parser's, not a literal to range-check
+    let complement = operator == tokenCaret and isSizedInteger(leftType) and expression.children[1].nodeKind == nodeInteger and expression.children[1].integerValue == 0 - 1 and expression.children[1].typeIndex == typeIdInteger
+    var operandType = leftType
+    if complement {
+        expression.children[1].typeIndex = leftType
+    } else if not typeEquals(leftType, rightType) {
+        if isSizedType(leftType) and adoptLiteral(expression.children[1], leftType) { operandType = leftType }
+        else if isSizedType(rightType) and adoptLiteral(expression.children[0], rightType) { operandType = rightType }
+        else { sizedMixError(expression, leftType, rightType) }
+    }
+    let isFloat32 = typeKinds[operandType] == kindFloat
+    if operator == tokenEquals or operator == tokenNotEquals {
+        expression.auxiliary = binaryCategoryInteger
+        if isFloat32 { expression.auxiliary = binaryCategoryFloat }
+        return typeIdBoolean
+    }
+    if operator == tokenLessThan or operator == tokenLessOrEqual or operator == tokenGreaterThan or operator == tokenGreaterOrEqual {
+        expression.auxiliary = binaryCategoryInteger
+        if isFloat32 { expression.auxiliary = binaryCategoryFloat }
+        if operandType == typeIdU64 {
+            expression.children[0] = sizedFlipSign(expression.children[0])
+            expression.children[1] = sizedFlipSign(expression.children[1])
+        }
+        return typeIdBoolean
+    }
+    if operator == tokenAmpersand or operator == tokenPipe or operator == tokenCaret {
+        if isFloat32 { failCompilation(expression.line, "'{tokenNames[operator]}' needs int operands, got f32") }
+        expression.auxiliary = binaryCategoryInteger
+        if complement and not sizedSigned(operandType) {
+            nodeBecome(expression, sizedWrap(sizedRawCopy(expression, typeIdInteger), operandType))
+        }
+        return operandType
+    }
+    if isFloat32 {
+        if operator == tokenPercent { failCompilation(expression.line, "'%' is not defined for f32") }
+        expression.auxiliary = binaryCategoryFloat
+        nodeBecome(expression, sizedWrap(sizedRawCopy(expression, typeIdFloat), operandType))
+        return operandType
+    }
+    expression.auxiliary = binaryCategoryInteger
+    if (operator == tokenSlash or operator == tokenPercent) and operandType == typeIdU64 {
+        var divisorArguments: [Node] = []
+        divisorArguments.push(expression.children[1])
+        divisorArguments.push(siteLiteral(expression))
+        var helper = "runtimeUnsignedDivide"
+        if operator == tokenPercent { helper = "runtimeUnsignedRemainder" }
+        return runtimeCall(expression, helper, expression.children[0], divisorArguments, typeIdU64)
+    }
+    // unsigned narrow / and % stay in range; signed / overflows only at MIN / -1
+    if operator == tokenPercent or (operator == tokenSlash and not sizedSigned(operandType)) { return operandType }
+    nodeBecome(expression, sizedWrap(sizedRawCopy(expression, typeIdInteger), operandType))
+    return operandType
+}
+
+// abs/min/max/pow work on int and float only (their results would not be canonical)
+fn rejectSizedArgument(expression: Node, typeIndex: int, builtinName: str) {
+    if isSizedType(typeIndex) {
+        diagnosticHint = "convert the argument first, e.g. `x as int` or `x as float`"
+        failCompilation(expression.line, "{builtinName} takes int or float, got {describeType(typeIndex)}")
+    }
+}
+
+// -x on a sized int wraps (-(-128) as i8 is -128, -1 as u8 is 255)
+fn checkSizedNegate(expression: Node, typeIndex: int) -> int {
+    if isSizedInteger(typeIndex) and sizedBits(typeIndex) < 64 {
+        nodeBecome(expression, sizedWrap(sizedRawCopy(expression, typeIdInteger), typeIndex))
+    }
+    return typeIndex
+}
+
+// `value as T` where either side is a sized scalar
+fn checkSizedCast(expression: Node, from: int, targetType: int) -> int {
+    let value = expression.children[0]
+    let sourceKind = typeKinds[from]
+    let targetKind = typeKinds[targetType]
+    if targetKind == kindString and (sourceKind == kindInteger or sourceKind == kindFloat) {
+        expression.auxiliary = castKindToString
+        expression.slot = typeDescriptorIndex(from)
+        return targetType
+    }
+    let fromInteger = sourceKind == kindInteger or sourceKind == kindEnum
+    if not ((fromInteger or sourceKind == kindFloat) and (targetKind == kindInteger or targetKind == kindFloat)) {
+        if sourceKind == kindString { diagnosticHint = "parse to int or float first: `(text as int) as {describeType(targetType)}`" }
+        failCompilation(expression.line, "no conversion from {describeType(from)} to {describeType(targetType)}")
+    }
+    var noArguments: [Node] = []
+    if fromInteger and targetKind == kindInteger {
+        // int -> int: wrap to the target width unless every source value fits
+        var sourceBits = 64
+        var sourceSigned = true
+        if sourceKind == kindInteger {
+            sourceBits = sizedBits(from)
+            sourceSigned = sizedSigned(from) or typeDefinitionIds[from] == 0
+        }
+        let targetBits = sizedBits(targetType)
+        let targetSigned = sizedSigned(targetType) or typeDefinitionIds[targetType] == 0
+        let contained = (sourceSigned == targetSigned and sourceBits <= targetBits) or (not sourceSigned and targetSigned and sourceBits < targetBits)
+        if contained or targetBits == 64 {
+            expression.auxiliary = castKindNoOperation
+            return targetType
+        }
+        nodeBecome(expression, sizedWrap(sizedCastNode(value, castKindNoOperation, typeIdInteger), targetType))
+        return targetType
+    }
+    if fromInteger {                                    // int -> float / f32
+        var converted = makeNode(nodeNone, expression.line)
+        if from == typeIdU64 {
+            let helperType = runtimeCall(converted, "runtimeUnsignedToFloat", value, noArguments, typeIdFloat)
+        } else {
+            converted = sizedCastNode(value, castKindIntegerToFloat, typeIdFloat)
+        }
+        if targetType == typeIdF32 { converted = sizedWrap(converted, typeIdF32) }
+        nodeBecome(expression, converted)
+        expression.typeIndex = targetType
+        return targetType
+    }
+    if targetKind == kindFloat {                        // float <-> f32
+        if targetType == typeIdF32 and from != typeIdF32 {
+            nodeBecome(expression, sizedWrap(sizedCastNode(value, castKindNoOperation, typeIdFloat), typeIdF32))
+            return targetType
+        }
+        expression.auxiliary = castKindNoOperation
+        return targetType
+    }
+    // float / f32 -> int type: truncate toward zero, saturating at the target's range
+    if targetType == typeIdU64 {
+        return runtimeCall(expression, "runtimeFloatToUnsigned", value, noArguments, typeIdU64)
+    }
+    let truncated = sizedCastNode(value, castKindTruncate, typeIdInteger)
+    if sizedBits(targetType) == 64 {
+        nodeBecome(expression, truncated)
+        expression.typeIndex = targetType
+        return targetType
+    }
+    var bounds: [Node] = []
+    bounds.push(sizedIntegerLiteral(sizedMinimum(targetType), typeIdInteger, expression.line))
+    bounds.push(sizedIntegerLiteral(sizedMaximum(targetType), typeIdInteger, expression.line))
+    return runtimeCall(expression, "runtimeClampInteger", truncated, bounds, targetType)
 }
 
 fn checkMethod(expression: Node) -> int {
@@ -4358,6 +4717,7 @@ fn checkCall(expression: Node) -> int {
         if argumentCount != 1 { failCompilation(expression.line, "abs(x) takes one argument") }
         let typeIndex = checkExpression(expression.children[1])
         if not isNumericType(typeIndex) { failCompilation(expression.line, "abs needs a number") }
+        rejectSizedArgument(expression, typeIndex, "abs")
         expression.auxiliary = callKindAbsolute
         return typeIndex
     }
@@ -4366,6 +4726,8 @@ fn checkCall(expression: Node) -> int {
         let leftType = checkExpression(expression.children[1])
         let rightType = checkExpression(expression.children[2])
         if not isNumericType(leftType) or not isNumericType(rightType) { failCompilation(expression.line, "{callee.name} needs numbers") }
+        rejectSizedArgument(expression, leftType, callee.name)
+        rejectSizedArgument(expression, rightType, callee.name)
         if callee.name == "min" { expression.auxiliary = callKindMin } else { expression.auxiliary = callKindMax }
         if typeKinds[leftType] == kindFloat or typeKinds[rightType] == kindFloat {
             expression.children[1] = coerce(expression.children[1], typeIdFloat, callee.name)
@@ -4383,6 +4745,8 @@ fn checkCall(expression: Node) -> int {
         if not isNumericType(baseType) or not isNumericType(exponentType) {
             failCompilation(expression.line, "pow(base, exponent) takes numbers, got {describeType(baseType)} and {describeType(exponentType)}")
         }
+        rejectSizedArgument(expression, baseType, "pow")
+        rejectSizedArgument(expression, exponentType, "pow")
         if typeKinds[baseType] == kindFloat or typeKinds[exponentType] == kindFloat {
             var extraArguments: [Node] = []
             extraArguments.push(coerce(expression.children[2], typeIdFloat, "pow exponent"))
@@ -4739,8 +5103,12 @@ fn checkExpressionInner(expression: Node) -> int {
             failCompilation(expression.line, "cannot infer the type of an empty list literal; annotate the variable")
         }
         var elementType = checkExpression(expression.children[0])
+        var sizedElementType = -1             // [x, 1, 2] with x: u8 is a list of u8; the literals adopt it
+        if isSizedType(elementType) { sizedElementType = elementType }
         for i in 1..expression.children.len() {
             let typeIndex = checkExpression(expression.children[i])
+            if sizedElementType < 0 and isSizedType(typeIndex) { sizedElementType = typeIndex }
+            if sizedElementType >= 0 { continue }
             if fits(elementType, typeIndex) { continue }
             if fits(typeIndex, elementType) {
                 elementType = typeIndex
@@ -4748,6 +5116,7 @@ fn checkExpressionInner(expression: Node) -> int {
             }
             failCompilation(expression.line, "mixed element types in list: {describeType(elementType)} and {describeType(typeIndex)}")
         }
+        if sizedElementType >= 0 { elementType = sizedElementType }
         for i in 0..expression.children.len() {
             expression.children[i] = coerce(expression.children[i], elementType, "list element")
         }
@@ -4834,6 +5203,7 @@ fn checkExpressionInner(expression: Node) -> int {
     if expression.nodeKind == nodeNegate {
         let typeIndex = checkExpression(expression.children[0])
         if not isNumericType(typeIndex) { failCompilation(expression.line, "unary '-' needs a number, got {describeType(typeIndex)}") }
+        if isSizedType(typeIndex) { return checkSizedNegate(expression, typeIndex) }
         return typeIndex
     }
     if expression.nodeKind == nodeNot {
@@ -4855,7 +5225,7 @@ fn checkExpressionInner(expression: Node) -> int {
                 expression.auxiliary = castKindNoOperation
                 return targetType
             }
-            if isPacked(targetType) and typeKinds[from] == kindList and typeEquals(typeElementIds[from], packedValueType(targetType)) {
+            if isPacked(targetType) and typeKinds[from] == kindList and (typeEquals(typeElementIds[from], packedValueType(targetType)) or typeEquals(typeElementIds[from], packedScalarType(targetType))) {
                 return runtimeCall(expression, "runtime{packedRuntimeFamily(targetType)}FromList", expression.children[0], noExtraArguments, targetType)
             }
             if isPacked(from) and typeKinds[targetType] == kindList and typeEquals(typeElementIds[targetType], packedValueType(from)) {
@@ -4873,6 +5243,7 @@ fn checkExpressionInner(expression: Node) -> int {
             lowerEnumFromInteger(expression, targetType)
             return checkExpressionInner(expression)
         }
+        if isSizedType(from) or isSizedType(targetType) { return checkSizedCast(expression, from, targetType) }
         let sourceKind = typeKinds[from]
         let targetKind = typeKinds[targetType]
         var castKind = -1
@@ -4988,6 +5359,13 @@ fn checkExpression(expression: Node) -> int {
 // of a list literal each coerce to the expected element type, which is what lets
 // a `[Shape]` argument hold a mix of implementing structs.
 fn checkExpectedExpression(expression: Node, wantedType: int) -> int {
+    var literalTarget = wantedType
+    if typeKinds[wantedType] == kindOptional { literalTarget = typeElementIds[wantedType] }
+    if isSizedType(literalTarget) and (expression.nodeKind == nodeInteger or expression.nodeKind == nodeFloat or expression.nodeKind == nodeNegate) {
+        let literalType = checkExpression(expression)          // 7 where a u8 is expected: a u8 literal
+        let adopted = adoptLiteral(expression, literalTarget)
+        return expression.typeIndex
+    }
     if expression.nodeKind == nodeStructLiteral and typeKinds[wantedType] == kindStruct {        // Box{...} where a Box[int] is expected
         let wantedStruct = structDefinitions[typeDefinitionIds[wantedType]]
         if wantedStruct.template >= 0 and findStruct(qualifyName(expression.name)) == wantedStruct.template { expression.name = wantedStruct.name }
@@ -5020,11 +5398,25 @@ fn checkExpectedExpression(expression: Node, wantedType: int) -> int {
         var noExtraArguments: [Node] = []
         return runtimeCall(expression, "runtime{packedRuntimeFamily(wantedType)}FromList", coerce(literal, plainType, "list"), noExtraArguments, wantedType)
     }
+    if expression.nodeKind == nodeMapLiteral and expression.children.len() > 0 and typeKinds[wantedType] == kindMap and (isSizedType(typeDefinitionIds[wantedType]) or isSizedType(typeElementIds[wantedType])) {
+        var i = 0                             // [1: "a"] where a [u16: str] is expected: the keys adopt u16
+        while i < expression.children.len() {
+            let keyType = checkExpectedExpression(expression.children[i], typeDefinitionIds[wantedType])
+            expression.children[i] = coerce(expression.children[i], typeDefinitionIds[wantedType], "map key")
+            let valueType = checkExpectedExpression(expression.children[i + 1], typeElementIds[wantedType])
+            expression.children[i + 1] = coerce(expression.children[i + 1], typeElementIds[wantedType], "map value")
+            i += 2
+        }
+        expression.typeIndex = wantedType
+        return wantedType
+    }
     if expression.nodeKind == nodeList and expression.children.len() > 0 and typeKinds[wantedType] == kindList {
         let elementType = typeElementIds[wantedType]
-        if typeKinds[elementType] == kindInterface {
+        if typeKinds[elementType] == kindInterface or isSizedType(elementType) {   // each element coerces (a [Shape], a list of u16)
             for i in 0..expression.children.len() {
-                let typeIndex = checkExpression(expression.children[i])
+                var typeIndex = 0
+                if isSizedType(elementType) { typeIndex = checkExpectedExpression(expression.children[i], elementType) }
+                else { typeIndex = checkExpression(expression.children[i]) }
                 expression.children[i] = coerce(expression.children[i], elementType, "list element")
             }
             expression.typeIndex = wantedType
@@ -12266,7 +12658,7 @@ fn generateProgram(program: Node) {
                 emitInstruction(".quad __c{addCString(enumDefinition.members[j])}")
             }
         } else {
-            emitInstruction(".quad {typeKind}")
+            emitInstruction(".quad {sizedDescriptorKind(typeIndex)}")
         }
         descriptorIndex += 1
     }
@@ -23276,7 +23668,7 @@ fn layoutWasmData() {
             writeWasmData64Bits(enumDefinition.members.len())
             for j in 0..enumDefinition.members.len() { patchWasmAddress(1, addCString(enumDefinition.members[j])) }
         } else {
-            writeWasmData64Bits(typeKind)
+            writeWasmData64Bits(sizedDescriptorKind(typeIndex))
         }
         descriptorIndex += 1
     }
