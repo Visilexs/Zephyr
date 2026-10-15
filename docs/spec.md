@@ -537,12 +537,16 @@ All other conversions are explicit via `expr as type`:
 | from \ to | int | float | str | bool |
 |-----------|-----|-------|-----|------|
 | **int**   | —   | exact | decimal | ✗ |
-| **float** | truncate toward zero | — | shortest decimal (`%.15g`) | ✗ |
+| **float** | truncate toward zero, saturating¹ | — | shortest decimal (`%.15g`) | ✗ |
 | **str**   | parse or panic | parse or panic | — | ✗ |
 | **bool**  | ✗   | ✗     | `"true"`/`"false"` | — |
 
 Lists and structs cannot be cast. `str` parses accept surrounding spaces and
-panic (§6) on any other malformed input.
+panic (§6) on any other malformed input; `str as int` also panics when the
+number does not fit in an int.
+
+¹ A float outside the int range converts to the nearest bound (`1e300 as int`
+is `INT_MAX`, `-1e300 as int` is `INT_MIN`), and NaN converts to 0.
 
 ### 3.3 Operators
 

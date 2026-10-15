@@ -53,6 +53,7 @@ declare -A KNOWN_FAIL=(
 declare -A EXPECT_EXIT=(
     [fill_loops]=1
     [inline_panic_file]=1
+    [str_int_overflow]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }

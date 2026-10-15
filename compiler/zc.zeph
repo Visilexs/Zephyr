@@ -8309,6 +8309,27 @@ fn divideConstantOk(divisor: Node) -> bool {
     return divisor.nodeKind == nodeInteger and divisor.integerValue >= 2 and divisor.integerValue <= 2147483647
 }
 
+// After cvttsd2si: x86 gives INT_MIN for NaN and out-of-range values.
+// Saturate instead (NaN -> 0, too large -> INT_MAX, too small -> INT_MIN),
+// using only the target register. `cmp target, 1` overflows only on INT_MIN.
+fn emitSaturateFloatToInteger(target: str, source: str) {
+    let doneLabel = allocateLabel()
+    let nanLabel = allocateLabel()
+    emitInstruction("cmp {target}, 1")
+    emitInstruction("jno {labelText(doneLabel)}")
+    emitInstruction("ucomisd {source}, {source}")
+    emitInstruction("jp {labelText(nanLabel)}")
+    emitInstruction("movq {target}, {source}")
+    emitInstruction("test {target}, {target}")
+    emitInstruction("movabs {target}, 9223372036854775807")
+    emitInstruction("jns {labelText(doneLabel)}")
+    emitInstruction("add {target}, 1")                  // INT_MAX + 1 wraps to INT_MIN
+    emitInstruction("jmp {labelText(doneLabel)}")
+    emitLabel(nanLabel)
+    emitInstruction("xor {target}, {target}")
+    emitLabel(doneLabel)
+}
+
 // rdx:rax = rax / rcx (quotient in rax, remainder in rdx). A divisor of -1
 // skips idiv, which traps on INT_MIN / -1: the result wraps (INT_MIN), and
 // the remainder is 0.
@@ -10577,6 +10598,7 @@ fn generateExpression(expression: Node) {
         } else if castKind == castKindTruncate {
             emitInstruction("movq xmm0, rax")
             emitInstruction("cvttsd2si rax, xmm0")
+            emitSaturateFloatToInteger("rax", "xmm0")
         } else if castKind == castKindToString {
             emitInstruction("mov rcx, rax")
             emitInstruction("lea rdx, [rip + __td{expression.slot}]")
@@ -12325,7 +12347,7 @@ let assemblyMnemonics: [str: int] = [
     "cvtsd2ss": 44, "cvtss2sd": 45, "addss": 46, "subss": 47, "mulss": 48, "divss": 49, "movss": 50,
     "je": 104, "jne": 105, "jl": 112, "jle": 114, "jg": 115, "jge": 113,
     "ja": 107, "jae": 103, "jb": 102, "jbe": 106, "jp": 110, "jnp": 111,
-    "js": 108, "jns": 109,
+    "js": 108, "jns": 109, "jo": 100, "jno": 101,
     "sete": 204, "setne": 205, "setl": 212, "setle": 214, "setg": 215, "setge": 213,
     "seta": 207, "setae": 203, "setb": 202, "setbe": 206, "setp": 210, "setnp": 211,
     "sets": 208, "setns": 209
@@ -20163,7 +20185,8 @@ fn emitWasmCast(expression: Node) {
     }
     if castKind == castKindTruncate {
         wasmFunctionBody.push(191)                         // f64.reinterpret_i64
-        wasmFunctionBody.push(176)                         // i64.trunc_f64_s
+        wasmFunctionBody.push(252)                         // i64.trunc_sat_f64_s (saturating)
+        wasmFunctionBody.push(7)
         return
     }
     if castKind != castKindNoOperation { failCompilation(expression.line, "--wasm: unsupported cast kind {castKind}") }

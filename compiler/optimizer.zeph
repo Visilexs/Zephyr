@@ -5435,6 +5435,22 @@ fn emitInstructionFor(value: int) {
         let source = floatIn(operands[0], "xmm0")
         let target = resultRegister(value, "rax")
         emitOptimized("cvttsd2si {target}, {source}")
+        // saturate like the baseline (emitSaturateFloatToInteger): NaN -> 0
+        let doneLabel = allocateLabel()
+        let nanLabel = allocateLabel()
+        emitOptimized("cmp {target}, 1")
+        emitOptimized("jno .L{doneLabel}")
+        emitOptimized("ucomisd {source}, {source}")
+        emitOptimized("jp .L{nanLabel}")
+        emitOptimized("movq {target}, {source}")
+        emitOptimized("test {target}, {target}")
+        emitOptimized("movabs {target}, 9223372036854775807")
+        emitOptimized("jns .L{doneLabel}")
+        emitOptimized("add {target}, 1")
+        emitOptimized("jmp .L{doneLabel}")
+        optimizerLines.push(".L{nanLabel}:\n")
+        emitOptimized("xor {target}, {target}")
+        optimizerLines.push(".L{doneLabel}:\n")
         finishResult(value, target)
         return
     }

@@ -1,0 +1,5 @@
+// str -> int accepts the full int range and panics on overflow (it used to
+// wrap silently).
+print("9223372036854775807" as int, "-9223372036854775808" as int, " -42 " as int, "+7" as int)
+print("9223372036854775808" as int)
+print("unreachable")

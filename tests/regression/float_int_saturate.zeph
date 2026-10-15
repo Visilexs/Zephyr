@@ -1,0 +1,17 @@
+// float -> int saturates: NaN -> 0, too large -> INT_MAX, too small ->
+// INT_MIN (it used to give INT_MIN for all three).
+fn convert(x: float) -> int { return x as int }
+
+let big = 1e300
+let zero = 0.0
+let nan = zero / zero
+print(convert(big), convert(0.0 - big), convert(nan))
+print(convert(9.3e18), convert(0.0 - 9.3e18), convert(0.0 - 9.223372036854775808e18))
+print(convert(2.9), convert(0.0 - 2.9), convert(1e18))
+var total = 0
+for i in 0..4 {
+    let f = (i as float) * 1e19 - 1.5e19
+    total = total / 2 + (f as int) / 4
+}
+print(total)
+print(big as int, nan as int)
