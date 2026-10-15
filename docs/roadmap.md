@@ -14,14 +14,16 @@ All existing runners are PowerShell/Windows. Nothing checks RC, threads, or
 baseline vs `-O2` parity on Linux, which is why several of the bugs below went
 unnoticed.
 
-- [ ] `tests/linux/run.sh`: copies zc-linux, runtime and lib into a temp dir,
+- [x] `tests/linux/run.sh`: copies zc-linux, runtime and lib into a temp dir,
   then builds every self-checking test (`tests/*.zeph`, `tests/regression`,
   `tests/fixtures/{basics,threads}`, `tests/linux`) at baseline and `-O2`. It
   diffs both against `.expected` (when one exists) and against each other.
-- [ ] Leak harness: a `runtimeLiveObjects()`/census builtin, and a check that
+- [x] Leak harness (`runtimeLiveObjectCount()`/`runtimeLiveObjectBytes()` census, `tests/leaks/`): a `runtimeLiveObjects()`/census builtin, and a check that
   running a body N and 2N times gives the same live-object delta at both tiers.
-- [ ] Run the existing python checks (`include_path`, `assert_message_release`,
-  `argument_tests`, `differential.py`) from the same script.
+- [x] Run the existing python checks (`include_path`, `assert_message_release`,
+  `argument_tests`, `differential.py`) from the same script. (`differential.py`
+  is not run: it needs the Windows toolchain. Known failures are XFAIL in
+  `KNOWN_FAIL` in run.sh; remove the entry when fixing one.)
 
 ## Phase 1: soundness and integral fixes
 
