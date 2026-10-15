@@ -687,6 +687,31 @@ fn runtimeCollectGarbage() {
     }
 }
 
+// ---- heap census (leak tests) ----
+// Walks [base, bump) and counts objects that are not on a free list. Reads
+// headers only and never allocates, so it is safe to call from test code.
+// Single-threaded use only: blocks parked in per-thread caches are not
+// free-flagged and would be counted as live.
+fn runtimeHeapCensus(wantBytes: int) -> int {
+    if runtimeHeapInitialized == 0 { return 0 }
+    var count = 0
+    var bytes = 0
+    var object = runtimeHeapBaseAddress + runtimeObjectHeaderBytes
+    while object < runtimeHeapBumpAddress {
+        let objectHeader = load64(object - 8)
+        let size = objectHeader & (0 - 8)
+        if (objectHeader & runtimeHeapFlagFree) == 0 {
+            count += 1
+            bytes += size + runtimeObjectHeaderBytes
+        }
+        object = object + runtimeObjectHeaderBytes + size
+    }
+    if wantBytes != 0 { return bytes }
+    return count
+}
+fn runtimeLiveObjectCount() -> int { return runtimeHeapCensus(0) }
+fn runtimeLiveObjectBytes() -> int { return runtimeHeapCensus(1) }
+
 // ---- reference counting ----
 // Every reference-typed value the compiler holds carries one count. Locals and
 // stored fields own theirs; parameters borrow the caller's. runtimeRetainReference and runtimeReleaseReference
