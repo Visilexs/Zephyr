@@ -1,0 +1,184 @@
+=== AREA frontend
+TESTS: Scratch setup: mkdir -p /tmp/claude-1000/zaudit-frontend; copy zc-linux, compiler/runtime.zeph (into compiler/) and lib/ there; build with `./zc-linux --linux --rt [-O2] prog.zeph prog && chmod +x prog && timeout 20 ./prog` (zc does not chmod its output). Helper script: /tmp/claude-1000/zaudit-frontend/t.sh <file.zeph> [flags]; repro programs are in /tmp/claude-1000/zaudit-frontend/{e,r,g,c,mod,tst,s,io}. Existing tests that run on Linux, from /home/ylvloha/repos/zephyr-wt-base (they write only to tempdirs): `python3 tests/include_path.py` (ok), `python3 tests/assert_message_release.py` (pass), `python3 tests/argument_tests.py --compiler ./zc-linux` (currently 8 passed / 16 failed, see the a
+- [high/bug/reproduced] Linux args() (and zc-linux's own argv) splits on spaces, drops empty args, mangles quotes, truncates at 4 KB
+    @ lib/os/linux.zeph:307-325 (kernel32GetCommandLineA)
+    fix: Read argc/argv straight from the initial stack at _start (or read all of /proc/self/cmdline in a loop) and build the args() list from the NUL-separated entries. Do not round-trip through a Windows command-line string. Add argument_tests.py to the Linux CI run.
+- [high/bug/reproduced] Panic site misattributed to the main file after front-end inlining (baseline and -O2 disagree)
+    @ compiler/zc.zeph:6687-6700 (cloneInlineNode), 6043 (panicSite)
+    fix: Add `copy.file = node.file` in cloneInlineNode, as cloneNode does at line 3840. Audit the other makeNode calls in post-parse passes (splitColdTails, accumulator/tail recursion) for the same problem. Add a regression test that a panic in an inlined imported function reports the imported file.
+- [high/bug/reproduced] Polymorphic generic recursion hangs the compiler (unbounded monomorphisation)
+    @ compiler/zc.zeph generics/monomorphisation (around cloneNode, line 3825 onward)
+    fix: Cap instantiation depth (type nesting depth, or instantiations per template, e.g. 64). Past the cap, report `error: generic 'f' instantiates itself with ever-growing types ([[[int]]]...)` at the call site.
+- [high/design-gap/reproduced] Compiler diagnostics: first error only, no column, formatted as a runtime panic, not machine-readable
+    @ compiler/zc.zeph:482-484 (failCompilation); 956 tokenizeSource (no column tracking)
+    fix: Track a column in Token and Node. Print `file:line:col: error: msg` without the `panic:` prefix and exit with a distinct code (e.g. 2). Keep checking after a type error at statement granularity (give the expression an error type), collect up to N errors, and add an `--error-format=json` mode.
+- [high/bug/reproduced] CLI and import errors expose compiler-internal locations and omit the offending path; unknown flags are silently taken as file names
+    @ compiler/zc.zeph:21534-21590 (argument loop), 18733 (expandImports readFile), 11919 (assembler)
+    fix: Reject unknown `-`/`--` flags and extra positionals with a clear message. Before reading, check pathExists and report `x.zeph:1: error: cannot find import 'nothere.zeph' (looked in ...)` or `error: cannot read input 'nosuch.zeph'`. Make --linux imply --rt, or error early with '--linux requires --rt'. Print usage to stdout with exit 0 for --help.
+- [medium/design-gap/reproduced] No stack traces; stack overflow is a silent SIGSEGV; runtime panic messages lack the offending values
+    @ compiler/runtime.zeph runtimeFail; lib/os/linux.zeph (no SIGSEGV/sigaltstack handler); spec §6
+    fix: Include values in the messages: `index 7 out of bounds for length 3`, `map key "b" not found`, `cannot read file '/x': ENOENT`. Install a sigaltstack SIGSEGV handler that reports a stack overflow with the faulting site. Optionally record a cheap return-address chain (rbp walk plus the --map/.zdbg symbols) to print a backtrace on panic.
+- [medium/design-gap/reproduced] `zc run` does not work on Linux
+    @ compiler/zc.zeph:19005-19110 (in-memory loader), 21529 (run detection), 21589; spec §3.6 'zc run builds a Windows image'
+    fix: On Linux, have `zc run` write the ELF to a memfd (memfd_create plus execveat) or a temp file and exec it with the remaining arguments. Make it imply --linux --rt on a Linux host. Also chmod 0755 output executables in assembleAndLink on Linux.
+- [medium/design-gap/reproduced] Generic errors point into the generic body or std file, never the call site; mismatch messages omit the expected type
+    @ compiler/zc.zeph monomorphisation/check (instantiation does not record its origin); spec §3.0.5, §3.0.5.1
+    fix: Keep an instantiation stack and append `note: while instantiating contains[T=H] from gstd.zeph:6`. Print the declared parameter type in argument mismatches. Name the missing or mismatched method in interface errors. Accept or explicitly diagnose `f[T](...)` call syntax. Longer term, add simple bounds (e.g. `[T: Eq]` or an interface bound) so errors
+- [medium/design-gap/reproduced] No error-propagation operator or recoverable failures; core I/O and conversions only panic
+    @ lib/std/result.zeph; lib/os/linux.zeph:937-945; spec §6, §3.2
+    fix: Add a postfix `?` for Result/optional in functions that return a compatible Result/optional (desugar to match plus early return). Add tryReadFile/tryWriteFile returning Result[str, str]. Implement getenv (from /proc/self/environ or the initial stack) and fork/execve+wait4 for run() on Linux.
+- [medium/design-gap/reproduced] --test runner stops at the first failing test, with no summary, filter, or assertion values
+    @ compiler/zc.zeph:18634-18654 (addTestRunner)
+    fix: Run each test in isolation (fork per test on Linux, or a panic hook that longjmps back to the runner), keep going after a failure, and print a final 'passed/failed' summary plus a non-zero exit. Add `--test-filter NAME`. Reject duplicate names. Have assert(a == b) print both operand values.
+- [medium/design-gap/reproduced] Strings are byte-only: no UTF-8 awareness in the language or std
+    @ spec §1, §3.5 string methods; lib/std/string.zeph (chars, reverseString, padLeft/padRight)
+    fix: Add std/utf8.zeph with codepoints(s) -> [int], runeCount, isValid, encode(cp) -> str and grapheme-unsafe but codepoint-safe reverse/pad. Make the lexer error print the byte as \xNN. Document that sub/len are byte-indexed.
+- [low/design-gap/reproduced] Common habits from other languages get generic parse errors, and a few are silently accepted
+    @ compiler/zc.zeph tokenizer (956) and parser expression/statement entry points; failCompilation call sites
+    fix: Add a table of targeted hints in the lexer/parser: on '&&' suggest 'and', on '||' suggest 'or', on '!' (not '!=') suggest 'not', on '++' suggest '+= 1', on ';' say 'statements end at newline; remove ;', on '?' after an expression mention if-expressions or (future) '?', on '=>' say 'arms are pattern { ... }', and map null/nil/True/False/len/range to
+=== AREA ffi
+TESTS: The existing Linux FFI tests are tests/linux/{extern_libc,extern_registers,std_linux}.zeph, each with a .expected file. They are driven by tests/linux_extern.sh, which uses $root/zc (a shell wrapper) and needs gcc for the .o variants; running it writes nothing into the repo because it builds in mktemp. The alternative without the wrapper, from a scratch copy that holds zc-linux, compiler/runtime.zeph and lib/ (as in /tmp/claude-1000/zaudit-ffi): for f in tl/*.zeph; do n=$(basename $f .zeph); for o in "" -O2; do timeout 20 ./zc-linux $o --linux --rt $f $n && chmod +x $n && timeout 20 ./$n </dev/null | diff - tl/$n.expected && echo ok $n $o; done; done. All 6 pass, but std_linux's 'ns monotoni
+- [critical/bug/reproduced] syscall builtin leaves unused argument registers as garbage; std/linux vmRead/vmWrite (and spec §9.1 example) pass no flags arg, so process_vm_readv always fails with EINVAL
+    @ compiler/zc.zeph:10133-10156 (callKindSyscall codegen); lib/std/linux.zeph vmRead/vmWrite (syscall(310/311, ...) with 5 args); docs/spec.md:
+    fix: Make the syscall builtin zero every argument register it does not use (xor rdi/rsi/rdx/r10/r8/r9), or require the full arity for known syscalls. Pass flags=0 explicitly in vmRead/vmWrite and fix the spec example. Delete the 'patched kernel' caveat and add a test that asserts vmRead returns the byte count.
+- [high/bug/reproduced] monotonicNanoseconds calls syscall 299 (recvmmsg on x86-64), so it always returns 0; the test passes vacuously
+    @ lib/std/linux.zeph monotonicNanoseconds (syscall(299, 1, base)); tests/linux/std_linux.zeph last block
+    fix: Use syscall(228, 1, buf.addr()) with a Bytes (or a global off-heap 16-byte scratch) and drop the red-zone, retry and stall logic. Make the test assert value > 0 and strictly increasing across a sleep.
+- [high/soundness/reproduced] Temporaries in an argument list are freed before the syscall/extern call runs: use-after-free from idiomatic cString(...).addr()
+    @ lib/std/bytes.zeph header (PINNING RULE); docs/spec.md §3.6 'a raw address stays valid exactly as long as some Zephyr variable still holds t
+    fix: Hold temporaries created while evaluating a call's arguments until the whole call statement finishes (C++ full-expression semantics), at least for syscall/callSysV/extern/win. Better still, have extern params accept Bytes/str/[u8] directly so the wrapper keeps the reference. Also add a keepAlive(x) intrinsic and a compile-time warning when .addr()/
+- [high/soundness/reproduced] std/linux memRead/memWrite do not check length against the Bytes buffer: heap overflow from a 'safe' API
+    @ lib/std/linux.zeph memRead / memWrite
+    fix: assert(length >= 0 and length <= buffer.len()), or drop the length parameter and use buffer.len(). Add an offset parameter so callers don't compute raw interior pointers. Have vmRead check iovec counts against the iovec Bytes sizes.
+- [medium/soundness/reproduced] Bytes fields are public: memory.push() or size assignment defeats the bounds checks (use-after-free / OOB through the checked wrapper)
+    @ lib/std/bytes.zeph struct Bytes; docs/spec.md §3.6 Raw memory paragraph and §4 'The heap is non-moving'
+    fix: Language: add private struct fields, or at least private-to-module fields. Short term: back Bytes with an off-heap mmap block plus a finalizer-free owner, or a [u8] it never exposes. Document in the spec that list/[u8] payloads move on growth.
+- [medium/bug/reproduced] Bytes bounds checks overflow on large offsets: SIGSEGV instead of a panic
+    @ lib/std/bytes.zeph put8..get64, at, putCString, putString, getString
+    fix: Check `offset <= self.size - N` (and `length >= 0 and length <= self.size - offset`) so no addition can overflow. Factor this into one private check(offset, width) helper.
+- [medium/design-gap/code-reference] Raw-memory primitive set is incomplete: no store16, no signed or float loads/stores, no memcpy/memset, no data-pointer accessor
+    @ compiler/zc.zeph:4161-4181 (load/store checker), compiler/optimizer.zeph:110-116 (irLoadRaw*/irStoreRaw*), lib/std/bytes.zeph get16/get32/ge
+    fix: Add store16, loadI8/I16/I32 (sign-extending), loadF32/loadF64/storeF32/storeF64, and copyMemory(dst, src, n) / fillMemory builtins that lower to IR, plus dataAddr(list|str|[u8]) so code stops hard-coding layout offsets. Then rewrite get16/get32/getString to use them, and add [u8]<->raw bulk copies so getString becomes one copy plus `as str`.
+- [medium/design-gap/reproduced] extern fn type surface too narrow: no narrow/unsigned/f32 returns or params, no struct by value, no callbacks
+    @ compiler/zc.zeph:5616-5700 desugarExternLinux; docs/spec.md §3.6 'Shared libraries on Linux' and addr() row
+    fix: Accept extern param/return annotations i8/i16/i32/u8/u16/u32/f32/bool/ptr that the wrapper converts (zero/sign-extend the return; cvtsd2ss/cvtss2sd for f32 using toSingle's existing lowering). Add a callback trampoline: an executable stub per signature that saves callee-saved regs, maps SysV args to a Zephyr closure call through the {code, env} cel
+- [medium/design-gap/reproduced] @C structs are mostly there already: plain int/float structs have C layout at addr(s); what is missing is narrow fields, padding rules and inline arrays
+    @ docs/spec.md:1022-1040 (§9.1); struct lowering in compiler/zc.zeph (8-byte slot per field)
+    fix: Implement @C as a layout attribute on structs whose fields are restricted to scalar sized types (i8..i64/u8..u64/f32/f64/bool8), nested @C structs and fixed arrays. Use natural alignment by default and allow @C(packed). Keep the counted header so addr() still works, and add sizeOf[T]/offsetOf. Document the existing 8-byte-slot layout in the meantim
+- [low/perf/reproduced] Any function or loop containing syscall stays at baseline under -O2
+    @ compiler/optimizer.zeph:2485-2487; lib/os/linux.zeph kernel32QueryPerformanceCounter/GetTickCount64
+    fix: Add an irSyscall opcode (clobbers rcx/r11/memory, args pinned to rdi/rsi/rdx/r10/r8/r9) and lower callSysV the same way. Use a static 16-byte timespec in the shim.
+- [low/design-gap/reproduced] No unsafe boundary: raw-memory builtins and runtime internals are callable from any file
+    @ compiler/zc.zeph:4008 (builtin name table), 3135; docs/spec.md §3.6 intro
+    fix: Gate the §3.6 builtins and runtime* symbols behind an `unsafe` block or file-level `#unsafe` marker (or an --allow-unsafe flag), with std/bytes and std/linux opting in. Make runtime functions private to the runtime unit.
+- [low/leak/code-reference] Linux extern desugaring: leaked mmap per symbol name and diagnostics pointing at <extern> source
+    @ compiler/zc.zeph:5620-5625 (__xcstr), 5681-5700
+    fix: Put the name strings in rodata (string literal bytes plus NUL) or free them after dlsym. Check the parameter count (max 16) in desugarExternLinux using externNode.line.
+=== AREA codegen
+TESTS: Setup (Linux, scratch only): mkdir -p /tmp/claude-1000/zaudit-codegen/compiler && cp /home/ylvloha/repos/zephyr-wt-base/zc-linux /tmp/claude-1000/zaudit-codegen/ && cp /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph /tmp/claude-1000/zaudit-codegen/compiler/ && cp -r /home/ylvloha/repos/zephyr-wt-base/lib /tmp/claude-1000/zaudit-codegen/. Compile and run: ./zc-linux --linux --rt [-O2] prog.zeph prog && chmod +x prog && timeout 20 ./prog </dev/null. The output needs chmod +x. Parity harness I used: /tmp/claude-1000/zaudit-codegen/run.sh NAME builds NAME.zeph at baseline and -O2, runs both and diffs them. Existing tests runnable on Linux: (1) sh /home/ylvloha/repos/zephyr-wt-base/tests
+- [critical/soundness/reproduced] Baseline fill-loop fast path (tryFill) runs on maps and corrupts the map's heap memory
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:10714-10745 (tryFill; type guard at 10727-10730 is inside `if macosTargetEnabled`)
+    fix: Apply the kindList and element-kind check on every target, not just macOS: `if typeKinds[targetList.typeIndex] != kindList or <element not int/float> { return false }`. Audit tryScaledVectorAddition and the other try* loop matchers for the same macOS-only guards. Add map, packed and str cases to tests/fill_loops.zeph and run it on Linux.
+- [critical/bug/reproduced] Weighted-reduction fast path (tryReduce) runs on maps: `acc += M[i] * i` gives wrong results on both tiers and reads map internals
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:10785-10820 (tryReduce; line 10811 only guards macOS)
+    fix: Require `typeKinds[sourceList.typeIndex] == kindList` with int elements (and not packed) on all targets before taking the native path. Run tests/macos_loops.zeph and tests/fill_loops.zeph in a Linux parity script.
+- [high/bug/reproduced] INT_MIN / -1 and INT_MIN % -1 kill the program with SIGFPE, and constant-folding them crashes the compiler
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:7038-7043 (constantFoldEval integer / and %), idiv emission at zc.zeph:8352,8374,8403,89
+    fix: Define the result in the spec (wrapping: INT_MIN/-1 = INT_MIN, INT_MIN%-1 = 0). Emit a `cmp divisor, -1` fast path (neg for /, 0 for %) before idiv wherever the divisor isn't a known constant other than -1. In both constant folders, special-case divisor -1 as negation and 0.
+- [high/bug/reproduced] Polymorphic recursion makes the compiler monomorphise forever (4 GB RSS in 8 s, never finishes)
+    @ generic instantiation / monomorphisation in /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph (no instantiation depth limit)
+    fix: Track instantiation nesting depth (or type-size growth per generic function) and report `error: polymorphic recursion: instantiating deep[Box[Box[...]]] exceeds depth 64` with the call site.
+- [medium/design-gap/reproduced] Stack overflow (deep recursion, deep structural ==) is a silent SIGSEGV with no diagnostic
+    @ /home/ylvloha/repos/zephyr-wt-base/lib/os/linux.zeph (no rt_sigaction/sigaltstack), compiler/runtime.zeph (no handler); spec docs/spec.md:90
+    fix: Install a SIGSEGV handler on an alternate signal stack that checks whether the fault address is in the current thread's guard region and prints `panic: stack overflow` (exit 1). Make structural ==, hash and print iterate over the last field/payload, or use an explicit worklist.
+- [medium/bug/reproduced] Compiler crashes (stack overflow) on long expressions, and compile time is quadratic in expression length
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph (recursive expression checker/codegen; depth-dependent work per node)
+    fix: Find the per-node walk that re-traverses the subtree (likely a type/purity/countNodes query called on every node while recursing) and memoize it. Add an explicit nesting-depth limit with a clean `expression nested too deeply` error, or run the compiler on a large thread stack.
+- [medium/design-gap/reproduced] Out-of-range float -> int conversion silently gives INT_MIN (1e300 as int is negative)
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:10564 (cvttsd2si), spec docs/spec.md:540
+    fix: Pick a semantics and put it in the spec: either saturate (NaN -> 0, as Rust does), costing a compare and cmov after cvttsd2si when the result equals 0x8000000000000000, or panic `float out of int range`. Apply the same rule in the constant folder.
+- [medium/bug/reproduced] Float formatting: nonzero values below 1e-15 print as 0, -0.0 prints 0 while -2.5e-20 prints -0, and output does not follow the documented %.15g
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:3295-3360 (runtimeAppendStringBuilderFloat), 3258 (runtimeFormatLargeIntegerFloat);
+    fix: Implement real %.15g: choose exponent notation when exp < -4 or exp >= 15, compute 15 significant digits (scale by powers of ten, or use a Ryu/Grisu-style shortest algorithm), and test the sign bit for -0.0. Otherwise change the spec to describe the actual format.
+- [medium/bug/reproduced] str -> int parse silently wraps on overflow instead of panicking
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:2606 (runtimeStringToInteger)
+    fix: Accumulate with an overflow check (value > (INT_MAX - digit) / 10, with an allowance for the INT_MIN magnitude) and call runtimeFail("cannot convert to int") on overflow.
+- [low/bug/reproduced] Linux ELF outputs are written with mode 0644 and cannot be executed
+    @ /home/ylvloha/repos/zephyr-wt-base/lib/os/linux.zeph:111-118, compiler/zc.zeph:21510 (writeElf call)
+    fix: Create the executable output with mode 0755 (or fchmod after writeElf when the output is not .o/.s).
+- [low/perf/reproduced] -O2 compile time is about 11x baseline on large programs; 96 functions fall back for `call kind 36`
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/optimizer.zeph (trial ladder, docs/optimizer.md:96-117); call-kind bailouts reported by tryOptim
+    fix: Profile -O2 on zc.zeph with a time breakdown per pass and region. Cap trial-ladder rungs by region size or skip them for cold functions. Add syscall (call kind 36) lowering to the SSA tier.
+=== AREA runtime
+TESTS: The existing thread and GC fixtures (tests/fixtures/threads/threads.zeph, thread_strings.zeph) are only run by tests/run_tests.ps1, which is Windows/PowerShell. There is no Linux runner for them. They pass on Linux when run by hand. Copy the compiler as a unit and build each fixture at both levels:
+  mkdir -p /tmp/claude-1000/zaudit-runtime/compiler && cd /tmp/claude-1000/zaudit-runtime && cp /home/ylvloha/repos/zephyr-wt-base/zc-linux . && cp /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph compiler/ && cp -r /home/ylvloha/repos/zephyr-wt-base/lib . && cp /home/ylvloha/repos/zephyr-wt-base/tests/fixtures/threads/*.zeph .
+  for f in threads thread_strings; do ./zc-linux --linux --rt 
+- [critical/soundness/reproduced] s.replace("", x) hands back its input without taking a count: use-after-free, then a count-underflow panic
+    @ compiler/runtime.zeph:1693-1696 (runtimeStringReplace)
+    fix: Return runtimeRetainReference(stringAddress) (or a fresh copy) on the empty-search path. Audit every runtime builtin that can return one of its arguments for the same ownership mistake.
+- [critical/soundness/reproduced] zeros(n) / repeat(n) / list allocation sizes are never range-checked: overflow gives a tiny buffer with a huge length, and a negative n writes into allocator headers
+    @ compiler/runtime.zeph:2735-2746 (runtimeNewDescribedList), 2775-2783 (runtimeNewPackedList), 1751-1761 (runtimeStringRepeat), 1305-1308 (run
+    fix: Panic in runtimeNewDescribedList and runtimeNewPackedList when length < 0 or length > (reserve / width). Check multiplication overflow in repeat, list growth and string concat lengths. Make runtimeAllocateObjectPayload reject size < 0 or size > runtimeHeapReserve with 'out of memory'.
+- [high/soundness/reproduced] Workers can share heap references through closure captures, and a data race corrupts the heap; spec and std docs also wrongly say counts are not atomic
+    @ lib/std/thread.zeph:73-98 (spawnThread accepts capturing closures); docs/spec.md:894, 988-991; lib/std/sync.zeph:2
+    fix: Either type-check thread bodies (reject closures that capture non-frozen heap values, or require freeze()) or document mutation as undefined. Update spec section 4/8 and sync.zeph to say counts are atomic once a thread exists, and state exactly what is allowed: read-only sharing of frozen or never-mutated data.
+- [high/bug/reproduced] Spawning threads from inside workers crashes most runs: the threadBodies/threadBodyInUse globals are changed without a lock
+    @ lib/std/thread.zeph:31-46 (retainThreadBody), 102-109 (join)
+    fix: Keep thread-body roots in an off-heap, lock-protected table: use runtimeLockHeap, or put the body in the native thread record and register it as a root. Do not use a Zephyr global list that every spawning thread mutates.
+- [high/leak/reproduced] Threaded programs' heaps grow without bound with no live data and no cycles (fragmentation; the deferred collector never catches up)
+    @ compiler/runtime.zeph:581-586 (collection skipped while workers live), 154-215 (forward-only coalesce), 1203-1225 (cached blocks not FREE-fl
+    fix: Record that a collection was requested while deferred, and run it from linuxCloseThread/join when runtimeUnsuspendableThreadCount reaches 0. Add backward coalescing on free: a boundary-tag footer, or find the predecessor through the start bitmap. Longer term, add signal-based safepoints so Linux can collect with workers alive.
+- [high/leak/reproduced] Cycles in a worker, or any never-joined thread (even a finished one), turn off cycle collection for the whole process
+    @ compiler/runtime.zeph:581-585; lib/os/linux.zeph:639-708 (count++), 732-753 (count-- only in linuxCloseThread)
+    fix: Decrement the unsuspendable count when the worker exits (CHILD_CLEARTID observed, or in runtimeMarkThreadDone), not at join. Then implement stop-the-world on Linux: a signal handler that saves registers and parks on a futex, registering the main thread too, so collection can run with live workers. Also detect or warn about Thread values dropped wit
+- [medium/leak/reproduced] Runtime builtins leak their temporaries: replace (~8 objects per call, quadratic), readFile/writeFile (path C-string), args() (buffer)
+    @ compiler/runtime.zeph:1693-1713 (runtimeStringReplace), 3467-3494 (runtimeReadFile/runtimeWriteFile), 3419-3457 (runtimeArguments)
+    fix: Build replace output in the string builder, or one pre-sized buffer, in a single pass. Release (runtimeReleaseReference) the C-string and the args buffer before returning. Add the leakscan pattern (collect, then assert unreleased == 0) as a regression test for every runtime builtin.
+- [medium/leak/reproduced] Each thread's string builder (64 KiB plus a page) is never freed: memory grows with every spawned thread that formats a string
+    @ compiler/runtime.zeph:3012-3042 (runtimeGetStringBuilder, runtimeEnsureStringBuilderCapacity), 518-540 (runtimeMarkThreadDone); lib/os/linux
+    fix: In runtimeMarkThreadDone, VirtualFree the thread's builder buffer and state and clear the TLS slot. Alternatively keep builders in a reusable pool like the thread caches. VirtualFree the old buffer in runtimeEnsureStringBuilderCapacity.
+- [medium/bug/reproduced] Fixed ~19 GB virtual reservation: every program segfaults (infinite runtimeFail recursion) under an address-space limit, and the heap has a hard 16 GiB ceiling
+    @ compiler/runtime.zeph:21, 143-147 (runtimeReserveMemory), 319-336, 2954-2975 (runtimeWriteOutputBytes/runtimeFail allocate on the heap)
+    fix: Make runtimeFail heap-free: write the message with a static, off-heap scratch word, never runtimeAllocateObject. Try a smaller reservation (halve it until mmap succeeds) and size the bitmaps and worklist from it, or make the reserve configurable or growable.
+- [medium/design-gap/reproduced] Hard limit of 64 live threads; parallelFor(cpuCount()) panics on machines with more than 64 CPUs
+    @ compiler/runtime.zeph:423, 486-490; lib/std/thread.zeph:113-117
+    fix: Grow the registry dynamically (off-heap, under the heap lock), or raise the limit to a few thousand. Check capacity before kernel32CreateThread, so a failure returns an error instead of leaving a gated native thread behind.
+- [low/bug/reproduced] readFile on /proc, pipes and other zero-size files returns an empty string
+    @ compiler/runtime.zeph:3467-3484; lib/os/linux.zeph:131-135
+    fix: Read until EOF into a growing buffer when the size is 0 or unknown, as linuxReadWholeFile already does off-heap.
+- [low/bug/reproduced] std/linux monotonicNanoseconds always returns 0 (uses syscall 299 = recvmmsg instead of 228 = clock_gettime)
+    @ lib/std/linux.zeph:134-150
+    fix: Use syscall 228 with an off-heap or static timespec buffer. Make the test assert that the second reading is greater than the first.
+- [low/bug/reproduced] Runtime-internal panics report the wrong file and line, and baseline and -O2 report different locations
+    @ compiler/zc.zeph (site attribution for merged runtime/os sources)
+    fix: Carry the original source file through when lib/os/linux.zeph and runtime.zeph are merged, or omit the location for runtime panics. Make both tiers use the same mapping.
+=== AREA rc
+TESTS: Existing RC tests have no Linux runner (only tests/run_tests.ps1 and optimizer_parity.ps1). The zc-linux output is written without the exec bit, so chmod +x is needed. Run each test at baseline and -O2 and diff the two outputs:
+mkdir -p /tmp/claude-1000/zaudit-rc && cd /tmp/claude-1000/zaudit-rc && for t in moves scoped_borrows borrow_roots match_bindings optionals global_references unaliased_globals string_append regression/assert_message_release regression/evaluation_order regression/global_store_exit regression/typedRawSlotReuse; do b=$(basename $t); for O in "" "-O2"; do timeout 60 /home/ylvloha/repos/zephyr-wt-base/zc-linux --linux --rt $O /home/ylvloha/repos/zephyr-wt-base/tests/$t.zep
+- [high/soundness/reproduced] str.replace("", x) returns its receiver without a +1: use-after-free / 'reference count underflow' in safe code
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:1696 (runtimeStringReplace)
+    fix: Return `runtimeRetainReference(stringAddress)` on the empty-search path. Alternatively, return a copy, or define what replace with an empty search should do. Also add a check, such as a debug-runtime assertion, that a runtime function never returns one of its parameters without retaining it.
+- [high/soundness/reproduced] Baseline: a local's last read in a `while` condition is treated as a move, so the next evaluation of the condition reads a cleared slot and segfaults
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:6349-6353 (moveScan, nodeWhile case)
+    fix: In moveScan, scan the while condition at depth + 1, just like the body: `moveScan(expression.children[0], depth + 1)`. Add this case, and a `continue`-to-condition variant, to tests/moves.zeph. Also check any other construct that evaluates a sub-expression more than once.
+- [medium/leak/reproduced] -O2 SSA inliner leaks an owned temporary argument when the inlined callee returns that parameter on only some paths (std padLeft/padRight, methods, interface dispatch)
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/optimizer.zeph:1436-1450 (takeOwnership) together with lowerInlinedBody (2696) and releaseTempor
+    fix: Do not let takeOwnership consume a pending temporary on just one path inside an inlined body. Either retain it on that path, letting cancelCountPairs remove the redundant pair when it is provably safe, or record the transfer per block and release the temporary on every other path that reaches regionReturnBlock. Add a leak-count regression test that
+- [medium/leak/reproduced] runtimeStringReplace leaks every intermediate string (only the backstop collector reclaims them) and is quadratic
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:1693-1714
+    fix: Compute the output length in one pass, allocate the result once, and copy into it, the way runtimeStringRepeat and runtimeJoinStringList do. Or at least runtimeReleaseReference each superseded `output` and each substring.
+- [medium/design-gap/reproduced] Locals are not released at scope exit: block and loop-body temporaries stay alive until the function returns, and baseline keeps more alive than -O2
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/zc.zeph:6128-6129; /home/ylvloha/repos/zephyr-wt-base/docs/spec.md:863-871
+    fix: Emit a release (and clear the slot) for owned reference locals when their block ends, and at the end of each loop iteration for body-declared locals. Skip slots that were moved. The -O2 tier already tracks ownedScopes, so it could do the same. Until then, document in spec §4 that a local lives until its slot is overwritten or the function returns.
+- [medium/bug/reproduced] Deep recursive operations (structural ==, and recursion in general) crash with a raw SIGSEGV and no panic
+    @ structural equality in /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph (runtimeValueEquals / generated struct equality); stack guar
+    fix: Implement structural equality, hashing and formatting with an explicit worklist the way release does, or add a depth check that panics. Install a SIGSEGV handler on an alternate stack (sigaltstack) that turns a guard-page hit into `panic: stack overflow`.
+- [low/soundness/code-reference] Linux collector does not scan callee-saved registers (RtlCaptureContext shim is a no-op); safety depends on the collector's own prologue happening to save them
+    @ /home/ylvloha/repos/zephyr-wt-base/lib/os/linux.zeph:722; /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:597-603
+    fix: Implement kernel32RtlCaptureContext on Linux: a small asm thunk or builtin that stores rbx, rbp, rsi, rdi and r12-r15 into the context at the Windows CONTEXT offsets the scan uses (120..248). Or have runtimeCollectGarbage explicitly spill all callee-saved registers to its frame before scanning.
+- [low/design-gap/code-reference] No leak regression coverage: RC tests check only output, and there is no reliable live-heap statistic
+    @ /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:121,129; /home/ylvloha/repos/zephyr-wt-base/tests/run_tests.ps1
+    fix: Add a runtime counter of live objects and bytes that alloc and free maintain, or a runtimeHeapCensus() walk. Add a leak harness that runs each RC test body N and 2N times at baseline and -O2 and asserts the live-object delta does not grow, plus a Linux shell runner for the RC and parity tests.
+- [low/design-gap/code-reference] Spec §4 says counts are not atomic, but the runtime switches to atomic counting once a thread is registered, and -O2 decides atomic vs plain counting statically from whether spawnThread exists
+    @ /home/ylvloha/repos/zephyr-wt-base/docs/spec.md:891; /home/ylvloha/repos/zephyr-wt-base/compiler/runtime.zeph:696-795; /home/ylvloha/repos/z
+    fix: Update spec §4 and §8 to describe atomic-once-threaded counting and freeze(). Base the -O2 decision on the same predicate the runtime uses, for example any reference to runtimeRegisterThread, rather than on the name spawnThread.
