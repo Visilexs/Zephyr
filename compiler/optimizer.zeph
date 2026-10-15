@@ -1433,11 +1433,22 @@ fn isPendingTemporary(value: int) -> bool {
 
 // a count for a value about to be stored where it is owned: a pending
 // temporary hands its own over, anything else is retained; returns the owned value
+//
+// Only a temporary of the current inline region can hand its count over. One
+// pending from outside (an owned argument of an inlined call) is released by
+// the caller's statement on every path, so a return that consumed it on just
+// one path leaked it on the others: retain instead.
 fn takeOwnership(value: int) -> int {
+    var floor = 0
+    if inlineStack.len() > 0 { floor = regionReturnTemporaryMark }
+    if regionInlineTemporaryMarks.len() > 0 and regionInlineTemporaryMarks[regionInlineTemporaryMarks.len() - 1] > floor {
+        floor = regionInlineTemporaryMarks[regionInlineTemporaryMarks.len() - 1]
+    }
     var remaining: [int] = []
     var found = false
-    for pending in pendingTemporaries {
-        if pending == value and not found { found = true }
+    for i in 0..pendingTemporaries.len() {
+        let pending = pendingTemporaries[i]
+        if pending == value and not found and i >= floor { found = true }
         else { remaining.push(pending) }
     }
     pendingTemporaries = remaining

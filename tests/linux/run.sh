@@ -43,7 +43,6 @@ zc="${ZC:-$root/zc-linux}"
 declare -A KNOWN_FAIL=(
     [leaks/replace:base]="rc/runtime: runtimeStringReplace leaks intermediate strings"
     [leaks/replace:O2]="rc/runtime: runtimeStringReplace leaks intermediate strings"
-    [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"
     [leaks/readfile:base]="runtime: readFile/writeFile/args leak temporaries"
     [leaks/readfile:O2]="runtime: readFile/writeFile/args leak temporaries"
     [leaks/args:base]="runtime: readFile/writeFile/args leak temporaries"
