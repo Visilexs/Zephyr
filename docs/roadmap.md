@@ -85,7 +85,7 @@ unnoticed.
 
 ## Phase 2: memory reading and writing
 
-### 2A Primitives and FFI (now)
+### 2A Primitives and FFI (done except std/mem)
 - [x] **critical** `syscall` leaves unused argument registers as garbage;
   zero them. std/linux vmRead/vmWrite pass no flags, so `process_vm_readv`
   always fails with EINVAL.
@@ -107,7 +107,7 @@ unnoticed.
   `runtimeSyscall` (one extra call per syscall); a true inline op with
   fixed-register operands is still open.
 
-### 2B Types and layout (next)
+### 2B Types and layout (now)
 - [x] Sized scalar types `i8..i64`, `u8..u64`, `f32` as real values. Struct
   fields, extern params and returns can use them. (spec §3.0.0.4; canonical
   64-bit words, lowered in the checker. Open: packed `[u8]`/`[f32]` elements
