@@ -6347,7 +6347,7 @@ fn moveScan(expression: Node, depth: int) {
     }
     if expression.nodeKind == nodeInline and expression.slot < declarationLoopDepths.len() { declarationLoopDepths[expression.slot] = depth }
     if expression.nodeKind == nodeWhile {
-        moveScan(expression.children[0], depth)
+        moveScan(expression.children[0], depth + 1)       // the condition runs every iteration
         moveScan(expression.children[1], depth + 1)
         return
     }
