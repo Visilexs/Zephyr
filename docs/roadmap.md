@@ -86,6 +86,9 @@ unnoticed.
 ## Phase 2: memory reading and writing
 
 ### 2A Primitives and FFI (now)
+Note (2026-10-15 merge): the rm-memory track committed nothing; its
+uncommitted syscall-zeroing and argument keep-alive work in zc.zeph was not
+merged and every 2A item is still open.
 - [ ] **critical** `syscall` leaves unused argument registers as garbage;
   zero them. std/linux vmRead/vmWrite pass no flags, so `process_vm_readv`
   always fails with EINVAL.
@@ -144,10 +147,10 @@ unnoticed.
   for hover, definitions and diagnostics.
 
 ## Phase 4: LLM apps in Zephyr (std)
-- [ ] `std/utf8.zeph`: codepoints, runeCount, validate, encode, safe
-  truncate and pad.
-- [ ] `std/json.zeph`: parse, stringify and streaming partial fields
-  (promoted from zui).
+- [x] `std/utf8.zeph`: codepoints, runeCount, validate, encode, safe
+  truncate and pad. (tests/std_utf8.zeph; docs/std.md section still to write)
+- [x] `std/json.zeph`: parse, stringify and streaming partial fields
+  (promoted from zui). (tests/std_json.zeph; docs/std.md section still to write)
 - [ ] `std/process.zeph`: spawn with pipes and wait (promoted from zui
   proc.zeph). Linux `run()` and `environmentVariable()`.
 - [ ] `tryReadFile`/`tryWriteFile` returning `Result`.
