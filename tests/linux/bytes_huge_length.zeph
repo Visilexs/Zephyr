@@ -1,0 +1,7 @@
+// A length that would overflow offset + length must panic too
+import "std/bytes.zeph"
+let b = Bytes.new(16)
+let c = Bytes.new(16)
+b.copyFrom(0, c, 8, 8)
+print("ok")
+b.copyFrom(8, c, 0, 9223372036854775800)

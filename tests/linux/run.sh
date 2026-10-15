@@ -52,6 +52,8 @@ declare -A EXPECT_EXIT=(
     [thread_stack_overflow]=1
     [inline_panic_file]=1
     [str_int_overflow]=1
+    [bytes_huge_offset]=1
+    [bytes_huge_length]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
