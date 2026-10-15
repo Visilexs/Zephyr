@@ -1,0 +1,21 @@
+// extern fn with sized scalar parameters and results (spec 3.6): f32 travels
+// as an IEEE single in an XMM register, narrow ints are extended per type.
+extern fn sqrtf(x: f32) -> f32 from "libm.so.6"
+extern fn fmaxf(a: f32, b: f32) -> f32 from "libm.so.6"
+extern fn ldexpf(x: f32, exponent: i32) -> f32 from "libm.so.6"
+extern fn lroundf(x: f32) -> int from "libm.so.6"
+extern fn fmaf(a: f32, b: f32, c: f32) -> f32 from "libm.so.6"
+extern fn hypot(x: f64, y: f64) -> f64 from "libm.so.6"
+extern fn htons(value: u16) -> u16 from "libc.so.6"
+extern fn htonl(value: u32) -> u32 from "libc.so.6"
+extern fn ntohs(value: u16) -> i16 from "libc.so.6"
+extern fn labs(value: i64) -> u64 from "libc.so.6"
+extern fn toupper(character: i32) -> u8 from "libc.so.6"
+
+let two: f32 = 2
+print(sqrtf(two), sqrtf(16), sqrtf(two) * sqrtf(two))
+print(fmaxf(-1.5, 0.25), fmaxf(3, 2.75), ldexpf(0.75, 4), lroundf(2.5), lroundf(-2.5))
+print(fmaf(0.1, 10, -1), hypot(3, 4))
+let port: u16 = 0x1234
+print(htons(port), htons(0xFF00), htonl(0x01020304), htonl(0xFFFFFFFE), ntohs(0x0080))
+print(labs(-5), labs(0 - 9223372036854775807), toupper('a'), toupper(255))

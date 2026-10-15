@@ -325,10 +325,11 @@ t.join()
 import "std/bytes.zeph"
 
 extern fn hypot(x: float, y: float) -> float from "libm.so.6"   // Linux: dlopen + dlsym
+extern fn sqrtf(x: f32) -> f32 from "libm.so.6"                  // C float: f32
 extern fn strlen(text: int) -> int from "libc.so.6"
 
 let message = cString("hello")           // NUL-terminated off-heap copy
-print(hypot(3.0, 4.0), strlen(message.addr()))
+print(hypot(3.0, 4.0), strlen(message.addr()), sqrtf(2))
 let buffer = Bytes.new(16)
 buffer.put32(0, 1234)
 buffer.putFloat64(8, 2.5)
@@ -337,9 +338,10 @@ let pid = syscall(39)                     // raw Linux syscall (getpid)
 print(pid > 0)
 ```
 
-Parameters of `extern fn` are `int` (integers, pointers) or `float` (C
-`double`); the result is `int`, `i32`, `bool`, `float` or nothing. Pass
-structs by pointer into `Bytes` memory.
+Parameters of `extern fn` are `int` (integers, pointers), `float` (C
+`double`), `bool` or a sized scalar (`u8`..`u64`, `i8`..`i64`, `f32` for a C
+`float`); the result is any of those or nothing. Exception kept for old code:
+`-> i32` returns an `int`. Pass structs by pointer into `Bytes` memory.
 
 C structs: declare them `@C` and copy them in and out of memory. Fields are
 sized scalars, `int`, `float`, `bool`, other `@C` structs and fixed arrays

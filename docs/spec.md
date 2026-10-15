@@ -955,11 +955,18 @@ extern fn SDL_CreateWindow(title: int, w: int, h: int, flags: int) -> int from "
 extern fn hypot(x: float, y: float) -> float from "libm.so.6"
 ```
 
-Parameters may be `int` (integers, pointers, enums) or `float` (a C `double`,
-passed in an XMM register). The return may be `int`, `i32` (the low 32 bits,
-sign-extended), `bool` (the low byte, for C's `bool`), `float` (a C `double`),
-or nothing. A C `float` (single) argument or result is not supported; pass
-structs by pointer into off-heap or `Bytes` memory. The function's Zephyr name
+Parameters may be `int` (integers, pointers, enums), `float`/`f64` (a C
+`double`, passed in an XMM register), `bool`, or a sized scalar (§3.0.0.4):
+`i8`..`u64` are passed as their canonical 64-bit value, so the callee sees
+the right C `int8_t`..`uint64_t`; `f32` is passed as an IEEE single in the
+low 32 bits of an XMM register (a C `float`). The return may be `int`, `bool`
+(the low byte, for C's `bool`), `float`/`f64` (a C `double`), a sized scalar,
+or nothing. A narrow integer result keeps the low bits of `rax` and is sign-
+or zero-extended per its type; an `f32` result is the single in `xmm0`. For
+compatibility, `-> i32` on an `extern fn` still returns an `int` (the low 32
+bits, sign-extended), not an `i32`; write `f() as i32` for the sized value.
+Pass structs by pointer into off-heap or `Bytes` memory (`storeStruct`,
+§3.0.0.5); structs by value are not supported. The function's Zephyr name
 is the C symbol, so a symbol that clashes with a builtin (`abs`, `pow`) needs
 a C-side alias. A load or lookup failure panics with `dlerror`'s message.
 

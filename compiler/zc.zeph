@@ -6670,6 +6670,16 @@ fn desugarExtern(program: Node) {
 // the dynamic ELF imports, see writeElfDynamicTables) and System V calls.
 // Parameters may be int or float (xmm registers); returns int, i32, bool (the
 // low byte, as C's bool), float, or nothing.
+// an extern argument as callSysV takes it: sized ints are already extended to
+// 64 bits; an f32 travels as a float whose low 32 bits hold the single, which
+// is what the callee reads from the XMM register.
+fn externArgumentText(name: str, typeName: str) -> str {
+    if typeName == "f32" { return "floatFromBits(runtimeNarrowFloat32Bits(bits({name} as float)))" }
+    if typeName == "bool" { return "if {name} \{ 1 \} else \{ 0 \}" }
+    if typeName == "int" or typeName == "float" or typeName == "f64" or typeName == "i64" { return name }
+    return "{name} as int"
+}
+
 fn desugarExternLinux(output: [Node], externs: [Node]) {
     linuxDynamicLinking = true
     var libraries: [str] = []
@@ -6704,20 +6714,20 @@ fn desugarExternLinux(output: [Node], externs: [Node]) {
         for i in 0..parameters.children.len() {
             let parameter = parameters.children[i]
             let parameterType = parameter.children[0]
-            if parameterType.nodeKind != nodeTypeName or (parameterType.name != "int" and parameterType.name != "float") {
-                failCompilation(parameter.line, "extern parameter '{parameter.name}' must be int or float (foreign arguments are addresses or scalars)")
+            if parameterType.nodeKind != nodeTypeName or (parameterType.name != "int" and parameterType.name != "float" and parameterType.name != "bool" and sizedTypeNamed(parameterType.name) < 0) {
+                failCompilation(parameter.line, "extern parameter '{parameter.name}' must be int, float, bool or a sized scalar (foreign arguments are addresses or scalars)")
             }
             if i > 0 {
                 signature.push(", ")
                 callArguments.push(", ")
             }
             signature.push("a{i}: {parameterType.name}")
-            callArguments.push("a{i}")
+            callArguments.push(externArgumentText("a{i}", parameterType.name))
         }
         var returnName = ""
         if returnType.nodeKind != nodeNone {
-            if returnType.nodeKind != nodeTypeName or (returnType.name != "int" and returnType.name != "i32" and returnType.name != "bool" and returnType.name != "float") {
-                failCompilation(externNode.line, "extern '{externNode.name}' must return int, i32, bool, float, or nothing")
+            if returnType.nodeKind != nodeTypeName or (returnType.name != "int" and returnType.name != "bool" and returnType.name != "float" and sizedTypeNamed(returnType.name) < 0) {
+                failCompilation(externNode.line, "extern '{externNode.name}' must return int, bool, float, a sized scalar, or nothing")
             }
             returnName = returnType.name
         }
@@ -6752,8 +6762,12 @@ fn desugarExternLinux(output: [Node], externs: [Node]) {
         if returnName == "" { source.push("    let __r = {call}\n") }
         else if returnName == "i32" { source.push("    return __xsext32({call})\n") }
         else if returnName == "bool" { source.push("    return ({call} & 255) != 0\n") }
-        else if returnName == "float" { source.push("    return callSysVFloat(__xf{j}" + argumentList + ")\n") }
-        else { source.push("    return {call}\n") }
+        else if returnName == "float" or returnName == "f64" { source.push("    return callSysVFloat(__xf{j}" + argumentList + ")\n") }
+        else if returnName == "f32" {         // the single in xmm0's low 32 bits
+            source.push("    return floatFromBits(runtimeWidenFloat32Bits(bits(callSysVFloat(__xf{j}" + argumentList + ")) & 4294967295)) as f32\n")
+        }
+        else if returnName == "int" or returnName == "i64" { source.push("    return {call}\n") }
+        else { source.push("    return {call} as {returnName}\n") }      // narrow: the low bits, sign- or zero-extended
         source.push("\}\n")
     }
     let savedSourceFile = currentSourceFile

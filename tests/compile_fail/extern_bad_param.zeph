@@ -1,0 +1,1 @@
+extern fn strlen(text: str) -> int from "libc.so.6"
