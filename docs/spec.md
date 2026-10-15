@@ -932,7 +932,7 @@ An additional native Apple Silicon macOS target uses the `zc` driver:
 | Flag | Target | Output | Notes |
 |------|--------|--------|-------|
 | *(default)* | Windows x86-64 | PE64 `.exe` | imports only `kernel32.dll`; the built-in assembler + PE linker write it directly |
-| `--linux` | Linux x86-64 | static ELF64 | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*`. A program with `extern fn` becomes a dynamic ELF importing only `dlopen`/`dlsym` from libc (§3.6) |
+| `--linux` | Linux x86-64 | static ELF64 (written with mode 0755 when the compiler runs on Linux) | no libc, no interpreter — the kernel is reached by raw `syscall`. Prepends `lib/os/linux.zeph`, which reimplements the kernel32 surface as `kernel32*`. A program with `extern fn` becomes a dynamic ELF importing only `dlopen`/`dlsym` from libc (§3.6) |
 | `--wasm` | WebAssembly | `.wasm` module | runtime included, reclaiming by collection rather than counting (§4); prepends `lib/os/wasm.zeph`. A separate non-x86 backend |
 | `./zc` driver | Apple Silicon macOS | ARM64 Mach-O | experimental; ARM64 instruction selection, including guarded integer AXPY/weighted-sum NEON kernels and wide array fills, followed by Apple Clang assembly/linking and a native Darwin OS runtime. See [macOS support](../README.md#apple-silicon-macos) |
 

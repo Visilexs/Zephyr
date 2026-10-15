@@ -135,7 +135,18 @@ run_extern() {
     verdict "sh:linux_extern" "$reason" >"$work/res/sh__linux_extern"
 }
 
-export -f run_tier verdict run_test run_python run_extern no_parity
+# The compiler writes Linux executables with mode 0755 (no chmod needed).
+run_mode() {
+    local reason=ok exe="$work/out/mode_check"
+    if ! timeout 300 "$work/zc-linux" --linux --rt "$root/tests/fixtures/basics/arguments.zeph" "$exe" >/dev/null 2>&1; then
+        reason="compile failed"
+    elif [ "$(stat -c %a "$exe")" != 755 ]; then
+        reason="output mode $(stat -c %a "$exe"), want 755"
+    fi
+    verdict "sh:elf_mode" "$reason" >"$work/res/sh__elf_mode"
+}
+
+export -f run_tier verdict run_test run_python run_extern no_parity run_mode
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -147,6 +158,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
+    matches "sh:elf_mode" && echo "run_mode"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'
 
 pass=0 fail=0 xfail=0 xpass=0

@@ -28,31 +28,31 @@ unnoticed.
 ## Phase 1: soundness and integral fixes
 
 ### 1A Runtime and memory (`compiler/runtime.zeph`, `lib/os/linux.zeph`, `lib/std/thread.zeph`)
-- [ ] **critical** `s.replace("", x)` returns its argument without a retain,
+- [x] **critical** `s.replace("", x)` returns its argument without a retain,
   so it is a use-after-free (runtime.zeph:1696). Also rewrite replace as a
   single pass; it currently leaks ~3k+2 objects per call and is quadratic.
-- [ ] **critical** `zeros(n)`, `repeat`, list/packed allocation never
+- [x] **critical** `zeros(n)`, `repeat`, list/packed allocation never
   range-check: a negative or overflowing n corrupts allocator headers.
-- [ ] Thread body roots (`threadBodies`) are mutated without a lock, so
+- [x] Thread body roots (`threadBodies`) are mutated without a lock, so
   spawning from workers crashes. Move them to an off-heap locked table.
-- [ ] A collection deferred while workers run is never re-run, so threaded
+- [x] A collection deferred while workers run is never re-run, so threaded
   heaps grow without bound. Run it when the last worker exits. Decrement the
   unsuspendable count at thread exit, not at join.
-- [ ] Per-thread string builder (64 KiB) is never freed. Free it in
+- [x] Per-thread string builder (64 KiB) is never freed. Free it in
   runtimeMarkThreadDone.
-- [ ] readFile/writeFile/args leak their C-string or buffer temporaries.
+- [x] readFile/writeFile/args leak their C-string or buffer temporaries.
   readFile on /proc and pipes returns "", so read until EOF instead.
-- [ ] `runtimeFail` allocates on the heap, so under an address-space limit it
+- [x] `runtimeFail` allocates on the heap, so under an address-space limit it
   recurses forever. Make it heap-free. Fall back to a smaller reservation when
   the 19 GB mmap fails.
-- [ ] 64-thread hard limit: grow the registry.
-- [ ] Linux `RtlCaptureContext` is a no-op, so callee-saved registers are
+- [x] 64-thread hard limit: grow the registry.
+- [x] Linux `RtlCaptureContext` is a no-op, so callee-saved registers are
   never scanned. Implement it.
-- [ ] Stack overflow is a silent SIGSEGV. Add a sigaltstack handler that
+- [x] Stack overflow is a silent SIGSEGV. Add a sigaltstack handler that
   panics with "stack overflow".
-- [ ] Linux `args()` goes through a fake Windows command line: it splits on
+- [x] Linux `args()` goes through a fake Windows command line: it splits on
   spaces, drops empty args and truncates at 4 KB. Read argv directly.
-- [ ] Linux ELF outputs are written 0644. Write them 0755.
+- [x] Linux ELF outputs are written 0644. Write them 0755.
 
 ### 1B Compiler correctness (`compiler/zc.zeph`, `compiler/optimizer.zeph`)
 - [ ] **critical** `tryFill`/`tryReduce` loop fast paths run on maps (their

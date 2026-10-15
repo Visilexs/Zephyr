@@ -21507,7 +21507,13 @@ fn assembleAndLink(path: str) {
         assembleLine(assemblyLines[i])
     }
     if elfObjectOutput { writeElfObject(path) }
-    else if linuxTargetEnabled { writeElf(path) } else { writePe(path) }
+    else if linuxTargetEnabled {
+        writeElf(path)
+        if executableDirectory().startsWith("/") {           // a Linux host: make the ELF executable (chmod 0755)
+            let pathBytes = path + chr(0)
+            let modeResult = syscall(90, addr(pathBytes) + 8, 493)
+        }
+    } else { writePe(path) }
     if symbolMapEnabled and not linuxTargetEnabled { writeSymbolMap(path + ".map") }
     if debugEnabled and not linuxTargetEnabled { writeDebugSymbols(path + ".zdbg") }
 }

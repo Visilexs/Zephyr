@@ -14,7 +14,8 @@
 //     registered thread, reads its CONTEXT for the integer registers, and scans
 //     from its Rsp to its stack base. A thread
 //     is registered before it is resumed, so it cannot allocate unseen. Linux
-//     defers cyclic collection until all workers are joined (no stack suspension).
+//     defers cyclic collection while workers run (no stack suspension) and
+//     runs it at the join that finds none left running.
 //
 // The argument passed to a thread is an `int` -- a worker index, or an address
 // in a buffer you allocated up front. It is deliberately not a heap reference:
