@@ -1,0 +1,150 @@
+// Typed Linux syscall wrappers for out-of-process work: reading and writing
+// other processes' memory (game cheats), /proc scanning, precise timing.
+// Opt-in module — import "std/linux.zeph". Requires --linux and --rt; it does
+// not compile on Windows or wasm targets (raw syscall is unavailable there).
+import "std/bytes.zeph"
+
+// ---- /proc/pid/mem: the reliable cross-process read/write path ----
+// pread64/pwrite64 on /proc/<pid>/mem need no iovec arrays and are not
+// subject to the intermittent process_vm_* rejections some patched kernels
+// apply, so this is the preferred path for cheats. Open with memOpen, then
+// memRead/memWrite at absolute target addresses. Reads may be short; loop
+// until `length` bytes are transferred.
+
+fn intToDecimal(value: int) -> str {
+    if value == 0 { return "0" }
+    var negative = value < 0
+    var v = value
+    if negative { v = 0 - v }
+    var digits: [int] = []
+    while v > 0 {
+        digits.push(48 + (v % 10))
+        v /= 10
+    }
+    if negative { digits.push(45) }
+    var parts: [str] = []
+    var i = digits.len() - 1
+    while i >= 0 {
+        parts.push(chr(digits[i]))
+        i -= 1
+    }
+    return parts.join("")
+}
+
+// Opens /proc/<pid>/mem for reading and writing (falls back to read-only).
+// Panics if the kernel refuses both.
+fn memOpen(pid: int) -> int {
+    let path = "/proc/" + intToDecimal(pid) + "/mem"
+    let name = cString(path)
+    var fd = syscall(2, name.addr(), 2)      // O_RDWR
+    if fd < 0 { fd = syscall(2, name.addr(), 0) }
+    assert(fd >= 0, "memOpen: " + path)
+    return fd
+}
+
+// Reads up to `length` bytes from `address` in the process backing `fd`
+// (from memOpen) into `buffer`. Returns the byte count, or a negative errno.
+fn memRead(fd: int, address: int, buffer: Bytes, length: int) -> int {
+    return syscall(17, fd, buffer.addr(), length, address)
+}
+
+// Writes up to `length` bytes from `buffer` to `address` in the process
+// backing `fd` (from memOpen). Returns the byte count, or a negative errno.
+fn memWrite(fd: int, address: int, buffer: Bytes, length: int) -> int {
+    return syscall(18, fd, buffer.addr(), length, address)
+}
+
+// ---- process_vm_readv/writev: bulk/scatter-gather alternative ----
+// An iovec is two consecutive 64-bit words: base address, then byte count.
+// Build the array inside a Bytes buffer (16 bytes per entry) and pass its
+// address to the vmRead/vmWrite calls below.
+fn iovecPut(iovs: Bytes, index: int, base: int, length: int) {
+    iovs.put64(index * 16, base)
+    iovs.put64(index * 16 + 8, length)
+}
+
+// Reads from process `pid` (0 means this process). Returns the byte count,
+// or a negative errno (-22 EINVAL, -14 EFAULT, ...). Both iovec arrays are
+// caller-built via iovecPut; counts are array lengths.
+// Some patched kernels (recent CachyOS) intermittently reject
+// process_vm_readv for stretches of tens of seconds, so callers that need a
+// reliable value should prefer memOpen/memRead, or keep the last good result
+// and retry on failure rather than blocking.
+fn vmRead(pid: int, localIovs: Bytes, localCount: int, remoteIovs: Bytes, remoteCount: int) -> int {
+    return syscall(310, pid, localIovs.addr(), localCount, remoteIovs.addr(), remoteCount)
+}
+
+// Writes to process `pid` (0 means this process). Returns the byte count,
+// or a negative errno. Same intermittent-rejection caveat as vmRead.
+fn vmWrite(pid: int, localIovs: Bytes, localCount: int, remoteIovs: Bytes, remoteCount: int) -> int {
+    return syscall(311, pid, localIovs.addr(), localCount, remoteIovs.addr(), remoteCount)
+}
+
+// ---- plain file access ----
+
+// Opens `path` read-only. Panics if the kernel rejects it.
+fn openPath(path: str) -> int {
+    let name = cString(path)
+    let fd = syscall(2, name.addr(), 0)
+    assert(fd >= 0, "openPath: " + path)
+    return fd
+}
+
+// Reads `fd` to EOF into a fresh string. Caller closes the fd.
+fn readAll(fd: int) -> str {
+    var buffer = Bytes.new(4096)
+    var total = 0
+    while true {
+        if total == buffer.len() {
+            var bigger = Bytes.new(buffer.len() * 2)
+            bigger.putString(0, buffer.getString(0, total))
+            buffer = bigger
+        }
+        let count = syscall(0, fd, buffer.addr() + total, buffer.len() - total)
+        assert(count >= 0, "readAll: read failed")
+        if count == 0 { break }
+        total += count
+    }
+    return buffer.getString(0, total)
+}
+
+fn closeFd(fd: int) {
+    assert(syscall(3, fd) == 0, "closeFd: close failed")
+}
+
+// ---- nanosecond clock ----
+
+// CLOCK_MONOTONIC in nanoseconds, for latency measurement and input jitter;
+// nowMilliseconds is too coarse.
+// Raw clock_gettime64 (299) into a red-zone window below rsp -- every Zephyr
+// allocation (lists, structs, Bytes) lives in mmap'd off-heap memory, which
+// recent kernels reject for this syscall, and the 32-bit clock_gettime (232)
+// is broken outright on them. Patched kernels also fail the first clock
+// syscall of a process (lazy per-task init), hence the single retry. The
+// red-zone window can be clobbered by caller frames, so the result is
+// sanity-checked (bounded fields, non-decreasing); when the kernel rejects
+// the call or the read looks wrong, the last good value is returned instead
+// of garbage (the timestamp stalls rather than jumping). Rarely the kernel
+// blocks the call for a while during a quirk window; that shows up as a
+// stall, not a wrong value.
+// ponytail: stall ceiling; a C shim calling libc clock_gettime (vDSO fast
+// path) gives true ns precision everywhere.
+var lastClockNanoseconds = 0
+
+fn monotonicNanoseconds() -> int {
+    let base = stackPointer() & (0 - 16) - 48
+    var result = syscall(299, 1, base)
+    if result != 0 { result = syscall(299, 1, base) }
+    if result == 0 {
+        let seconds = load64(base)
+        let nanos = load64(base + 8)
+        if seconds >= 0 and seconds < 1000000000 and nanos >= 0 and nanos < 1000000000 {
+            let value = seconds * 1000000000 + nanos
+            if value >= lastClockNanoseconds {
+                lastClockNanoseconds = value
+                return value
+            }
+        }
+    }
+    return lastClockNanoseconds
+}

@@ -1,0 +1,25 @@
+// An assert whose message allocates (interpolation) lowers the message in the
+// fail block only. Its temporary must not be released on the ok path, where it
+// was never defined: -O2 used to emit a release of whatever the register held,
+// freeing a caller's live object (here the half-built list literal).
+
+fn checkedRun(slot: int, count: int) -> [int] {
+    assert(count == 540, "slot {slot}: expected 540, got {count}")
+    var out: [int] = []
+    for i in 0..100 { out.push(slot * 1000 + i) }
+    return out
+}
+
+fn checkedValue(value: int) -> int {
+    assert(value >= 0, "negative value {value}")
+    return value * 2
+}
+
+fn main() {
+    let runs = [checkedRun(0, 540), checkedRun(1, 540), checkedRun(2, 540)]
+    var churn: [[int]] = []
+    for k in 0..50 { churn.push([k, k, k, k]) }
+    print("runs {runs[0][1]} {runs[1][1]} {runs[2][99]} {churn.len()}")
+    let values = [checkedValue(1), checkedValue(2), checkedValue(3)]
+    print("values {values[0]} {values[1]} {values[2]}")
+}

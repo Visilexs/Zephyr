@@ -2190,12 +2190,16 @@ fn isPlainLiteral(expression: Node) -> bool {
 }
 
 fn lowerPanicAt(expression: Node, message: Node) {
+    let mark = pendingTemporaries.len()
     var messageValue = 0
     if isPlainLiteral(message) { messageValue = emitIr0(irDataAddress, classInteger, addDataString(message.children[0].name)) }
     else { messageValue = lowerExpression(message) }       // a str the panic only reads
     if optimizerBailed { return }
     var noOperands: [int] = []
     terminate(irPanicAt, [messageValue], addDataString(panicSite(expression)), noOperands)
+    // the message's temporaries live only in this (now dead) block; left pending,
+    // assert's ok path would release values it never defined (stale registers)
+    releaseTemporariesFrom(mark)
 }
 
 fn lowerFixedPanic(stringIndex: int) {

@@ -1,0 +1,4 @@
+memread ok
+memwrite ok
+readall ok
+ns monotonic true

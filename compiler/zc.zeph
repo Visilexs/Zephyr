@@ -18462,6 +18462,8 @@ fn embeddedLibrarySource(index: int) -> str {
 // and the `std/` library resolve next to the compiler wherever it is installed
 // -- not the current directory. Computed once into cachedExecutableDirectory.
 var cachedExecutableDirectory = ""
+// -I directories: searched (in order) for imports not found beside the importing file
+var includeDirectories: [str] = []
 fn executableDirectory() -> str {
     let buffer = zeros(64)                         // 512-byte path buffer (a [int] keeps its data alive)
     let bufferAddress = load64(addr(buffer) + 16)
@@ -18664,6 +18666,15 @@ fn expandImports(program: Node, baseDirectory: str) -> Node {
                 // Fall back to the compiler's own directory, then to lib/
                 // beneath it, so `import "std/list.zeph"` or `import
                 // "std/list.zeph"` finds the shipped library from anywhere.
+                if not pathExists(path) {
+                    for includeIndex in 0..includeDirectories.len() {
+                        let candidate = includeDirectories[includeIndex] + topLevelNode.name
+                        if not pathExists(path) and pathExists(candidate) {
+                            path = candidate
+                            display = candidate
+                        }
+                    }
+                }
                 if not pathExists(path) and cachedExecutableDirectory != "" {
                     if pathExists(cachedExecutableDirectory + topLevelNode.name) {
                         path = cachedExecutableDirectory + topLevelNode.name
@@ -21544,6 +21555,16 @@ while argumentIndex < commandLineArguments.len() {
         else { profileUsePath = commandLineArguments[argumentIndex] }
     }
     else if argument == "--map" { symbolMapEnabled = true }
+    else if argument == "-I" or (argument.len() > 2 and argument.startsWith("-I")) {
+        var directory = ""
+        if argument == "-I" {
+            argumentIndex += 1
+            if argumentIndex >= commandLineArguments.len() { panic("-I requires a directory") }
+            directory = commandLineArguments[argumentIndex]
+        } else { directory = argument.sub(2, argument.len()) }
+        if not directory.endsWith("/") and not directory.endsWith("\\") { directory += "/" }
+        includeDirectories.push(directory)
+    }
     else if argument == "--test" {                  // run the main file's test blocks instead of main()
         runTests = true
         includeRuntime = true
@@ -21560,7 +21581,7 @@ if inputPath == "" and showVersion {
     // --version alone: nothing to compile
 } else {
     if inputPath == "" or (outputPath == "" and not runInProcess) {
-        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [--version] <input.zeph> <output.exe|output.s|output.wasm>\n       zc run [--test] <input.zeph> [program arguments...]")
+        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [-I dir] [--version] <input.zeph> <output.exe|output.s|output.wasm>\n       zc run [--test] <input.zeph> [program arguments...]")
     }
     if macosTargetEnabled and (linuxTargetEnabled or wasmTargetEnabled or runInProcess) { panic("--macos-ir requires scalar assembly output; use scripts/macos.py to build or run native ARM64 programs") }
     if macosTargetEnabled and not outputPath.endsWith(".s") { panic("--macos-ir output must end in .s") }

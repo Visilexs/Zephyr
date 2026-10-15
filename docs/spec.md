@@ -1011,3 +1011,82 @@ worker remains unjoined, including a worker requesting collection itself.
 Reference counting continues to reclaim acyclic objects; cyclic garbage may grow
 until the workers are joined and a later collection runs. Join every worker. Threads
 are not available on `--wasm`.
+
+## 9. Proposals (draft)
+
+Not part of the language yet. Each item below is a candidate change with its
+motivation and a rough sketch; none is implemented, and none has settled
+semantics. Discussion should target this section before any of it lands in
+§3–§8.
+
+### 9.1 `@C` C-layout structs
+
+Motivation: FFI against C ABIs (Linux iovec/timespec, X11 request headers,
+UE4/UE5 struct layouts read through memory) currently requires hand-packing
+`Bytes` buffers with `put64`/`putFloat32` at literal offsets. A C-layout
+struct attribute would let code declare the layout once and pass `addr(s)`
+to `extern fn` calls.
+
+Sketch:
+
+```zephyr
+@C struct iovec { base: int, length: int }   // no padding, field order as written
+var v: iovec = iovec{base: p, length: 8}
+syscall(310, pid, addr(v), 1, addr(v2), 1)
+```
+
+Open questions: default alignment (none vs. natural), explicit padding fields,
+whether `@C` structs may contain `str`/lists (probably not in v1), and how
+`@C` interacts with the existing generic-struct rules (§3.0.5.1).
+
+### 9.2 Refcount-free hot paths (`@hot`, static/arena buffers)
+
+Motivation: every counted heap allocation pays retain/release traffic on each
+access. Tight loops (memory-scan cheats, frame readers) want zero overhead.
+Today the only escape hatch is raw `Bytes` off-heap storage plus manual
+lifecycle.
+
+Sketch: an `@hot` function annotation that forbids creating or touching
+counted objects inside (compile-time check), plus a `static` buffer declaration
+that allocates fixed storage in the data segment instead of the heap:
+
+```zephyr
+@hot fn scan(r: Reader, out: [int]) { ... }   // no allocations allowed
+var window: [int] = static zeros(4096)       // BSS-backed, no refcounts
+```
+
+Open questions: interaction with the backstop collector (§8), whether `static`
+is process-lifetime only, and what the checker says about calling non-`@hot`
+code from `@hot` code.
+
+### 9.3 Reference-carrying threads and channels
+
+Motivation: §8 restricts worker arguments and channel values to `int`, so
+sharing a heap object across threads means re-wrapping a raw address on the
+receiving side. A verified reference-passing mode would remove the footgun
+while keeping the collector sound.
+
+Sketch: `spawnThreadRef(f, ref)` where `f: fn(T)` receives a retained copy of
+the reference; the runtime pins the object for the worker's lifetime (no
+reclaim while pinned) and records the pin in the stop-the-world scan set.
+Channels gain a `Channel[T]` variant with the same pinning rule.
+
+Open questions: pin budget / leak detection for long-lived workers, GC
+behavior when a pinned object is cyclic, and Windows vs. Linux collection
+differences (§8) under pinning.
+
+### 9.4 Seedable build-fingerprint rotation
+
+Motivation: static binaries are identified by stable emitted traits (import
+table shape, runtime string literals, panic message text, constant pool
+layout). A per-build seed would rotate those traits so two builds of the
+same source are not byte-identical in their fingerprints.
+
+Sketch: `zc --seed <n>` feeds a PRNG that (a) permutes label/symbol names in
+the object, (b) selects equivalent encoding forms for constant loads, and
+(c) pads/reorders the cold block table. The seed is not embedded in the
+output; builds remain reproducible for a given seed.
+
+Open questions: which rotations stay within the self-hosted compiler's own
+codegen (it must compile itself with the feature on), and a stable subset
+good enough for `--test` golden comparisons.

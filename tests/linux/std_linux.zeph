@@ -1,0 +1,39 @@
+// std/linux.zeph: cross-process reads/writes via /proc/pid/mem, /proc,
+// nanosecond clock. Run by tests/linux_extern.sh (static and gcc-linked,
+// baseline and -O2).
+import "std/linux.zeph"
+import "std/bytes.zeph"
+
+let pid = syscall(39)
+
+var data = Bytes.new(64)
+data.put64(0, 0x1122334455667788)
+data.put64(16, 0xaabbccddeeff0011)
+
+let memFd = memOpen(pid)
+
+var scratch = Bytes.new(8)
+let got = memRead(memFd, data.addr(), scratch, 8)
+if got == 8 and scratch.get64(0) == 0x1122334455667788 { print("memread ok") } else { print("memread fail") }
+
+// Write the known value at data[16] into data[8] and verify it landed.
+var src = Bytes.new(8)
+let moved = memRead(memFd, data.addr() + 16, src, 8)
+let put = memWrite(memFd, data.addr() + 8, src, 8)
+if moved == 8 and put == 8 and data.get64(8) == 0xaabbccddeeff0011 { print("memwrite ok") } else { print("memwrite fail") }
+closeFd(memFd)
+
+let fd = openPath("/proc/self/cmdline")
+let commandLine = readAll(fd)
+closeFd(fd)
+if commandLine.len() > 0 { print("readall ok") } else { print("readall fail") }
+
+// monotonicNanoseconds must never go backwards: on rejected calls it returns the
+// last good value instead of a fresh (possibly clobbered) reading.
+var first = monotonicNanoseconds()
+var spins = 0
+while spins < 1000 {
+    spins += 1
+}
+let second = monotonicNanoseconds()
+if second >= first { print("ns monotonic true") } else { print("ns monotonic false") }
