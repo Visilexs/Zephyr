@@ -589,6 +589,72 @@ fn linuxNativeInitialize() {
     store8(codeAddress + 110, 5)
     store8(codeAddress + 111, 15)
     store8(codeAddress + 112, 11)
+    // RtlCaptureContext (at +128): store RBX, RSP, RBP, RSI, RDI and R12-R15
+    // into the CONTEXT in RCX at their Windows offsets (0x90..0xF0); ret.
+    store8(codeAddress + 128, 72)
+    store8(codeAddress + 129, 137)
+    store8(codeAddress + 130, 153)
+    store8(codeAddress + 131, 144)
+    store8(codeAddress + 132, 0)
+    store8(codeAddress + 133, 0)
+    store8(codeAddress + 134, 0)
+    store8(codeAddress + 135, 72)
+    store8(codeAddress + 136, 137)
+    store8(codeAddress + 137, 161)
+    store8(codeAddress + 138, 152)
+    store8(codeAddress + 139, 0)
+    store8(codeAddress + 140, 0)
+    store8(codeAddress + 141, 0)
+    store8(codeAddress + 142, 72)
+    store8(codeAddress + 143, 137)
+    store8(codeAddress + 144, 169)
+    store8(codeAddress + 145, 160)
+    store8(codeAddress + 146, 0)
+    store8(codeAddress + 147, 0)
+    store8(codeAddress + 148, 0)
+    store8(codeAddress + 149, 72)
+    store8(codeAddress + 150, 137)
+    store8(codeAddress + 151, 177)
+    store8(codeAddress + 152, 168)
+    store8(codeAddress + 153, 0)
+    store8(codeAddress + 154, 0)
+    store8(codeAddress + 155, 0)
+    store8(codeAddress + 156, 72)
+    store8(codeAddress + 157, 137)
+    store8(codeAddress + 158, 185)
+    store8(codeAddress + 159, 176)
+    store8(codeAddress + 160, 0)
+    store8(codeAddress + 161, 0)
+    store8(codeAddress + 162, 0)
+    store8(codeAddress + 163, 76)
+    store8(codeAddress + 164, 137)
+    store8(codeAddress + 165, 161)
+    store8(codeAddress + 166, 216)
+    store8(codeAddress + 167, 0)
+    store8(codeAddress + 168, 0)
+    store8(codeAddress + 169, 0)
+    store8(codeAddress + 170, 76)
+    store8(codeAddress + 171, 137)
+    store8(codeAddress + 172, 169)
+    store8(codeAddress + 173, 224)
+    store8(codeAddress + 174, 0)
+    store8(codeAddress + 175, 0)
+    store8(codeAddress + 176, 0)
+    store8(codeAddress + 177, 76)
+    store8(codeAddress + 178, 137)
+    store8(codeAddress + 179, 177)
+    store8(codeAddress + 180, 232)
+    store8(codeAddress + 181, 0)
+    store8(codeAddress + 182, 0)
+    store8(codeAddress + 183, 0)
+    store8(codeAddress + 184, 76)
+    store8(codeAddress + 185, 137)
+    store8(codeAddress + 186, 185)
+    store8(codeAddress + 187, 240)
+    store8(codeAddress + 188, 0)
+    store8(codeAddress + 189, 0)
+    store8(codeAddress + 190, 0)
+    store8(codeAddress + 191, 195)
     linuxNative = codeAddress
 }
 
@@ -783,7 +849,12 @@ fn kernel32ResumeThread(threadHandle: int) -> int {
 fn kernel32SuspendThread(threadHandle: int) -> int { return 0 - 1 }
 // No stopped register context is available on this platform yet.
 fn kernel32GetThreadContext(threadHandle: int, contextAddress: int) -> int { return 0 }
-fn kernel32RtlCaptureContext(contextAddress: int) -> int { return 0 }
+// The callee-saved registers, which -O2 code may keep references in, for the
+// collector's own-thread scan. RSP is the thunk's, close enough for a root scan.
+fn kernel32RtlCaptureContext(contextAddress: int) -> int {
+    linuxNativeInitialize()
+    return callPointer(linuxNative + 128, contextAddress)
+}
 
 // Wait on CHILD_CLEARTID using shared futexes (the kernel's wake convention).
 fn kernel32WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {

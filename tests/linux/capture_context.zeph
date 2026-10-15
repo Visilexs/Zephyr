@@ -1,0 +1,14 @@
+// RtlCaptureContext on Linux used to be a no-op, so the collector never saw
+// references held only in callee-saved registers. It stores RBX, RSP, RBP,
+// RSI, RDI and R12-R15 at their Windows CONTEXT offsets now.
+let context = win("VirtualAlloc", 0, 4096, 12288, 4)
+for i in 0..512 { store64(context + i * 8, 0 - 1) }
+let captured = win("RtlCaptureContext", context)
+let here = stackPointer()
+let rsp = load64(context + 152)
+print("rsp near", rsp != 0 - 1 and rsp - here < 65536 and here - rsp < 65536)
+var stored = 0
+for offset in [144, 160, 168, 176, 216, 224, 232, 240] {
+    if load64(context + offset) != 0 - 1 { stored += 1 }
+}
+print("callee-saved stored", stored >= 7, "untouched rax", load64(context + 120) == 0 - 1)
