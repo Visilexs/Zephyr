@@ -181,6 +181,7 @@ var temporaryVariableCount = 0
 
 var optimizerBailed = false
 var optimizerBailReason = ""
+var optimizingFunctionName = ""         // the function tryOptimizeFunction is working on
 var currentIrBlock = 0
 var currentLoopDepth = 0
 var regionIsFunction = true                // whole function, or an outlined loop
@@ -2526,6 +2527,21 @@ fn lowerCall(expression: Node) -> int {
         else { lowerFixedPanic(panicStringIndex(expression, "assertion failed")) }
         currentIrBlock = okBlock
         return 0
+    }
+    if callKind == callKindSyscall {
+        // Linux: a call to lib/os/linux.zeph's runtimeSyscall, whose baseline
+        // body is the `syscall` instruction, so the caller still gets -O2.
+        if not linuxTargetEnabled or optimizingFunctionName == "runtimeSyscall" {
+            optimizerBail("call kind {callKind}")
+            return 0
+        }
+        var operands: [int] = []
+        for i in 1..expression.children.len() {
+            operands.push(lowerExpression(expression.children[i]))
+            if optimizerBailed { return 0 }
+        }
+        while operands.len() < 7 { operands.push(integerConstant(0)) }
+        return lowerRuntimeCall("runtimeSyscall", operands)
     }
     if callKind != callKindUser {
         optimizerBail("call kind {callKind}")
@@ -8128,6 +8144,7 @@ fn describeRegionInlines() -> str {
 // whole function: replaces generateFunctionBody when every statement lowers
 fn tryOptimizeFunction(functionIndex: int) -> bool {
     let functionDefinition = functionDefinitions[functionIndex]
+    optimizingFunctionName = functionDefinition.name
     if functionDefinition.name == "runtimeCollectGarbage" { return false }
     if containsBaselineVectorCandidate(functionDefinition.body) {
         optimizerNote("function {functionDefinition.name}: baseline (holds a target-native kernel loop)")

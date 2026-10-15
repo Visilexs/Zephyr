@@ -23,6 +23,12 @@ let mapAnonymousPrivate = 34          // MAP_PRIVATE | MAP_ANONYMOUS
 let mapNoReservation = 16384
 
 // mmap and friends report failure as a small negative value (-errno)
+// -O2 lowers `syscall(...)` in an optimized function to a call of this (its
+// own body stays baseline), so functions that make syscalls still get -O2.
+fn runtimeSyscall(number: int, a: int, b: int, c: int, d: int, e: int, f: int) -> int {
+    return syscall(number, a, b, c, d, e, f)
+}
+
 fn linuxFailed(result: int) -> bool {
     return result < 0 and result > 0 - 4096
 }
