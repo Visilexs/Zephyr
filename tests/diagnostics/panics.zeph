@@ -1,0 +1,19 @@
+// runtime panics carry the offending values
+let which = args().len()
+let xs = [10, 20, 30]
+let m = ["a": 1]
+let n = [3: 1]
+let bytes: [u8] = [1, 2]
+if which == 1 { print(xs[which + 6]) }
+if which == 2 { print(m["b"]) }
+if which == 3 { print(n[7]) }
+if which == 4 { print(bytes[which + 1]) }
+if which == 5 { print("abc".byte(which + 4)) }
+if which == 6 {
+    let s = "x"
+    assert(s + "y" == "xz")
+}
+if which == 7 {
+    let f = 1.5
+    assert(f < 1.0)
+}

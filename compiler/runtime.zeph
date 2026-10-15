@@ -24,6 +24,10 @@ let runtimeHeapFlagMarked = 1
 let runtimeHeapFlagFree = 2
 let runtimeObjectHeaderBytes = 24                        // header bytes before every payload
 
+// Nonzero: a panic exits with this code and prints nothing. The compiler sets
+// it once it has reported a compile error, so a crash while it keeps checking
+// after that error cannot bury the diagnostics under an internal panic.
+var runtimePanicQuietExitCode = 0
 var runtimeHeapBaseAddress = 0      // heap base
 var runtimeHeapBumpAddress = 0      // end of the used heap: bump allocation starts here
 var runtimeHeapCommittedEnd = 0    // committed end
@@ -2153,7 +2157,7 @@ fn runtimeMapSet(mapAddress: int, key: int, value: int) {
 // argument; everything else borrows.
 fn runtimeMapGet(mapAddress: int, key: int) -> int {
     let index = runtimeFindMapEntry(mapAddress, key)
-    if index < 0 { runtimeFail("map key not found") }
+    if index < 0 { runtimeFailMissingKey(mapAddress, key, "") }
     let value = load64(load64(mapAddress + 16) + index * 24 + 16)
     if runtimeMapValueIsReference(mapAddress) == 1 { let retainedValue = runtimeRetainReference(value) }
     return value
@@ -2808,6 +2812,7 @@ fn runtimeNewPackedList(elementCount: int, width: int) -> int {
 }
 
 fn runtimeFailPackedAccess(site: str, message: str) {
+    if runtimePanicQuietExitCode != 0 { let quiet = win("ExitProcess", runtimePanicQuietExitCode) }
     let handle = win("GetStdHandle", 0 - 12)   // stderr
     runtimeWriteOutputBytes(handle, addr("panic: ") + 8, 7)
     runtimeWriteOutputBytes(handle, addr(site) + 8, site.len())
@@ -2872,12 +2877,12 @@ fn runtimePackedStore(listAddress: int, index: int, value: int, width: int) {
 }
 
 fn runtimePackedGet(listAddress: int, index: int, width: int, site: str) -> int {
-    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, "index out of bounds") }
+    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, runtimeIndexMessage(index, load64(listAddress))) }
     return runtimePackedLoad(listAddress, index, width)
 }
 
 fn runtimePackedSet(listAddress: int, index: int, value: int, width: int, site: str) {
-    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, "index out of bounds") }
+    if index < 0 or index >= load64(listAddress) { runtimeFailPackedAccess(site, runtimeIndexMessage(index, load64(listAddress))) }
     runtimePackedStore(listAddress, index, value, width)
 }
 
@@ -2991,7 +2996,19 @@ fn runtimeWriteOutputString(stringAddress: int) {
 }
 
 // ---- panics ----
+// Write text to stderr and exit with code (no "panic: " prefix).
+fn runtimeExitWithMessage(text: str, code: int) {
+    let handle = win("GetStdHandle", 0 - 12)
+    runtimeWriteOutputBytes(handle, addr(text) + 8, text.len())
+    let result = win("ExitProcess", code)
+}
+
+fn runtimeWriteStandardError(text: str) {
+    runtimeWriteOutputBytes(win("GetStdHandle", 0 - 12), addr(text) + 8, text.len())
+}
+
 fn runtimeFail(message: str) {
+    if runtimePanicQuietExitCode != 0 { let quiet = win("ExitProcess", runtimePanicQuietExitCode) }
     let handle = win("GetStdHandle", 0 - 12)   // stderr
     runtimeWriteOutputBytes(handle, addr("panic: ") + 8, 7)
     runtimeWriteOutputBytes(handle, addr(message) + 8, message.len())
@@ -3004,7 +3021,31 @@ fn runtimePanicWithString(text: str) {
 }
 
 fn runtimeFailBoundsCheck(index: int, count: int) {
-    runtimeFail("index out of bounds")
+    runtimeFail(runtimeIndexMessage(index, count))
+}
+
+fn runtimeIndexMessage(index: int, count: int) -> str {
+    return "index " + (index as str) + " out of bounds for length " + (count as str)
+}
+
+// Native bounds-check failure paths: site is "file:line: ".
+fn runtimeFailIndexAt(site: str, index: int, count: int) {
+    runtimeFail(site + runtimeIndexMessage(index, count))
+}
+
+// map[key] on a missing key; site is "file:line: " (filled in by the compiler)
+fn runtimeFailMissingKey(mapAddress: int, key: int, site: str) {
+    if runtimePanicQuietExitCode != 0 { let quiet = win("ExitProcess", runtimePanicQuietExitCode) }
+    let keyKind = load64(mapAddress + 24)
+    if keyKind == 0 { runtimeFail(site + "map key " + (key as str) + " not found") }
+    if keyKind != 1 { runtimeFail(site + "map key not found") }
+    let handle = win("GetStdHandle", 0 - 12)
+    runtimeWriteOutputBytes(handle, addr("panic: ") + 8, 7)
+    runtimeWriteOutputBytes(handle, addr(site) + 8, site.len())
+    runtimeWriteOutputBytes(handle, addr("map key \"") + 8, 9)
+    runtimeWriteOutputBytes(handle, key + 8, load64(key))
+    runtimeWriteOutputBytes(handle, addr("\" not found\n") + 8, 12)
+    let result = win("ExitProcess", 1)
 }
 
 fn runtimeFailDivisionByZero() {

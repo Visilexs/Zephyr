@@ -659,6 +659,15 @@ fn classOfType(typeIndex: int) -> int {
 
 fn panicStringIndex(expression: Node, message: str) -> int { return addDataString(panicSite(expression) + message) }
 
+// An index bounds check names its string by the site alone ("file:line: "):
+// its cold path calls runtimeFailIndexAt with the index and the length.
+var indexPanicSites: [int: bool] = [:]
+fn indexPanicStringIndex(expression: Node) -> int {
+    let stringIndex = addDataString(panicSite(expression))
+    indexPanicSites[stringIndex] = true
+    return stringIndex
+}
+
 fn conditionForToken(operator: int) -> int {
     if operator == tokenEquals { return conditionEqual }
     if operator == tokenNotEquals { return conditionNotEqual }
@@ -1986,7 +1995,7 @@ fn plainListElement(listType: int) -> int {
 // bounds-checked element address: returns the data pointer; the caller indexes it
 fn lowerElementAddress(list: int, index: int, site: Node) -> int {
     let length = emitIr1(irListLength, classInteger, list, 0)
-    let checked = emitIr2(irBoundsCheck, classInteger, length, index, panicStringIndex(site, "index out of bounds"))
+    let checked = emitIr2(irBoundsCheck, classInteger, length, index, indexPanicStringIndex(site))
     let data = emitIr1(irListData, classInteger, list, 0)
     irBorrowed[data] = true                   // a push reallocates it
     return data
@@ -2454,7 +2463,7 @@ fn lowerCall(expression: Node) -> int {
         let index = lowerExpression(expression.children[1])
         if optimizerBailed { return 0 }
         let length = emitIr1(irListLength, classInteger, text, 1)
-        emitIr2(irBoundsCheck, classInteger, length, index, panicStringIndex(expression, "index out of bounds"))
+        emitIr2(irBoundsCheck, classInteger, length, index, indexPanicStringIndex(expression))
         return emitIr2(irLoadByte, classInteger, text, index, 0)
     }
     if callKind == callKindBits {                // bits() and floatFromBits(): same bits, retyped
@@ -4907,6 +4916,21 @@ fn emitPhiMoves(block: int) {
     emitParallelMoves()
 }
 
+fn emitColdIndexPanic(siteIndex: int, indexRegister: str, lengthLocation: str) -> int {
+    let label = allocateLabel()
+    var scratch = "r11"
+    if indexRegister == "r11" { scratch = "r10" }
+    optimizerColdLines.push(".L{label}:\n")
+    emitCold("mov {scratch}, {lengthLocation}")
+    emitCold("mov rdx, {indexRegister}")
+    emitCold("mov r8, {scratch}")
+    emitCold("lea rcx, [rip + __s{siteIndex}]")
+    emitCold("and rsp, -16")
+    emitCold("sub rsp, 32")
+    emitCold("call runtimeFailIndexAt")
+    return label
+}
+
 fn emitColdPanic(stringIndex: int) -> int {
     let label = allocateLabel()
     optimizerColdLines.push(".L{label}:\n")
@@ -5595,7 +5619,8 @@ fn emitInstructionFor(value: int) {
     if opcode == irBoundsCheck {                  // unsigned: a negative index fails too
         let index = integerIn(operands[1], "rdx")
         emitOptimized("cmp {index}, {locationOf(operands[0])}")
-        emitOptimized("jae .L{emitColdPanic(immediate)}")
+        if indexPanicSites.has(immediate) { emitOptimized("jae .L{emitColdIndexPanic(immediate, index, locationOf(operands[0]))}") }
+        else { emitOptimized("jae .L{emitColdPanic(immediate)}") }
         return
     }
     if opcode == irListLength or opcode == irListData {

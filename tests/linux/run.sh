@@ -4,8 +4,9 @@
 # Builds every self-checking test at baseline and -O2 with zc-linux, runs it
 # with a timeout, and checks the exit code, the .expected file next to the
 # source (when one exists) and that both tiers print the same thing. Also runs
-# the leak checks (tests/leaks), the python checks that work on Linux and
-# tests/linux_extern.sh (when gcc is available).
+# the leak checks (tests/leaks), the python checks that work on Linux,
+# tests/linux_extern.sh (when gcc is available) and tests/linux/diagnostics.sh
+# (compile errors, CLI, zc run, the --test runner, runtime panic messages).
 #
 # The compiler, runtime and lib/ are copied into a temp dir first, so the
 # repository stays clean.
@@ -138,7 +139,13 @@ run_extern() {
     verdict "sh:linux_extern" "$reason" >"$work/res/sh__linux_extern"
 }
 
-export -f run_tier verdict run_test run_python run_extern no_parity
+run_diagnostics() {
+    local reason=ok
+    (cd "$root" && timeout 600 bash tests/linux/diagnostics.sh "$work") >"$work/out/sh__diagnostics.log" 2>&1 || reason="$(tail -1 "$work/out/sh__diagnostics.log")"
+    verdict "sh:diagnostics" "$reason" >"$work/res/sh__diagnostics"
+}
+
+export -f run_tier verdict run_test run_python run_extern run_diagnostics no_parity
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -150,6 +157,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
+    matches "sh:diagnostics" && echo "run_diagnostics"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'
 
 pass=0 fail=0 xfail=0 xpass=0
