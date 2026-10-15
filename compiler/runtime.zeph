@@ -2642,14 +2642,18 @@ fn runtimeStringToInteger(stringAddress: int) -> int {
     while index < stringLength {
         let character = load8(stringAddress + 8 + index)
         if character < 48 or character > 57 { break }
-        value = value * 10 + (character - 48)
+        // accumulate negatively, so INT_MIN's magnitude fits; panic on overflow
+        let digit = character - 48
+        if value < (0 - 9223372036854775807 - 1 + digit) / 10 { runtimeFail("cannot convert to int: out of range") }
+        value = value * 10 - digit
         sawDigit = true
         index += 1
     }
     while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
     if not sawDigit or index != stringLength { runtimeFail("cannot convert to int") }
-    if isNegative { return 0 - value }
-    return value
+    if isNegative { return value }
+    if value == 0 - 9223372036854775807 - 1 { runtimeFail("cannot convert to int: out of range") }
+    return 0 - value
 }
 
 // decimal float parser (sign, integer part, fraction; no exponent yet).
