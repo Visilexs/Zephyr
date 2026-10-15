@@ -1,0 +1,21 @@
+// std/utf8.zeph: decoding, validation, truncation, width and padding.
+import "std/utf8.zeph"
+
+let text = "héllo, 世界"
+print(utf8RuneCount(text), text.len())
+print(utf8Codepoints("aé世😀"))
+print(utf8FromCodepoints([97, 233, 19990, 128512]) == "aé世😀")
+let (cp, size) = utf8DecodeAt("😀", 0)
+print(cp, size)
+print(utf8Encode(55296) == utf8Encode(65533), utf8Encode(1114112).len())
+print(utf8IsValid(text), utf8IsValid(""), utf8IsValid(chr(255)), utf8IsValid(chr(192) + chr(128)))
+print(utf8IsValid(chr(237) + chr(160) + chr(128)), utf8IsValid(chr(244) + chr(144) + chr(128) + chr(128)))
+print(utf8IsValid("世".sub(0, 2)), utf8RuneCount("世".sub(0, 2)))
+print(utf8Truncate(text, 4), utf8Truncate(text, 100) == text, utf8Truncate(text, 0) == "")
+print(utf8TruncateBytes("a世b", 3), utf8TruncateBytes("a世b", 4), utf8TruncateBytes("a世b", 9))
+print(utf8Sub(text, 7, 9), utf8RuneOffset(text, 2))
+print(utf8DisplayWidth(text), utf8DisplayWidth("e" + utf8Encode(769)), utf8DisplayWidth("😀!"))
+print("[" + utf8PadRight("世", 5) + "]", "[" + utf8PadLeft("é", 3) + "]")
+print("[" + utf8TruncateWidth("世界abc", 3) + "]", "[" + utf8Fit("世界abc", 5) + "]", "[" + utf8Fit("ab", 4) + "]")
+// invalid input decodes one replacement per bad byte
+print(utf8Codepoints("a" + chr(128) + chr(255) + "b"))

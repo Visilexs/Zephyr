@@ -1,0 +1,53 @@
+{"a":1,"b":[true,false,null],"c":{"d":"x\ny"}}
+[1,-2,3.5,-0.25,1000,0.0015,0,0,12345678901234567000]
+"é世😀/\""
+[0.1,0.2,0.30000000000000004,1e+21,1e-7,5e-324,1.7976931348623157e+308,123456.789]
+error: json: number out of range at byte 6
+error: json: unexpected end of input at byte 0
+error: json: unexpected character ']' at byte 3
+error: json: expected ':' at byte 5
+error: json: expected ',' or ']' at byte 2
+error: json: unterminated string at byte 4
+error: json: trailing characters at byte 4
+error: json: unexpected end of input at byte 0
+error: json: invalid escape at byte 2
+error: json: invalid number at byte 2
+error: json: expected a string key at byte 1
+error: json: control character in string at byte 2
+error: json: unexpected character '.' at byte 1
+error: json: invalid number at byte 3
+error: json: nesting too deep at byte 513
+hi 42
+true 2.5
+false false false object
+["choices", "x"] 1 true false
+{"name":"zé \"q\" \\ \u0001","n":4.5,"tags":["a","b",null],"empty":[],"obj":{}}
+"\u00e9\u4e16\ud83d\ude00\u007f"
+{
+  "name": "zé \"q\" \\ \u0001",
+  "n": 4.5,
+  "tags": [
+    "a",
+    "b",
+    null
+  ],
+  "empty": [],
+  "obj": {}
+}
+true true
+partial: none
+partial: {}
+partial: {}
+partial: {}
+partial: {}
+partial: {"path":"src/ma"}
+partial: {"path":"a"}
+partial: {"path":"a"}
+partial: {"path":"x"}
+partial: {"path":"x","n":12}
+partial: [1,[2,{}]]
+partial: {"a":""}
+false
+command ls -la true
+cwd /ho false
+echo "hi false

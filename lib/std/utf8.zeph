@@ -1,0 +1,233 @@
+// std/utf8.zeph -- UTF-8 over Zephyr's byte strings.
+//
+//     import "std/utf8.zeph"
+//     let text = "héllo, 世界"
+//     print(utf8RuneCount(text))          // 9
+//     print(utf8Truncate(text, 4))        // "héll"
+//     print(utf8DisplayWidth(text))       // 11 (CJK counts 2 columns)
+//
+// Strings stay byte strings; these functions read them as UTF-8. Invalid
+// input never panics: a byte that does not start a valid sequence decodes as
+// U+FFFD (the replacement character) and advances one byte, so every loop
+// makes progress and every byte belongs to exactly one rune.
+
+const utf8Replacement = 65533
+
+// The codepoint starting at byte `index`, and the byte length of its
+// encoding: (codepoint, length). Invalid or truncated sequences, overlong
+// forms, surrogates and values above U+10FFFF give (65533, 1). Panics only
+// when `index` is outside the string.
+fn utf8DecodeAt(text: str, index: int) -> (int, int) {
+    let n = text.len()
+    assert(index >= 0 and index < n, "utf8DecodeAt: index out of range")
+    let b0 = text.byte(index)
+    if b0 < 128 { return (b0, 1) }
+    if b0 < 194 or b0 > 244 { return (utf8Replacement, 1) }     // continuation, overlong lead or out of range
+    if b0 < 224 {
+        if index + 1 >= n { return (utf8Replacement, 1) }
+        let b1 = text.byte(index + 1)
+        if (b1 & 192) != 128 { return (utf8Replacement, 1) }
+        return (((b0 & 31) << 6) | (b1 & 63), 2)
+    }
+    if b0 < 240 {
+        if index + 2 >= n { return (utf8Replacement, 1) }
+        let b1 = text.byte(index + 1)
+        let b2 = text.byte(index + 2)
+        if (b1 & 192) != 128 or (b2 & 192) != 128 { return (utf8Replacement, 1) }
+        if b0 == 224 and b1 < 160 { return (utf8Replacement, 1) }   // overlong
+        if b0 == 237 and b1 >= 160 { return (utf8Replacement, 1) }  // surrogate
+        return (((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63), 3)
+    }
+    if index + 3 >= n { return (utf8Replacement, 1) }
+    let b1 = text.byte(index + 1)
+    let b2 = text.byte(index + 2)
+    let b3 = text.byte(index + 3)
+    if (b1 & 192) != 128 or (b2 & 192) != 128 or (b3 & 192) != 128 { return (utf8Replacement, 1) }
+    if b0 == 240 and b1 < 144 { return (utf8Replacement, 1) }       // overlong
+    if b0 == 244 and b1 >= 144 { return (utf8Replacement, 1) }      // above U+10FFFF
+    return (((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63), 4)
+}
+
+// The encoding of one codepoint. Surrogates, negatives and values above
+// U+10FFFF encode as U+FFFD.
+fn utf8Encode(codepoint: int) -> str {
+    var cp = codepoint
+    if cp < 0 or cp > 1114111 or (cp >= 55296 and cp < 57344) { cp = utf8Replacement }
+    if cp < 128 { return chr(cp) }
+    if cp < 2048 { return chr(192 | (cp >> 6)) + chr(128 | (cp & 63)) }
+    if cp < 65536 { return chr(224 | (cp >> 12)) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63)) }
+    return chr(240 | (cp >> 18)) + chr(128 | ((cp >> 12) & 63)) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63))
+}
+
+// The string made of these codepoints.
+fn utf8FromCodepoints(codepoints: [int]) -> str {
+    var parts: [str] = []
+    for cp in codepoints { parts.push(utf8Encode(cp)) }
+    return parts.join()
+}
+
+// Every codepoint, in order (invalid bytes become 65533).
+fn utf8Codepoints(text: str) -> [int] {
+    var result: [int] = []
+    var i = 0
+    while i < text.len() {
+        let (cp, size) = utf8DecodeAt(text, i)
+        result.push(cp)
+        i += size
+    }
+    return result
+}
+
+// The number of runes (codepoints, counting each invalid byte as one).
+fn utf8RuneCount(text: str) -> int {
+    var count = 0
+    var i = 0
+    let n = text.len()
+    while i < n {
+        if text.byte(i) < 128 { i += 1 } else {
+            let (cp, size) = utf8DecodeAt(text, i)
+            i += size
+        }
+        count += 1
+    }
+    return count
+}
+
+// Whether the whole string is well-formed UTF-8 (no overlongs, surrogates
+// or values above U+10FFFF).
+fn utf8IsValid(text: str) -> bool {
+    var i = 0
+    let n = text.len()
+    while i < n {
+        if text.byte(i) < 128 { i += 1 } else {
+            let (cp, size) = utf8DecodeAt(text, i)
+            if size == 1 { return false }      // only ASCII decodes to one byte legitimately
+            i += size
+        }
+    }
+    return true
+}
+
+// The byte offset where rune number `runeIndex` starts (0-based); the byte
+// length when the string has no more runes than that.
+fn utf8RuneOffset(text: str, runeIndex: int) -> int {
+    var i = 0
+    var count = 0
+    while i < text.len() and count < runeIndex {
+        let (cp, size) = utf8DecodeAt(text, i)
+        i += size
+        count += 1
+    }
+    return i
+}
+
+// Runes [start, end) as a string; out-of-range bounds are clamped.
+fn utf8Sub(text: str, start: int, end: int) -> str {
+    let from = utf8RuneOffset(text, max(start, 0))
+    if end <= start { return "" }
+    let to = utf8RuneOffset(text, end)
+    return text.sub(from, to)
+}
+
+// The first `count` runes; the whole string when it is shorter. Never cuts
+// a multi-byte sequence in half.
+fn utf8Truncate(text: str, count: int) -> str {
+    if count <= 0 { return "" }
+    return text.sub(0, utf8RuneOffset(text, count))
+}
+
+// The longest prefix of at most `maxBytes` bytes that ends on a rune
+// boundary (for byte-limited buffers and protocol fields).
+fn utf8TruncateBytes(text: str, maxBytes: int) -> str {
+    if maxBytes <= 0 { return "" }
+    if text.len() <= maxBytes { return text }
+    var i = 0
+    while i < text.len() {
+        let (cp, size) = utf8DecodeAt(text, i)
+        if i + size > maxBytes { break }
+        i += size
+    }
+    return text.sub(0, i)
+}
+
+// Terminal columns one codepoint takes: 0 for control characters,
+// combining marks and zero-width joiners, 2 for East Asian wide/fullwidth
+// characters and most emoji, 1 otherwise. An approximation of wcwidth with
+// no tables; good enough for aligning CLI output.
+fn utf8RuneWidth(cp: int) -> int {
+    if cp == 0 { return 0 }
+    if cp < 32 or (cp >= 127 and cp < 160) { return 0 }
+    if cp < 768 { return 1 }
+    if (cp >= 768 and cp <= 879) or (cp >= 1155 and cp <= 1161) or (cp >= 1425 and cp <= 1469) { return 0 }
+    if (cp >= 6832 and cp <= 6911) or (cp >= 7616 and cp <= 7679) or (cp >= 8400 and cp <= 8447) { return 0 }
+    if (cp >= 65024 and cp <= 65039) or (cp >= 65056 and cp <= 65071) { return 0 }   // variation selectors, half marks
+    if cp == 8203 or cp == 8204 or cp == 8205 or cp == 8288 or cp == 65279 { return 0 }  // ZWSP, ZWNJ, ZWJ, WJ, BOM
+    if cp >= 4352 and cp <= 4447 { return 2 }                       // Hangul Jamo leading
+    if cp >= 11904 and cp <= 42191 and cp != 12351 { return 2 }      // CJK radicals .. Yi
+    if cp >= 43360 and cp <= 43391 { return 2 }
+    if cp >= 44032 and cp <= 55203 { return 2 }                     // Hangul syllables
+    if cp >= 63744 and cp <= 64255 { return 2 }                     // CJK compatibility ideographs
+    if cp >= 65040 and cp <= 65049 { return 2 }
+    if cp >= 65072 and cp <= 65135 { return 2 }
+    if cp >= 65280 and cp <= 65376 { return 2 }                     // fullwidth forms
+    if cp >= 65504 and cp <= 65510 { return 2 }
+    if cp >= 127744 and cp <= 129791 { return 2 }                   // emoji and pictographs
+    if cp >= 131072 and cp <= 262141 { return 2 }                   // CJK extension planes
+    return 1
+}
+
+// Terminal columns the whole string takes (sum of utf8RuneWidth).
+fn utf8DisplayWidth(text: str) -> int {
+    var width = 0
+    var i = 0
+    let n = text.len()
+    while i < n {
+        let b = text.byte(i)
+        if b >= 32 and b < 127 {
+            width += 1
+            i += 1
+        } else {
+            let (cp, size) = utf8DecodeAt(text, i)
+            width += utf8RuneWidth(cp)
+            i += size
+        }
+    }
+    return width
+}
+
+// The longest prefix that fits in `columns` terminal columns.
+fn utf8TruncateWidth(text: str, columns: int) -> str {
+    var width = 0
+    var i = 0
+    while i < text.len() {
+        let (cp, size) = utf8DecodeAt(text, i)
+        let w = utf8RuneWidth(cp)
+        if width + w > columns { break }
+        width += w
+        i += size
+    }
+    return text.sub(0, i)
+}
+
+// Pad with spaces on the right to `columns` display columns; text already
+// that wide is returned unchanged (not truncated).
+fn utf8PadRight(text: str, columns: int) -> str {
+    let width = utf8DisplayWidth(text)
+    if width >= columns { return text }
+    return text + " ".repeat(columns - width)
+}
+
+// Pad with spaces on the left to `columns` display columns.
+fn utf8PadLeft(text: str, columns: int) -> str {
+    let width = utf8DisplayWidth(text)
+    if width >= columns { return text }
+    return " ".repeat(columns - width) + text
+}
+
+// Exactly `columns` display columns: truncated with "…" when too wide,
+// padded with spaces when too narrow. For table cells.
+fn utf8Fit(text: str, columns: int) -> str {
+    if columns <= 0 { return "" }
+    if utf8DisplayWidth(text) <= columns { return utf8PadRight(text, columns) }
+    return utf8PadRight(utf8TruncateWidth(text, columns - 1) + "…", columns)
+}
