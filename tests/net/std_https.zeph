@@ -1,0 +1,23 @@
+// std/http over TLS (libcurl) against tests/net/server.py's https server.
+// args: the https port and the self-signed CA/cert file it uses.
+import "std/http.zeph"
+
+let port = args()[1] as int
+let caFile = args()[2]
+var noHeaders: [str: str] = [:]
+let trusted = HttpOptions{caFile: caFile, timeoutMilliseconds: 5000}
+let hello = requestWith("GET", "https://127.0.0.1:{port}/hello", noHeaders, "", trusted).unwrap()
+print(hello.status, hello.body, hello.header("x-server").or("?"))
+var headers: [str: str] = [:]
+headers["X-Test"] = "tls"
+print(requestWith("POST", "https://localhost:{port}/echo", headers, "secret", trusted).unwrap().body)
+var seen: [str] = []
+let events = requestEvents("GET", "https://127.0.0.1:{port}/sse", noHeaders, "", trusted, fn(event: SseEvent) -> bool {
+    seen.push(event.data)
+    return true
+})
+print(events.isOk(), seen.len(), seen[seen.len() - 1])
+// an untrusted self-signed certificate is an Err, unless insecure
+let untrusted = requestWith("GET", "https://127.0.0.1:{port}/hello", noHeaders, "", HttpOptions{timeoutMilliseconds: 5000})
+print(untrusted.isError(), untrusted.error().or("").contains("curl error"))
+print(requestWith("GET", "https://127.0.0.1:{port}/hello", noHeaders, "", HttpOptions{insecure: true}).unwrap().body)

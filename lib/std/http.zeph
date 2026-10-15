@@ -1,0 +1,667 @@
+// std/http.zeph -- HTTP/1.1 client with streaming and Server-Sent Events
+// (Linux). Plain http:// goes over std/net; https:// goes through libcurl
+// (libcurl.so.4, loaded with dlopen on first use).
+//
+//     import "std/http.zeph"
+//     match request("GET", "http://127.0.0.1:8000/", [:], "") {
+//         Ok(response) { print(response.status, response.body) }
+//         Err(message) { print(message) }
+//     }
+//
+//     // an LLM streaming API: one callback per SSE event
+//     var headers: [str: str] = [:]
+//     headers["Content-Type"] = "application/json"
+//     let result = requestEvents("POST", url, headers, body, HttpOptions{},
+//         fn(event: SseEvent) -> bool {
+//             if event.data == "[DONE]" { return false }    // false stops the stream
+//             print(event.event, event.data)
+//             return true
+//         })
+//
+// Results, not panics: network errors, timeouts and malformed responses are
+// Err(text); an HTTP error status is still Ok (check response.status).
+// Bodies: Content-Length, chunked and close-delimited. Requests send
+// Connection: close (one request per connection) and do not follow
+// redirects. Response header names are lowercased; repeated headers are
+// joined with ", ".
+//
+// HTTPS needs libcurl.so.4 (any distro's libcurl package). Without it,
+// https:// URLs give Err("https: libcurl.so.4 is not available ..."). Using
+// this module makes the executable dynamically linked (it imports dlopen).
+import "std/bytes.zeph"
+import "std/result.zeph"
+import "std/net.zeph"
+
+struct HttpOptions {
+    timeoutMilliseconds: int = 60000  // connect and each read; libcurl: the whole transfer
+    useCurl: bool = false             // send http:// through libcurl too
+    caFile: str = ""                  // libcurl: a CA bundle (PEM) to trust instead of the system one
+    insecure: bool = false            // libcurl: skip TLS certificate checks
+}
+
+struct Response {
+    status: int
+    reason: str
+    headers: [str: str]               // lowercased names
+    body: str                         // "" for the streaming calls
+}
+
+impl Response {
+    fn header(self, name: str) -> str? { return self.headers.get(name.lower()) }
+    fn isSuccess(self) -> bool { return self.status >= 200 and self.status < 300 }
+}
+
+struct Url { scheme: str, host: str, port: int, path: str }
+
+// "http://host:port/path?q" -> Url. The fragment is dropped; IPv6 hosts are
+// written [::1]. Only http and https.
+fn parseUrl(url: str) -> Result[Url, str] {
+    let schemeEnd = url.indexOf("://")
+    if schemeEnd <= 0 { return Result.Err("bad url {url}: no scheme") }
+    let scheme = url.sub(0, schemeEnd).lower()
+    if scheme != "http" and scheme != "https" { return Result.Err("bad url {url}: unsupported scheme {scheme}") }
+    var rest = url.sub(schemeEnd + 3, url.len())
+    let hash = rest.indexOf("#")
+    if hash >= 0 { rest = rest.sub(0, hash) }
+    var pathStart = rest.len()
+    for i in 0..rest.len() {
+        let c = rest.byte(i)
+        if (c == 47 or c == 63) and pathStart == rest.len() { pathStart = i }
+    }
+    var authority = rest.sub(0, pathStart)
+    var path = rest.sub(pathStart, rest.len())
+    if path == "" { path = "/" }
+    if path.startsWith("?") { path = "/" + path }
+    let at = authority.indexOf("@")
+    if at >= 0 { authority = authority.sub(at + 1, authority.len()) }
+    var host = authority
+    var port = if scheme == "https" { 443 } else { 80 }
+    var portText = ""
+    if authority.startsWith("[") {
+        let close = authority.indexOf("]")
+        if close < 0 { return Result.Err("bad url {url}: unclosed [") }
+        host = authority.sub(1, close)
+        if close + 1 < authority.len() {
+            if authority.byte(close + 1) != 58 { return Result.Err("bad url {url}: junk after ]") }
+            portText = authority.sub(close + 2, authority.len())
+        }
+    } else {
+        let colon = authority.indexOf(":")
+        if colon >= 0 {
+            host = authority.sub(0, colon)
+            portText = authority.sub(colon + 1, authority.len())
+        }
+    }
+    if portText != "" {
+        var value = 0
+        for i in 0..portText.len() {
+            let c = portText.byte(i)
+            if c < 48 or c > 57 or value > 65535 { return Result.Err("bad url {url}: bad port") }
+            value = value * 10 + c - 48
+        }
+        if value <= 0 or value > 65535 { return Result.Err("bad url {url}: bad port") }
+        port = value
+    }
+    if host == "" { return Result.Err("bad url {url}: no host") }
+    return Result.Ok(Url{scheme: scheme, host: host, port: port, path: path})
+}
+
+// ---- public entry points ----
+
+// One request; the whole body is collected into response.body.
+fn request(method: str, url: str, headers: [str: str], body: str) -> Result[Response, str] {
+    return requestWith(method, url, headers, body, HttpOptions{})
+}
+
+fn requestWith(method: str, url: str, headers: [str: str], body: str, options: HttpOptions) -> Result[Response, str] {
+    var parts: [str] = []
+    let result = requestStream(method, url, headers, body, options, fn(chunk: str) -> bool {
+        parts.push(chunk)
+        return true
+    })
+    match result {
+        Ok(response) {
+            response.body = parts.join()
+            return Result.Ok(response)
+        }
+        Err(message) { return Result.Err(message) }
+    }
+}
+
+fn get(url: str) -> Result[Response, str] {
+    var headers: [str: str] = [:]
+    return requestWith("GET", url, headers, "", HttpOptions{})
+}
+
+// POST a JSON text with Content-Type: application/json plus `headers`.
+fn postJson(url: str, json: str, headers: [str: str]) -> Result[Response, str] {
+    var all: [str: str] = [:]
+    for name in headers.keys() { all[name] = headers[name] }
+    all["Content-Type"] = "application/json"
+    return requestWith("POST", url, all, json, HttpOptions{})
+}
+
+// Streams the body: onChunk gets each piece of decoded body as it arrives
+// (chunked framing removed); returning false stops reading and closes the
+// connection. The returned Response has an empty body.
+fn requestStream(method: str, url: str, headers: [str: str], body: str, options: HttpOptions,
+                 onChunk: fn(str) -> bool) -> Result[Response, str] {
+    var parsed = Url{scheme: "", host: "", port: 0, path: ""}
+    match parseUrl(url) {
+        Ok(value) { parsed = value }
+        Err(message) { return Result.Err(message) }
+    }
+    if parsed.scheme == "https" or options.useCurl {
+        return curlRequest(method, url, headers, body, options, onChunk)
+    }
+    return httpPlainRequest(method, parsed, headers, body, options, onChunk)
+}
+
+// Server-Sent Events: onEvent gets each complete event (text/event-stream,
+// what OpenAI/Anthropic-style streaming APIs send). Return false to stop.
+// Sends Accept: text/event-stream unless headers set Accept.
+fn requestEvents(method: str, url: str, headers: [str: str], body: str, options: HttpOptions,
+                 onEvent: fn(SseEvent) -> bool) -> Result[Response, str] {
+    var all: [str: str] = [:]
+    var hasAccept = false
+    for name in headers.keys() {
+        all[name] = headers[name]
+        if name.lower() == "accept" { hasAccept = true }
+    }
+    if not hasAccept { all["Accept"] = "text/event-stream" }
+    let parser = SseParser{}
+    return requestStream(method, url, all, body, options, fn(chunk: str) -> bool {
+        for event in parser.feed(chunk) {
+            if not onEvent(event) { return false }
+        }
+        return true
+    })
+}
+
+// ---- Server-Sent Events ----
+
+// One event: `event` defaults to "message"; data lines are joined with "\n".
+struct SseEvent { event: str, data: str, id: str }
+
+// Incremental text/event-stream parser: feed it bytes in any split.
+struct SseParser {
+    pending: str = ""
+    event: str = ""
+    data: [str]?
+    lastId: str = ""
+}
+
+impl SseParser {
+    // The events completed by this chunk.
+    fn feed(self, chunk: str) -> [SseEvent] {
+        var events: [SseEvent] = []
+        let text = self.pending + chunk
+        var start = 0
+        var index = 0
+        while index < text.len() {
+            let c = text.byte(index)
+            if c == 10 or c == 13 {
+                if c == 13 and index + 1 == text.len() { break }   // maybe CRLF split across chunks
+                let line = text.sub(start, index)
+                if c == 13 and text.byte(index + 1) == 10 { index += 1 }
+                if let event = self.line(line) { events.push(event) }
+                start = index + 1
+            }
+            index += 1
+        }
+        self.pending = text.sub(start, text.len())
+        return events
+    }
+
+    // Handles one line; a blank line returns the finished event, if any.
+    fn line(self, line: str) -> SseEvent? {
+        if line == "" {
+            let lines = self.data
+            let kind = if self.event == "" { "message" } else { self.event }
+            self.event = ""
+            self.data = none
+            if let collected = lines {
+                return SseEvent{event: kind, data: collected.join("\n"), id: self.lastId}
+            }
+            return none
+        }
+        if line.startsWith(":") { return none }
+        var field = line
+        var value = ""
+        let colon = line.indexOf(":")
+        if colon >= 0 {
+            field = line.sub(0, colon)
+            value = line.sub(colon + 1, line.len())
+            if value.startsWith(" ") { value = value.sub(1, value.len()) }
+        }
+        if field == "data" {
+            var lines: [str] = []
+            if let existing = self.data { lines = existing }
+            lines.push(value)
+            self.data = lines
+        } else if field == "event" {
+            self.event = value
+        } else if field == "id" {
+            if not value.contains(chr(0)) { self.lastId = value }
+        }
+        return none
+    }
+}
+
+// ---- plain HTTP/1.1 over std/net ----
+
+private fn httpRequestText(method: str, target: Url, headers: [str: str], body: str) -> str {
+    var hostHeader = target.host
+    if target.host.contains(":") { hostHeader = "[" + target.host + "]" }
+    if target.port != 80 { hostHeader = hostHeader + ":{target.port}" }
+    var lines: [str] = ["{method} {target.path} HTTP/1.1"]
+    var given: [str: bool] = [:]
+    for name in headers.keys() {
+        given[name.lower()] = true
+        lines.push(name + ": " + headers[name])
+    }
+    if not given.has("host") { lines.push("Host: " + hostHeader) }
+    if not given.has("user-agent") { lines.push("User-Agent: zephyr-http/1") }
+    if not given.has("accept") { lines.push("Accept: */*") }
+    if not given.has("connection") { lines.push("Connection: close") }
+    let needsLength = body.len() > 0 or method == "POST" or method == "PUT" or method == "PATCH"
+    if needsLength and not given.has("content-length") { lines.push("Content-Length: {body.len()}") }
+    return lines.join("\r\n") + "\r\n\r\n" + body
+}
+
+private fn httpParseHex(text: str) -> int {
+    var value = 0
+    var digits = 0
+    for i in 0..text.len() {
+        let c = text.byte(i)
+        var digit = 0 - 1
+        if c >= 48 and c <= 57 { digit = c - 48 }
+        if c >= 97 and c <= 102 { digit = c - 87 }
+        if c >= 65 and c <= 70 { digit = c - 55 }
+        if digit < 0 { break }
+        if digits >= 15 { return 0 - 1 }
+        value = value * 16 + digit
+        digits += 1
+    }
+    if digits == 0 { return 0 - 1 }
+    return value
+}
+
+// Parses "HTTP/1.1 200 OK\r\nName: value\r\n..." (no blank line) into a Response.
+fn parseResponseHead(head: str) -> Result[Response, str] {
+    let lines = head.split("\n")
+    let statusLine = lines[0].trim()
+    if not statusLine.startsWith("HTTP/") { return Result.Err("bad status line: " + statusLine) }
+    let firstSpace = statusLine.indexOf(" ")
+    if firstSpace < 0 { return Result.Err("bad status line: " + statusLine) }
+    let afterVersion = statusLine.sub(firstSpace + 1, statusLine.len())
+    let codeEnd = if afterVersion.indexOf(" ") >= 0 { afterVersion.indexOf(" ") } else { afterVersion.len() }
+    let codeText = afterVersion.sub(0, codeEnd)
+    if codeText.len() != 3 { return Result.Err("bad status line: " + statusLine) }
+    var status = 0
+    for i in 0..3 {
+        let c = codeText.byte(i)
+        if c < 48 or c > 57 { return Result.Err("bad status line: " + statusLine) }
+        status = status * 10 + c - 48
+    }
+    let reason = afterVersion.sub(codeEnd, afterVersion.len()).trim()
+    var headers: [str: str] = [:]
+    for i in 1..lines.len() {
+        let line = lines[i].trim()
+        let colon = line.indexOf(":")
+        if colon <= 0 { continue }
+        let name = line.sub(0, colon).trim().lower()
+        let value = line.sub(colon + 1, line.len()).trim()
+        if headers.has(name) { headers[name] = headers[name] + ", " + value } else { headers[name] = value }
+    }
+    return Result.Ok(Response{status: status, reason: reason, headers: headers, body: ""})
+}
+
+// Decodes chunked framing incrementally; `done` once the last chunk arrives.
+struct ChunkDecoder { pending: str = "", remaining: int = 0 - 1, done: bool = false, failed: bool = false }
+
+impl ChunkDecoder {
+    // Body bytes completed by `data` (may be several pieces).
+    fn feed(self, data: str) -> [str] {
+        var out: [str] = []
+        self.pending = self.pending + data
+        var going = true
+        while going and not self.done and not self.failed {
+            if self.remaining > 0 {
+                if self.pending.len() == 0 { going = false } else {
+                    let take = min(self.remaining, self.pending.len())
+                    out.push(self.pending.sub(0, take))
+                    self.pending = self.pending.sub(take, self.pending.len())
+                    self.remaining -= take
+                    if self.remaining == 0 { self.remaining = 0 - 2 }
+                }
+            } else if self.remaining == 0 - 2 {
+                if self.pending.len() < 2 { going = false } else {
+                    self.pending = self.pending.sub(2, self.pending.len())
+                    self.remaining = 0 - 1
+                }
+            } else {
+                let end = self.pending.indexOf("\r\n")
+                if end < 0 {
+                    if self.pending.len() > 4096 { self.failed = true }
+                    going = false
+                } else {
+                    var sizeText = self.pending.sub(0, end)
+                    let semicolon = sizeText.indexOf(";")
+                    if semicolon >= 0 { sizeText = sizeText.sub(0, semicolon) }
+                    let size = httpParseHex(sizeText.trim())
+                    self.pending = self.pending.sub(end + 2, self.pending.len())
+                    if size < 0 { self.failed = true }
+                    else if size == 0 { self.done = true }
+                    else { self.remaining = size }
+                }
+            }
+        }
+        return out
+    }
+}
+
+private fn httpPlainRequest(method: str, target: Url, headers: [str: str], body: str, options: HttpOptions,
+                            onChunk: fn(str) -> bool) -> Result[Response, str] {
+    var conn = TcpConnection{fd: 0 - 1, open: false}
+    match tcpConnect(target.host, target.port, options.timeoutMilliseconds) {
+        Ok(c) { conn = c }
+        Err(message) { return Result.Err(message) }
+    }
+    let result = httpExchange(conn, method, target, headers, body, onChunk)
+    conn.close()
+    return result
+}
+
+private fn httpExchange(conn: TcpConnection, method: str, target: Url, headers: [str: str], body: str,
+                        onChunk: fn(str) -> bool) -> Result[Response, str] {
+    match conn.send(httpRequestText(method, target, headers, body)) {
+        Ok(n) { }
+        Err(message) { return Result.Err(message) }
+    }
+    // read the head (skipping 1xx interim responses)
+    var buffered = ""
+    var response = Response{status: 0, reason: "", headers: [:], body: ""}
+    while response.status == 0 or (response.status >= 100 and response.status < 200) {
+        var headEnd = buffered.indexOf("\r\n\r\n")
+        while headEnd < 0 {
+            if buffered.len() > 1048576 { return Result.Err("http: response head too large") }
+            match conn.recv(65536) {
+                Ok(chunk) {
+                    if chunk == "" { return Result.Err("http {conn.peer}: connection closed before the response head") }
+                    buffered = buffered + chunk
+                }
+                Err(message) { return Result.Err(message) }
+            }
+            headEnd = buffered.indexOf("\r\n\r\n")
+        }
+        match parseResponseHead(buffered.sub(0, headEnd)) {
+            Ok(parsed) { response = parsed }
+            Err(message) { return Result.Err("http {conn.peer}: " + message) }
+        }
+        buffered = buffered.sub(headEnd + 4, buffered.len())
+    }
+    if method == "HEAD" or response.status == 204 or response.status == 304 { return Result.Ok(response) }
+    let encoding = response.header("transfer-encoding").or("").lower()
+    if encoding.contains("chunked") {
+        let decoder = ChunkDecoder{}
+        var incoming = buffered
+        while true {
+            for piece in decoder.feed(incoming) {
+                if not onChunk(piece) { return Result.Ok(response) }
+            }
+            if decoder.done { return Result.Ok(response) }
+            if decoder.failed { return Result.Err("http {conn.peer}: bad chunked encoding") }
+            match conn.recv(65536) {
+                Ok(chunk) {
+                    if chunk == "" { return Result.Err("http {conn.peer}: connection closed mid-body") }
+                    incoming = chunk
+                }
+                Err(message) { return Result.Err(message) }
+            }
+        }
+    }
+    if let lengthText = response.header("content-length") {
+        var remaining = 0
+        match parseNonNegative(lengthText) {
+            Ok(n) { remaining = n }
+            Err(message) { return Result.Err("http {conn.peer}: bad Content-Length " + lengthText) }
+        }
+        var incoming = buffered
+        while true {
+            if incoming.len() > remaining { incoming = incoming.sub(0, remaining) }
+            if incoming != "" {
+                remaining -= incoming.len()
+                if not onChunk(incoming) { return Result.Ok(response) }
+            }
+            if remaining == 0 { return Result.Ok(response) }
+            match conn.recv(min(remaining, 65536)) {
+                Ok(chunk) {
+                    if chunk == "" { return Result.Err("http {conn.peer}: connection closed mid-body") }
+                    incoming = chunk
+                }
+                Err(message) { return Result.Err(message) }
+            }
+        }
+    }
+    // no length: the body runs to connection close
+    var incoming = buffered
+    while true {
+        if incoming != "" and not onChunk(incoming) { return Result.Ok(response) }
+        match conn.recv(65536) {
+            Ok(chunk) {
+                if chunk == "" { return Result.Ok(response) }
+                incoming = chunk
+            }
+            Err(message) { return Result.Err(message) }
+        }
+    }
+    return Result.Ok(response)
+}
+
+private fn parseNonNegative(text: str) -> Result[int, str] {
+    let trimmed = text.trim()
+    if trimmed.len() == 0 or trimmed.len() > 18 { return Result.Err("bad number") }
+    var value = 0
+    for i in 0..trimmed.len() {
+        let c = trimmed.byte(i)
+        if c < 48 or c > 57 { return Result.Err("bad number") }
+        value = value * 10 + c - 48
+    }
+    return Result.Ok(value)
+}
+
+// ---- libcurl (https) ----
+// No native callbacks exist yet, so libcurl's default write function (fwrite)
+// writes the body and the headers into two memfds through unbuffered FILE*s;
+// the multi interface drives the transfer and this loop reads the new bytes
+// with pread between curl_multi_poll calls, so streaming still works.
+
+var curlLibrary = 0
+var curlLibcLibrary = 0
+var curlSymbols: [str: int] = [:]
+var curlInitialized = false
+
+private fn curlDlopen(name: str) -> int {
+    let text = cString(name)
+    let dlopenFunction = load64(dynamicImport(0))
+    return callSysV(dlopenFunction, text.addr(), 2)          // RTLD_NOW
+}
+
+private fn curlSymbol(library: int, name: str) -> int {
+    if curlSymbols.has(name) { return curlSymbols[name] }
+    let text = cString(name)
+    let dlsymFunction = load64(dynamicImport(1))
+    let address = callSysV(dlsymFunction, library, text.addr())
+    curlSymbols[name] = address
+    return address
+}
+
+private fn curlLoad() -> Result[int, str] {
+    if curlLibrary == 0 { curlLibrary = curlDlopen("libcurl.so.4") }
+    if curlLibrary == 0 { return Result.Err("https: libcurl.so.4 is not available (install libcurl to use https:// URLs)") }
+    if curlLibcLibrary == 0 { curlLibcLibrary = curlDlopen("libc.so.6") }
+    if curlLibcLibrary == 0 { return Result.Err("https: libc.so.6 is not available") }
+    for name in ["curl_global_init", "curl_easy_init", "curl_easy_setopt", "curl_easy_cleanup",
+                 "curl_easy_getinfo", "curl_easy_strerror", "curl_slist_append", "curl_slist_free_all",
+                 "curl_multi_init", "curl_multi_add_handle", "curl_multi_remove_handle",
+                 "curl_multi_perform", "curl_multi_poll", "curl_multi_info_read", "curl_multi_cleanup"] {
+        if curlSymbol(curlLibrary, name) == 0 { return Result.Err("https: libcurl lacks " + name) }
+    }
+    for name in ["fdopen", "setvbuf", "fclose"] {
+        if curlSymbol(curlLibcLibrary, name) == 0 { return Result.Err("https: libc lacks " + name) }
+    }
+    if not curlInitialized {
+        let initialized = callSysV(curlSymbols["curl_global_init"], 3)   // CURL_GLOBAL_ALL
+        curlInitialized = true
+    }
+    return Result.Ok(curlLibrary)
+}
+
+private fn curlSetString(easy: int, option: int, value: Bytes) -> int {
+    return callSysV(curlSymbols["curl_easy_setopt"], easy, option, value.addr())
+}
+
+private fn curlSetInt(easy: int, option: int, value: int) -> int {
+    return callSysV(curlSymbols["curl_easy_setopt"], easy, option, value)
+}
+
+// A memfd with an unbuffered write FILE* on a dup of it: (fd, FILE*).
+private fn curlSink(name: str) -> (int, int) {
+    let label = cString(name)
+    let fd = syscall(319, label.addr(), 1, 0, 0, 0, 0)       // memfd_create(MFD_CLOEXEC)
+    if fd < 0 { return (0 - 1, 0) }
+    let writer = syscall(32, fd, 0, 0, 0, 0, 0)                // dup
+    let mode = cString("w")
+    let file = callSysV(curlSymbols["fdopen"], writer, mode.addr())
+    if file == 0 {
+        let closed = syscall(3, writer, 0, 0, 0, 0, 0)
+        return (fd, 0)
+    }
+    let unbuffered = callSysV(curlSymbols["setvbuf"], file, 0, 2, 0)   // _IONBF
+    return (fd, file)
+}
+
+// The bytes of fd from `offset` on (pread), "" when nothing new.
+private fn curlReadFrom(fd: int, offset: int, buffer: Bytes) -> str {
+    var parts: [str] = []
+    var at = offset
+    while true {
+        let count = syscall(17, fd, buffer.addr(), buffer.len(), at, 0, 0)
+        if count <= 0 { break }
+        parts.push(buffer.getString(0, count))
+        at += count
+    }
+    return parts.join()
+}
+
+private fn curlRequest(method: str, url: str, headers: [str: str], body: str, options: HttpOptions,
+                       onChunk: fn(str) -> bool) -> Result[Response, str] {
+    match curlLoad() {
+        Ok(library) { }
+        Err(message) { return Result.Err(message) }
+    }
+    let easy = callSysV(curlSymbols["curl_easy_init"])
+    if easy == 0 { return Result.Err("https: curl_easy_init failed") }
+    let (bodyFd, bodyFile) = curlSink("zephyr-http-body")
+    let (headFd, headFile) = curlSink("zephyr-http-head")
+    if bodyFile == 0 or headFile == 0 {
+        let cleaned = callSysV(curlSymbols["curl_easy_cleanup"], easy)
+        return Result.Err("https: cannot create transfer buffers")
+    }
+    // every string handed to libcurl stays alive in `keep` until cleanup
+    var keep: [Bytes] = []
+    let urlText = cString(url)
+    keep.push(urlText)
+    var status = curlSetString(easy, 10002, urlText)                      // CURLOPT_URL
+    let methodText = cString(method)
+    keep.push(methodText)
+    if method == "HEAD" { status = curlSetInt(easy, 44, 1) }                 // CURLOPT_NOBODY
+    else if method != "GET" { status = curlSetString(easy, 10036, methodText) }   // CURLOPT_CUSTOMREQUEST
+    if body.len() > 0 or method == "POST" or method == "PUT" or method == "PATCH" {
+        let bodyText = cString(body)
+        keep.push(bodyText)
+        status = curlSetInt(easy, 30120, body.len())                         // CURLOPT_POSTFIELDSIZE_LARGE
+        status = curlSetString(easy, 10165, bodyText)                        // CURLOPT_COPYPOSTFIELDS
+        if method != "POST" { status = curlSetString(easy, 10036, methodText) }
+    }
+    var list = 0
+    for name in headers.keys() {
+        let line = cString(name + ": " + headers[name])
+        keep.push(line)
+        list = callSysV(curlSymbols["curl_slist_append"], list, line.addr())
+    }
+    let expectNone = cString("Expect:")
+    list = callSysV(curlSymbols["curl_slist_append"], list, expectNone.addr())
+    status = curlSetInt(easy, 10023, list)                                   // CURLOPT_HTTPHEADER
+    status = curlSetInt(easy, 10001, bodyFile)                               // CURLOPT_WRITEDATA
+    status = curlSetInt(easy, 10029, headFile)                               // CURLOPT_HEADERDATA
+    status = curlSetInt(easy, 99, 1)                                         // CURLOPT_NOSIGNAL
+    status = curlSetInt(easy, 155, options.timeoutMilliseconds)              // CURLOPT_TIMEOUT_MS
+    status = curlSetInt(easy, 156, options.timeoutMilliseconds)              // CURLOPT_CONNECTTIMEOUT_MS
+    let agent = cString("zephyr-http/1")
+    status = curlSetString(easy, 10018, agent)                               // CURLOPT_USERAGENT
+    if options.caFile != "" {
+        let caText = cString(options.caFile)
+        keep.push(caText)
+        status = curlSetString(easy, 10065, caText)                          // CURLOPT_CAINFO
+    }
+    if options.insecure {
+        status = curlSetInt(easy, 64, 0)                                     // CURLOPT_SSL_VERIFYPEER
+        status = curlSetInt(easy, 81, 0)                                     // CURLOPT_SSL_VERIFYHOST
+    }
+    let multi = callSysV(curlSymbols["curl_multi_init"])
+    let added = callSysV(curlSymbols["curl_multi_add_handle"], multi, easy)
+    let running = Bytes.new(8)
+    let buffer = Bytes.new(65536)
+    var offset = 0
+    var stopped = false
+    var going = true
+    while going {
+        running.put64(0, 0)
+        let performed = callSysV(curlSymbols["curl_multi_perform"], multi, running.addr())
+        let fresh = curlReadFrom(bodyFd, offset, buffer)
+        offset += fresh.len()
+        if fresh != "" and not onChunk(fresh) {
+            stopped = true
+            going = false
+        }
+        if running.get32(0) == 0 or performed != 0 { going = false }
+        if going { let polled = callSysV(curlSymbols["curl_multi_poll"], multi, 0, 0, 100, 0) }
+    }
+    var failure = ""
+    if not stopped {
+        let remaining = Bytes.new(8)
+        let message = callSysV(curlSymbols["curl_multi_info_read"], multi, remaining.addr())
+        if message != 0 and load32(message) == 1 {                          // CURLMSG_DONE
+            let code = load32(message + 16)
+            if code != 0 {
+                let text = callSysV(curlSymbols["curl_easy_strerror"], code)
+                var length = 0
+                while text != 0 and load8(text + length) != 0 and length < 512 { length += 1 }
+                var chars: [str] = []
+                for i in 0..length { chars.push(chr(load8(text + i))) }
+                failure = "https {url}: " + chars.join() + " (curl error {code})"
+            }
+        }
+        // anything written after the last poll
+        let fresh = curlReadFrom(bodyFd, offset, buffer)
+        if fresh != "" and failure == "" { let kept = onChunk(fresh) }
+    }
+    let head = curlReadFrom(headFd, 0, buffer)
+    let removed = callSysV(curlSymbols["curl_multi_remove_handle"], multi, easy)
+    let multiCleaned = callSysV(curlSymbols["curl_multi_cleanup"], multi)
+    let cleaned = callSysV(curlSymbols["curl_easy_cleanup"], easy)
+    if list != 0 { let freed = callSysV(curlSymbols["curl_slist_free_all"], list) }
+    let closedBody = callSysV(curlSymbols["fclose"], bodyFile)
+    let closedHead = callSysV(curlSymbols["fclose"], headFile)
+    let c1 = syscall(3, bodyFd, 0, 0, 0, 0, 0)
+    let c2 = syscall(3, headFd, 0, 0, 0, 0, 0)
+    if failure != "" { return Result.Err(failure) }
+    // the last header block is the final response (after 1xx ones)
+    let normalized = head.replace("\r\n", "\n")
+    var last = ""
+    for block in normalized.split("\n\n") { if block.trim() != "" { last = block } }
+    if last == "" { return Result.Err("https {url}: no response") }
+    return parseResponseHead(last)
+}

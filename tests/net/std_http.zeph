@@ -1,0 +1,67 @@
+// std/http against tests/net/server.py (args: echo, DNS, HTTP ports; a 4th
+// argument "curl" sends the same requests through libcurl).
+import "std/http.zeph"
+
+let port = args()[3] as int
+let viaCurl = args().len() > 4 and args()[4] == "curl"
+let base = "http://127.0.0.1:{port}"
+let options = HttpOptions{useCurl: viaCurl, timeoutMilliseconds: 5000}
+var none_: [str: str] = [:]
+
+let u = parseUrl("https://user@[::1]:8443/v1/chat?x=1#frag").unwrap()
+print(u.scheme, u.host, u.port, u.path)
+print(parseUrl("http://example.com").unwrap().path, parseUrl("ftp://x").error().or(""), parseUrl("http://h:99999/").isError())
+
+let hello = requestWith("GET", base + "/hello", none_, "", options).unwrap()
+print(hello.status, hello.reason, hello.body, hello.header("X-Server").or("?"), hello.isSuccess())
+
+var headers: [str: str] = [:]
+headers["X-Test"] = "yes"
+let echoed = requestWith("POST", base + "/echo", headers, "payload {1}", options).unwrap()
+print(echoed.status, echoed.body)
+print(requestWith("PUT", base + "/echo", none_, "", options).unwrap().body)
+
+let chunked = requestWith("GET", base + "/chunked", none_, "", options).unwrap()
+print(chunked.body, chunked.header("transfer-encoding").or("-"))
+let big = requestWith("GET", base + "/big", none_, "", options).unwrap()
+print(big.body.len(), big.body.sub(299990, 300000))
+if not viaCurl {
+    print(requestWith("GET", base + "/close", none_, "", options).unwrap().body)
+}
+let missing = requestWith("GET", base + "/missing", none_, "", options).unwrap()
+print(missing.status, missing.isSuccess(), missing.body)
+let head = requestWith("HEAD", base + "/hello", none_, "", options).unwrap()
+print(head.status, head.body == "")
+
+var pieces: [str] = []
+let streamed = requestStream("GET", base + "/chunked", none_, "", options, fn(chunk: str) -> bool {
+    pieces.push(chunk)
+    return true
+})
+print(streamed.unwrap().status, pieces.join("+").replace("+", "").len())
+
+var seen: [str] = []
+let events = requestEvents("GET", base + "/sse", none_, "", options, fn(event: SseEvent) -> bool {
+    seen.push("{event.event}|{event.id}|{event.data}")
+    return event.data != "[DONE]"
+})
+print(events.unwrap().header("content-type").or("?"))
+for line in seen { print(line) }
+
+
+let stopped = requestEvents("GET", base + "/sse", none_, "", options, fn(event: SseEvent) -> bool {
+    return false
+})
+print(stopped.isOk())
+
+let slow = requestWith("GET", base + "/slow", none_, "", HttpOptions{useCurl: viaCurl, timeoutMilliseconds: 500})
+print(slow.isError())
+print(requestWith("GET", "http://127.0.0.1:1/", none_, "", options).isError())
+
+// the SSE parser on its own: arbitrary splits, CRLF, comments, multi-line data
+let parser = SseParser{}
+var got: [SseEvent] = []
+for piece in ["data: a\r", "\ndata: b\r\n\r\n: c\n\nevent: e\nid: 7\ndata", ": x\n", "\n"] {
+    for e in parser.feed(piece) { got.push(e) }
+}
+for e in got { print(e.event, e.id, e.data.replace("\n", "\\n")) }
