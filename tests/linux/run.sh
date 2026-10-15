@@ -39,8 +39,6 @@ zc="${ZC:-$root/zc-linux}"
 # is "<test>:base", "<test>:O2", "<test>:parity" or "py:<check>". Remove an
 # entry when its bug is fixed; the harness reports XPASS until you do.
 declare -A KNOWN_FAIL=(
-    [macos_loops:base]="codegen: tryReduce weighted-reduction fast path runs on maps"
-    [macos_loops:O2]="codegen: tryReduce weighted-reduction fast path runs on maps"
     [leaks/replace:base]="rc/runtime: runtimeStringReplace leaks intermediate strings"
     [leaks/replace:O2]="rc/runtime: runtimeStringReplace leaks intermediate strings"
     [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"

@@ -10724,10 +10724,12 @@ fn tryFill(statement: Node, returnLabel: int) -> bool {
     let value = assignment.children[1]
     if not isLeaf(value) or usesLocal(value, loopSlot) { return false }
     let targetList = target.children[0]
-    if macosTargetEnabled {
-        if typeKinds[targetList.typeIndex] != kindList or typeKinds[typeElementIds[targetList.typeIndex]] != kindInteger { return false }
-        if not nativeAxpyPure(statement.children[0]) or not nativeAxpyPure(statement.children[1]) { return false }
-    }
+    // Every target: the kernel writes raw 8-byte cells, so only a plain
+    // [int] or [float] (never a map or a packed list).
+    if typeKinds[targetList.typeIndex] != kindList { return false }
+    let fillElementKind = typeKinds[typeElementIds[targetList.typeIndex]]
+    if fillElementKind != kindInteger and fillElementKind != kindFloat { return false }
+    if not nativeAxpyPure(statement.children[0]) or not nativeAxpyPure(statement.children[1]) { return false }
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
     let scalarLoopLabel = allocateLabel()
@@ -10811,7 +10813,7 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     let innerIndexExpression = indexNode.children[1]
     if innerIndexExpression.nodeKind != nodeIdentifier or innerIndexExpression.auxiliary != identifierKindLocal or innerIndexExpression.slot != loopSlot { return false }  // L[i]
     let sourceList = indexNode.children[0]
-    if macosTargetEnabled and not nativeReduceInputsSafe(sourceList, statement.children[0], statement.children[1]) { return false }
+    if not nativeReduceInputsSafe(sourceList, statement.children[0], statement.children[1]) { return false }
     let accumulatorAddress = slotAddress(accumulator.auxiliary, accumulator.slot)
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
