@@ -537,7 +537,7 @@ All other conversions are explicit via `expr as type`:
 | from \ to | int | float | str | bool |
 |-----------|-----|-------|-----|------|
 | **int**   | —   | exact | decimal | ✗ |
-| **float** | truncate toward zero, saturating¹ | — | shortest decimal (`%.15g`) | ✗ |
+| **float** | truncate toward zero, saturating¹ | — | C's `%.15g` | ✗ |
 | **str**   | parse or panic | parse or panic | — | ✗ |
 | **bool**  | ✗   | ✗     | `"true"`/`"false"` | — |
 
@@ -904,7 +904,8 @@ The `--wasm` backend emits no counting and reclaims with the collector alone.
 ## 5. Formatting
 
 `print`, interpolation, and `as str` format values as: ints in decimal;
-floats with `%.15g` (`5.0` prints as `5`); bools as `true`/`false`; strs
+floats like C's `%.15g` (`5.0` prints as `5`, `1e20` as `1e+20`, `1e-7` as
+`1e-07`, `-0.0` as `-0`, and NaN/infinity as `nan`, `inf`, `-inf`); bools as `true`/`false`; strs
 verbatim (but quoted, with `\" \\ \n \t` escaped, when nested inside a list
 or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 
