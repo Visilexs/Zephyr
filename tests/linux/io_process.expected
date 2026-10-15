@@ -1,0 +1,12 @@
+0 7 0 137
+0
+true
+true false
+0
+wrote 12
+12 world
+0
+true
+read /: is a directory
+open /proc/zephyr/nope: no such file or directory
+true

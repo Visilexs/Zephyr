@@ -88,6 +88,7 @@ fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCoun
     while bytesWritten < byteCount {
         let result = syscall(systemCallWrite, handle, bytesAddress + bytesWritten, byteCount - bytesWritten)
         if result <= 0 {
+            if result < 0 { linuxSetErrno(result) }
             if writtenCountAddress != 0 { store64(writtenCountAddress, bytesWritten) }
             return 0
         }
@@ -100,6 +101,7 @@ fn kernel32WriteFile(handle: int, bytesAddress: int, byteCount: int, writtenCoun
 fn kernel32ReadFile(handle: int, buffer: int, byteCount: int, readCountAddress: int, overlapped: int) -> int {
     let result = syscall(systemCallRead, handle, buffer, byteCount)
     if result < 0 {
+        linuxSetErrno(result)
         if readCountAddress != 0 { store64(readCountAddress, 0) }
         return 0
     }
@@ -122,7 +124,10 @@ fn kernel32CreateFileA(cStringPointer: int, access: int, share: int, securityAtt
     if creationDisposition == 4 { openFlags = openFlags | 64 }  // OPEN_ALWAYS: O_CREAT
     if creationDisposition == 5 { openFlags = openFlags | 512 } // TRUNCATE_EXISTING
     let fileDescriptor = syscall(systemCallOpen, cStringPointer, openFlags, mode)
-    if fileDescriptor < 0 { return 0 - 1 }
+    if fileDescriptor < 0 {
+        linuxSetErrno(fileDescriptor)
+        return 0 - 1
+    }
     return fileDescriptor
 }
 
@@ -134,6 +139,7 @@ fn kernel32GetFileSize(handle: int, highSizeAddress: int) -> int {
 }
 
 fn kernel32CloseHandle(handle: int) -> int {
+    if linuxIsProcessHandle(handle) { return 1 }
     if linuxCloseThread(handle) { return 1 }
     let result = syscall(systemCallClose, handle)
     if result < 0 { return 0 }
@@ -1026,6 +1032,7 @@ fn kernel32RtlCaptureContext(contextAddress: int) -> int {
 
 // Wait on CHILD_CLEARTID using shared futexes (the kernel's wake convention).
 fn kernel32WaitForSingleObject(threadHandle: int, waitTimeout: int) -> int {
+    if linuxIsProcessHandle(threadHandle) { return linuxWaitForProcess(threadHandle, waitTimeout) }
     if waitTimeout != 4294967295 and waitTimeout != 0 { return 4294967295 }
     var threadId = load64(threadHandle) & 4294967295
     while threadId != 0 {
@@ -1242,17 +1249,166 @@ fn kernel32FindFirstFileA(pattern: int, result: int) -> int {
     return handle
 }
 
-// These paths are reached only after runtime initialization, so panic is safe.
-// Environment capture and process creation need more than a direct syscall shim.
+// ---- environment and child processes (std/io environmentVariable, run) ----
+// Reached only after runtime startup, but they still use raw mmap scratch so
+// they never touch the heap (fork's child must not take the heap lock).
+
+// Linux errors reach GetLastError as linuxErrnoTag | errno, so std/io can tell
+// them from Windows codes and print the errno text.
+let linuxErrnoTag = 536870912         // 0x20000000, the Windows "application error" bit
+fn linuxSetErrno(result: int) { linuxLastError = linuxErrnoTag | (0 - result) }
+
+// /proc/self/environ, read once: NUL-separated NAME=value entries.
+var linuxEnvironment = 0
+var linuxEnvironmentLength = 0
+
+fn linuxLoadEnvironment() -> int {
+    if linuxEnvironment != 0 { return linuxEnvironment }
+    let capacity = 4194304
+    let buffer = linuxMapMemory(0, capacity, memoryProtectionReadWrite, mapAnonymousPrivate + mapNoReservation)
+    if buffer == 0 { return 0 }
+    let path = buffer + capacity - 64
+    let suffixAddress = linuxProcSelfPath(path)
+    store8(suffixAddress, 101)           // e
+    store8(suffixAddress + 1, 110)       // n
+    store8(suffixAddress + 2, 118)       // v
+    store8(suffixAddress + 3, 105)       // i
+    store8(suffixAddress + 4, 114)       // r
+    store8(suffixAddress + 5, 111)       // o
+    store8(suffixAddress + 6, 110)       // n
+    store8(suffixAddress + 7, 0)
+    linuxEnvironmentLength = linuxReadWholeFile(path, buffer, capacity - 64)
+    linuxEnvironment = buffer
+    return buffer
+}
+
+// Windows contract: the value's length when it fits (NUL written), else the
+// size needed including the NUL; 0 with ERROR_ENVVAR_NOT_FOUND (203) if unset.
 fn kernel32GetEnvironmentVariableA(name: int, buffer: int, capacity: int) -> int {
-    panic("env: not supported on linux")
+    let environment = linuxLoadEnvironment()
+    var nameLength = 0
+    while load8(name + nameLength) != 0 { nameLength += 1 }
+    var start = 0
+    while environment != 0 and start < linuxEnvironmentLength {
+        var end = start
+        while end < linuxEnvironmentLength and load8(environment + end) != 0 { end += 1 }
+        var matched = end - start > nameLength and load8(environment + start + nameLength) == 61
+        var index = 0
+        while matched and index < nameLength {
+            if load8(environment + start + index) != load8(name + index) { matched = false }
+            index += 1
+        }
+        if matched {
+            let valueStart = start + nameLength + 1
+            let valueLength = end - valueStart
+            if valueLength >= capacity { return valueLength + 1 }
+            for i in 0..valueLength { store8(buffer + i, load8(environment + valueStart + i)) }
+            store8(buffer + valueLength, 0)
+            return valueLength
+        }
+        start = end + 1
+    }
+    linuxLastError = 203
     return 0
 }
+
+// A process handle is linuxProcessTag + pid, the "thread" handle is the bare
+// tag; CloseHandle ignores both. A waited child's exit code is kept until read.
+let linuxProcessTag = 17592186044416   // 1 << 44, above every fd and mmap address
+var linuxWaitedPid = 0
+var linuxWaitedCode = 0
+var linuxStatusPage = 0
+
+fn linuxIsProcessHandle(handle: int) -> bool {
+    return handle >= linuxProcessTag and handle < linuxProcessTag * 2
+}
+
+fn linuxExitCode(status: int) -> int {
+    if (status & 127) == 0 { return (status >> 8) & 255 }
+    return 128 + (status & 127)
+}
+
+// The child of fork: run /bin/sh -c COMMAND with this process's environment.
+fn linuxExecShell(command: int) {
+    let page = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if page == 0 { let failed = syscall(60, 127, 0, 0, 0, 0, 0) }
+    // "/bin/sh" at page, "-c" at page + 16, argv at page + 32
+    store8(page, 47)
+    store8(page + 1, 98)
+    store8(page + 2, 105)
+    store8(page + 3, 110)
+    store8(page + 4, 47)
+    store8(page + 5, 115)
+    store8(page + 6, 104)
+    store8(page + 7, 0)
+    store8(page + 16, 45)
+    store8(page + 17, 99)
+    store8(page + 18, 0)
+    store64(page + 32, page)
+    store64(page + 40, page + 16)
+    store64(page + 48, command)
+    store64(page + 56, 0)
+    var entries = 0
+    for i in 0..linuxEnvironmentLength { if load8(linuxEnvironment + i) == 0 { entries += 1 } }
+    let environmentVector = linuxMapMemory(0, entries * 8 + 8, memoryProtectionReadWrite, mapAnonymousPrivate)
+    var count = 0
+    var start = 0
+    while environmentVector != 0 and start < linuxEnvironmentLength {
+        store64(environmentVector + count * 8, linuxEnvironment + start)
+        count += 1
+        while load8(linuxEnvironment + start) != 0 { start += 1 }
+        start += 1
+    }
+    if environmentVector != 0 { store64(environmentVector + count * 8, 0) }
+    let executed = syscall(59, page, page + 32, environmentVector, 0, 0, 0)
+    let exited = syscall(60, 127, 0, 0, 0, 0, 0)
+}
+
 fn kernel32CreateProcessA(application: int, command: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, process: int) -> int {
-    panic("run: not supported on linux")
-    return 0
+    let loaded = linuxLoadEnvironment()
+    let pid = syscall(57, 0, 0, 0, 0, 0, 0)          // fork
+    if pid == 0 { linuxExecShell(command) }
+    if pid < 0 {
+        linuxSetErrno(pid)
+        return 0
+    }
+    store64(process, linuxProcessTag + pid)
+    store64(process + 8, linuxProcessTag)
+    store32(process + 16, pid)
+    store32(process + 20, 0)
+    return 1
 }
+
+fn linuxWaitProcess(pid: int, options: int) -> int {
+    if linuxStatusPage == 0 { linuxStatusPage = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate) }
+    store64(linuxStatusPage, 0)
+    var result = syscall(61, pid, linuxStatusPage, options, 0, 0, 0)   // wait4
+    while result == 0 - 4 { result = syscall(61, pid, linuxStatusPage, options, 0, 0, 0) }
+    if result == pid {
+        linuxWaitedPid = pid
+        linuxWaitedCode = linuxExitCode(load64(linuxStatusPage) & 4294967295)
+    }
+    return result
+}
+
+fn linuxWaitForProcess(handle: int, waitTimeout: int) -> int {
+    let pid = handle - linuxProcessTag
+    if pid == 0 or pid == linuxWaitedPid { return 0 }
+    var options = 0
+    if waitTimeout == 0 { options = 1 }               // WNOHANG
+    let result = linuxWaitProcess(pid, options)
+    if result == pid { return 0 }
+    if result == 0 { return 258 }                     // WAIT_TIMEOUT
+    return 4294967295
+}
+
 fn kernel32GetExitCodeProcess(handle: int, result: int) -> int {
-    panic("run: not supported on linux")
-    return 0
+    if not linuxIsProcessHandle(handle) { return 0 }
+    let pid = handle - linuxProcessTag
+    if pid != linuxWaitedPid and linuxWaitProcess(pid, 1) != pid {
+        store32(result, 259)                          // STILL_ACTIVE
+        return 1
+    }
+    store32(result, linuxWaitedCode)
+    return 1
 }

@@ -1,6 +1,8 @@
-// Typed kernel32 wrappers. Linux builds route these calls through os/linux.zeph.
-// env and run currently panic explicitly on Linux. Paths/names reject NUL bytes.
+// Typed kernel32 wrappers. Linux builds route these calls through os/linux.zeph
+// (run uses /bin/sh -c there; environmentVariable reads /proc/self/environ).
+// Paths/names reject NUL bytes.
 import "std/bytes.zeph"
+import "std/result.zeph"
 
 fn checkedCString(value: str) -> Bytes {
     for i in 0..value.len() { assert(value.byte(i) != 0, "io: embedded NUL") }
@@ -139,7 +141,9 @@ fn sleepMilliseconds(milliseconds: int) {
     let ignored = win("Sleep", milliseconds)
 }
 
-// Windows command line, no implicit shell; pass cmd.exe /c for shell commands.
+// Windows: a raw command line, no implicit shell (pass cmd.exe /c for shell
+// syntax). Linux: run by /bin/sh -c with this process's environment; a
+// command killed by signal N gives 128 + N, and 127 means sh could not start.
 fn run(command: str) -> int {
     let commandBuffer = checkedCString(command)
     let startup = Bytes.new(104)
@@ -154,4 +158,90 @@ fn run(command: str) -> int {
     let processClosed = win("CloseHandle", process.get64(0))
     assert(threadClosed != 0 and waitResult == 0 and success != 0 and processClosed != 0, "run: wait failed")
     return result.get32(0)
+}
+
+// ---- fallible file access ----
+
+// Text for a GetLastError code: Linux errno values (tagged 0x20000000 by
+// os/linux.zeph) or the common Windows codes.
+fn ioErrorText(code: int) -> str {
+    if (code & 536870912) != 0 {
+        let errno = code & 65535
+        let names = [2: "no such file or directory", 1: "operation not permitted", 4: "interrupted",
+            5: "input/output error", 9: "bad file descriptor", 12: "out of memory", 13: "permission denied",
+            17: "file exists", 20: "not a directory", 21: "is a directory", 22: "invalid argument",
+            24: "too many open files", 27: "file too large", 28: "no space left on device",
+            30: "read-only file system", 32: "broken pipe", 36: "file name too long", 40: "too many symbolic links"]
+        return names.get(errno).or("errno {errno}")
+    }
+    let windows = [2: "no such file or directory", 3: "path not found", 5: "permission denied",
+        32: "file in use", 80: "file exists", 112: "no space left on device", 123: "invalid file name"]
+    return windows.get(code).or("error {code}")
+}
+
+private fn ioFailure(what: str, path: str) -> str {
+    return "{what} {path}: " + ioErrorText(win("GetLastError"))
+}
+
+// The whole file, or Err("open PATH: no such file or directory") and the
+// like. Reads to EOF, so /proc files and FIFOs work. Never panics on I/O.
+fn tryReadFile(path: str) -> Result[str, str] {
+    for i in 0..path.len() {
+        if path.byte(i) == 0 { return Result.Err("open {path}: embedded NUL") }
+    }
+    let filename = cString(path)
+    let cleared = win("SetLastError", 0)
+    let handle = win("CreateFileA", filename.addr(), 2147483648, 1, 0, 3, 128, 0)
+    if handle == -1 { return Result.Err(ioFailure("open", path)) }
+    var buffer = Bytes.new(65536)
+    let countBuffer = Bytes.new(8)
+    var total = 0
+    while true {
+        if total == buffer.len() {
+            let bigger = Bytes.new(buffer.len() * 2)
+            bigger.putString(0, buffer.getString(0, total))
+            buffer = bigger
+        }
+        countBuffer.put64(0, 0)
+        let success = win("ReadFile", handle, buffer.addr() + total, buffer.len() - total, countBuffer.addr(), 0)
+        if success == 0 {
+            let message = ioFailure("read", path)
+            let closed = win("CloseHandle", handle)
+            return Result.Err(message)
+        }
+        let amount = countBuffer.get32(0)
+        if amount == 0 { break }
+        total += amount
+    }
+    let closed = win("CloseHandle", handle)
+    return Result.Ok(buffer.getString(0, total))
+}
+
+// Creates or truncates PATH and writes DATA. Ok(byte count) or Err(text).
+fn tryWriteFile(path: str, data: str) -> Result[int, str] {
+    for i in 0..path.len() {
+        if path.byte(i) == 0 { return Result.Err("open {path}: embedded NUL") }
+    }
+    let filename = cString(path)
+    let cleared = win("SetLastError", 0)
+    let handle = win("CreateFileA", filename.addr(), 1073741824, 0, 0, 2, 128, 0)
+    if handle == -1 { return Result.Err(ioFailure("open", path)) }
+    let buffer = cString(data)
+    let countBuffer = Bytes.new(8)
+    var written = 0
+    while written < data.len() {
+        countBuffer.put64(0, 0)
+        let requested = min(data.len() - written, 1073741824)
+        let success = win("WriteFile", handle, buffer.addr() + written, requested, countBuffer.addr(), 0)
+        let amount = countBuffer.get32(0)
+        if success == 0 or amount <= 0 {
+            let message = ioFailure("write", path)
+            let closed = win("CloseHandle", handle)
+            return Result.Err(message)
+        }
+        written += amount
+    }
+    let closed = win("CloseHandle", handle)
+    if closed == 0 { return Result.Err(ioFailure("close", path)) }
+    return Result.Ok(written)
 }
