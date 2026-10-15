@@ -748,7 +748,11 @@ fn linuxCloseThread(threadHandle: int) -> bool {
                 store64(threadRecord + 40, 0)
                 store64(threadRecord + 48, 0)
                 store64(threadRecord + 56, load64(threadRecord + 56) + 1)
-                runtimeAdjustUnsuspendableThreads(0 - 1)
+                // a worker that reached runtimeMarkThreadDone already left the count
+                let exitedSlot = runtimeExitedThreadSlot()
+                if exitedSlot < 0 or load64(threadRecord + 64 + 8 * exitedSlot) == 0 {
+                    runtimeAdjustUnsuspendableThreads(0 - 1)
+                }
             }
             runtimeUnlockHeap()
             return true

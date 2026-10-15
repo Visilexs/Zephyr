@@ -1,0 +1,50 @@
+// Workers spawning workers: the thread-body roots used to live in a Zephyr
+// global list every spawner mutated without a lock, which crashed most runs.
+// Also spawns more than 64 threads at once (the registry used to stop there)
+// and formats strings on every worker (each one's builder is freed at exit).
+import "std/thread.zeph"
+
+let OUTER = 8
+let INNER = 12
+var results = win("VirtualAlloc", 0, OUTER * INNER * 8, 12288, 4)
+
+fn outer(id: int) {
+    var children: [Thread] = []
+    for k in 0..INNER {
+        children.push(spawnThread(fn(slot: int) {
+            var text = ""
+            for r in 0..50 { text = "{slot}:{r}" }
+            store64(results + slot * 8, text.len() + slot)
+        }, id * INNER + k))
+    }
+    for child in children { child.join() }
+}
+
+for round in 0..3 {
+    var parents: [Thread] = []
+    for i in 0..OUTER { parents.push(spawnThread(outer, i)) }
+    for parent in parents { parent.join() }
+}
+var total = 0
+for i in 0..OUTER * INNER { total = total + load64(results + i * 8) }
+print("total", total)
+
+// 100 threads alive at the same time
+let wide = 100
+var gate = win("VirtualAlloc", 0, 8, 12288, 4)
+var arrived = win("VirtualAlloc", 0, wide * 8, 12288, 4)
+var many: [Thread] = []
+for i in 0..wide {
+    many.push(spawnThread(fn(slot: int) {
+        store64(arrived + slot * 8, 1)
+        while load64(gate) == 0 { let pause = win("Sleep", 1) }
+    }, i))
+}
+var ready = 0
+while ready < wide {
+    ready = 0
+    for i in 0..wide { ready = ready + load64(arrived + i * 8) }
+}
+store64(gate, 1)
+for worker in many { worker.join() }
+print("wide", ready)

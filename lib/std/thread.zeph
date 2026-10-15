@@ -26,27 +26,10 @@
 struct Thread { handle: int, recordAddress: int, slot: int }
 
 // Thread bodies are closures, and a closure is a heap object. The record handed
-// to the OS lives outside the heap, so without this list the collector would
-// see no reference to a running thread's body and free it.
-// join() releases the entry, so spawning in a loop reuses these rather than
-// growing a list the collector has to walk on every cycle.
-var threadBodies: [fn(int)] = []
-var threadBodyInUse: [bool] = []
+// to the OS lives outside the heap, so the runtime keeps each body in an
+// off-heap, locked table the collector scans (runtimeRetainThreadBody) until
+// join releases it. Workers may spawn threads too.
 var threadEntryThunkAddress = 0
-
-// Retain a thread body in a reusable root slot until its worker is joined.
-fn retainThreadBody(threadBody: fn(int)) -> int {
-    for i in 0..threadBodies.len() {
-        if not threadBodyInUse[i] {
-            threadBodies[i] = threadBody
-            threadBodyInUse[i] = true
-            return i
-        }
-    }
-    threadBodies.push(threadBody)
-    threadBodyInUse.push(true)
-    return threadBodies.len() - 1
-}
 
 // push rbx / mov rbx,rsp        -- keep a copy of the stack pointer
 // mov rax,[rcx]                 -- rcx = record; rax = the closure cell
@@ -77,7 +60,7 @@ fn spawnThread(threadFunction: fn(int), argument: int) -> Thread {
         threadFunction(workerArgument)
         runtimeMarkThreadDone()
     }
-    let bodySlot = retainThreadBody(threadBody)
+    let bodySlot = runtimeRetainThreadBody(addr(threadBody))
 
     let recordAddress = win("VirtualAlloc", 0, 32, 12288, 4)
     if recordAddress == 0 { panic("thread: cannot allocate record") }
@@ -103,7 +86,8 @@ impl Thread {
         let handleClosed = win("CloseHandle", self.handle)
         // the body has returned, so nothing reaches the record or the closure
         let recordReleased = win("VirtualFree", self.recordAddress, 0, 32768) // MEM_RELEASE
-        threadBodyInUse[self.slot] = false
+        runtimeReleaseThreadBody(self.slot)
+        runtimeRunDeferredCollection()
     }
 }
 

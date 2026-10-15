@@ -1007,10 +1007,17 @@ string interpolation uses a per-thread builder on both native targets.
 On Windows the backstop collector remains stop-the-world: it suspends every
 other registered thread and scans its register context and stack. Linux cannot
 suspend threads without signal handlers, so collection is deferred while any
-worker remains unjoined, including a worker requesting collection itself.
-Reference counting continues to reclaim acyclic objects; cyclic garbage may grow
-until the workers are joined and a later collection runs. Join every worker. Threads
-are not available on `--wasm`.
+worker is still running its body, including a worker requesting collection
+itself. A worker stops counting once its body returns, whether or not it is ever
+joined, and a collection deferred while workers ran is run by the `join` that
+finds none left running. Reference counting continues to reclaim acyclic
+objects meanwhile; only cyclic garbage waits. Threads are not available on
+`--wasm`.
+
+There is no fixed limit on live threads: the runtime's thread registry and
+the table that keeps thread bodies alive grow as needed (off-heap, under the
+heap lock), and threads may spawn and join threads. A finished worker's string
+builder and allocation cache go back to the runtime when its body returns.
 
 ## 9. Proposals (draft)
 

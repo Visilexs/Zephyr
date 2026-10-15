@@ -420,15 +420,24 @@ let runtimeCacheBatchBytes = 16384
 let runtimeCacheClassLimit = 512
 var runtimeThreadCacheSlot = 0 - 1      // TLS index, set when the first thread is registered
 var runtimeThreadCaches = 0             // registry: every cache, linked through [4000]
-let runtimeMaximumThreadCount = 64
+var runtimeThreadRecordCapacity = 64    // registry slots; doubles (off-heap, under the lock) when full
 var runtimeThreadRecords = 0
+// Thread bodies (closures) waiting to be joined. Their only other holder is
+// an off-heap record the OS hands the new thread, so this table keeps them
+// counted and is scanned as a root. Off-heap and changed only under the heap
+// lock: spawning happens on workers too.
+var runtimeThreadBodyTable = 0
+var runtimeThreadBodyCapacity = 0
+var runtimeCollectionDeferred = 0         // a collection was skipped while workers ran
+var runtimeThreadExitedSlot = 0 - 1      // TLS: 1 once a Linux worker has left the unsuspendable count
 var runtimeCollectorScratchAddress = 0        // collector's own scratch: runtimeGetScratchPage() is shared
 var runtimeRegisteredThreadCount = 0
 var runtimeHeapLockAddress = 0
 var runtimeThreadContextAddress = 0
-var runtimeUnsuspendableThreadCount = 0   // Linux workers not yet joined (under runtimeLockHeap)
+var runtimeUnsuspendableThreadCount = 0   // Linux workers still running (under runtimeLockHeap)
 
-// Linux calls this under runtimeLockHeap when a native worker is created or joined.
+// Linux calls this under runtimeLockHeap when a native worker is created, when
+// it finishes (runtimeMarkThreadDone) and when one that never reached that is joined.
 fn runtimeAdjustUnsuspendableThreads(threadDelta: int) {
     runtimeUnsuspendableThreadCount += threadDelta
 }
@@ -437,7 +446,8 @@ fn runtimeInitializeThreadRegistry() {
     if runtimeHeapLockAddress != 0 { return }
     runtimeHeapLockAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
     let initializationResult = win("InitializeCriticalSection", runtimeHeapLockAddress)
-    runtimeThreadRecords = win("VirtualAlloc", 0, runtimeMaximumThreadCount * 32, 12288, 4)
+    runtimeThreadRecords = win("VirtualAlloc", 0, runtimeThreadRecordCapacity * 32, 12288, 4)
+    if runtimeThreadRecords == 0 { runtimeFail("out of memory (thread registry)") }
     runtimeThreadContextAddress = win("VirtualAlloc", 0, 4096, 12288, 4)      // CONTEXT, page-aligned
     runtimeCollectorScratchAddress = win("VirtualAlloc", 0, 4096, 12288, 4)
 }
@@ -484,9 +494,17 @@ fn runtimeRegisterThread(handle: int, threadId: int) -> int {
         }
     }
     if slotIndex < 0 {
-        if runtimeRegisteredThreadCount >= runtimeMaximumThreadCount {
-            let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
-            panic("thread: more than 64 live threads")
+        if runtimeRegisteredThreadCount >= runtimeThreadRecordCapacity {
+            // every reader of the registry holds the lock, so the old copy can go at once
+            let grown = win("VirtualAlloc", 0, runtimeThreadRecordCapacity * 64, 12288, 4)
+            if grown == 0 {
+                let overflowUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+                runtimeFail("out of memory (thread registry)")
+            }
+            runtimeCopyMemory(grown, runtimeThreadRecords, runtimeThreadRecordCapacity * 32)
+            let released = win("VirtualFree", runtimeThreadRecords, 0, 32768)
+            runtimeThreadRecords = grown
+            runtimeThreadRecordCapacity = runtimeThreadRecordCapacity * 2
         }
         slotIndex = runtimeRegisteredThreadCount
         runtimeRegisteredThreadCount += 1
@@ -497,6 +515,52 @@ fn runtimeRegisterThread(handle: int, threadId: int) -> int {
     store64(slot + 16, threadId)
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
     return slotIndex
+}
+
+fn runtimeExitedThreadSlot() -> int { return runtimeThreadExitedSlot }
+
+// Keep a thread body alive (and seen by the collector) until its worker is
+// joined. Returns the table index runtimeReleaseThreadBody takes.
+fn runtimeRetainThreadBody(body: int) -> int {
+    runtimeInitializeThreadRegistry()
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    var index = 0
+    while index < runtimeThreadBodyCapacity and load64(runtimeThreadBodyTable + index * 8) != 0 { index += 1 }
+    if index == runtimeThreadBodyCapacity {
+        var capacity = runtimeThreadBodyCapacity * 2
+        if capacity == 0 { capacity = 64 }
+        let grown = win("VirtualAlloc", 0, capacity * 8, 12288, 4)
+        if grown == 0 {
+            let failUnlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+            runtimeFail("out of memory (thread bodies)")
+        }
+        if runtimeThreadBodyTable != 0 {
+            runtimeCopyMemory(grown, runtimeThreadBodyTable, runtimeThreadBodyCapacity * 8)
+            let released = win("VirtualFree", runtimeThreadBodyTable, 0, 32768)
+        }
+        runtimeThreadBodyTable = grown
+        runtimeThreadBodyCapacity = capacity
+    }
+    store64(runtimeThreadBodyTable + index * 8, runtimeRetainReference(body))
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+    return index
+}
+
+fn runtimeReleaseThreadBody(index: int) {
+    let lockResult = win("EnterCriticalSection", runtimeHeapLockAddress)
+    let body = load64(runtimeThreadBodyTable + index * 8)
+    store64(runtimeThreadBodyTable + index * 8, 0)
+    let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
+    runtimeReleaseReference(body)
+}
+
+// Run a collection that was skipped while Linux workers were running, once
+// they have all finished. join calls this.
+fn runtimeRunDeferredCollection() {
+    if runtimeCollectionDeferred == 0 { return }
+    runtimeLockHeap()
+    if runtimeCollectionDeferred != 0 and runtimeUnsuspendableThreadCount == 0 { runtimeCollectGarbage() }
+    runtimeUnlockHeap()
 }
 
 // called by the new thread as its first act: publish where its stack lives
@@ -516,6 +580,7 @@ fn runtimeMarkThreadReady() {
 }
 
 fn runtimeMarkThreadDone() {
+    runtimeFreeThreadStringBuilder()
     if runtimeThreadCacheSlot >= 0 {
         // give the blocks back and the cache up: the thread only returns from here on
         let cache = win("TlsGetValue", runtimeThreadCacheSlot)
@@ -534,6 +599,14 @@ fn runtimeMarkThreadDone() {
             store64(runtimeThreadRecords + index * 32, 0)         // no handle: the slot is reusable
         }
         index += 1
+    }
+    // A Linux worker stops counting as unsuspendable here rather than at
+    // join, so a thread nobody joins does not turn the collector off for good.
+    // It touches no heap object from here on. Windows never counts its threads.
+    if runtimeUnsuspendableThreadCount > 0 {
+        if runtimeThreadExitedSlot < 0 { runtimeThreadExitedSlot = win("TlsAlloc") }
+        runtimeUnsuspendableThreadCount -= 1
+        let exitedResult = win("TlsSetValue", runtimeThreadExitedSlot, 1)
     }
     let unlockResult = win("LeaveCriticalSection", runtimeHeapLockAddress)
 }
@@ -582,7 +655,11 @@ fn runtimeCollectGarbage() {
     // ponytail: Linux cannot suspend stacks yet, including the unregistered
     // main thread. Defer cyclic garbage until all workers are joined; add signal
     // safepoints if long-lived workers need bounded cyclic-heap growth.
-    if runtimeUnsuspendableThreadCount != 0 { return }
+    if runtimeUnsuspendableThreadCount != 0 {
+        runtimeCollectionDeferred = 1      // runtimeRunDeferredCollection (join) runs it later
+        return
+    }
+    runtimeCollectionDeferred = 0
     runtimeEmptyThreadCaches()
     // clear marks
     var index = 0
@@ -593,6 +670,7 @@ fn runtimeCollectGarbage() {
     runtimeWorklistCount = 0
     // roots: globals, then the machine stack (current rsp .. stack base)
     if runtimeGlobalRootCount > 0 { runtimeScanRootRange(runtimeGlobalRootsAddress, runtimeGlobalRootsAddress + runtimeGlobalRootCount * 8) }
+    if runtimeThreadBodyCapacity > 0 { runtimeScanRootRange(runtimeThreadBodyTable, runtimeThreadBodyTable + runtimeThreadBodyCapacity * 8) }
     let lowLimitAddress = runtimeCollectorScratchAddress
     let highLimitAddress = lowLimitAddress + 8
     let ignored = win("GetCurrentThreadStackLimits", lowLimitAddress, highLimitAddress)   // returns VOID
@@ -1342,6 +1420,8 @@ fn runtimeAllocateObjectPayload(size: int) -> int {
     // halves peak memory as is.
     if runtimeHeapBumpAddress >= runtimeNextCollectionAddress {
         runtimeCollectGarbage()
+    }
+    if runtimeHeapBumpAddress >= runtimeNextCollectionAddress and runtimeCollectionDeferred == 0 {
         // Proportional trigger (Go-style): allow the bump pointer to advance by
         // another `live` bytes before the next collection, so the heap peaks at
         // ~2x the live set. The target is measured from the CURRENT bump, i.e.
@@ -3083,6 +3163,17 @@ fn runtimeGetStringBuilder() -> int {
     return builderAddress
 }
 
+// runtimeMarkThreadDone: a finished worker's builder (state block and buffer,
+// both off-heap) goes back to the OS.
+fn runtimeFreeThreadStringBuilder() {
+    if runtimeMainStringBuilder == 0 { return }
+    let builderAddress = win("TlsGetValue", runtimeStringBuilderThreadLocalIndex)
+    if builderAddress == 0 or builderAddress == runtimeMainStringBuilder { return }
+    let tlsBuilderResult = win("TlsSetValue", runtimeStringBuilderThreadLocalIndex, 0)
+    let bufferReleased = win("VirtualFree", load64(builderAddress), 0, 32768)
+    let stateReleased = win("VirtualFree", builderAddress, 0, 32768)
+}
+
 fn runtimeEnsureStringBuilderCapacity(builderAddress: int, extra: int) {
     let usedLength = load64(builderAddress + 8)
     let capacity = load64(builderAddress + 16)
@@ -3093,7 +3184,9 @@ fn runtimeEnsureStringBuilderCapacity(builderAddress: int, extra: int) {
     // VirtualAlloc, not runtimeAllocateObject: the builder must not itself allocate on the
     // GC heap, or formatting could trigger a collection mid-interpolation.
     let newBuffer = win("VirtualAlloc", 0, newCapacity, 12288, 4)
+    if newBuffer == 0 { runtimeFail("out of memory (string builder)") }
     runtimeCopyMemory(newBuffer, load64(builderAddress), usedLength)
+    let oldReleased = win("VirtualFree", load64(builderAddress), 0, 32768)
     store64(builderAddress, newBuffer)
     store64(builderAddress + 16, newCapacity)
 }

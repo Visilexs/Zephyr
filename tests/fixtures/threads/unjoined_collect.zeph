@@ -1,0 +1,36 @@
+// A worker that finishes but is never joined used to keep the collector off
+// for the rest of the process (the unsuspendable count only fell at join), so
+// cyclic garbage was never reclaimed. It now leaves the count when it finishes,
+// and a collection skipped while workers ran is re-run at join.
+import "std/thread.zeph"
+
+struct Node { id: int, links: [Node] }
+
+fn makeCycles(count: int) {
+    for i in 0..count {
+        var node = Node{id: i, links: []}
+        node.links.push(node)               // a cycle counting cannot free
+    }
+}
+
+var done = win("VirtualAlloc", 0, 8, 12288, 4)
+let forgotten = spawnThread(fn(unused: int) { store64(done, 1) }, 0)
+while load64(done) == 0 { let pause = win("Sleep", 1) }
+let pause = win("Sleep", 20)               // let it get past runtimeMarkThreadDone
+
+makeCycles(2000)
+let before = runtimeLiveObjectCount()
+runtimeCollectGarbage()
+let after = runtimeLiveObjectCount()
+print("collected", before - after >= 2000)
+
+// a collection deferred while a worker runs happens at join
+var gate = win("VirtualAlloc", 0, 8, 12288, 4)
+let busy = spawnThread(fn(unused: int) { while load64(gate) == 0 { let nap = win("Sleep", 1) } }, 0)
+makeCycles(2000)
+let held = runtimeLiveObjectCount()
+runtimeCollectGarbage()                    // deferred: the worker cannot be suspended
+print("deferred", runtimeLiveObjectCount() >= held)
+store64(gate, 1)
+busy.join()
+print("after join", held - runtimeLiveObjectCount() >= 2000)
