@@ -38,6 +38,9 @@ unnoticed.
 - [x] A collection deferred while workers run is never re-run, so threaded
   heaps grow without bound. Run it when the last worker exits. Decrement the
   unsuspendable count at thread exit, not at join.
+  (The count drops in runtimeMarkThreadDone, the last thing a std/thread body
+  runs; a raw CreateThread worker still leaves it at join. The rerun happens
+  at join. Collecting with live workers still needs signal safepoints.)
 - [x] Per-thread string builder (64 KiB) is never freed. Free it in
   runtimeMarkThreadDone.
 - [x] readFile/writeFile/args leak their C-string or buffer temporaries.
@@ -52,6 +55,9 @@ unnoticed.
   panics with "stack overflow".
 - [x] Linux `args()` goes through a fake Windows command line: it splits on
   spaces, drops empty args and truncates at 4 KB. Read argv directly.
+  (Done via /proc/self/cmdline read to EOF, re-quoted by the Windows rules
+  that runtimeArguments now parses; reading argv off the entry stack would
+  need a codegen change in the ELF entry stub.)
 - [x] Linux ELF outputs are written 0644. Write them 0755.
 
 ### 1B Compiler correctness (`compiler/zc.zeph`, `compiler/optimizer.zeph`)
