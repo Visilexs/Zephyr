@@ -76,6 +76,8 @@ let tokenShiftRightAssign = 69
 let tokenTilde = 70
 let tokenMatch = 71
 let tokenDefer = 72
+let tokenSemicolon = 73    // only inside a fixed array type: [u8; 16]
+let tokenAttribute = 74    // @C: text holds the name
 
 let tokenNames = ["end of file", "newline", "int literal", "float literal", "string",
     "identifier", "fn", "let", "var", "if", "else", "while", "for", "in", "return",
@@ -83,7 +85,7 @@ let tokenNames = ["end of file", "newline", "int literal", "float literal", "str
     "(", ")", "\{", "\}", "[", "]", ",", ":", ".", "..",
     "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "=", "->",
     "+=", "-=", "*=", "/=", "&", "|", "^", "<<", ">>", "enum", "import", "?", "none",
-    "impl", "interface", "extern", "const", "%=", "&=", "|=", "^=", "<<=", ">>=", "~", "match", "defer"]
+    "impl", "interface", "extern", "const", "%=", "&=", "|=", "^=", "<<=", ">>=", "~", "match", "defer", ";", "attribute"]
 
 // ---------------- node kinds ----------------
 let nodeNone = 0
@@ -387,6 +389,7 @@ var pendingLabel = 0         // set by `name:` for the loop that follows
 var loopLabels: [str] = []   // checker: labels of the enclosing loops, innermost last
 var lowerCount = 0           // numbers the hidden names of each desugaring apart
 var holesChecked = false     // lowerSnippet: holes are already type-checked
+var fixedArraysAllowed = false   // resolving a @C struct's fields: [u8; 16] is allowed
 var aliasNames: [str: Node] = [:]   // type Name = T
 var aliasDepth = 0
 // checker
@@ -1370,6 +1373,21 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
             position = tokenEnd
             continue
         }
+        if character == 64 and isIdentifierStart(byteAt(source, position + 1)) {      // @C: an attribute
+            var attributeEnd = position + 1
+            while attributeEnd < sourceLength and isIdentifierCharacter(byteAt(source, attributeEnd)) { attributeEnd += 1 }
+            var attribute = makeToken(tokenAttribute, tokenLine)
+            attribute.text = source.sub(position + 1, attributeEnd)
+            output.push(attribute)
+            position = attributeEnd
+            continue
+        }
+        // `;` exists only in a fixed array type, right after `[T`
+        if character == 59 and output.len() >= 2 and output[output.len() - 1].tokenKind == tokenIdentifier and output[output.len() - 2].tokenKind == tokenLeftBracket {
+            output.push(makeToken(tokenSemicolon, tokenLine))
+            position += 1
+            continue
+        }
         habitPunctuation(character, byteAt(source, position + 1), byteAt(source, position + 2), tokenLine)
         var punctuationKind = -1
         var punctuationLength = 3
@@ -1501,6 +1519,12 @@ fn parseTypeBase() -> Node {
         let consumedToken = nextToken()
         var typeNode = makeNode(nodeListType, token.line)
         typeNode.children.push(parseType())
+        if atTokenKind(tokenSemicolon) {             // [u8; 16]: a fixed array (a @C struct field)
+            let semicolon = nextToken()
+            let countToken = expect(tokenIntegerLiteral, "an element count")
+            if countToken.integerValue <= 0 { failCompilation(countToken.line, "a fixed array needs a positive element count") }
+            typeNode.integerValue = countToken.integerValue
+        }
         if atTokenKind(tokenColon) {                 // [K: V] is a map type
             let punctuation = nextToken()
             typeNode.nodeKind = nodeMapType
@@ -1813,6 +1837,26 @@ fn parseStructDefinition() -> Node {
     }
     let closingBrace = expect(tokenRightBrace, "'\}'")
     for typeParameter in typeParameters.children { structNode.children.push(typeParameter) }   // type params follow the fields, as N_TYNAMEs
+    return structNode
+}
+
+// @C struct / @C(packed) struct: a struct with a C layout (spec 3.0.0.5).
+// The struct node's integerValue is 1 for @C, 2 for @C(packed).
+fn parseAttributedStruct() -> Node {
+    let attribute = nextToken()
+    if attribute.text != "C" { failCompilation(attribute.line, "unknown attribute '@{attribute.text}' (there is @C and @C(packed))") }
+    var layout = 1
+    if atTokenKind(tokenLeftParenthesis) {
+        let opening = nextToken()
+        let word = expect(tokenIdentifier, "'packed'")
+        if word.text != "packed" { failCompilation(word.line, "unknown @C option '{word.text}' (there is @C(packed))") }
+        let closing = expect(tokenRightParenthesis, "')'")
+        layout = 2
+    }
+    skipNewline()
+    if not atTokenKind(tokenStruct) { failCompilation(attribute.line, "@C applies to a struct declaration") }
+    var structNode = parseStructDefinition()
+    structNode.integerValue = layout
     return structNode
 }
 
@@ -2702,6 +2746,7 @@ fn parseTokens(tokens: [Token]) -> Node {
         }
         else if atTokenKind(tokenFunction) { program.children.push(parseFunction()) }
         else if atTokenKind(tokenStruct) { program.children.push(parseStructDefinition()) }
+        else if atTokenKind(tokenAttribute) { program.children.push(parseAttributedStruct()) }
         else if atTokenKind(tokenEnum) { program.children.push(parseEnumDefinition()) }
         else if atTokenKind(tokenImpl) { program.children.push(parseImpl()) }
         else if atTokenKind(tokenInterface) { program.children.push(parseInterface()) }
@@ -3460,6 +3505,9 @@ fn resolveTypeHere(typeExpression: Node) -> int {
     }
     if typeExpression.nodeKind == nodeListType {
         let element = typeExpression.children[0]
+        if typeExpression.integerValue > 0 and not fixedArraysAllowed {
+            failCompilation(typeExpression.line, "a fixed array [T; {typeExpression.integerValue}] is only allowed as a field of a @C struct")
+        }
         if element.nodeKind == nodeTypeName and element.children.len() == 0 and element.name == "u8" { return listTypeOf(typeIdByte) }
         if element.nodeKind == nodeTypeName and element.children.len() == 0 and element.name == "f32" { return listTypeOf(typeIdFloat32) }
         return listTypeOf(resolveType(element))
@@ -4014,6 +4062,245 @@ fn checkSizedCast(expression: Node, from: int, targetType: int) -> int {
     bounds.push(sizedIntegerLiteral(sizedMinimum(targetType), typeIdInteger, expression.line))
     bounds.push(sizedIntegerLiteral(sizedMaximum(targetType), typeIdInteger, expression.line))
     return runtimeCall(expression, "runtimeClampInteger", truncated, bounds, targetType)
+}
+
+// ---------------- @C structs (spec 3.0.0.5) ----------------
+// A @C struct is an ordinary Zephyr struct (a reference, one word per field)
+// that also has a C layout: offsets with C's natural alignment (or none, for
+// @C(packed)). loadStruct / storeStruct copy it in and out of raw memory with
+// one load or store per field at that field's width; they are lowered here to
+// load8/16/32/64 and store8/32/64 calls, so no back end knows about them.
+struct CLayout { offsets: [int], counts: [int], elementTypes: [int], size: int, alignment: int }
+var cLayouts: [int: CLayout] = [:]          // struct index -> layout
+var cLayoutsInProgress: [int: bool] = [:]
+
+fn isCStruct(typeIndex: int) -> bool {
+    if typeKinds[typeIndex] != kindStruct { return false }
+    let node = structDefinitions[typeDefinitionIds[typeIndex]].node
+    return node.nodeKind == nodeStructDefinition and node.integerValue > 0 and not node.isMutable
+}
+
+// the C size of one scalar or @C struct element (0: not allowed in a @C struct)
+fn cElementSize(typeIndex: int, line: int) -> int {
+    if typeKinds[typeIndex] == kindBoolean { return 1 }
+    if typeKinds[typeIndex] == kindInteger { return sizedBits(typeIndex) / 8 }
+    if typeKinds[typeIndex] == kindFloat {
+        if typeIndex == typeIdF32 { return 4 }
+        return 8
+    }
+    if isCStruct(typeIndex) { return cLayoutOf(typeDefinitionIds[typeIndex], line).size }
+    return 0
+}
+fn cElementAlignment(typeIndex: int, line: int) -> int {
+    if isCStruct(typeIndex) { return cLayoutOf(typeDefinitionIds[typeIndex], line).alignment }
+    return cElementSize(typeIndex, line)
+}
+
+fn layoutCStructs(program: Node) {
+    for topLevelNode in program.children {
+        if topLevelNode.nodeKind == nodeStructDefinition and topLevelNode.integerValue > 0 and not topLevelNode.isMutable {
+            currentSourceFile = topLevelNode.file
+            let layout = cLayoutOf(topLevelNode.referenceIndex, topLevelNode.line)
+        }
+    }
+}
+
+fn cLayoutOf(structIndex: int, line: int) -> CLayout {
+    if cLayouts.has(structIndex) { return cLayouts[structIndex] }
+    let definition = structDefinitions[structIndex]
+    if cLayoutsInProgress.has(structIndex) { failCompilation(definition.line, "@C struct '{definition.name}' contains itself") }
+    cLayoutsInProgress[structIndex] = true
+    let packed = definition.node.integerValue == 2
+    if definition.typeParameters.len() > 0 { failCompilation(definition.line, "a @C struct cannot be generic") }
+    if definition.fieldNames.len() == 0 { failCompilation(definition.line, "a @C struct needs at least one field") }
+    var offsets: [int] = []
+    var counts: [int] = []
+    var elementTypes: [int] = []
+    var offset = 0
+    var alignment = 1
+    var fieldIndex = 0
+    for fieldNode in definition.node.children {
+        if fieldNode.nodeKind != nodeFieldDefinition { continue }
+        let typeNode = fieldNode.children[0]
+        var count = 0
+        var elementType = definition.fieldTypes[fieldIndex]
+        if typeNode.nodeKind == nodeListType and typeNode.integerValue > 0 {
+            count = typeNode.integerValue
+            fixedArraysAllowed = false
+            elementType = resolveType(typeNode.children[0])
+        }
+        var size = cElementSize(elementType, fieldNode.line)
+        if size == 0 or (count > 0 and typeKinds[elementType] == kindList) {
+            diagnosticHint = "a @C field is a sized scalar, int, float, bool, another @C struct, or a fixed array of those: [u8; 16]"
+            failCompilation(fieldNode.line, "@C struct '{definition.name}': field '{fieldNode.name}' cannot be {describeType(definition.fieldTypes[fieldIndex])}")
+        }
+        var fieldAlignment = cElementAlignment(elementType, fieldNode.line)
+        if packed { fieldAlignment = 1 }
+        if count > 0 { size = size * count }
+        offset = (offset + fieldAlignment - 1) / fieldAlignment * fieldAlignment
+        offsets.push(offset)
+        counts.push(count)
+        elementTypes.push(elementType)
+        offset += size
+        if fieldAlignment > alignment { alignment = fieldAlignment }
+        fieldIndex += 1
+    }
+    let size = (offset + alignment - 1) / alignment * alignment
+    let layout = CLayout{offsets: offsets, counts: counts, elementTypes: elementTypes, size: size, alignment: alignment}
+    cLayouts[structIndex] = layout
+    return layout
+}
+
+fn isCLayoutBuiltin(name: str) -> bool { return name == "sizeOf" or name == "offsetOf" or name == "loadStruct" }
+
+// the T of sizeOf[T]: an expression as parsed (Name, ns.Name) read as a type
+fn typeArgumentOf(argument: Node, builtinName: str) -> int {
+    var typeNode = makeNode(nodeTypeName, argument.line)
+    if argument.nodeKind == nodeIdentifier { typeNode.name = argument.name }
+    else if argument.nodeKind == nodeMember and argument.children[0].nodeKind == nodeIdentifier { typeNode.name = argument.children[0].name + "." + argument.name }
+    else { failCompilation(argument.line, "{builtinName}[T] takes a type name, e.g. {builtinName}[Header]") }
+    return resolveType(typeNode)
+}
+
+fn cStructArgument(typeIndex: int, builtinName: str, line: int) -> CLayout {
+    if not isCStruct(typeIndex) {
+        diagnosticHint = "declare it with @C: `@C struct {describeType(typeIndex)} \{ ... \}`"
+        failCompilation(line, "{builtinName} needs a @C struct, got {describeType(typeIndex)}")
+    }
+    return cLayoutOf(typeDefinitionIds[typeIndex], line)
+}
+
+// sizeOf[T]()  offsetOf[T]("field")  loadStruct[T](address)  loadStruct[T](bytes, offset)
+fn checkCLayoutCall(expression: Node) -> int {
+    let builtinName = expression.children[0].children[0].name
+    let typeIndex = typeArgumentOf(expression.children[0].children[1], builtinName)
+    let argumentCount = expression.children.len() - 1
+    if builtinName == "sizeOf" {
+        if argumentCount != 0 { failCompilation(expression.line, "sizeOf[T]() takes no arguments") }
+        var size = 0
+        if isCStruct(typeIndex) { size = cLayoutOf(typeDefinitionIds[typeIndex], expression.line).size }
+        else if typeKinds[typeIndex] != kindStruct { size = cElementSize(typeIndex, expression.line) }
+        if size == 0 { failCompilation(expression.line, "sizeOf needs a @C struct or a scalar type, got {describeType(typeIndex)}") }
+        nodeBecome(expression, sizedIntegerLiteral(size, typeIdInteger, expression.line))
+        return typeIdInteger
+    }
+    let layout = cStructArgument(typeIndex, builtinName, expression.line)
+    let definition = structDefinitions[typeDefinitionIds[typeIndex]]
+    if builtinName == "offsetOf" {
+        let nameArgument = expression.children[1]
+        if argumentCount != 1 or nameArgument.nodeKind != nodeStringLiteral or nameArgument.children.len() != 1 or nameArgument.children[0].nodeKind != nodeStringText {
+            failCompilation(expression.line, "offsetOf[T](\"field\") takes the field name as a string literal")
+        }
+        let fieldIndex = indexIn(definition.fieldNames, nameArgument.children[0].name)
+        if fieldIndex < 0 { failCompilation(expression.line, "{definition.name} has no field '{nameArgument.children[0].name}'") }
+        nodeBecome(expression, sizedIntegerLiteral(layout.offsets[fieldIndex], typeIdInteger, expression.line))
+        return typeIdInteger
+    }
+    // loadStruct: let p = address in T{field: load(p + offset), ...}
+    if argumentCount != 1 and argumentCount != 2 { failCompilation(expression.line, "loadStruct[T](address) or loadStruct[T](bytes, offset)") }
+    lowerCount += 1
+    let pointer = "__z{lowerCount}_p"
+    var holes: [Node] = []
+    holes.push(expression.children[1])
+    var addressText = "__hole0"
+    if argumentCount == 2 {
+        holes.push(expression.children[2])
+        addressText = "__hole0.checkedAddress(__hole1, {layout.size})"
+    }
+    var noBodies: [Node] = []
+    let declaration = lowerSnippet("let {pointer} = {addressText}\n", expression.line, holes, noBodies)
+    var fields: [str] = []
+    for i in 0..definition.fieldNames.len() {
+        fields.push("{definition.fieldNames[i]}: {cLoadText(layout, i, definition.fieldTypes[i], pointer)}")
+    }
+    let valueStatement = lowerSnippet("{definition.name}\{{fields.join(", ")}\}\n", expression.line, noBodies, noBodies)
+    var lowered = makeNode(nodeLetExpression, expression.line)
+    lowered.children.push(declaration)
+    lowered.children.push(valueStatement.children[0])
+    nodeBecome(expression, lowered)
+    return checkExpressionInner(expression)
+}
+
+// Zephyr source reading one element of C type `elementType` at `address`.
+// asPackedElement: the element of a packed [u8]/[f32], which reads as int/float.
+fn cLoadElementText(elementType: int, address: str, asPackedElement: bool) -> str {
+    if typeKinds[elementType] == kindBoolean { return "load8({address}) != 0" }
+    if elementType == typeIdF32 {
+        if asPackedElement { return "floatFromBits(runtimeWidenFloat32Bits(load32({address})))" }
+        return "floatFromBits(runtimeWidenFloat32Bits(load32({address}))) as f32"
+    }
+    if typeKinds[elementType] == kindFloat { return "floatFromBits(load64({address}))" }
+    if isCStruct(elementType) { return "loadStruct[{structDefinitions[typeDefinitionIds[elementType]].name}]({address})" }
+    let bitCount = sizedBits(elementType)
+    var load = "load{bitCount}({address})"
+    if asPackedElement or elementType == typeIdInteger { return load }
+    return "{load} as {describeType(elementType)}"
+}
+fn cLoadText(layout: CLayout, fieldIndex: int, fieldType: int, pointer: str) -> str {
+    let elementType = layout.elementTypes[fieldIndex]
+    let offset = layout.offsets[fieldIndex]
+    let count = layout.counts[fieldIndex]
+    if count == 0 { return cLoadElementText(elementType, "{pointer} + {offset}", false) }
+    let elementSize = cElementSize(elementType, 0)
+    var elements: [str] = []
+    for i in 0..count { elements.push(cLoadElementText(elementType, "{pointer} + {offset + i * elementSize}", isPacked(fieldType))) }
+    return "[" + elements.join(", ") + "]"
+}
+
+// Zephyr statements writing `value` (an element of C type `elementType`) at `address`.
+fn cStoreElementText(elementType: int, address: str, value: str) -> str {
+    if typeKinds[elementType] == kindBoolean { return "store8({address}, if {value} \{ 1 \} else \{ 0 \})" }
+    if elementType == typeIdF32 { return "store32({address}, runtimeNarrowFloat32Bits(bits({value} as float)))" }
+    if typeKinds[elementType] == kindFloat { return "store64({address}, bits({value}))" }
+    if isCStruct(elementType) { return "storeStruct({address}, {value})" }
+    let bitCount = sizedBits(elementType)
+    // TODO(rm-memory): use store16 once the raw builtin set has it
+    if bitCount == 16 { return "store8({address}, ({value} as int) & 255)\nstore8({address} + 1, (({value} as int) >> 8) & 255)" }
+    return "store{bitCount}({address}, {value} as int)"
+}
+
+// storeStruct(address, value) / storeStruct(bytes, offset, value), a statement:
+//   if true { let a = address; let v = value; store(a + offset, v.field) ... }
+fn lowerStoreStruct(statement: Node) {
+    let call = statement.children[0]
+    let argumentCount = call.children.len() - 1
+    if argumentCount != 2 and argumentCount != 3 { failCompilation(call.line, "storeStruct(address, value) or storeStruct(bytes, offset, value)") }
+    for i in 1..call.children.len() { let argumentType = checkExpression(call.children[i]) }
+    let valueType = call.children[argumentCount].typeIndex
+    let layout = cStructArgument(valueType, "storeStruct", call.line)
+    let definition = structDefinitions[typeDefinitionIds[valueType]]
+    lowerCount += 1
+    let prefix = "__z{lowerCount}"
+    var lines: [str] = []
+    lines.push("if true \{")
+    var holes: [Node] = []
+    for i in 0..argumentCount {
+        lines.push("let {prefix}_a{i} = __hole{i}")
+        holes.push(call.children[i + 1])
+    }
+    let value = "{prefix}_a{argumentCount - 1}"
+    if argumentCount == 3 { lines.push("let {prefix}_p = {prefix}_a0.checkedAddress({prefix}_a1, {layout.size})") }
+    else { lines.push("let {prefix}_p = {prefix}_a0") }
+    for i in 0..definition.fieldNames.len() {
+        let elementType = layout.elementTypes[i]
+        let address = "{prefix}_p + {layout.offsets[i]}"
+        let field = "{value}.{definition.fieldNames[i]}"
+        let count = layout.counts[i]
+        if count == 0 {
+            lines.push(cStoreElementText(elementType, address, field))
+            continue
+        }
+        lines.push("assert({field}.len() == {count}, \"storeStruct: {definition.name}.{definition.fieldNames[i]} must have {count} elements\")")
+        lines.push("for {prefix}_i in 0..{count} \{")
+        lines.push(cStoreElementText(elementType, "{address} + {prefix}_i * {cElementSize(elementType, call.line)}", "{field}[{prefix}_i]"))
+        lines.push("\}")
+    }
+    lines.push("\}")
+    var noBodies: [Node] = []
+    holesChecked = true
+    let lowered = lowerSnippet(joinLines(lines), call.line, holes, noBodies)
+    holesChecked = false
+    nodeBecome(statement, lowered)
 }
 
 fn checkMethod(expression: Node) -> int {
@@ -4647,6 +4934,10 @@ for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV",
 
 fn checkCall(expression: Node) -> int {
     let callee = expression.children[0]
+    if callee.nodeKind == nodeIndex and callee.children[0].nodeKind == nodeIdentifier and isCLayoutBuiltin(callee.children[0].name) { return checkCLayoutCall(expression) }
+    if callee.nodeKind == nodeIdentifier and callee.name == "storeStruct" {
+        failCompilation(expression.line, "storeStruct(...) is a statement; it has no value")
+    }
     resolveNamespace(callee)                                   // geo.area(r) is a plain call
     if callee.nodeKind == nodeMember { return checkMethod(expression) }
     if callee.nodeKind != nodeIdentifier { return checkIndirect(expression, checkExpression(callee)) }   // any expression of fn type
@@ -5684,6 +5975,12 @@ fn checkStatementInner(statement: Node) {
         return
     }
     if statement.nodeKind == nodeExpressionStatement {
+        let call = statement.children[0]
+        if call.nodeKind == nodeCall and call.children[0].nodeKind == nodeIdentifier and call.children[0].name == "storeStruct" {
+            lowerStoreStruct(statement)
+            checkStatement(statement)
+            return
+        }
         let checkedType = checkExpression(statement.children[0])
         return
     }
@@ -6664,13 +6961,16 @@ fn checkProgram(program: Node) {
                     }
                 }
                 structDefinition.fieldNames.push(fieldNode.name)
+                fixedArraysAllowed = topLevelNode.integerValue > 0          // [u8; 16] in a @C struct
                 if structDefinition.typeParameters.len() > 0 { structDefinition.fieldTypes.push(typeIdVoid) }       // a template: resolved per instance
                 else { structDefinition.fieldTypes.push(resolveType(fieldNode.children[0])) }
+                fixedArraysAllowed = false
                 if fieldNode.children.len() > 1 { structDefinition.defaults.push(fieldNode.children[1]) }       // field: T = default
                 else { structDefinition.defaults.push(makeNode(nodeNone, fieldNode.line)) }
             }
         }
     }
+    layoutCStructs(program)
     // pass 1c: function signatures
     for topLevelNode in program.children {
         currentSourceFile = topLevelNode.file

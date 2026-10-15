@@ -207,6 +207,7 @@ Raw fixed-size buffers are reference-counted and non-moving, with a GC backstop.
 | `Bytes.len() -> int` | Buffer length in bytes. |
 | `Bytes.addr() -> int` | Address of byte zero. |
 | `Bytes.at(offset: int) -> int` | Address at an offset, including the end pointer. |
+| `Bytes.checkedAddress(offset: int, length: int) -> int` | Address of `length` bytes at `offset`; panics unless they are all inside the buffer. `loadStruct[T](bytes, offset)` and `storeStruct(bytes, offset, value)` use it. |
 | `Bytes.put8(offset: int, value: int)` | Store one byte. |
 | `Bytes.get8(offset: int) -> int` | Read one unsigned byte. |
 | `Bytes.put16(offset: int, value: int)` | Store 16 bits. |

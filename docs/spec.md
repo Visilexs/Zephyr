@@ -83,8 +83,9 @@ externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
 fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
              "(" [ param { "," param } ] ")" [ "->" type ] block ;
 param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
-structdecl = "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
-             "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
+structdecl = [ "@C" [ "(" "packed" ")" ] ]                   (* C layout, §3.0.0.5 *)
+             "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
+             "{" { ID ":" ( type | "[" type ";" INT "]" ) [ "=" expr ] [ "," ] } "}" ;
 enumdecl   = "enum" ID [ "[" ID { "," ID } "]" ]
              "{" member { "," member } "}" ;
 member     = ID [ "(" type { "," type } ")" ] ;              (* Circle(float) *)
@@ -343,6 +344,60 @@ list literal containing a sized value (`[b, 1, 2]`) is a list of that type.
 **Printing.** Integers print in decimal (`u64` as unsigned). `f32` prints with
 7 significant digits (C's `%.7g`), `float` with 15: `0.1 as f32` prints `0.1`
 and `(0.1 as f32) as float` prints `0.100000001490116`.
+
+### 3.0.0.5 `@C` structs
+
+    @C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+    @C(packed) struct Wire { tag: u8, length: u32 }
+    @C struct Entry { name: [u8; 16], header: Header, scale: f32, live: bool }
+
+    let h = loadStruct[Header](address)        // copy in from raw memory
+    h.version += 1
+    storeStruct(address, h)                     // copy out
+    let e = loadStruct[Entry](buffer, 64)       // from a Bytes, bounds-checked
+    storeStruct(buffer, 64, e)
+    print(sizeOf[Header](), offsetOf[Header]("size"))   // 16 8
+
+`@C struct` (on its own or `@C(packed)`) declares an ordinary struct (§3:
+a reference, compared and printed like any struct) that also has a C memory
+layout. Its fields may only be sized scalars (§3.0.0.4), `int`, `float`,
+`bool`, other `@C` structs, and fixed arrays `[T; N]` of those scalars or
+`@C` structs. `[T; N]` is written only as a `@C` field type; the field holds
+an ordinary list (`[u8; N]` and `[f32; N]` hold the packed `[u8]`/`[f32]`
+lists of §3.0.0.3, so their elements read as `int`/`float`). A `@C` struct
+cannot be generic or empty, and cannot contain itself.
+
+**Layout** follows the C rules of the System V x86-64 ABI (what gcc and
+clang do): fields in declaration order, each at the next offset that is a
+multiple of its alignment; the struct's alignment is its largest field
+alignment and its size is rounded up to it. Sizes and alignments: `i8 u8
+bool` 1, `i16 u16` 2, `i32 u32 f32` 4, `int i64 u64 float f64` 8, an array
+N times its element (element alignment), a nested `@C` struct its own size
+and alignment. `@C(packed)` (gcc's `__attribute__((packed))`) gives every
+field alignment 1: no padding at all; a nested struct keeps its own inner
+layout.
+
+**Builtins.** The type argument is written in brackets and must be a type
+name:
+
+| Builtin | Result |
+|---------|--------|
+| `sizeOf[T]()` | the C size of `T` (a `@C` struct or a scalar type), a compile-time `int` |
+| `offsetOf[T]("field")` | the byte offset of a field of the `@C` struct `T`, a compile-time `int` |
+| `loadStruct[T](address)` | a new `T` whose fields are read from raw memory at `address` |
+| `loadStruct[T](bytes, offset)` | the same from a `Bytes` (std/bytes); panics unless `offset .. offset + sizeOf[T]()` is inside it |
+| `storeStruct(address, value)` | writes every field of `value` to raw memory (a statement) |
+| `storeStruct(bytes, offset, value)` | the same into a `Bytes`, bounds-checked |
+
+Loads and stores are copies, one access per field at its width: a narrow
+integer is read and sign- or zero-extended per its type, a `bool` is read as
+a byte (nonzero is `true`) and written as 0 or 1, an `f32` travels as an
+IEEE single. Padding bytes are never written. `storeStruct` panics when a
+fixed array field's list does not have exactly N elements. The raw-address
+forms are unsafe like `load64` (§3.6). The struct value itself lives in the
+Zephyr heap with one word per field, so `addr(s)` of a `@C` struct is *not*
+a C-laid-out pointer; to hand C a struct, `storeStruct` it into a `Bytes`
+and pass `bytes.addr()`.
 
 ### 3.0.1 Maps
 
@@ -1145,23 +1200,9 @@ semantics. Discussion should target this section before any of it lands in
 
 ### 9.1 `@C` C-layout structs
 
-Motivation: FFI against C ABIs (Linux iovec/timespec, X11 request headers,
-UE4/UE5 struct layouts read through memory) currently requires hand-packing
-`Bytes` buffers with `put64`/`putFloat32` at literal offsets. A C-layout
-struct attribute would let code declare the layout once and pass `addr(s)`
-to `extern fn` calls.
-
-Sketch:
-
-```zephyr
-@C struct iovec { base: int, length: int }   // no padding, field order as written
-var v: iovec = iovec{base: p, length: 8}
-syscall(310, pid, addr(v), 1, addr(v2), 1)
-```
-
-Open questions: default alignment (none vs. natural), explicit padding fields,
-whether `@C` structs may contain `str`/lists (probably not in v1), and how
-`@C` interacts with the existing generic-struct rules (§3.0.5.1).
+Implemented: see §3.0.0.5 (with the sized scalars of §3.0.0.4). Still open:
+typed pointers and views (`ptr[T]`, `span[T]`), passing `@C` structs by value
+to `extern fn`, and making `addr(s)` of a `@C` struct C-laid-out.
 
 ### 9.2 Refcount-free hot paths (`@hot`, static/arena buffers)
 

@@ -1,0 +1,2 @@
+storeStruct needs a @C struct, got Plain
+hint: declare it with @C

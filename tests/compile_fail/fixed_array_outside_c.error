@@ -1,0 +1,1 @@
+a fixed array [T; 4] is only allowed as a field of a @C struct

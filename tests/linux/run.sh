@@ -7,7 +7,7 @@
 # stderr) and that both tiers print the same thing. Also runs
 # the compile-error checks (tests/compile_fail/*.zeph with a .error file), the
 # leak checks (tests/leaks), the python checks that work on Linux,
-# tests/linux_extern.sh (when gcc is available) and tests/linux/diagnostics.sh
+# tests/linux_extern.sh and tests/c_layout/check.sh (when gcc is available) and tests/linux/diagnostics.sh
 # (compile errors, CLI, zc run, the --test runner, runtime panic messages).
 #
 # The compiler, runtime and lib/ are copied into a temp dir first, so the
@@ -52,6 +52,8 @@ declare -A EXPECT_EXIT=(
     [thread_stack_overflow]=1
     [inline_panic_file]=1
     [str_int_overflow]=1
+    [cstruct_array_length]=1
+    [cstruct_bytes_range]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
@@ -160,6 +162,13 @@ run_extern() {
     verdict "sh:linux_extern" "$reason" >"$work/res/sh__linux_extern"
 }
 
+# @C struct layouts against gcc (tests/c_layout)
+run_c_layout() {
+    local reason=ok
+    (cd "$root" && timeout 600 sh tests/c_layout/check.sh "$work/zc-linux") >"$work/out/sh__c_layout.log" 2>&1 || reason="layouts differ from gcc"
+    verdict "sh:c_layout" "$reason" >"$work/res/sh__c_layout"
+}
+
 # The compiler writes Linux executables with mode 0755 (no chmod needed).
 run_mode() {
     local reason=ok exe="$work/out/mode_check"
@@ -177,7 +186,7 @@ run_diagnostics() {
     verdict "sh:diagnostics" "$reason" >"$work/res/sh__diagnostics"
 }
 
-export -f run_tier verdict run_test run_compile_fail run_python run_extern run_diagnostics no_parity run_mode
+export -f run_tier verdict run_test run_compile_fail run_python run_extern run_diagnostics no_parity run_mode run_c_layout
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -195,6 +204,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"
     matches "py:llm_examples" && echo "run_python llm_examples --compiler $work/zc-linux"
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
+    if command -v gcc >/dev/null && matches "sh:c_layout"; then echo "run_c_layout"; fi
     matches "sh:elf_mode" && echo "run_mode"
     matches "sh:diagnostics" && echo "run_diagnostics"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'

@@ -1,0 +1,8 @@
+// storeStruct checks that a fixed array field has exactly its C length.
+import "std/bytes.zeph"
+@C struct Name { text: [u8; 4] }
+let buffer = Bytes.new(8)
+storeStruct(buffer, 0, Name{text: [1, 2, 3, 4]})
+print(loadStruct[Name](buffer, 0))
+storeStruct(buffer, 0, Name{text: [1, 2]})
+print("not reached")

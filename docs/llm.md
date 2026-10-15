@@ -339,7 +339,29 @@ print(pid > 0)
 
 Parameters of `extern fn` are `int` (integers, pointers) or `float` (C
 `double`); the result is `int`, `i32`, `bool`, `float` or nothing. Pass
-structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
+structs by pointer into `Bytes` memory.
+
+C structs: declare them `@C` and copy them in and out of memory. Fields are
+sized scalars, `int`, `float`, `bool`, other `@C` structs and fixed arrays
+`[T; N]` (only allowed in `@C` structs). `addr(s)` of the struct itself is
+not C-laid-out: always go through `storeStruct` into a `Bytes`.
+
+```zephyr
+import "std/bytes.zeph"
+
+@C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+@C(packed) struct Wire { tag: u8, length: u32 }          // no padding
+@C struct Entry { name: [u8; 4], header: Header, scale: f32, live: bool }
+
+print(sizeOf[Header](), offsetOf[Header]("size"), sizeOf[Wire](), sizeOf[Entry]())   // 16 8 5 32
+let buffer = Bytes.new(64)
+let h = Header{magic: 0xCAFEBABE, version: 1, flags: 0, size: 4096}
+storeStruct(buffer, 0, h)                  // bounds-checked copy out (raw: storeStruct(address, h))
+let copy = loadStruct[Header](buffer, 0)   // a new struct (raw: loadStruct[Header](address))
+copy.version += 1                           // memory is unchanged until stored again
+storeStruct(buffer, 16, Entry{name: [104, 105, 0, 0], header: copy, scale: 0.5, live: true})
+print(buffer.get32(0), loadStruct[Entry](buffer, 16).header.version)
+``` `load64/store64/load8/store8`,
 `addr(x)` and `callPointer` bypass every safety guarantee.
 
 ## Standard library (import "std/NAME.zeph")

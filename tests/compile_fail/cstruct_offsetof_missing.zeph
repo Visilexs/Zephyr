@@ -1,0 +1,2 @@
+@C struct S { a: u8 }
+print(offsetOf[S]("b"))
