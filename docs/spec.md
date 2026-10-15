@@ -705,7 +705,7 @@ running it.
 | `args()`   | → [str] | process arguments, `args()[0]` is the program |
 | `readFile(p)` | str → str | whole file; panics if unreadable |
 | `writeFile(p, d)` | str, str → void | create/overwrite; panics on failure |
-| `zeros(n)` | int → [int] | preallocated list of `n` zeros |
+| `zeros(n)` | int → [int] | preallocated list of `n` zeros (panics when `n < 0`, "out of memory" when it cannot fit) |
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |

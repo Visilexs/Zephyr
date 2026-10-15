@@ -1163,6 +1163,9 @@ fn runtimeAllocateDescribedObject(size: int, descriptor: int) -> int {
         store64(block - 16, descriptor)
         return block
     }
+    // a negative or wrapped size would round to a tiny block (or run past the
+    // reserve) and the caller would write over its neighbours' headers
+    if size < 0 or size > runtimeHeapReserve { runtimeFail("out of memory") }
     runtimeLockHeap()
     let result = runtimeAllocateObjectPayload(size)
     store64(result - 24, 1)
@@ -1715,27 +1718,51 @@ fn runtimeStringSplit(stringAddress: int, separator: int) -> int {
     runtimeListPush(output, runtimeSubstringValue(stringAddress, start, stringLength))
     return output
 }
+// One pass to count the matches, one allocation, one pass to copy. An empty
+// search returns the input itself, so it hands out a count of its own.
 fn runtimeStringReplace(stringAddress: int, searchText: int, replacement: int) -> int {
     let stringLength = load64(stringAddress)
     let searchLength = load64(searchText)
-    if searchLength == 0 { return stringAddress }
-    var output = runtimeAllocateString(0)
-    var start = 0
+    if searchLength == 0 or searchLength > stringLength { return runtimeRetainReference(stringAddress) }
+    let replacementLength = load64(replacement)
+    let firstByte = load8(searchText + 8)
+    var matchCount = 0
     var index = 0
     while index + searchLength <= stringLength {
-        var matchedByteCount = 0
-        while matchedByteCount < searchLength and load8(stringAddress + 8 + index + matchedByteCount) == load8(searchText + 8 + matchedByteCount) { matchedByteCount += 1 }
-        if matchedByteCount == searchLength {
-            output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, index))
-            output = runtimeConcatenateStrings(output, replacement)
+        if load8(stringAddress + 8 + index) == firstByte and runtimeBytesMatch(stringAddress + 8 + index, searchText + 8, searchLength) == 1 {
+            matchCount += 1
+            index += searchLength
+        } else {
+            index += 1
+        }
+    }
+    if matchCount == 0 { return runtimeRetainReference(stringAddress) }
+    let output = runtimeAllocateString(stringLength + matchCount * (replacementLength - searchLength))
+    var outputIndex = output + 8
+    var start = 0
+    index = 0
+    while index + searchLength <= stringLength {
+        if load8(stringAddress + 8 + index) == firstByte and runtimeBytesMatch(stringAddress + 8 + index, searchText + 8, searchLength) == 1 {
+            runtimeCopyMemory(outputIndex, stringAddress + 8 + start, index - start)
+            outputIndex += index - start
+            runtimeCopyMemory(outputIndex, replacement + 8, replacementLength)
+            outputIndex += replacementLength
             index += searchLength
             start = index
         } else {
             index += 1
         }
     }
-    output = runtimeConcatenateStrings(output, runtimeSubstringValue(stringAddress, start, stringLength))
+    runtimeCopyMemory(outputIndex, stringAddress + 8 + start, stringLength - start)
     return output
+}
+fn runtimeBytesMatch(left: int, right: int, byteCount: int) -> int {
+    var index = 0
+    while index < byteCount {
+        if load8(left + index) != load8(right + index) { return 0 }
+        index += 1
+    }
+    return 1
 }
 fn runtimeUppercaseString(stringAddress: int) -> int {
     let stringLength = load64(stringAddress)
@@ -1777,6 +1804,7 @@ fn runtimeStringRepeat(stringAddress: int, repetitionCount: int) -> int {
     let textLength = load64(stringAddress)
     var effectiveCount = repetitionCount
     if effectiveCount < 0 { effectiveCount = 0 }
+    if textLength > 0 and effectiveCount > runtimeHeapReserve / textLength { runtimeFail("out of memory") }
     let result = runtimeAllocateString(textLength * effectiveCount)
     var index = 0
     while index < effectiveCount {
@@ -2760,6 +2788,8 @@ fn runtimeListNew(initialLength: int) -> int {
 fn runtimeNewDescribedList(initialLength: int, descriptor: int) -> int {
     var shapeDescriptor = descriptor
     if shapeDescriptor == 0 { shapeDescriptor = runtimeValueListDescriptor }    // the data buffer still has to go when the list does
+    if initialLength < 0 { runtimeFail("negative list length") }
+    if initialLength > runtimeHeapReserve >> 3 { runtimeFail("out of memory") }
     let listAddress = runtimeAllocateDescribedObject(24, shapeDescriptor)
     var capacity = initialLength
     if capacity < 4 { capacity = 4 }
@@ -2798,6 +2828,8 @@ fn runtimeListPop(listAddress: int) -> int {
 // stored as its 32-bit pattern and enters Zephyr as a float (a double):
 // runtimeWidenFloat32Bits on the way out, runtimeNarrowFloat32Bits (round to nearest even) on the way in.
 fn runtimeNewPackedList(elementCount: int, width: int) -> int {
+    if elementCount < 0 { runtimeFail("negative list length") }
+    if elementCount > runtimeHeapReserve / width { runtimeFail("out of memory") }
     let listAddress = runtimeAllocateDescribedObject(24, runtimeValueListDescriptor)
     var capacity = elementCount
     if capacity < 4 { capacity = 4 }

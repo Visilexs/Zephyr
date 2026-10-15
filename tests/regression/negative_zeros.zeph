@@ -1,0 +1,6 @@
+// zeros(n) with a negative n used to corrupt allocator headers; it panics now
+// (exit 1). Expected by tests/linux/run.sh EXPECT_EXIT.
+print("start")
+var n = 0 - 5
+let list = zeros(n)
+print("unreachable", list.len())

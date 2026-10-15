@@ -41,8 +41,6 @@ zc="${ZC:-$root/zc-linux}"
 declare -A KNOWN_FAIL=(
     [macos_loops:base]="codegen: tryReduce weighted-reduction fast path runs on maps"
     [macos_loops:O2]="codegen: tryReduce weighted-reduction fast path runs on maps"
-    [leaks/replace:base]="rc/runtime: runtimeStringReplace leaks intermediate strings"
-    [leaks/replace:O2]="rc/runtime: runtimeStringReplace leaks intermediate strings"
     [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"
     [leaks/readfile:base]="runtime: readFile/writeFile/args leak temporaries"
     [leaks/readfile:O2]="runtime: readFile/writeFile/args leak temporaries"
@@ -53,6 +51,8 @@ declare -A KNOWN_FAIL=(
 # Tests that are expected to exit nonzero (an intentional panic).
 declare -A EXPECT_EXIT=(
     [fill_loops]=1
+    [negative_zeros]=1
+    [huge_repeat]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
