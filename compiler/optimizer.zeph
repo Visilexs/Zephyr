@@ -4649,6 +4649,22 @@ var savedIntegerRegisters: [int] = []
 var savedFloatRegisters: [int] = []
 var currentOrderPosition = 0
 
+// rax / divisor (quotient rax, remainder rdx); a divisor of -1 wraps instead
+// of trapping: INT_MIN / -1 = INT_MIN, x % -1 = 0.
+fn emitOptimizedSignedDivide(divisor: str) {
+    let divideLabel = allocateLabel()
+    let doneLabel = allocateLabel()
+    emitOptimized("cmp {divisor}, -1")
+    emitOptimized("jne .L{divideLabel}")
+    emitOptimized("neg rax")
+    emitOptimized("xor edx, edx")
+    emitOptimized("jmp .L{doneLabel}")
+    optimizerLines.push(".L{divideLabel}:\n")
+    emitOptimized("cqo")
+    emitOptimized("idiv {divisor}")
+    optimizerLines.push(".L{doneLabel}:\n")
+}
+
 fn emitOptimized(text: str) { optimizerLines.push("  " + text + "\n") }
 fn emitCold(text: str) { optimizerColdLines.push("  " + text + "\n") }
 
@@ -5289,10 +5305,9 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode == irDivide or opcode == irModulo {
-        let divisor = integerIn(operands[1], "rcx")
         emitOptimized("mov rax, {locationOf(operands[0])}")
-        emitOptimized("cqo")
-        emitOptimized("idiv {divisor}")
+        let divisor = integerIn(operands[1], "rcx")
+        emitOptimizedSignedDivide(divisor)
         if opcode == irDivide { finishResult(value, "rax") }
         else { finishResult(value, "rdx") }
         return
@@ -5647,8 +5662,7 @@ fn emitInstructionFor(value: int) {
         emitOptimized("jmp .L{doneLabel}")
         optimizerLines.push(".L{slowLabel}:\n")
         emitOptimized("mov rcx, {divisor}")
-        emitOptimized("cqo")
-        emitOptimized("idiv rcx")
+        emitOptimizedSignedDivide("rcx")
         if opcode == irModuloByInvariant { emitOptimized("mov rax, rdx") }
         optimizerLines.push(".L{doneLabel}:\n")
         finishResult(value, "rax")

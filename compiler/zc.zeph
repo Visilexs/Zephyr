@@ -7037,10 +7037,11 @@ fn constantFoldEval(expression: Node) -> Node {
             else if operator == tokenStar { value = leftOperand.integerValue * rightOperand.integerValue }
             else if operator == tokenSlash {
                 if rightOperand.integerValue == 0 { return makeNode(nodeNone, expression.line) }
-                value = leftOperand.integerValue / rightOperand.integerValue
+                if rightOperand.integerValue == 0 - 1 { value = 0 - leftOperand.integerValue }      // wraps: INT_MIN / -1 = INT_MIN
+                else { value = leftOperand.integerValue / rightOperand.integerValue }
             } else if operator == tokenPercent {
                 if rightOperand.integerValue == 0 { return makeNode(nodeNone, expression.line) }
-                value = leftOperand.integerValue % rightOperand.integerValue
+                if rightOperand.integerValue != 0 - 1 { value = leftOperand.integerValue % rightOperand.integerValue }   // x % -1 = 0
             } else { return makeNode(nodeNone, expression.line) }
             var folded = makeNode(nodeInteger, expression.line)
             folded.integerValue = value
@@ -8307,6 +8308,23 @@ fn divideConstantOk(divisor: Node) -> bool {
     return divisor.nodeKind == nodeInteger and divisor.integerValue >= 2 and divisor.integerValue <= 2147483647
 }
 
+// rdx:rax = rax / rcx (quotient in rax, remainder in rdx). A divisor of -1
+// skips idiv, which traps on INT_MIN / -1: the result wraps (INT_MIN), and
+// the remainder is 0.
+fn emitSignedDivide() {
+    let divideLabel = allocateLabel()
+    let doneLabel = allocateLabel()
+    emitInstruction("cmp rcx, -1")
+    emitInstruction("jne {labelText(divideLabel)}")
+    emitInstruction("neg rax")
+    emitInstruction("xor edx, edx")
+    emitInstruction("jmp {labelText(doneLabel)}")
+    emitLabel(divideLabel)
+    emitInstruction("cqo")
+    emitInstruction("idiv rcx")
+    emitLabel(doneLabel)
+}
+
 fn generateDivideConstant(expression: Node) {
     let divisor = expression.children[1].integerValue
     var shiftAmount = 0
@@ -8349,8 +8367,7 @@ fn generateDivideConstant(expression: Node) {
     emitInstruction("jmp {labelText(doneLabel)}")
     emitLabel(slowPathLabel)
     emitInstruction("mov rcx, {divisor}")
-    emitInstruction("cqo")
-    emitInstruction("idiv rcx")
+    emitSignedDivide()
     if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
     emitLabel(doneLabel)
 }
@@ -8371,8 +8388,7 @@ fn generateDivideFast(expression: Node) {
     if remainderRegister == "" {
         generateIntegerOperands(expression.children[0], expression.children[1])
         generateZeroCheck(expression)
-        emitInstruction("cqo")
-        emitInstruction("idiv rcx")
+        emitSignedDivide()
         if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
         return
     }
@@ -8400,8 +8416,7 @@ fn generateDivideFast(expression: Node) {
     emitLabel(slowPathLabel)
     generateLeaf("rcx", expression.children[1])    // divisor is a leaf by construction
     generateZeroCheck(expression)
-    emitInstruction("cqo")
-    emitInstruction("idiv rcx")
+    emitSignedDivide()
     if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
     emitLabel(doneLabel)
 }
@@ -8964,8 +8979,7 @@ fn generateBinaryOperator(expression: Node) {
     }
     if operator == tokenSlash or operator == tokenPercent {
         generateZeroCheck(expression)
-        emitInstruction("cqo")
-        emitInstruction("idiv rcx")
+        emitSignedDivide()
         if operator == tokenPercent { emitInstruction("mov rax, rdx") }
         return
     }

@@ -560,7 +560,8 @@ read of `x` precedes `e`; a field or indexed target is evaluated again for the
 subsequent store.
 
 - `+ - * / %`: numeric. Two ints yield int (`/` truncates toward zero; `/`
-  and `%` by zero panic). Any float operand yields float (`%` is not defined
+  and `%` by zero panic; int arithmetic wraps, so the one overflowing
+  quotient `INT_MIN / -1` is `INT_MIN` and `INT_MIN % -1` is 0). Any float operand yields float (`%` is not defined
   for floats). `+` on two strs concatenates.
 - `& | ^ << >>`: bitwise, int operands only, int result. `<<`/`>>` shift by
   the low 6 bits of the right operand; `>>` is arithmetic (sign-preserving).
