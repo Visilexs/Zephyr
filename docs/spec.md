@@ -796,14 +796,26 @@ parameter must be `int`; the return must be `int`, `i32`, or nothing.
 extern fn MessageBoxA(hwnd: int, text: int, cap: int, flags: int) -> i32 from "user32.dll"
 ```
 
+**Argument lifetime.** In a call to `syscall`, `win`, `callPointer`,
+`callSysV`, `callSysVFloat` or an `extern fn`, every temporary made while
+evaluating the arguments stays alive until the call returns (C++
+full-expression rules), so `syscall(1, 1, cString(s).addr(), n)` hands the
+kernel valid memory.
+
 **Raw memory.** Addresses are plain `int`s; there is no bounds checking and the
 runtime does not count or trace them (see the caution below).
 
 | Builtin | Signature | Notes |
 |---------|-----------|-------|
 | `load64(a)` / `load32(a)` / `load16(a)` / `load8(a)` | int → int | Read 8 / 4 / 2 / 1 bytes at address `a`; narrower reads zero-extend. |
-| `store64(a, v)` / `store32(a, v)` / `store8(a, v)` | int, int → void | Write 8 / 4 / 1 bytes. |
+| `loadI32(a)` / `loadI16(a)` / `loadI8(a)` | int → int | The same reads, sign-extended. |
+| `store64(a, v)` / `store32(a, v)` / `store16(a, v)` / `store8(a, v)` | int, int → void | Write the low 8 / 4 / 2 / 1 bytes of `v`. |
+| `loadF64(a)` / `storeF64(a, v)` | int → float / int, float → void | An IEEE double. An int `v` widens. |
+| `loadF32(a)` / `storeF32(a, v)` | int → float / int, float → void | An IEEE single: widened exactly on load, rounded to nearest (ties to even, to infinity when too large) on store. |
+| `copyMemory(dst, src, n)` | int, int, int → void | Copy `n` bytes; the ranges may overlap (memmove). `n <= 0` does nothing. |
+| `fillMemory(dst, b, n)` | int, int, int → void | Set `n` bytes to `b & 255` (memset). `n <= 0` does nothing. |
 | `addr(x)` | any → int | Address of a `str`, list, struct, or **function** value. A function yields its `{code, env}` closure cell — the handle a native callback thunk needs. |
+| `dataAddr(x)` | str or list → int | Address of element 0: a `str`'s bytes, or the element array of a list, `[u8]` or `[f32]`. A list's array moves when it grows, so the address is valid until the next `push` (and only while `x` is alive). |
 | `stackPointer()` | → int | Current stack pointer (`rsp`). |
 | `bits(x)` | float → int | IEEE-754 bit pattern (also in §3.5), the bridge for passing floats through the int-only FFI. |
 
@@ -819,7 +831,8 @@ the value.
 **Linux and WebAssembly.** On `--linux`/`--wasm`, `win("Foo", …)` is rewritten
 to the kernel shim `kernel32Foo(…)` from `lib/os/{linux,wasm}.zeph`; a non-kernel32
 prefix (`user32!…`) is a compile error. Additional builtins on those targets:
-`syscall(n, args…)` (raw Linux syscall, 1–7 args), and wasm-only `growMemory`,
+`syscall(n, args…)` (raw Linux syscall, 1–7 args; the argument registers
+the call leaves out are zero), and wasm-only `growMemory`,
 `hostWrite`, `hostExit`. `extern fn … from` is unavailable on `--wasm`.
 
 **Shared libraries on Linux.** On `--linux`, `extern fn … from "libfoo.so.N"`

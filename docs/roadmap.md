@@ -86,27 +86,26 @@ unnoticed.
 ## Phase 2: memory reading and writing
 
 ### 2A Primitives and FFI (now)
-Note (2026-10-15 merge): the rm-memory track committed nothing; its
-uncommitted syscall-zeroing and argument keep-alive work in zc.zeph was not
-merged and every 2A item is still open.
-- [ ] **critical** `syscall` leaves unused argument registers as garbage;
+- [x] **critical** `syscall` leaves unused argument registers as garbage;
   zero them. std/linux vmRead/vmWrite pass no flags, so `process_vm_readv`
   always fails with EINVAL.
-- [ ] `monotonicNanoseconds` uses syscall 299 (recvmmsg). Use 228.
-- [ ] Temporaries in a call's argument list are freed before
+- [x] `monotonicNanoseconds` uses syscall 299 (recvmmsg). Use 228.
+- [x] Temporaries in a call's argument list are freed before
   extern/syscall/win runs, so `f(cString(s).addr())` is a use-after-free.
   Keep argument temporaries alive until the call returns.
-- [ ] memRead/memWrite don't check length against the Bytes size. Bytes
+- [x] memRead/memWrite don't check length against the Bytes size. Bytes
   bounds checks overflow on huge offsets.
-- [ ] Complete the primitive set: `store16`, sign-extending `loadI8/I16/I32`,
+- [x] Complete the primitive set: `store16`, sign-extending `loadI8/I16/I32`,
   `loadF32/storeF32/loadF64/storeF64`, `copyMemory`, `fillMemory`, and
   `dataAddr(list|str|[u8])`.
 - [ ] `std/mem.zeph`: process memory via process_vm_readv/writev, with typed
   reads, `/proc/pid/maps` parsing, AOB pattern scan with wildcards, and
   pointer-chain resolution. All of it returns optionals or Results, never
   panics.
-- [ ] Add an `irSyscall` SSA op, so functions that use syscall can be
-  optimized under `-O2`.
+- [x] Add an `irSyscall` SSA op, so functions that use syscall can be
+  optimized under `-O2`. Done as a call to lib/os/linux.zeph's
+  `runtimeSyscall` (one extra call per syscall); a true inline op with
+  fixed-register operands is still open.
 
 ### 2B Types and layout (next)
 - [ ] Sized scalar types `i8..i64`, `u8..u64`, `f32` as real values. Struct

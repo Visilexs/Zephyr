@@ -316,8 +316,23 @@ print(pid > 0)
 
 Parameters of `extern fn` are `int` (integers, pointers) or `float` (C
 `double`); the result is `int`, `i32`, `bool`, `float` or nothing. Pass
-structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
-`addr(x)` and `callPointer` bypass every safety guarantee.
+structs by pointer into `Bytes` memory. Prefer `Bytes` accessors: they are
+bounds-checked (a bad or huge offset panics). The raw builtins bypass every
+safety guarantee:
+
+- `load8/16/32/64(a)` zero-extend; `loadI8/I16/I32(a)` sign-extend.
+- `store8/16/32/64(a, v)` keep the low bits of `v`.
+- `loadF32/storeF32` (an IEEE single, widened / rounded to nearest) and
+  `loadF64/storeF64` take and return `float`.
+- `copyMemory(dst, src, n)` is memmove (overlap is fine), `fillMemory(dst,
+  byte, n)` is memset; `n <= 0` does nothing.
+- `dataAddr(x)` is the address of element 0 of a str, list, `[u8]` or
+  `[f32]` (never hard-code layout offsets like `addr(x) + 16`); `addr(x)` is
+  the object itself. Both stay valid only while `x` is alive.
+- Temporaries in the arguments of `syscall`, `extern fn`, `callSysV`,
+  `callPointer` and `win` live until the call returns, so
+  `syscall(1, 1, cString(s).addr(), n)` is safe. Arguments left out of
+  `syscall` are passed as 0.
 
 ## Standard library (import "std/NAME.zeph")
 
@@ -350,7 +365,9 @@ structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
   `args() -> [str]` (`args()[0]` is the program).
 - `bytes`: `Bytes.new(n)`, `b.put8/16/32/64(off, v)`, `b.get8/16/32/64(off)`,
   `putFloat32/getFloat32`, `putFloat64/getFloat64`, `putString`,
-  `getString(off, len)`, `b.addr()`, `cString(s) -> Bytes`.
+  `putCString`, `getString(off, len)`, `b.addr()`, `b.at(off)`,
+  `b.copyFrom(off, src, srcOff, n)`, `b.fill(off, n, byte)`,
+  `b.slice(off, n)` (a view sharing the memory), `cString(s) -> Bytes`.
 - `thread`: `spawnThread(f, arg) -> Thread`, `t.join()`, `parallelFor(n, f)`,
   `cpuCount()`. `sync`: `newMutex()` (`lock`, `unlock`, `tryLock`),
   `newAtomic(v)` (`load`, `store`, `add`, `swap`, `compareExchange`),

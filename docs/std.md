@@ -199,7 +199,7 @@ import "std/set.zeph"
 import "std/bytes.zeph"
 ```
 
-Raw fixed-size buffers are reference-counted and non-moving, with a GC backstop. Keep a `Bytes` value reachable while foreign code holds its address. Accessors bounds-check. Integer encodings are little-endian.
+Raw fixed-size buffers are reference-counted and non-moving, with a GC backstop. Keep a `Bytes` value reachable while foreign code holds its address. Accessors bounds-check (overflow-safe: a huge offset or length panics). Integer encodings are little-endian.
 
 | Signature | Description |
 | --- | --- |
@@ -222,6 +222,9 @@ Raw fixed-size buffers are reference-counted and non-moving, with a GC backstop.
 | `Bytes.putCString(offset: int, text: str)` | Copy bytes and append NUL. |
 | `Bytes.putString(offset: int, text: str)` | Copy bytes without a terminator. |
 | `Bytes.getString(offset: int, length: int) -> str` | Copy length bytes to a string. |
+| `Bytes.copyFrom(offset: int, source: Bytes, sourceOffset: int, length: int)` | Copy bytes from another (or the same) buffer; overlap is fine. |
+| `Bytes.fill(offset: int, length: int, value: int)` | Set bytes to `value & 255`. |
+| `Bytes.slice(offset: int, length: int) -> Bytes` | A view of part of the buffer that shares (and keeps alive) its memory. |
 | `cString(text: str) -> Bytes` | Allocate a NUL-terminated copy. |
 | `uint64Array(values: [int]) -> Bytes` | Build a contiguous 64-bit array. |
 | `uint32Array(values: [int]) -> Bytes` | Build a contiguous 32-bit array. |
