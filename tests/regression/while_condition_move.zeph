@@ -1,0 +1,33 @@
+// A local whose last read is in a while condition is read on every
+// iteration, so the baseline must not move it out (it used to segfault).
+struct Box { s: str }
+var counter = 0
+fn more(l: [str]) -> bool {
+    counter += 1
+    return counter < 4
+}
+fn check(b: Box) -> bool {
+    counter += 1
+    return b.s.len() > 0 and counter < 8
+}
+
+fn loopOnCondition() {
+    let s = "made{1}"
+    var acc: [str] = []
+    while more([s]) { acc.push("x") }
+    print(acc.len())
+}
+
+fn loopWithContinue() {
+    let s = "box{2}"
+    var n = 0
+    while check(Box{s: s}) {
+        n += 1
+        if n % 2 == 0 { continue }
+    }
+    print(n)
+}
+
+loopOnCondition()
+loopWithContinue()
+print("done", counter)

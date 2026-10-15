@@ -1,0 +1,22 @@
+// INT_MIN / -1 wraps to INT_MIN and INT_MIN % -1 is 0, at run time and when
+// constant-folded (it used to raise SIGFPE and crash the compiler).
+fn divide(a: int, b: int) -> int { return a / b }
+fn modulo(a: int, b: int) -> int { return a % b }
+
+let minimum = 0 - 9223372036854775807 - 1
+print(divide(minimum, 0 - 1), modulo(minimum, 0 - 1))
+print(divide(7, 0 - 1), modulo(7, 0 - 1), divide(0 - 7, 2), modulo(0 - 7, 2))
+print((0 - 9223372036854775807 - 1) / (0 - 1), (0 - 9223372036854775807 - 1) % (0 - 1))
+var d = 0 - 1
+var total = 0
+for i in 0..4 {
+    total += (minimum + i) / d
+    total += (minimum + i) % d
+    let q = i / d
+    total += q
+}
+print(total)
+var values: [int] = [minimum, 5, 0 - 9]
+var acc = 0
+for v in values { acc = acc + v / d + v % d }
+print(acc)

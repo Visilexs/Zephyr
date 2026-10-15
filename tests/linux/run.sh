@@ -3,8 +3,10 @@
 #
 # Builds every self-checking test at baseline and -O2 with zc-linux, runs it
 # with a timeout, and checks the exit code, the .expected file next to the
-# source (when one exists) and that both tiers print the same thing. Also runs
-# the leak checks (tests/leaks), the python checks that work on Linux and
+# source (when one exists), the lines of a .stderr file (each must appear in
+# stderr) and that both tiers print the same thing. Also runs
+# the compile-error checks (tests/compile_fail/*.zeph with a .error file), the
+# leak checks (tests/leaks), the python checks that work on Linux and
 # tests/linux_extern.sh (when gcc is available).
 #
 # The compiler, runtime and lib/ are copied into a temp dir first, so the
@@ -39,9 +41,6 @@ zc="${ZC:-$root/zc-linux}"
 # is "<test>:base", "<test>:O2", "<test>:parity" or "py:<check>". Remove an
 # entry when its bug is fixed; the harness reports XPASS until you do.
 declare -A KNOWN_FAIL=(
-    [macos_loops:base]="codegen: tryReduce weighted-reduction fast path runs on maps"
-    [macos_loops:O2]="codegen: tryReduce weighted-reduction fast path runs on maps"
-    [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"
 )
 # Tests that are expected to exit nonzero (an intentional panic).
 declare -A EXPECT_EXIT=(
@@ -50,6 +49,8 @@ declare -A EXPECT_EXIT=(
     [huge_repeat]=1
     [stack_overflow]=1
     [thread_stack_overflow]=1
+    [inline_panic_file]=1
+    [str_int_overflow]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }
@@ -86,6 +87,13 @@ run_tier() {
     if [ "$code" != "$want" ]; then echo "exit $code (want $want)"; return; fi
     local expected="$root/tests/$name.expected"
     if [ -f "$expected" ] && ! cmp -s "$exe.out" "$expected"; then echo "output differs from .expected"; return; fi
+    # <test>.stderr: every line must appear in what the program wrote to stderr
+    local stderr_expected="$root/tests/$name.stderr" line
+    if [ -f "$stderr_expected" ]; then
+        while IFS= read -r line; do
+            grep -qF -- "$line" "$log" || { echo "stderr lacks: $line"; return; }
+        done <"$stderr_expected"
+    fi
     echo ok
 }
 
@@ -117,6 +125,22 @@ run_test() {
     } >"$work/res/$id"
 }
 
+# run_compile_fail NAME: tests/compile_fail/NAME.zeph must be rejected (within
+# 60 s, at baseline and -O2) with every line of NAME.error in the message.
+run_compile_fail() {
+    local name="$1" id="cf__$1" reason=ok flag line log
+    for flag in "" -O2; do
+        log="$work/out/$id$flag.log"
+        if timeout 60 "$work/zc-linux" --linux --rt $flag "$root/tests/compile_fail/$name.zeph" "$work/out/$id.exe" >"$log" 2>&1; then
+            reason="compiled (want an error)"; break
+        fi
+        while IFS= read -r line; do
+            grep -qF -- "$line" "$log" || { reason="message lacks: $line"; break 2; }
+        done <"$root/tests/compile_fail/$name.error"
+    done
+    verdict "compile_fail/$name" "$reason" >"$work/res/$id"
+}
+
 run_python() {
     local check="$1" id="py__$1" result reason=ok
     shift
@@ -146,7 +170,7 @@ run_mode() {
     verdict "sh:elf_mode" "$reason" >"$work/res/sh__elf_mode"
 }
 
-export -f run_tier verdict run_test run_python run_extern no_parity run_mode
+export -f run_tier verdict run_test run_compile_fail run_python run_extern no_parity run_mode
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -154,6 +178,11 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
 
 {
     for name in "${tests[@]}"; do matches "$name" && echo "run_test $name"; done
+    for source in "$root"/tests/compile_fail/*.zeph; do
+        [ -f "$source" ] || continue
+        name="$(basename "$source" .zeph)"
+        matches "compile_fail/$name" && echo "run_compile_fail $name"
+    done
     matches "py:include_path" && echo "run_python include_path"
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"

@@ -2770,14 +2770,18 @@ fn runtimeStringToInteger(stringAddress: int) -> int {
     while index < stringLength {
         let character = load8(stringAddress + 8 + index)
         if character < 48 or character > 57 { break }
-        value = value * 10 + (character - 48)
+        // accumulate negatively, so INT_MIN's magnitude fits; panic on overflow
+        let digit = character - 48
+        if value < (0 - 9223372036854775807 - 1 + digit) / 10 { runtimeFail("cannot convert to int: out of range") }
+        value = value * 10 - digit
         sawDigit = true
         index += 1
     }
     while index < stringLength and load8(stringAddress + 8 + index) == 32 { index += 1 }
     if not sawDigit or index != stringLength { runtimeFail("cannot convert to int") }
-    if isNegative { return 0 - value }
-    return value
+    if isNegative { return value }
+    if value == 0 - 9223372036854775807 - 1 { runtimeFail("cannot convert to int: out of range") }
+    return 0 - value
 }
 
 // decimal float parser (sign, integer part, fraction; no exponent yet).
@@ -3422,127 +3426,191 @@ fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation
     }
 }
 
-fn runtimeIntegerPowerOfTen(exponent: int) -> int {
-    var result = 1
+// Multiply a little-endian base-10^9 bignum by a small factor (< 2^31) in place.
+fn runtimeBigMultiplySmall(limbs: [int], factor: int) {
+    var carry = 0
     var index = 0
-    while index < exponent {
-        result = result * 10
+    while index < limbs.len() {
+        let product = limbs[index] * factor + carry
+        limbs[index] = product % 1000000000
+        carry = product / 1000000000
         index += 1
     }
-    return result
-}
-
-// Format a double (given as its bit pattern) with up to 16 significant
-// fractional digits, rounded, with trailing zeros trimmed (like %g). Handles
-// magnitudes below 2^63; NaN and infinity are named.
-// A double of magnitude >= 2^63 has no fractional bits, but its integer value
-// does not fit in an i64 -- `y as int` saturates and the digit loop then
-// generated negative digits (1e20 printed as "0.-).0-*(+,))+(0("). Peel powers
-// of two off until the mantissa fits, then double the decimal digits back k
-// times. Exact for every finite double, including 1e300.
-fn runtimeFormatLargeIntegerFloat(inputValue: float) {
-    var scaledValue = inputValue
-    var binaryExponent = 0
-    while scaledValue >= 9223372036854775808.0 {
-        scaledValue = scaledValue / 2.0                       // exact: halving a normal double
-        binaryExponent += 1
-    }
-    var decimalDigits: [int] = []
-    var remainingInteger = scaledValue as int
-    while remainingInteger > 0 {
-        decimalDigits.push(remainingInteger % 10)
-        remainingInteger = remainingInteger / 10
-    }
-    if decimalDigits.len() == 0 { decimalDigits.push(0) }
-    var index = 0
-    while index < binaryExponent {
-        var carry = 0
-        var otherIndex = 0
-        while otherIndex < decimalDigits.len() {
-            let doubledDigit = decimalDigits[otherIndex] * 2 + carry
-            decimalDigits[otherIndex] = doubledDigit % 10
-            carry = doubledDigit / 10
-            otherIndex += 1
-        }
-        while carry > 0 {
-            decimalDigits.push(carry % 10)
-            carry = carry / 10
-        }
-        index += 1
-    }
-    var digitIndex = decimalDigits.len() - 1
-    while digitIndex >= 0 {
-        runtimeAppendStringBuilderByte(48 + decimalDigits[digitIndex])
-        digitIndex -= 1
+    while carry > 0 {
+        limbs.push(carry % 1000000000)
+        carry = carry / 1000000000
     }
 }
 
+// Format a double (given as its bit pattern) like C's %.15g: 15 significant
+// digits, correctly rounded (ties to even) from the exact binary value,
+// trailing zeros trimmed, exponent form (1e+20, 2.5e-07) when the decimal
+// exponent is below -4 or at least 15. -0.0 prints as -0; NaN and the
+// infinities print as nan, inf and -inf.
 fn runtimeAppendStringBuilderFloat(bitPattern: int) {
-    let value = floatFromBits(bitPattern)
-    if value != value {                          // NaN
+    let exponentBits = (bitPattern >> 52) & 2047
+    var mantissa = bitPattern & 4503599627370495         // low 52 bits
+    if exponentBits == 2047 and mantissa != 0 {          // NaN
         runtimeAppendStringBuilderByte(110)
         runtimeAppendStringBuilderByte(97)
         runtimeAppendStringBuilderByte(110)
         return
     }
-    var magnitude = value
-    if magnitude < 0.0 {
-        runtimeAppendStringBuilderByte(45)                   // '-'
-        magnitude = 0.0 - magnitude
-    }
-    let infinity = floatFromBits(9218868437227405312)   // 0x7FF0000000000000
-    if magnitude == infinity {
+    if bitPattern < 0 { runtimeAppendStringBuilderByte(45) }                 // '-' (also for -0.0)
+    if exponentBits == 2047 {
         runtimeAppendStringBuilderByte(105)
         runtimeAppendStringBuilderByte(110)
         runtimeAppendStringBuilderByte(102)
         return
     }
-    if magnitude >= 9223372036854775808.0 {      // integer part too large for i64
-        runtimeFormatLargeIntegerFloat(magnitude)
+    if exponentBits == 0 and mantissa == 0 {
+        runtimeAppendStringBuilderByte(48)
         return
     }
-    var integerPart = magnitude as int
-    var fraction = magnitude - (integerPart as float)
-    var integerDigitCount = 0                            // integer-part digit count
-    var remainingInteger = integerPart
-    while remainingInteger > 0 {
-        remainingInteger = remainingInteger / 10
-        integerDigitCount += 1
+    var binaryExponent = 0 - 1074                        // value = mantissa * 2^binaryExponent
+    if exponentBits != 0 {
+        mantissa += 4503599627370496
+        binaryExponent = exponentBits - 1075
     }
-    var fractionDigitCount = 15 - integerDigitCount                   // ~15 significant figures total (like %.15g)
-    if fractionDigitCount < 1 { fractionDigitCount = 1 }
-    if fractionDigitCount > 16 { fractionDigitCount = 16 }
-    var fractionDigits = 0
-    var fractionRemainder = fraction
+    // Exact decimal expansion: value = limbs / 10^fractionDigitCount.
+    var limbs: [int] = []
+    limbs.push(mantissa % 1000000000)
+    limbs.push(mantissa / 1000000000 % 1000000000)
+    limbs.push(mantissa / 1000000000000000000)
+    var fractionDigitCount = 0
+    if binaryExponent > 0 {
+        var remaining = binaryExponent
+        while remaining > 0 {
+            var step = remaining
+            if step > 30 { step = 30 }
+            runtimeBigMultiplySmall(limbs, 1 << step)
+            remaining -= step
+        }
+    } else {
+        // m * 2^-n = m * 5^n / 10^n
+        fractionDigitCount = 0 - binaryExponent
+        var remaining = fractionDigitCount
+        while remaining > 0 {
+            var step = remaining
+            if step > 13 { step = 13 }
+            var factor = 1
+            var index = 0
+            while index < step {
+                factor = factor * 5
+                index += 1
+            }
+            runtimeBigMultiplySmall(limbs, factor)
+            remaining -= step
+        }
+    }
+    while limbs.len() > 1 and limbs[limbs.len() - 1] == 0 { limbs.pop() }
+    // most significant digit first
+    var digits: [int] = []
+    var limbIndex = limbs.len() - 1
+    var top = limbs[limbIndex]
+    var topDigits: [int] = []
+    while top > 0 {
+        topDigits.push(top % 10)
+        top = top / 10
+    }
+    var reverseIndex = topDigits.len() - 1
+    while reverseIndex >= 0 {
+        digits.push(topDigits[reverseIndex])
+        reverseIndex -= 1
+    }
+    limbIndex -= 1
+    while limbIndex >= 0 {
+        var divisor = 100000000
+        while divisor > 0 {
+            digits.push(limbs[limbIndex] / divisor % 10)
+            divisor = divisor / 10
+        }
+        limbIndex -= 1
+    }
+    var decimalExponent = digits.len() - 1 - fractionDigitCount
+    // round to 15 significant digits, ties to even
+    var significant: [int] = []
     var index = 0
-    while index < fractionDigitCount {
-        fractionRemainder = fractionRemainder * 10.0
-        let digitValue = fractionRemainder as int
-        fractionDigits = fractionDigits * 10 + digitValue
-        fractionRemainder = fractionRemainder - (digitValue as float)
+    while index < 15 {
+        if index < digits.len() { significant.push(digits[index]) } else { significant.push(0) }
         index += 1
     }
-    fractionRemainder = fractionRemainder * 10.0                          // round on the next digit
-    if (fractionRemainder as int) >= 5 { fractionDigits = fractionDigits + 1 }
-    let fractionLimit = runtimeIntegerPowerOfTen(fractionDigitCount)
-    if fractionDigits >= fractionLimit {                        // carry rounded past the fraction
-        fractionDigits = fractionDigits - fractionLimit
-        integerPart = integerPart + 1
+    if digits.len() > 15 {
+        let nextDigit = digits[15]
+        var restNonzero = false
+        var restIndex = 16
+        while restIndex < digits.len() and not restNonzero {
+            if digits[restIndex] != 0 { restNonzero = true }
+            restIndex += 1
+        }
+        if nextDigit > 5 or (nextDigit == 5 and (restNonzero or significant[14] % 2 == 1)) {
+            var carryIndex = 14
+            var carrying = true
+            while carrying and carryIndex >= 0 {
+                if significant[carryIndex] == 9 {
+                    significant[carryIndex] = 0
+                    carryIndex -= 1
+                } else {
+                    significant[carryIndex] = significant[carryIndex] + 1
+                    carrying = false
+                }
+            }
+            if carrying {                                // 999... rounded up to 1000...
+                significant[0] = 1
+                decimalExponent += 1
+            }
+        }
     }
-    runtimeAppendStringBuilderInteger(integerPart)
-    if fractionDigits == 0 { return }                 // no fractional part (matches %g)
-    runtimeAppendStringBuilderByte(46)                        // '.'
-    var lastDigitIndex = fractionDigitCount - 1
-    var remainingFraction = fractionDigits
-    while lastDigitIndex > 0 and remainingFraction % 10 == 0 {      // trim trailing zeros
-        remainingFraction = remainingFraction / 10
-        lastDigitIndex -= 1
+    var digitCount = 15                                  // trim trailing zeros
+    while digitCount > 1 and significant[digitCount - 1] == 0 { digitCount -= 1 }
+    if decimalExponent < 0 - 4 or decimalExponent >= 15 {
+        runtimeAppendStringBuilderByte(48 + significant[0])
+        if digitCount > 1 {
+            runtimeAppendStringBuilderByte(46)
+            index = 1
+            while index < digitCount {
+                runtimeAppendStringBuilderByte(48 + significant[index])
+                index += 1
+            }
+        }
+        runtimeAppendStringBuilderByte(101)              // 'e'
+        var exponentMagnitude = decimalExponent
+        if decimalExponent < 0 {
+            runtimeAppendStringBuilderByte(45)
+            exponentMagnitude = 0 - decimalExponent
+        } else {
+            runtimeAppendStringBuilderByte(43)
+        }
+        if exponentMagnitude < 10 { runtimeAppendStringBuilderByte(48) }
+        runtimeAppendStringBuilderInteger(exponentMagnitude)
+        return
     }
-    var digitIndex = 0
-    while digitIndex <= lastDigitIndex {                     // emit MSD-first, keeping leading zeros
-        let digit = (fractionDigits / runtimeIntegerPowerOfTen(fractionDigitCount - 1 - digitIndex)) % 10
-        runtimeAppendStringBuilderByte(48 + digit)
-        digitIndex += 1
+    if decimalExponent < 0 {
+        runtimeAppendStringBuilderByte(48)
+        runtimeAppendStringBuilderByte(46)
+        index = 0
+        while index < 0 - decimalExponent - 1 {
+            runtimeAppendStringBuilderByte(48)
+            index += 1
+        }
+        index = 0
+        while index < digitCount {
+            runtimeAppendStringBuilderByte(48 + significant[index])
+            index += 1
+        }
+        return
+    }
+    index = 0
+    while index <= decimalExponent {
+        runtimeAppendStringBuilderByte(48 + significant[index])
+        index += 1
+    }
+    if digitCount > decimalExponent + 1 {
+        runtimeAppendStringBuilderByte(46)
+        while index < digitCount {
+            runtimeAppendStringBuilderByte(48 + significant[index])
+            index += 1
+        }
     }
 }
 

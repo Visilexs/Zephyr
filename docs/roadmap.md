@@ -61,25 +61,27 @@ unnoticed.
 - [x] Linux ELF outputs are written 0644. Write them 0755.
 
 ### 1B Compiler correctness (`compiler/zc.zeph`, `compiler/optimizer.zeph`)
-- [ ] **critical** `tryFill`/`tryReduce` loop fast paths run on maps (their
+- [x] **critical** `tryFill`/`tryReduce` loop fast paths run on maps (their
   type guard is macOS-only), which corrupts map memory or gives wrong sums.
-- [ ] Baseline moveScan treats a while-condition read as the last use and
+- [x] Baseline moveScan treats a while-condition read as the last use and
   moves it, so the condition segfaults on its second evaluation.
-- [ ] The `-O2` inliner's takeOwnership leaks an owned temporary argument when
+- [x] The `-O2` inliner's takeOwnership leaks an owned temporary argument when
   the callee returns that parameter on only some paths (affects
   padLeft/padRight, methods, interface dispatch).
-- [ ] `INT_MIN / -1` raises SIGFPE, and constant-folding it crashes the
+- [x] `INT_MIN / -1` raises SIGFPE, and constant-folding it crashes the
   compiler. Define it as wrapping.
-- [ ] Polymorphic generic recursion monomorphises forever. Cap the depth and
+- [x] Polymorphic generic recursion monomorphises forever. Cap the depth and
   emit an error at the call site.
-- [ ] Long expressions overflow the compiler stack, and compile time is
-  quadratic in expression length.
-- [ ] cloneInlineNode drops `file`, so panic sites are misattributed after
+- [x] Long expressions overflow the compiler stack, and compile time is
+  quadratic in expression length. (Folding is linear now; expressions nest
+  at most 2000 levels, past that a clean compile error. Running the compiler
+  on a bigger stack would lift the limit.)
+- [x] cloneInlineNode drops `file`, so panic sites are misattributed after
   inlining.
-- [ ] Float→int out of range gives INT_MIN silently. Saturate it, and put the
+- [x] Float→int out of range gives INT_MIN silently. Saturate it, and put the
   rule in the spec.
-- [ ] str→int parse wraps on overflow. Panic instead.
-- [ ] Float formatting is not `%.15g` (1e-16 prints 0, -0.0 sign).
+- [x] str→int parse wraps on overflow. Panic instead.
+- [x] Float formatting is not `%.15g` (1e-16 prints 0, -0.0 sign).
 
 ## Phase 2: memory reading and writing
 

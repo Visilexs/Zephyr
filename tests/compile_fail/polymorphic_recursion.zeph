@@ -1,0 +1,11 @@
+// Polymorphic recursion: every level instantiates deep with a bigger type,
+// so monomorphisation never ends. The compiler must stop with an error at the
+// call site instead of running forever.
+struct Box[T] { value: T }
+
+fn deep[T](x: T, n: int) -> int {
+    if n == 0 { return 0 }
+    return deep(Box{value: x}, n - 1) + 1
+}
+
+print(deep(1, 3))

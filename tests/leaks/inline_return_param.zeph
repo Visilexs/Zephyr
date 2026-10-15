@@ -1,0 +1,38 @@
+// Leak check: an -O2-inlined callee (function, method or interface method)
+// that returns its owned temporary argument on only some paths must not leak
+// it on the others. The live-object delta must not grow with iterations.
+struct Wrap { prefix: str }
+impl Wrap {
+    fn pick(self, text: str, keep: bool) -> str {
+        if keep { return text }
+        return self.prefix + text
+    }
+    fn choose(self, text: str, n: int) -> str {
+        if n % 2 == 0 { return text }
+        return text + self.prefix
+    }
+}
+interface Picker { fn choose(self, text: str, n: int) -> str }
+fn either(text: str, n: int) -> str {
+    if n % 3 == 0 { return text }
+    return "x" + text
+}
+var total = 0
+let w = Wrap{prefix: "p"}
+let picker: Picker = w
+fn body(i: int) {
+    total += either("{i}", i).len()
+    total += w.pick("{i}", i % 2 == 0).len()
+    total += picker.choose("{i}", i).len()
+}
+fn measure(n: int) -> int {
+    let before = runtimeLiveObjectCount()
+    for i in 0..n { body(i) }
+    return runtimeLiveObjectCount() - before
+}
+let warm = measure(20)
+let once = measure(100)
+let twice = measure(200)
+print("leak-delta", once, twice)
+assert(twice <= once, "live objects grow with iterations")
+print("ok")

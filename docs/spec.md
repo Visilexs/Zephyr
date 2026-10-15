@@ -426,7 +426,9 @@ Generics are monomorphised: each distinct set of type arguments compiles to its
 own copy of the body, type-checked with `T` bound. That checking is the whole
 contract — `contains` compiles `v == x` for the concrete `T`, so it works for
 `int`, `str` and enums, and is rejected for element types with no `==`. There is
-no trait system.
+no trait system. Because every instantiation is a separate copy, polymorphic
+recursion (a generic calling itself with a growing type such as `Box[T]`) is a
+compile error: instantiations may nest at most 64 deep.
 
 A generic function has no single type, so it cannot be used as a function value.
 
@@ -537,14 +539,22 @@ All other conversions are explicit via `expr as type`:
 | from \ to | int | float | str | bool |
 |-----------|-----|-------|-----|------|
 | **int**   | —   | exact | decimal | ✗ |
-| **float** | truncate toward zero | — | shortest decimal (`%.15g`) | ✗ |
+| **float** | truncate toward zero, saturating¹ | — | C's `%.15g` | ✗ |
 | **str**   | parse or panic | parse or panic | — | ✗ |
 | **bool**  | ✗   | ✗     | `"true"`/`"false"` | — |
 
 Lists and structs cannot be cast. `str` parses accept surrounding spaces and
-panic (§6) on any other malformed input.
+panic (§6) on any other malformed input; `str as int` also panics when the
+number does not fit in an int.
+
+¹ A float outside the int range converts to the nearest bound (`1e300 as int`
+is `INT_MAX`, `-1e300 as int` is `INT_MIN`), and NaN converts to 0.
 
 ### 3.3 Operators
+
+An expression may nest at most 2000 levels deep (operators, parentheses,
+calls and literals each count; a flat `a + b + c + ...` chain nests once per
+operator). Deeper expressions are a compile error.
 
 Expressions evaluate left to right: binary operands, call arguments, literal
 elements and fields (including map keys before their values), and the container
@@ -560,7 +570,8 @@ read of `x` precedes `e`; a field or indexed target is evaluated again for the
 subsequent store.
 
 - `+ - * / %`: numeric. Two ints yield int (`/` truncates toward zero; `/`
-  and `%` by zero panic). Any float operand yields float (`%` is not defined
+  and `%` by zero panic; int arithmetic wraps, so the one overflowing
+  quotient `INT_MIN / -1` is `INT_MIN` and `INT_MIN % -1` is 0). Any float operand yields float (`%` is not defined
   for floats). `+` on two strs concatenates.
 - `& | ^ << >>`: bitwise, int operands only, int result. `<<`/`>>` shift by
   the low 6 bits of the right operand; `>>` is arithmetic (sign-preserving).
@@ -899,7 +910,8 @@ The `--wasm` backend emits no counting and reclaims with the collector alone.
 ## 5. Formatting
 
 `print`, interpolation, and `as str` format values as: ints in decimal;
-floats with `%.15g` (`5.0` prints as `5`); bools as `true`/`false`; strs
+floats like C's `%.15g` (`5.0` prints as `5`, `1e20` as `1e+20`, `1e-7` as
+`1e-07`, `-0.0` as `-0`, and NaN/infinity as `nan`, `inf`, `-inf`); bools as `true`/`false`; strs
 verbatim (but quoted, with `\" \\ \n \t` escaped, when nested inside a list
 or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 

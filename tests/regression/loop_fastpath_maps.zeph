@@ -1,0 +1,28 @@
+// The fill (L[i] = K) and weighted-reduction (acc += L[i] * i) loop fast
+// paths must only fire on plain [int]/[float] lists, never on maps or packed
+// lists (they used to read and write the map's internals on Linux).
+var m: [int: int] = [:]
+for i in 0..10 { m[i] = i + 1 }
+for i in 0..10 { m[i] = 7 }
+var total = 0
+for i in 0..10 { total += m[i] }
+print(total, m.len())
+
+var w: [int: int] = [:]
+for i in 0..8 { w[i] = i }
+var acc = 0
+for i in 0..8 { acc = acc + w[i] * i }
+print(acc)
+
+var bytes: [u8] = zeros(16) as [u8]
+for i in 0..16 { bytes[i] = 3 }
+var byteSum = 0
+for i in 0..16 { byteSum = byteSum + bytes[i] * i }
+print(byteSum, bytes.len())
+
+var ints: [int] = []
+for i in 0..20 { ints.push(i) }
+for i in 2..18 { ints[i] = 5 }
+var weighted = 0
+for i in 0..20 { weighted = weighted + ints[i] * i }
+print(weighted)

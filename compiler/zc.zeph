@@ -369,6 +369,12 @@ var dispatchInterfaceIndices: [int] = []
 var instantiationKeys: [str] = []
 var instantiationFunctionIndices: [int] = []
 var pendingInstantiations: [Instantiation] = []
+// polymorphic-recursion guard: how deep each instance sits in the chain of
+// instantiations that created it (an instance queued while checking another
+// is one deeper), and the depth of the body being checked right now
+var instantiationDepths: [int: int] = [:]
+var currentInstantiationDepth = 0
+let maximumInstantiationDepth = 64
 var instantiatedFunctions: [int] = []          // functionDefinitions indices to code-generate after program.children
 var typeBindingNames: [str] = []
 var typeBindingTypes: [int] = []
@@ -2047,7 +2053,21 @@ fn binaryPrecedence(tokenKind: int) -> int {
     return 0
 }
 
+// Expression nesting limit: see checkExpressionNesting.
+let maximumExpressionNesting = 2000
+var parseExpressionNesting = 0
+
 fn parseExpression(minimumPrecedence: int) -> Node {
+    parseExpressionNesting += 1                  // parentheses, calls, literals and precedence levels recurse
+    if parseExpressionNesting > maximumExpressionNesting {
+        failCompilation(peek().line, "expression nested too deeply (more than {maximumExpressionNesting} levels); split it into several statements")
+    }
+    let parsed = parseExpressionNested(minimumPrecedence)
+    parseExpressionNesting -= 1
+    return parsed
+}
+
+fn parseExpressionNested(minimumPrecedence: int) -> Node {
     var leftHandSide = parseUnary()
     var lastComparison = makeNode(nodeNone, 0)   // the comparison just parsed, for chaining
     var going = true
@@ -2463,7 +2483,34 @@ fn parse(tokens: [Token]) -> Node {
         else { pushStatement(program, parseStatement()) }
         terminator()
     }
+    checkExpressionNesting(program)
     return program
+}
+
+// Every pass walks expressions recursively, so a tree nested deeper than this
+// would overflow the compiler's stack (left-assoc chains such as a + b + ...
+// need no parser recursion to get deep). Statement nesting (else-if chains,
+// blocks) costs little stack and is not counted. Iterative, so the check
+// itself cannot overflow.
+
+fn checkExpressionNesting(root: Node) {
+    var nodes: [Node] = [root]
+    var depths: [int] = [0]
+    while nodes.len() > 0 {
+        let node = nodes.pop()
+        var depth = depths.pop()
+        let kind = node.nodeKind
+        if kind != nodeProgram and kind != nodeIf and kind != nodeOptionalBinding and kind != nodeFunction and kind != nodeImpl {
+            depth += 1
+            if depth > maximumExpressionNesting {
+                failCompilation(node.line, "expression nested too deeply (more than {maximumExpressionNesting} levels); split it into several statements")
+            }
+        }
+        for child in node.children {
+            nodes.push(child)
+            depths.push(depth)
+        }
+    }
 }
 
 // ---------------- types ----------------
@@ -3900,7 +3947,7 @@ fn unifyTypeParameters(typeExpression: Node, actualType: int, typeParameters: [s
 // Get (or create) the monomorphisation of generic fi for these bindings.
 // Every value is 64 bits, so an instantiation is just the body re-checked with
 // T bound -- which also gives each one the right ==, <, and print for its T.
-fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
+fn instantiate(functionIndex: int, names: [str], types: [int], line: int) -> int {
     let functionDefinition = functionDefinitions[functionIndex]
     var keyParts: [str] = []
     keyParts.push(functionDefinition.name)
@@ -3911,6 +3958,9 @@ fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
     let instantiationKey = keyParts.join()
     for i in 0..instantiationKeys.len() {
         if instantiationKeys[i] == instantiationKey { return instantiationFunctionIndices[i] }
+    }
+    if currentInstantiationDepth >= maximumInstantiationDepth {
+        failCompilation(line, "polymorphic recursion: instantiating '{functionDefinition.name}' exceeds the generic instantiation depth limit of {maximumInstantiationDepth} (a generic function calls itself with an ever-growing type)")
     }
     for i in 0..names.len() {                    // bind, resolve the signature
         typeBindingNames.push(names[i])
@@ -3939,6 +3989,7 @@ fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
     instantiationKeys.push(instantiationKey)                        // cache before checking, so a
     instantiationFunctionIndices.push(instanceIndex)                         // recursive generic terminates
     instantiatedFunctions.push(instanceIndex)
+    instantiationDepths[instanceIndex] = currentInstantiationDepth + 1
     pendingInstantiations.push(Instantiation{functionIndex: instanceIndex, typeParameterNames: names, typeArguments: types})
     return instanceIndex
 }
@@ -3975,7 +4026,7 @@ fn checkGenericCall(expression: Node, functionIndex: int, receiver: Node) -> int
             if names[j] == typeParameter { orderedTypes.push(types[j]) }
         }
     }
-    let instanceIndex = instantiate(functionIndex, functionDefinition.typeParameters, orderedTypes)
+    let instanceIndex = instantiate(functionIndex, functionDefinition.typeParameters, orderedTypes, expression.line)
     let instantiatedFunction = functionDefinitions[instanceIndex]
     if receiver.nodeKind != nodeNone {
         expression.children[0].children[0] = coerce(receiver, instantiatedFunction.parameterTypes[0], "argument 1")
@@ -5993,7 +6044,9 @@ fn drainPending() {
             typeBindingNames.push(instance.typeParameterNames[i])
             typeBindingTypes.push(instance.typeArguments[i])
         }
+        currentInstantiationDepth = instantiationDepths[instance.functionIndex]
         checkFunctionBody(functionDefinitions[instance.functionIndex])
+        currentInstantiationDepth = 0
         for i in 0..instance.typeParameterNames.len() {
             let poppedName = typeBindingNames.pop()
             let poppedType = typeBindingTypes.pop()
@@ -6347,7 +6400,7 @@ fn moveScan(expression: Node, depth: int) {
     }
     if expression.nodeKind == nodeInline and expression.slot < declarationLoopDepths.len() { declarationLoopDepths[expression.slot] = depth }
     if expression.nodeKind == nodeWhile {
-        moveScan(expression.children[0], depth)
+        moveScan(expression.children[0], depth + 1)       // the condition runs every iteration
         moveScan(expression.children[1], depth + 1)
         return
     }
@@ -6695,6 +6748,7 @@ fn cloneInlineNode(node: Node, parameterBase: int, localBase: int, resultSlot: i
     copy.auxiliary = node.auxiliary
     copy.referenceIndex = node.referenceIndex
     copy.isMutable = node.isMutable
+    copy.file = node.file    // panic sites keep the inlined callee's file
     if node.nodeKind == nodeIdentifier and node.auxiliary == identifierKindParameter and node.slot < inlineSubstitutions.len() and inlineSubstitutions[node.slot].nodeKind != nodeNone {
         return cloneNode(inlineSubstitutions[node.slot])      // argument substituted in place
     }
@@ -7037,10 +7091,11 @@ fn constantFoldEval(expression: Node) -> Node {
             else if operator == tokenStar { value = leftOperand.integerValue * rightOperand.integerValue }
             else if operator == tokenSlash {
                 if rightOperand.integerValue == 0 { return makeNode(nodeNone, expression.line) }
-                value = leftOperand.integerValue / rightOperand.integerValue
+                if rightOperand.integerValue == 0 - 1 { value = 0 - leftOperand.integerValue }      // wraps: INT_MIN / -1 = INT_MIN
+                else { value = leftOperand.integerValue / rightOperand.integerValue }
             } else if operator == tokenPercent {
                 if rightOperand.integerValue == 0 { return makeNode(nodeNone, expression.line) }
-                value = leftOperand.integerValue % rightOperand.integerValue
+                if rightOperand.integerValue != 0 - 1 { value = leftOperand.integerValue % rightOperand.integerValue }   // x % -1 = 0
             } else { return makeNode(nodeNone, expression.line) }
             var folded = makeNode(nodeInteger, expression.line)
             folded.integerValue = value
@@ -7105,6 +7160,11 @@ fn nodeBecome(expression: Node, source: Node) {
     expression.children = source.children
 }
 
+fn foldLeaf(expression: Node) -> bool {
+    let kind = expression.nodeKind
+    return kind == nodeInteger or kind == nodeFloat or kind == nodeBoolean or kind == nodeIdentifier
+}
+
 fn foldConstants(expression: Node) {
     for i in 0..expression.children.len() { foldConstants(expression.children[i]) }
     // `and`/`or` with a literal side: true-and-X is X, X-and-true is X (X is
@@ -7124,6 +7184,11 @@ fn foldConstants(expression: Node) {
         }
     }
     if expression.nodeKind != nodeBinary and expression.nodeKind != nodeNegate and expression.nodeKind != nodeCast and expression.nodeKind != nodeNot { return }
+    // The children are folded already: an operand that is still an operator
+    // node did not fold, so neither can this one. Checking that here keeps the
+    // pass linear (constantFoldEval re-walks the whole subtree).
+    if expression.children.len() > 0 and not foldLeaf(expression.children[0]) { return }
+    if expression.nodeKind == nodeBinary and not foldLeaf(expression.children[1]) { return }
     let folded = constantFoldEval(expression)
     if folded.nodeKind != nodeInteger and folded.nodeKind != nodeFloat and folded.nodeKind != nodeBoolean { return }
     expression.nodeKind = folded.nodeKind
@@ -8307,6 +8372,44 @@ fn divideConstantOk(divisor: Node) -> bool {
     return divisor.nodeKind == nodeInteger and divisor.integerValue >= 2 and divisor.integerValue <= 2147483647
 }
 
+// After cvttsd2si: x86 gives INT_MIN for NaN and out-of-range values.
+// Saturate instead (NaN -> 0, too large -> INT_MAX, too small -> INT_MIN),
+// using only the target register. `cmp target, 1` overflows only on INT_MIN.
+fn emitSaturateFloatToInteger(target: str, source: str) {
+    let doneLabel = allocateLabel()
+    let nanLabel = allocateLabel()
+    emitInstruction("cmp {target}, 1")
+    emitInstruction("jno {labelText(doneLabel)}")
+    emitInstruction("ucomisd {source}, {source}")
+    emitInstruction("jp {labelText(nanLabel)}")
+    emitInstruction("movq {target}, {source}")
+    emitInstruction("test {target}, {target}")
+    emitInstruction("movabs {target}, 9223372036854775807")
+    emitInstruction("jns {labelText(doneLabel)}")
+    emitInstruction("add {target}, 1")                  // INT_MAX + 1 wraps to INT_MIN
+    emitInstruction("jmp {labelText(doneLabel)}")
+    emitLabel(nanLabel)
+    emitInstruction("xor {target}, {target}")
+    emitLabel(doneLabel)
+}
+
+// rdx:rax = rax / rcx (quotient in rax, remainder in rdx). A divisor of -1
+// skips idiv, which traps on INT_MIN / -1: the result wraps (INT_MIN), and
+// the remainder is 0.
+fn emitSignedDivide() {
+    let divideLabel = allocateLabel()
+    let doneLabel = allocateLabel()
+    emitInstruction("cmp rcx, -1")
+    emitInstruction("jne {labelText(divideLabel)}")
+    emitInstruction("neg rax")
+    emitInstruction("xor edx, edx")
+    emitInstruction("jmp {labelText(doneLabel)}")
+    emitLabel(divideLabel)
+    emitInstruction("cqo")
+    emitInstruction("idiv rcx")
+    emitLabel(doneLabel)
+}
+
 fn generateDivideConstant(expression: Node) {
     let divisor = expression.children[1].integerValue
     var shiftAmount = 0
@@ -8349,8 +8452,7 @@ fn generateDivideConstant(expression: Node) {
     emitInstruction("jmp {labelText(doneLabel)}")
     emitLabel(slowPathLabel)
     emitInstruction("mov rcx, {divisor}")
-    emitInstruction("cqo")
-    emitInstruction("idiv rcx")
+    emitSignedDivide()
     if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
     emitLabel(doneLabel)
 }
@@ -8371,8 +8473,7 @@ fn generateDivideFast(expression: Node) {
     if remainderRegister == "" {
         generateIntegerOperands(expression.children[0], expression.children[1])
         generateZeroCheck(expression)
-        emitInstruction("cqo")
-        emitInstruction("idiv rcx")
+        emitSignedDivide()
         if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
         return
     }
@@ -8400,8 +8501,7 @@ fn generateDivideFast(expression: Node) {
     emitLabel(slowPathLabel)
     generateLeaf("rcx", expression.children[1])    // divisor is a leaf by construction
     generateZeroCheck(expression)
-    emitInstruction("cqo")
-    emitInstruction("idiv rcx")
+    emitSignedDivide()
     if expression.operator == tokenPercent { emitInstruction("mov rax, rdx") }
     emitLabel(doneLabel)
 }
@@ -8964,8 +9064,7 @@ fn generateBinaryOperator(expression: Node) {
     }
     if operator == tokenSlash or operator == tokenPercent {
         generateZeroCheck(expression)
-        emitInstruction("cqo")
-        emitInstruction("idiv rcx")
+        emitSignedDivide()
         if operator == tokenPercent { emitInstruction("mov rax, rdx") }
         return
     }
@@ -10562,6 +10661,7 @@ fn generateExpression(expression: Node) {
         } else if castKind == castKindTruncate {
             emitInstruction("movq xmm0, rax")
             emitInstruction("cvttsd2si rax, xmm0")
+            emitSaturateFloatToInteger("rax", "xmm0")
         } else if castKind == castKindToString {
             emitInstruction("mov rcx, rax")
             emitInstruction("lea rdx, [rip + __td{expression.slot}]")
@@ -10724,10 +10824,12 @@ fn tryFill(statement: Node, returnLabel: int) -> bool {
     let value = assignment.children[1]
     if not isLeaf(value) or usesLocal(value, loopSlot) { return false }
     let targetList = target.children[0]
-    if macosTargetEnabled {
-        if typeKinds[targetList.typeIndex] != kindList or typeKinds[typeElementIds[targetList.typeIndex]] != kindInteger { return false }
-        if not nativeAxpyPure(statement.children[0]) or not nativeAxpyPure(statement.children[1]) { return false }
-    }
+    // Every target: the kernel writes raw 8-byte cells, so only a plain
+    // [int] or [float] (never a map or a packed list).
+    if typeKinds[targetList.typeIndex] != kindList { return false }
+    let fillElementKind = typeKinds[typeElementIds[targetList.typeIndex]]
+    if fillElementKind != kindInteger and fillElementKind != kindFloat { return false }
+    if not nativeAxpyPure(statement.children[0]) or not nativeAxpyPure(statement.children[1]) { return false }
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
     let scalarLoopLabel = allocateLabel()
@@ -10811,7 +10913,7 @@ fn tryReduce(statement: Node, returnLabel: int) -> bool {
     let innerIndexExpression = indexNode.children[1]
     if innerIndexExpression.nodeKind != nodeIdentifier or innerIndexExpression.auxiliary != identifierKindLocal or innerIndexExpression.slot != loopSlot { return false }  // L[i]
     let sourceList = indexNode.children[0]
-    if macosTargetEnabled and not nativeReduceInputsSafe(sourceList, statement.children[0], statement.children[1]) { return false }
+    if not nativeReduceInputsSafe(sourceList, statement.children[0], statement.children[1]) { return false }
     let accumulatorAddress = slotAddress(accumulator.auxiliary, accumulator.slot)
     let loopVariableAddress = slotAddress(identifierKindLocal, loopSlot)
     let scalarLabel = allocateLabel()
@@ -12308,7 +12410,7 @@ let assemblyMnemonics: [str: int] = [
     "cvtsd2ss": 44, "cvtss2sd": 45, "addss": 46, "subss": 47, "mulss": 48, "divss": 49, "movss": 50,
     "je": 104, "jne": 105, "jl": 112, "jle": 114, "jg": 115, "jge": 113,
     "ja": 107, "jae": 103, "jb": 102, "jbe": 106, "jp": 110, "jnp": 111,
-    "js": 108, "jns": 109,
+    "js": 108, "jns": 109, "jo": 100, "jno": 101,
     "sete": 204, "setne": 205, "setl": 212, "setle": 214, "setg": 215, "setge": 213,
     "seta": 207, "setae": 203, "setb": 202, "setbe": 206, "setp": 210, "setnp": 211,
     "sets": 208, "setns": 209
@@ -20146,7 +20248,8 @@ fn emitWasmCast(expression: Node) {
     }
     if castKind == castKindTruncate {
         wasmFunctionBody.push(191)                         // f64.reinterpret_i64
-        wasmFunctionBody.push(176)                         // i64.trunc_f64_s
+        wasmFunctionBody.push(252)                         // i64.trunc_sat_f64_s (saturating)
+        wasmFunctionBody.push(7)
         return
     }
     if castKind != castKindNoOperation { failCompilation(expression.line, "--wasm: unsupported cast kind {castKind}") }

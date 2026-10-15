@@ -1433,11 +1433,22 @@ fn isPendingTemporary(value: int) -> bool {
 
 // a count for a value about to be stored where it is owned: a pending
 // temporary hands its own over, anything else is retained; returns the owned value
+//
+// Only a temporary of the current inline region can hand its count over. One
+// pending from outside (an owned argument of an inlined call) is released by
+// the caller's statement on every path, so a return that consumed it on just
+// one path leaked it on the others: retain instead.
 fn takeOwnership(value: int) -> int {
+    var floor = 0
+    if inlineStack.len() > 0 { floor = regionReturnTemporaryMark }
+    if regionInlineTemporaryMarks.len() > 0 and regionInlineTemporaryMarks[regionInlineTemporaryMarks.len() - 1] > floor {
+        floor = regionInlineTemporaryMarks[regionInlineTemporaryMarks.len() - 1]
+    }
     var remaining: [int] = []
     var found = false
-    for pending in pendingTemporaries {
-        if pending == value and not found { found = true }
+    for i in 0..pendingTemporaries.len() {
+        let pending = pendingTemporaries[i]
+        if pending == value and not found and i >= floor { found = true }
         else { remaining.push(pending) }
     }
     pendingTemporaries = remaining
@@ -4649,6 +4660,22 @@ var savedIntegerRegisters: [int] = []
 var savedFloatRegisters: [int] = []
 var currentOrderPosition = 0
 
+// rax / divisor (quotient rax, remainder rdx); a divisor of -1 wraps instead
+// of trapping: INT_MIN / -1 = INT_MIN, x % -1 = 0.
+fn emitOptimizedSignedDivide(divisor: str) {
+    let divideLabel = allocateLabel()
+    let doneLabel = allocateLabel()
+    emitOptimized("cmp {divisor}, -1")
+    emitOptimized("jne .L{divideLabel}")
+    emitOptimized("neg rax")
+    emitOptimized("xor edx, edx")
+    emitOptimized("jmp .L{doneLabel}")
+    optimizerLines.push(".L{divideLabel}:\n")
+    emitOptimized("cqo")
+    emitOptimized("idiv {divisor}")
+    optimizerLines.push(".L{doneLabel}:\n")
+}
+
 fn emitOptimized(text: str) { optimizerLines.push("  " + text + "\n") }
 fn emitCold(text: str) { optimizerColdLines.push("  " + text + "\n") }
 
@@ -5289,10 +5316,9 @@ fn emitInstructionFor(value: int) {
         return
     }
     if opcode == irDivide or opcode == irModulo {
-        let divisor = integerIn(operands[1], "rcx")
         emitOptimized("mov rax, {locationOf(operands[0])}")
-        emitOptimized("cqo")
-        emitOptimized("idiv {divisor}")
+        let divisor = integerIn(operands[1], "rcx")
+        emitOptimizedSignedDivide(divisor)
         if opcode == irDivide { finishResult(value, "rax") }
         else { finishResult(value, "rdx") }
         return
@@ -5420,6 +5446,22 @@ fn emitInstructionFor(value: int) {
         let source = floatIn(operands[0], "xmm0")
         let target = resultRegister(value, "rax")
         emitOptimized("cvttsd2si {target}, {source}")
+        // saturate like the baseline (emitSaturateFloatToInteger): NaN -> 0
+        let doneLabel = allocateLabel()
+        let nanLabel = allocateLabel()
+        emitOptimized("cmp {target}, 1")
+        emitOptimized("jno .L{doneLabel}")
+        emitOptimized("ucomisd {source}, {source}")
+        emitOptimized("jp .L{nanLabel}")
+        emitOptimized("movq {target}, {source}")
+        emitOptimized("test {target}, {target}")
+        emitOptimized("movabs {target}, 9223372036854775807")
+        emitOptimized("jns .L{doneLabel}")
+        emitOptimized("add {target}, 1")
+        emitOptimized("jmp .L{doneLabel}")
+        optimizerLines.push(".L{nanLabel}:\n")
+        emitOptimized("xor {target}, {target}")
+        optimizerLines.push(".L{doneLabel}:\n")
         finishResult(value, target)
         return
     }
@@ -5647,8 +5689,7 @@ fn emitInstructionFor(value: int) {
         emitOptimized("jmp .L{doneLabel}")
         optimizerLines.push(".L{slowLabel}:\n")
         emitOptimized("mov rcx, {divisor}")
-        emitOptimized("cqo")
-        emitOptimized("idiv rcx")
+        emitOptimizedSignedDivide("rcx")
         if opcode == irModuloByInvariant { emitOptimized("mov rax, rdx") }
         optimizerLines.push(".L{doneLabel}:\n")
         finishResult(value, "rax")
