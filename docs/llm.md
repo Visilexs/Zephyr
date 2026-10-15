@@ -89,7 +89,9 @@ print(size, total)
 | `T?` | `none`, or any T | optional |
 | `(A, B)` | `(1, "x")` | tuple, read with `.0`, `.1` |
 | `fn(A) -> R` | `fn(x: int) -> int { return x }` | function value / closure |
-| `[u8]`, `[f32]` | `"abc" as [u8]` | packed numeric buffers |
+| `[u8]`, `[f32]` | `"abc" as [u8]` | packed numeric buffers (elements read as int / float) |
+| `i8 i16 i32 u8 u16 u32 u64` | `let b: u8 = 255` | sized ints: wrap at their width, never mix with `int` |
+| `f32` | `let h: f32 = 0.5` | single precision; `i64` = `int`, `f64` = `float` |
 
 ```zephyr
 let xs: [int] = []                 // empty literals need a type
@@ -103,6 +105,27 @@ let t = (1, "one")
 let (num, word) = t                // destructuring
 print(xs.len(), n, f, s, num, word, t.1)
 ```
+
+## Sized scalars
+
+```zephyr
+var b: u8 = 250
+b += 10                          // wraps at 8 bits: 4
+let n = b as int + 1000          // no implicit widening: convert with `as`
+let small = 300 as u8            // int -> u8 truncates: 44
+let big: u64 = 0xFFFFFFFFFFFFFFFF   // u64 literals above int's range: hex
+print(b, n, small, big, big / 3, big > 1)   // u64 compares, divides, shifts unsigned
+let x: f32 = 0.1                 // rounded to single after every operation
+print(x * 3, x as float, 2.9 as u8, -1.0 as u32)   // float -> int saturates: 2 0
+let words: [u16] = [1, 2, 65535] // literals adopt the expected type (a range error otherwise)
+print(words, -(128 as i8))
+```
+
+- `u8 + int` is a compile error: both operands must have the same type
+  (literals adapt). A sized value passed where an `int` is expected needs
+  `as int`. `abs/min/max/pow/sqrt` take only int/float.
+- `[u8]` written as a type is the packed list; its elements still read as
+  `int`. `for v in bytes { total += v as u32 }`.
 
 ## Structs, enums, methods, interfaces
 
@@ -302,10 +325,11 @@ t.join()
 import "std/bytes.zeph"
 
 extern fn hypot(x: float, y: float) -> float from "libm.so.6"   // Linux: dlopen + dlsym
+extern fn sqrtf(x: f32) -> f32 from "libm.so.6"                  // C float: f32
 extern fn strlen(text: int) -> int from "libc.so.6"
 
 let message = cString("hello")           // NUL-terminated off-heap copy
-print(hypot(3.0, 4.0), strlen(message.addr()))
+print(hypot(3.0, 4.0), strlen(message.addr()), sqrtf(2))
 let buffer = Bytes.new(16)
 buffer.put32(0, 1234)
 buffer.putFloat64(8, 2.5)
@@ -314,9 +338,32 @@ let pid = syscall(39)                     // raw Linux syscall (getpid)
 print(pid > 0)
 ```
 
-Parameters of `extern fn` are `int` (integers, pointers) or `float` (C
-`double`); the result is `int`, `i32`, `bool`, `float` or nothing. Pass
-structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
+Parameters of `extern fn` are `int` (integers, pointers), `float` (C
+`double`), `bool` or a sized scalar (`u8`..`u64`, `i8`..`i64`, `f32` for a C
+`float`); the result is any of those or nothing. Exception kept for old code:
+`-> i32` returns an `int`. Pass structs by pointer into `Bytes` memory.
+
+C structs: declare them `@C` and copy them in and out of memory. Fields are
+sized scalars, `int`, `float`, `bool`, other `@C` structs and fixed arrays
+`[T; N]` (only allowed in `@C` structs). `addr(s)` of the struct itself is
+not C-laid-out: always go through `storeStruct` into a `Bytes`.
+
+```zephyr
+import "std/bytes.zeph"
+
+@C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+@C(packed) struct Wire { tag: u8, length: u32 }          // no padding
+@C struct Entry { name: [u8; 4], header: Header, scale: f32, live: bool }
+
+print(sizeOf[Header](), offsetOf[Header]("size"), sizeOf[Wire](), sizeOf[Entry]())   // 16 8 5 32
+let buffer = Bytes.new(64)
+let h = Header{magic: 0xCAFEBABE, version: 1, flags: 0, size: 4096}
+storeStruct(buffer, 0, h)                  // bounds-checked copy out (raw: storeStruct(address, h))
+let copy = loadStruct[Header](buffer, 0)   // a new struct (raw: loadStruct[Header](address))
+copy.version += 1                           // memory is unchanged until stored again
+storeStruct(buffer, 16, Entry{name: [104, 105, 0, 0], header: copy, scale: 0.5, live: true})
+print(buffer.get32(0), loadStruct[Entry](buffer, 16).header.version)
+``` `load64/store64/load8/store8`,
 `addr(x)` and `callPointer` bypass every safety guarantee.
 
 ## Standard library (import "std/NAME.zeph")
@@ -401,7 +448,8 @@ structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
 | `len(xs)`, `xs.length` | `xs.len()` |
 | `str(x)`, `x.toString()` | `x as str` or `"{x}"` |
 | `int("4")` | `"4" as int`, or `parseInt("4")` (std/string) for an `int?` |
-| `string`, `i64`, `double` | `str`, `int`, `float` |
+| `string`, `long`, `double` | `str`, `int` (= `i64`), `float` (= `f64`) |
+| `let x: u8 = 3; x + y` with `y: int` | `x + (y as u8)` or `(x as int) + y` |
 | `cond ? a : b` | `if cond { a } else { b }` |
 | `match x { 1 => ... }` | `match x { 1 { ... } else { ... } }` |
 | `for (i = 0; i < n; i++)` | `for i in 0..n { ... }` |

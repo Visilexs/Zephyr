@@ -1,0 +1,41 @@
+// @C structs: layout builtins and copies through raw memory and Bytes
+// (spec 3.0.0.5). tests/c_layout checks the layouts against gcc.
+import "std/bytes.zeph"
+
+@C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+@C struct Mixed { tag: u8, value: f64, small: i16, ok: bool, ratio: f32, inner: Header, name: [u8; 5], count: i32 }
+@C(packed) struct Packed { tag: u8, value: u32, more: u16 }
+@C struct Arr { xs: [i16; 3], fs: [f32; 2], hs: [Header; 2] }
+
+print(sizeOf[Header](), offsetOf[Header]("size"), sizeOf[Mixed](), offsetOf[Mixed]("inner"), offsetOf[Mixed]("name"), offsetOf[Mixed]("count"))
+print(sizeOf[Packed](), offsetOf[Packed]("more"), sizeOf[u16](), sizeOf[Arr]())
+let buffer = Bytes.new(256)
+let h = Header{magic: 0xCAFEBABE, version: 2, flags: 0xFFFF, size: 0xFFFFFFFFFFFFFFFF}
+storeStruct(buffer.addr(), h)
+print(buffer.get32(0), buffer.get16(4), buffer.get16(6), buffer.get64(8))
+let back = loadStruct[Header](buffer.addr())
+print(back, back == h)
+let m = Mixed{tag: 7, value: 2.5, small: -2, ok: true, ratio: 0.1, inner: h, name: [104, 105, 0, 0, 0], count: -100000}
+storeStruct(buffer, 16, m)
+let m2 = loadStruct[Mixed](buffer, 16)
+print(m2)
+let p = Packed{tag: 1, value: 0x01020304, more: 0xBEEF}
+storeStruct(buffer, 0, p)
+print(buffer.get8(0), buffer.get8(1), buffer.get8(4), buffer.get16(5), loadStruct[Packed](buffer, 0))
+let a = Arr{xs: [-1, 2, -3], fs: [0.5, 1.25], hs: [h, back]}
+storeStruct(buffer, 100, a)
+print(loadStruct[Arr](buffer, 100))
+
+// every field width, read back byte by byte from the raw copy
+@C struct Widths { a: i8, b: u8, c: i16, d: u16, e: i32, f: u32, g: i64, h: u64, x: f32, y: f64, z: bool }
+let w = Widths{a: -1, b: 255, c: -2, d: 65534, e: -3, f: 4294967293, g: -4, h: 0xFFFFFFFFFFFFFFFC, x: -0.75, y: 1.0e300, z: true}
+let raw = Bytes.new(sizeOf[Widths]())
+storeStruct(raw, 0, w)
+var dump: [int] = []
+for i in 0..sizeOf[Widths]() { dump.push(raw.get8(i)) }
+print(sizeOf[Widths](), dump)
+print(loadStruct[Widths](raw.addr()), loadStruct[Widths](raw, 0) == w)
+// copy semantics: changing the copy leaves memory alone
+let copy = loadStruct[Header](buffer.addr() + 100)
+copy.version = 9
+print(loadStruct[Header](buffer.addr() + 100).version, copy.version)

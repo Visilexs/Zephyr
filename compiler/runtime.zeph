@@ -2005,7 +2005,7 @@ fn runtimeKeyEquals(mapAddress: int, leftValue: int, rightValue: int) -> int {
 fn runtimeValueEquals(leftValue: int, rightValue: int, typeDescriptor: int) -> int {
     let kind = load64(typeDescriptor)
     if kind == 3 { return runtimeStringsEqual(leftValue, rightValue) }
-    if kind == 1 {
+    if kind == 1 or kind == 13 {          // float, f32
         if floatFromBits(leftValue) == floatFromBits(rightValue) { return 1 }
         return 0
     }
@@ -3462,6 +3462,15 @@ fn runtimeFormatValueIntoBuilder(value: int, typeDescriptor: int, representation
             index += 1
         }
         runtimeAppendStringBuilderByte(93)
+    } else if kind == 12 {                // u64: the 64 bits as an unsigned decimal
+        if value >= 0 { runtimeAppendStringBuilderInteger(value) }
+        else {
+            let quotient = ((value >> 1) & 9223372036854775807) / 5       // value / 10, unsigned
+            runtimeAppendStringBuilderInteger(quotient)
+            runtimeAppendStringBuilderByte(48 + (value - quotient * 10))
+        }
+    } else if kind == 13 {                // f32: 7 significant digits
+        runtimeAppendStringBuilderFloatDigits(value, 7)
     } else {
         runtimeAppendStringBuilderFloat(value)
     }
@@ -3488,7 +3497,10 @@ fn runtimeBigMultiplySmall(limbs: [int], factor: int) {
 // trailing zeros trimmed, exponent form (1e+20, 2.5e-07) when the decimal
 // exponent is below -4 or at least 15. -0.0 prints as -0; NaN and the
 // infinities print as nan, inf and -inf.
-fn runtimeAppendStringBuilderFloat(bitPattern: int) {
+fn runtimeAppendStringBuilderFloat(bitPattern: int) { runtimeAppendStringBuilderFloatDigits(bitPattern, 15) }
+
+// The same with `precision` significant digits (15 for float, 7 for f32).
+fn runtimeAppendStringBuilderFloatDigits(bitPattern: int, precision: int) {
     let exponentBits = (bitPattern >> 52) & 2047
     var mantissa = bitPattern & 4503599627370495         // low 52 bits
     if exponentBits == 2047 and mantissa != 0 {          // NaN
@@ -3569,23 +3581,23 @@ fn runtimeAppendStringBuilderFloat(bitPattern: int) {
         limbIndex -= 1
     }
     var decimalExponent = digits.len() - 1 - fractionDigitCount
-    // round to 15 significant digits, ties to even
+    // round to `precision` significant digits, ties to even
     var significant: [int] = []
     var index = 0
-    while index < 15 {
+    while index < precision {
         if index < digits.len() { significant.push(digits[index]) } else { significant.push(0) }
         index += 1
     }
-    if digits.len() > 15 {
-        let nextDigit = digits[15]
+    if digits.len() > precision {
+        let nextDigit = digits[precision]
         var restNonzero = false
-        var restIndex = 16
+        var restIndex = precision + 1
         while restIndex < digits.len() and not restNonzero {
             if digits[restIndex] != 0 { restNonzero = true }
             restIndex += 1
         }
-        if nextDigit > 5 or (nextDigit == 5 and (restNonzero or significant[14] % 2 == 1)) {
-            var carryIndex = 14
+        if nextDigit > 5 or (nextDigit == 5 and (restNonzero or significant[precision - 1] % 2 == 1)) {
+            var carryIndex = precision - 1
             var carrying = true
             while carrying and carryIndex >= 0 {
                 if significant[carryIndex] == 9 {
@@ -3602,9 +3614,9 @@ fn runtimeAppendStringBuilderFloat(bitPattern: int) {
             }
         }
     }
-    var digitCount = 15                                  // trim trailing zeros
+    var digitCount = precision                                  // trim trailing zeros
     while digitCount > 1 and significant[digitCount - 1] == 0 { digitCount -= 1 }
-    if decimalExponent < 0 - 4 or decimalExponent >= 15 {
+    if decimalExponent < 0 - 4 or decimalExponent >= precision {
         runtimeAppendStringBuilderByte(48 + significant[0])
         if digitCount > 1 {
             runtimeAppendStringBuilderByte(46)
@@ -3839,4 +3851,57 @@ fn runtimeSubstringFromCheckedBounds(stringAddress: int, lowerBound: int, upperB
     let result = runtimeAllocateString(upperBound - lowerBound)
     runtimeCopyMemory(result + 8, stringAddress + 8 + lowerBound, upperBound - lowerBound)
     return result
+}
+
+// ---- sized scalars (spec 3.0.0.4): the u64 operations and conversions the
+// code generator has no instruction for. Floats travel as their bit patterns.
+fn runtimeUnsignedLess(left: int, right: int) -> bool {
+    return (left ^ (0 - 9223372036854775807 - 1)) < (right ^ (0 - 9223372036854775807 - 1))
+}
+
+fn runtimeUnsignedDivide(dividend: int, divisor: int, site: str) -> int {
+    if divisor == 0 { runtimeFailPackedAccess(site, "division by zero") }
+    if divisor < 0 {                                   // divisor >= 2^63: the quotient is 0 or 1
+        if runtimeUnsignedLess(dividend, divisor) { return 0 }
+        return 1
+    }
+    if dividend >= 0 { return dividend / divisor }
+    var quotient = (((dividend >> 1) & 9223372036854775807) / divisor) << 1
+    let remainder = dividend - quotient * divisor
+    if not runtimeUnsignedLess(remainder, divisor) { quotient += 1 }
+    return quotient
+}
+
+fn runtimeUnsignedRemainder(dividend: int, divisor: int, site: str) -> int {
+    if divisor == 0 { runtimeFailPackedAccess(site, "modulo by zero") }
+    return dividend - runtimeUnsignedDivide(dividend, divisor, site) * divisor
+}
+
+fn runtimeUnsignedShiftRight(value: int, count: int) -> int {
+    let shift = count & 63
+    if shift == 0 { return value }
+    return (value >> shift) & (9223372036854775807 >> (shift - 1))
+}
+
+// u64 -> float bits, rounded to nearest like cvtsi2sd on the unsigned value
+fn runtimeUnsignedToFloat(value: int) -> int {
+    if value >= 0 { return bits(value as float) }
+    let halved = ((value >> 1) & 9223372036854775807) | (value & 1)   // keep the sticky bit
+    let half = halved as float
+    return bits(half + half)
+}
+
+// float bits -> u64: truncate toward zero, saturating at 0 and 2^64 - 1 (NaN -> 0)
+fn runtimeFloatToUnsigned(valueBits: int) -> int {
+    let value = floatFromBits(valueBits)
+    if not (value > 0.0) { return 0 }
+    if value >= 18446744073709551616.0 { return 0 - 1 }
+    if value < 9223372036854775808.0 { return value as int }
+    return (value - 9223372036854775808.0) as int ^ (0 - 9223372036854775807 - 1)
+}
+
+fn runtimeClampInteger(value: int, low: int, high: int) -> int {
+    if value < low { return low }
+    if value > high { return high }
+    return value
 }

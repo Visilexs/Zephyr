@@ -83,8 +83,9 @@ externdecl = "extern" "fn" ID "(" [ param { "," param } ] ")"
 fndecl     = "fn" ID [ "[" ID { "," ID } "]" ]                (* type params *)
              "(" [ param { "," param } ] ")" [ "->" type ] block ;
 param      = ID ":" type [ "=" expr ] | "self" ;              (* self only in impl/interface *)
-structdecl = "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
-             "{" { ID ":" type [ "=" expr ] [ "," ] } "}" ;
+structdecl = [ "@C" [ "(" "packed" ")" ] ]                   (* C layout, §3.0.0.5 *)
+             "struct" ID [ "[" ID { "," ID } "]" ]            (* type params *)
+             "{" { ID ":" ( type | "[" type ";" INT "]" ) [ "=" expr ] [ "," ] } "}" ;
 enumdecl   = "enum" ID [ "[" ID { "," ID } "]" ]
              "{" member { "," member } "}" ;
 member     = ID [ "(" type { "," type } ")" ] ;              (* Circle(float) *)
@@ -96,7 +97,9 @@ private    = "private" ( fndecl | structdecl | enumdecl | ifacedecl | typealias 
 test       = "test" STRING block ;                           (* run by zc --test *)
 
 type       = basetype [ "?" ] ;                              (* T? optional *)
-basetype   = "int" | "i32" | "float" | "bool" | "str"
+basetype   = "int" | "float" | "bool" | "str"
+           | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+           | "f32" | "f64"                                   (* sized scalars, §3.0.0.4 *)
            | ID [ "[" type { "," type } "]" ]                (* Box[int]: generic struct *)
            | "[" type "]"                                    (* list *)
            | "[" ( "u8" | "f32" ) "]"                        (* packed list *)
@@ -166,9 +169,8 @@ at the top level.
 map), and named struct and enum types. `void` is the type of no value; it
 cannot be named in source.
 
-`i32` (listed in the grammar above) is a 32-bit signed integer that exists only as an `extern fn` return type
-(§3.6): the low 32 bits of the return register, sign-extended to a Zephyr `int`.
-It is not a general-purpose type — locals, fields and arithmetic all use `int`.
+The sized scalars `i8 i16 i32 u8 u16 u32 u64 f32` (and the aliases `i64` =
+`int`, `f64` = `float`) are value types like `int` and `float`; see §3.0.0.4.
 
 Two types are equal structurally, except structs and enums, which are equal
 only if they are the same declaration. There is no null and no implicit
@@ -261,12 +263,13 @@ map keys when their elements can (§3.0.1).
     var weights: [f32] = [0.1, 2.5]
     let doubles = weights as [float] // [0.100000001490116, 2.5]
 
-`[u8]` stores one byte per element and `[f32]` four (an IEEE single). They
-are the only places `u8` and `f32` appear: there are no `u8` or `f32`
-values, variables or fields. Reading an element gives an `int` (0 to 255) or
-a `float` (the single widened exactly); storing one keeps the low 8 bits of
-the int, or rounds the float to the nearest single (to infinity when too
-large).
+`[u8]` stores one byte per element and `[f32]` four (an IEEE single).
+Written as a type, `[u8]` and `[f32]` always mean these packed lists. For
+compatibility their elements read as `int` (0 to 255) and `float` (the single
+widened exactly), not as the `u8`/`f32` scalars of §3.0.0.4; storing one
+keeps the low 8 bits of the int, or rounds the float to the nearest single
+(to infinity when too large). A list literal of `u8` or `f32` *values*
+(`[a, b]` with `a: u8`) is an ordinary list; `as [u8]` / `as [f32]` packs it.
 
 A packed list has `.len()`, `.push(v)`, `.pop()`, indexing, `for` (including
 `for i, x in`), `==`, printing, and `[u8]` can be a map key. Anything else
@@ -277,6 +280,124 @@ convert with `as`. The conversions are `[int] as [u8]`, `[u8] as [int]`,
 converted element by element. Packed lists are for large numeric buffers
 (images, audio, meshes); they use an eighth or a half of a plain list's
 memory, at the cost of a runtime call per element access.
+
+### 3.0.0.4 Sized scalars
+
+    let flags: u16 = 0x8001
+    var counter: u8 = 250
+    counter += 10                    // wraps: 4
+    let wide = counter as int + 1000 // conversions are explicit
+    let half: f32 = 0.5
+
+| Type | Range | Notes |
+|------|-------|-------|
+| `i8` `i16` `i32` | two's complement, 8/16/32 bits | |
+| `i64` | the same type as `int` | |
+| `u8` `u16` `u32` `u64` | 0 to 2^n - 1 | |
+| `f32` | IEEE single | |
+| `f64` | the same type as `float` | |
+
+They are value types usable everywhere `int` and `float` are: locals, globals,
+consts, parameters, returns, struct fields, list elements, map keys (not
+`f32`), optionals, tuples and generic type arguments.
+
+**Representation.** Every value still occupies one 64-bit word. An integer of
+width n is kept *canonical*: sign-extended (`i*`) or zero-extended (`u*`)
+from its low n bits, so `==`, hashing and the runtime see an ordinary int.
+`u64` is the raw 64 bits. An `f32` is a `float` whose value is exactly a
+single, rounded (to nearest even) after every operation.
+
+**Arithmetic.** Both operands of a binary operator must have the same type;
+the result has that type (comparisons give `bool`). There is no implicit
+conversion between sized types, or between a sized type and `int`/`float`;
+mixing them is a compile error with a hint to use `as`. Integer arithmetic
+wraps at the type's width (`+ - * << unary -`, and `/` for `MIN / -1`): the
+result is computed on 64 bits, then truncated and re-extended. `/` and `%`
+truncate toward zero and panic on zero, as for `int`. `~x` flips the type's
+n bits. The shift count may have any integer type and, as for `int`, uses
+its low 6 bits (`x << 8` on a `u8` is 0, a shift by 64 is a shift by 0).
+`>>` is arithmetic on signed types and logical on unsigned ones. `u64`
+compares, divides and shifts right unsigned. `f32` has `+ - * /` (each
+rounded to single), comparisons and unary `-`, not `%` or bit operators.
+`abs`, `min`, `max`, `pow` and `sqrt` take `int`/`float` only: convert first.
+
+**Literals.** An integer literal (also negated, also `'a'`) where a sized
+integer is expected takes that type if its value is in range, otherwise it
+is a compile error: `let b: u8 = 256` fails. A literal is "expected" to have
+a type as an initializer or assignment of that type, an argument, a return
+value, a struct field, a list or map literal element under an annotation, or
+the other operand of a binary operator (`b + 1`). `u64` accepts any literal
+that is not negated, so values above `int`'s range are written in hex
+(`0xFFFFFFFFFFFFFFFF`). Integer and float literals adopt `f32`, rounded. A
+list literal containing a sized value (`[b, 1, 2]`) is a list of that type.
+
+**Conversions** with `as` (any numeric type to any numeric type):
+
+| From \ to | sized/plain integer | `float` | `f32` |
+|-----------|-----------------|---------|-------|
+| integer | wraps to the target width (truncate, then sign/zero-extend); exact when the value fits | exact up to 2^53, else rounded; `u64` as unsigned | rounded to single |
+| `float`/`f32` | truncates toward zero, saturating at the target's range; NaN gives 0 | exact | rounded to single |
+
+`x as str` gives the decimal text; `str as u8` is not a conversion (parse to
+`int` first). `as int` on a `u64` reinterprets the bits.
+
+**Printing.** Integers print in decimal (`u64` as unsigned). `f32` prints with
+7 significant digits (C's `%.7g`), `float` with 15: `0.1 as f32` prints `0.1`
+and `(0.1 as f32) as float` prints `0.100000001490116`.
+
+### 3.0.0.5 `@C` structs
+
+    @C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+    @C(packed) struct Wire { tag: u8, length: u32 }
+    @C struct Entry { name: [u8; 16], header: Header, scale: f32, live: bool }
+
+    let h = loadStruct[Header](address)        // copy in from raw memory
+    h.version += 1
+    storeStruct(address, h)                     // copy out
+    let e = loadStruct[Entry](buffer, 64)       // from a Bytes, bounds-checked
+    storeStruct(buffer, 64, e)
+    print(sizeOf[Header](), offsetOf[Header]("size"))   // 16 8
+
+`@C struct` (on its own or `@C(packed)`) declares an ordinary struct (§3:
+a reference, compared and printed like any struct) that also has a C memory
+layout. Its fields may only be sized scalars (§3.0.0.4), `int`, `float`,
+`bool`, other `@C` structs, and fixed arrays `[T; N]` of those scalars or
+`@C` structs. `[T; N]` is written only as a `@C` field type; the field holds
+an ordinary list (`[u8; N]` and `[f32; N]` hold the packed `[u8]`/`[f32]`
+lists of §3.0.0.3, so their elements read as `int`/`float`). A `@C` struct
+cannot be generic or empty, and cannot contain itself.
+
+**Layout** follows the C rules of the System V x86-64 ABI (what gcc and
+clang do): fields in declaration order, each at the next offset that is a
+multiple of its alignment; the struct's alignment is its largest field
+alignment and its size is rounded up to it. Sizes and alignments: `i8 u8
+bool` 1, `i16 u16` 2, `i32 u32 f32` 4, `int i64 u64 float f64` 8, an array
+N times its element (element alignment), a nested `@C` struct its own size
+and alignment. `@C(packed)` (gcc's `__attribute__((packed))`) gives every
+field alignment 1: no padding at all; a nested struct keeps its own inner
+layout.
+
+**Builtins.** The type argument is written in brackets and must be a type
+name:
+
+| Builtin | Result |
+|---------|--------|
+| `sizeOf[T]()` | the C size of `T` (a `@C` struct or a scalar type), a compile-time `int` |
+| `offsetOf[T]("field")` | the byte offset of a field of the `@C` struct `T`, a compile-time `int` |
+| `loadStruct[T](address)` | a new `T` whose fields are read from raw memory at `address` |
+| `loadStruct[T](bytes, offset)` | the same from a `Bytes` (std/bytes); panics unless `offset .. offset + sizeOf[T]()` is inside it |
+| `storeStruct(address, value)` | writes every field of `value` to raw memory (a statement) |
+| `storeStruct(bytes, offset, value)` | the same into a `Bytes`, bounds-checked |
+
+Loads and stores are copies, one access per field at its width: a narrow
+integer is read and sign- or zero-extended per its type, a `bool` is read as
+a byte (nonzero is `true`) and written as 0 or 1, an `f32` travels as an
+IEEE single. Padding bytes are never written. `storeStruct` panics when a
+fixed array field's list does not have exactly N elements. The raw-address
+forms are unsafe like `load64` (§3.6). The struct value itself lives in the
+Zephyr heap with one word per field, so `addr(s)` of a `@C` struct is *not*
+a C-laid-out pointer; to hand C a struct, `storeStruct` it into a `Bytes`
+and pass `bytes.addr()`.
 
 ### 3.0.1 Maps
 
@@ -539,7 +660,8 @@ A value of type `S` *fits* type `T` if `S = T`, or `S = int` and `T = float`
 arguments, returns, list elements, struct fields, and mixed arithmetic or
 comparison (the int operand widens).
 
-All other conversions are explicit via `expr as type`:
+Sized scalars (§3.0.0.4) never widen implicitly. All other conversions are
+explicit via `expr as type`:
 
 | from \ to | int | float | str | bool |
 |-----------|-----|-------|-----|------|
@@ -833,11 +955,18 @@ extern fn SDL_CreateWindow(title: int, w: int, h: int, flags: int) -> int from "
 extern fn hypot(x: float, y: float) -> float from "libm.so.6"
 ```
 
-Parameters may be `int` (integers, pointers, enums) or `float` (a C `double`,
-passed in an XMM register). The return may be `int`, `i32` (the low 32 bits,
-sign-extended), `bool` (the low byte, for C's `bool`), `float` (a C `double`),
-or nothing. A C `float` (single) argument or result is not supported; pass
-structs by pointer into off-heap or `Bytes` memory. The function's Zephyr name
+Parameters may be `int` (integers, pointers, enums), `float`/`f64` (a C
+`double`, passed in an XMM register), `bool`, or a sized scalar (§3.0.0.4):
+`i8`..`u64` are passed as their canonical 64-bit value, so the callee sees
+the right C `int8_t`..`uint64_t`; `f32` is passed as an IEEE single in the
+low 32 bits of an XMM register (a C `float`). The return may be `int`, `bool`
+(the low byte, for C's `bool`), `float`/`f64` (a C `double`), a sized scalar,
+or nothing. A narrow integer result keeps the low bits of `rax` and is sign-
+or zero-extended per its type; an `f32` result is the single in `xmm0`. For
+compatibility, `-> i32` on an `extern fn` still returns an `int` (the low 32
+bits, sign-extended), not an `i32`; write `f() as i32` for the sized value.
+Pass structs by pointer into off-heap or `Bytes` memory (`storeStruct`,
+§3.0.0.5); structs by value are not supported. The function's Zephyr name
 is the C symbol, so a symbol that clashes with a builtin (`abs`, `pow`) needs
 a C-side alias. A load or lookup failure panics with `dlerror`'s message.
 
@@ -1078,23 +1207,9 @@ semantics. Discussion should target this section before any of it lands in
 
 ### 9.1 `@C` C-layout structs
 
-Motivation: FFI against C ABIs (Linux iovec/timespec, X11 request headers,
-UE4/UE5 struct layouts read through memory) currently requires hand-packing
-`Bytes` buffers with `put64`/`putFloat32` at literal offsets. A C-layout
-struct attribute would let code declare the layout once and pass `addr(s)`
-to `extern fn` calls.
-
-Sketch:
-
-```zephyr
-@C struct iovec { base: int, length: int }   // no padding, field order as written
-var v: iovec = iovec{base: p, length: 8}
-syscall(310, pid, addr(v), 1, addr(v2), 1)
-```
-
-Open questions: default alignment (none vs. natural), explicit padding fields,
-whether `@C` structs may contain `str`/lists (probably not in v1), and how
-`@C` interacts with the existing generic-struct rules (§3.0.5.1).
+Implemented: see §3.0.0.5 (with the sized scalars of §3.0.0.4). Still open:
+typed pointers and views (`ptr[T]`, `span[T]`), passing `@C` structs by value
+to `extern fn`, and making `addr(s)` of a `@C` struct C-laid-out.
 
 ### 9.2 Refcount-free hot paths (`@hot`, static/arena buffers)
 

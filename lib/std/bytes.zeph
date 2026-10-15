@@ -34,6 +34,13 @@ impl Bytes {
         return self.address + offset
     }
 
+    // address of bytes offset .. offset + length, all inside the buffer; what
+    // loadStruct[T](bytes, offset) and storeStruct(bytes, offset, value) use
+    fn checkedAddress(self, offset: int, length: int) -> int {
+        assert(offset >= 0 and length >= 0 and offset <= self.size - length, "Bytes: {length} bytes at offset {offset} are out of range (size {self.size})")
+        return self.address + offset
+    }
+
     fn put8(self, offset: int, value: int) {
         assert(offset >= 0 and offset + 1 <= self.size, "Bytes.put8: out of range")
         store8(self.address + offset, value)

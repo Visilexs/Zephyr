@@ -1,0 +1,26 @@
+// @C struct layouts: tests/c_layout/check.sh compares this output with
+// layout.c compiled by gcc. Each line: struct name, sizeof, then offsets.
+@C struct Header { magic: u32, version: u16, flags: u16, size: u64 }
+@C struct Mixed { tag: u8, value: f64, small: i16, ok: bool, ratio: f32, inner: Header, name: [u8; 5], count: i32 }
+@C(packed) struct Packed { tag: u8, value: u32, more: u16 }
+@C struct Arrays { xs: [i16; 3], fs: [f32; 2], hs: [Header; 2], tail: u8 }
+@C struct Tiny { a: u8 }
+@C struct Pair { a: u8, b: u16 }
+@C struct Trail { big: u64, small: u8 }
+@C(packed) struct PackedInner { a: u8, h: Header, b: u8 }
+@C struct Wrap { a: u8, p: Packed, b: i8 }
+@C struct Floats { a: f32, b: float, c: f32 }
+@C struct Ints { a: i8, b: int, c: i32, d: i64, e: u16 }
+
+print("Header", sizeOf[Header](), offsetOf[Header]("magic"), offsetOf[Header]("version"), offsetOf[Header]("flags"), offsetOf[Header]("size"))
+print("Mixed", sizeOf[Mixed](), offsetOf[Mixed]("tag"), offsetOf[Mixed]("value"), offsetOf[Mixed]("small"), offsetOf[Mixed]("ok"), offsetOf[Mixed]("ratio"), offsetOf[Mixed]("inner"), offsetOf[Mixed]("name"), offsetOf[Mixed]("count"))
+print("Packed", sizeOf[Packed](), offsetOf[Packed]("tag"), offsetOf[Packed]("value"), offsetOf[Packed]("more"))
+print("Arrays", sizeOf[Arrays](), offsetOf[Arrays]("xs"), offsetOf[Arrays]("fs"), offsetOf[Arrays]("hs"), offsetOf[Arrays]("tail"))
+print("Tiny", sizeOf[Tiny](), offsetOf[Tiny]("a"))
+print("Pair", sizeOf[Pair](), offsetOf[Pair]("a"), offsetOf[Pair]("b"))
+print("Trail", sizeOf[Trail](), offsetOf[Trail]("big"), offsetOf[Trail]("small"))
+print("PackedInner", sizeOf[PackedInner](), offsetOf[PackedInner]("a"), offsetOf[PackedInner]("h"), offsetOf[PackedInner]("b"))
+print("Wrap", sizeOf[Wrap](), offsetOf[Wrap]("a"), offsetOf[Wrap]("p"), offsetOf[Wrap]("b"))
+print("Floats", sizeOf[Floats](), offsetOf[Floats]("a"), offsetOf[Floats]("b"), offsetOf[Floats]("c"))
+print("Ints", sizeOf[Ints](), offsetOf[Ints]("a"), offsetOf[Ints]("b"), offsetOf[Ints]("c"), offsetOf[Ints]("d"), offsetOf[Ints]("e"))
+print("scalars", sizeOf[i8](), sizeOf[u16](), sizeOf[i32](), sizeOf[u64](), sizeOf[f32](), sizeOf[float](), sizeOf[bool](), sizeOf[int]())

@@ -109,15 +109,24 @@ merged and every 2A item is still open.
   optimized under `-O2`.
 
 ### 2B Types and layout (next)
-- [ ] Sized scalar types `i8..i64`, `u8..u64`, `f32` as real values. Struct
-  fields, extern params and returns can use them.
-- [ ] `@C struct` (spec §9.1) with natural alignment, `@C(packed)`, inline
-  fixed arrays, `sizeOf[T]` and `offsetOf`. Plain int/float structs already
-  have C layout after the header, so this extends that.
+- [x] Sized scalar types `i8..i64`, `u8..u64`, `f32` as real values. Struct
+  fields, extern params and returns can use them. (spec §3.0.0.4; canonical
+  64-bit words, lowered in the checker. Open: packed `[u8]`/`[f32]` elements
+  still read as int/float for compatibility; `abs/min/max/pow` reject sized
+  arguments instead of supporting them; `int as f32` above 2^53 rounds twice.)
+- [x] `@C struct` (spec §3.0.0.5) with natural alignment, `@C(packed)`, inline
+  fixed arrays `[T; N]`, `sizeOf[T]()` and `offsetOf[T]("f")`, and
+  copy-in/copy-out `loadStruct[T]` / `storeStruct` on raw addresses and Bytes.
+  Layouts are checked against gcc (tests/c_layout). Open: `addr(s)` of a @C
+  struct is not C-laid-out; 16-bit fields are stored with two `store8` (TODO:
+  `store16` from 2A); f32 fields convert in software (TODO: `loadF32/storeF32`).
 - [ ] `ptr[T]` typed pointers and `span[T]` views over off-heap memory, with
   inline bounds checks.
-- [ ] extern: f32 args and returns, narrow and unsigned types, struct by
-  value, and native→Zephyr callbacks via per-signature trampolines.
+- [~] extern: f32 args and returns, narrow and unsigned types (done on
+  Linux; f32 is narrowed/widened by the runtime's software conversion, not
+  cvtsd2ss, and `-> i32` still returns int for old code; Windows `extern`
+  unchanged), struct by value, and native→Zephyr callbacks via per-signature
+  trampolines (open).
 - [ ] `unsafe` boundary: the raw builtins and `runtime*` symbols are allowed
   only in files marked unsafe.
 - [ ] Private struct fields, so Bytes can't be broken by `memory.push()`.

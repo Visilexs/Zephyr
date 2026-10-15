@@ -1,0 +1,137 @@
+// Sized scalar types (spec 3.0.0.4): wrapping per width, unsigned u64
+// operations, conversions, literal typing, printing. Run at both tiers.
+
+struct Pixel { r: u8, g: u8, b: u8, weight: f32, delta: i16 }
+
+fn average(a: u8, b: u8) -> u8 { return a / 2 + b / 2 + (a & b & 1) }
+fn largest[T](items: [T]) -> T {
+    var best = items[0]
+    for x in items { if x > best { best = x } }
+    return best
+}
+fn sumBytes(values: [u8]) -> u32 {           // [u8] is the packed list: elements read as int
+    var total: u32 = 0
+    for v in values { total += v as u32 }
+    return total
+}
+
+fn wrapping() {
+    let a: u8 = 200
+    let b: u8 = 100
+    print("u8", a + b, a - b, b - a, a * 2, a / 3, a % 7, a << 1, a >> 3, ~a, -a)
+    var c: i8 = 127
+    c += 1
+    let d: i8 = -128
+    print("i8", c, d - 1, d * -1, d / -1, d % -1, -d, d >> 1, d >> 7, d << 1)
+    let e: u16 = 65535
+    let f: i16 = 32767
+    print("16", e + 1, e * e, ~e, f + 1, f * 2, (f + 1) / -1)
+    let g: u32 = 4294967295
+    let h: i32 = 2147483647
+    print("32", g + 1, g * g, g >> 31, g << 4, h + 1, h * h, -h - 2, (h + 1) / -1)
+    let i: u64 = 0xFFFFFFFFFFFFFFFF
+    let j: i64 = 9223372036854775807
+    print("64", i + 1, i * 2, j + 1, i == 0xFFFFFFFFFFFFFFFF)
+    // the shift count is any int type and uses its low 6 bits, like int
+    let count: u8 = 4
+    print("shift", a << count, g >> count, i >> 63, i >> 64, (1 as u64) << 63)
+}
+
+fn unsigned64() {
+    let big: u64 = 0x8000000000000000
+    let max: u64 = 0xFFFFFFFFFFFFFFFF
+    let one: u64 = 1
+    print(big > one, big < one, max >= big, one <= max, max > max, largest([one, big, max]))
+    print(max / 3, max % 10, max / big, max % big, big / one, max / max, max / 0xFFFFFFFF)
+    print(max >> 1, max >> 60, big >> 63, max >> 0)
+    var acc: u64 = 1
+    for k in 0..70 { acc *= 3 }
+    print(acc, acc as int)
+}
+
+fn conversions() {
+    let n = 300
+    print(n as u8, n as i8, -1 as u16, -1 as u32, -1 as u64, 65535 as i16)
+    let small: u8 = 255
+    print(small as int, small as i8, small as u16, small as i64, small as f32, small as float)
+    let neg: i8 = -2
+    print(neg as u8, neg as u64, neg as int, neg as i32, neg as u32)
+    let wide: u64 = 0xFFFFFFFFFFFFFFFE
+    print(wide as int, wide as u32, wide as i8, wide as float, wide as f32)
+    print(3.9 as u8, -3.9 as i8, 300.5 as u8, -5.0 as u32, 1e30 as i16, -1e30 as i16)
+    print(1e19 as u64, 2e19 as u64, -1.0 as u64, 0.5 as u64)
+    let x: f32 = 0.1
+    print(x, x as float, x * 3, x + x, x / 3, 1.0e10 as f32, 16777217 as f32, -x)
+    let y: f32 = 1.5
+    print(y as int, y as u8, (2.5 as f32) == 2.5, 0.1 as f32 == x, x < y)
+    print("{small} {wide} {x} {neg}", wide as str, x as str)
+}
+
+fn literals() {
+    let a: u8 = 255
+    let b: i8 = -128
+    let c: u16 = 'A'
+    let d: u64 = 0xFFFFFFFFFFFFFFFF
+    let e: f32 = 2
+    let f: f32 = -0.5
+    var g: u32? = none
+    g = 7
+    let list: [i16] = [1, -2, 300]
+    let map: [u16: str] = [1: "one", 65535: "max"]
+    print(a, b, c, d, e, f, g, list, map[65535])
+    print(a == 255, b < 0, 1 + a, 2 * e, average(255, 253), average(a, 1))
+    let mixed = [b, 3, -4]
+    print(mixed, largest(mixed))
+}
+
+fn structures() {
+    let p = Pixel{r: 250, g: 10, b: 0, weight: 0.25, delta: -3}
+    p.r += 10
+    p.delta *= 20000
+    p.weight = p.weight / 3
+    print(p, p == Pixel{r: 4, g: 10, b: 0, weight: 0.25 as f32 / 3, delta: 5536})
+    var byKey: [u32: str] = [:]
+    byKey[5] = "five"
+    print(byKey[5], byKey.has(6))
+    let bytes: [u8] = [1, 2, 255]
+    print(sumBytes(bytes), [a8(1), a8(2)] as [u8])
+    var counter: u16 = 0
+    var steps = 0
+    while counter < 10 {
+        counter += 3
+        steps += 1
+    }
+    print(counter, steps)
+}
+fn a8(v: int) -> u8 { return v as u8 }
+
+// consts, defaults, match patterns, optionals, closures, generics, tuples
+struct Box[T] { value: T }
+const LIMIT: u8 = 200
+fn bump(x: u8 = 5) -> u8 { return x + LIMIT }
+fn language() {
+    let b: u8 = 7
+    let r = match b {
+        1 { "one" }
+        2..10 { "small" }
+        else { "big" }
+    }
+    let k: u8? = none
+    let f = fn(v: u16) -> u16 { return v * 2 }
+    let box = Box{value: b}
+    let big: u64 = 0xF000000000000000
+    let mid: u64 = 5
+    print(r, k.or(9), f(40000), box, bump(), bump(100), mid < big and big > 1, 1 < mid < big)
+    let t: (u8, f32) = (1, 2.5)
+    print(t, "{t.1}")
+    var total: u32 = 0
+    for v in [1, 2, 3] { total += v as u32 }
+    print(total, -LIMIT, LIMIT == 200)
+}
+
+wrapping()
+unsigned64()
+conversions()
+literals()
+structures()
+language()

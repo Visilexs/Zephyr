@@ -1,0 +1,3 @@
+struct Plain { a: int }
+let p = Plain{a: 1}
+storeStruct(0, p)

@@ -1,0 +1,6 @@
+// loadStruct[T](bytes, offset) is bounds-checked against the Bytes size.
+import "std/bytes.zeph"
+@C struct Pair { a: u32, b: u32 }
+let buffer = Bytes.new(12)
+print(loadStruct[Pair](buffer, 4))
+print(loadStruct[Pair](buffer, 5))

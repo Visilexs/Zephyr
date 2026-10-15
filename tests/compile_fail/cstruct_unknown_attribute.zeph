@@ -1,0 +1,1 @@
+@Packed struct S { a: u8 }
