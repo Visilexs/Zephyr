@@ -1,1 +1,2 @@
-expression_chain_too_long.zeph:4: error: expression nested too deeply
+expression_chain_too_long.zeph:4:
+error: expression nested too deeply

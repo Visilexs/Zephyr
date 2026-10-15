@@ -4185,6 +4185,7 @@ fn instantiate(functionIndex: int, names: [str], types: [int], line: int) -> int
     }
     if currentInstantiationDepth >= maximumInstantiationDepth {
         failCompilation(line, "polymorphic recursion: instantiating '{functionDefinition.name}' exceeds the generic instantiation depth limit of {maximumInstantiationDepth} (a generic function calls itself with an ever-growing type)")
+        finishDiagnostics()                      // fatal: recovering would keep instantiating
     }
     for i in 0..names.len() {                    // bind, resolve the signature
         typeBindingNames.push(names[i])
