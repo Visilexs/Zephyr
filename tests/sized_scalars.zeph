@@ -105,8 +105,33 @@ fn structures() {
 }
 fn a8(v: int) -> u8 { return v as u8 }
 
+// consts, defaults, match patterns, optionals, closures, generics, tuples
+struct Box[T] { value: T }
+const LIMIT: u8 = 200
+fn bump(x: u8 = 5) -> u8 { return x + LIMIT }
+fn language() {
+    let b: u8 = 7
+    let r = match b {
+        1 { "one" }
+        2..10 { "small" }
+        else { "big" }
+    }
+    let k: u8? = none
+    let f = fn(v: u16) -> u16 { return v * 2 }
+    let box = Box{value: b}
+    let big: u64 = 0xF000000000000000
+    let mid: u64 = 5
+    print(r, k.or(9), f(40000), box, bump(), bump(100), mid < big and big > 1, 1 < mid < big)
+    let t: (u8, f32) = (1, 2.5)
+    print(t, "{t.1}")
+    var total: u32 = 0
+    for v in [1, 2, 3] { total += v as u32 }
+    print(total, -LIMIT, LIMIT == 200)
+}
+
 wrapping()
 unsigned64()
 conversions()
 literals()
 structures()
+language()
