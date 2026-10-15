@@ -156,6 +156,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     matches "py:include_path" && echo "run_python include_path"
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"
+    matches "py:llm_examples" && echo "run_python llm_examples --compiler $work/zc-linux"
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
     matches "sh:diagnostics" && echo "run_diagnostics"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'

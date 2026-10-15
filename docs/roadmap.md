@@ -112,22 +112,26 @@ unnoticed.
 - [ ] Private struct fields, so Bytes can't be broken by `memory.push()`.
 
 ## Phase 3: agentic coding (LLMs writing Zephyr)
-- [ ] Diagnostics: `file:line:col: error: msg` (track columns), exit code 2,
+- [x] Diagnostics: `file:line:col: error: msg` (track columns), exit code 2,
   no `panic:` prefix, keep going and collect up to N errors,
-  `--error-format=json`.
-- [ ] CLI: reject unknown flags, clear errors for missing input or import
+  `--error-format=json`. (Type errors are collected per statement, N=20;
+  syntax errors still stop at the first one.)
+- [x] CLI: reject unknown flags, clear errors for missing input or import
   paths, `--linux` implies `--rt`, `--help`.
-- [ ] Targeted hints for other-language habits: `&& || ! ++ ; => null nil
+- [x] Targeted hints for other-language habits: `&& || ! ++ ; => null nil
   True len()`.
-- [ ] Generic errors name the instantiation site and the expected type.
-- [ ] Runtime panics include values (`index 7 out of bounds for length 3`)
-  and an optional backtrace via an rbp walk plus `--map`/`.zdbg`.
-- [ ] `zc run` on Linux: memfd + execveat; it implies `--linux --rt` on a
-  Linux host.
-- [ ] `--test`: keep going after a failure (fork per test), print a summary,
-  `--test-filter`, and have `assert(a == b)` print both sides.
-- [ ] `docs/llm.md`: a compact cheat sheet of syntax, gotchas and idioms for
-  agents. Ship it as a pi/Claude skill.
+- [x] Generic errors name the instantiation site and the expected type
+  (`note: while instantiating first[T=int] from main.zeph:5`).
+- [x] Runtime panics include values (`index 7 out of bounds for length 3`,
+  `map key "b" not found`). Not done: the optional backtrace via an rbp walk
+  plus `--map`/`.zdbg`.
+- [x] `zc run` on Linux: memfd + execve of `/proc/self/fd/N` (temp file
+  fallback); it implies `--linux --rt` on a Linux host.
+- [x] `--test`: keep going after a failure (fork per test, Linux only), print
+  a summary, `--test-filter`, and have `assert(a == b)` print both sides.
+- [x] `docs/llm.md`: a compact cheat sheet of syntax, gotchas and idioms for
+  agents (its examples run in `py:llm_examples`). Not done: shipping it as a
+  pi/Claude skill.
 - [ ] Later: `zc check` (front end only, fast), `zc fmt`, and an LSP server
   for hover, definitions and diagnostics.
 
