@@ -1,0 +1,20 @@
+// Leak check: string interpolation, concatenation, lists and maps of strings (clean).
+// Runs body() N and 2N times; the live-object delta (runtimeLiveObjectCount, a
+// heap census) must not grow. Run by tests/linux/run.sh at baseline and -O2.
+
+fn body(i: int) {
+    let s = "abc{i}" + "x"
+    let l = [s, s + "y"]
+    let m: [str: int] = [s: i]
+}
+fn measure(n: int) -> int {
+    let before = runtimeLiveObjectCount()
+    for i in 0..n { body(i) }
+    return runtimeLiveObjectCount() - before
+}
+let warm = measure(20)
+let once = measure(100)
+let twice = measure(200)
+print("leak-delta", once, twice)
+assert(twice <= once, "live objects grow with iterations")
+print("ok")

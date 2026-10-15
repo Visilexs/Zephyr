@@ -1,0 +1,6 @@
+int-exit 27 13
+float-exit 7.25 3.5
+int-stores 21 34 35
+float-stores 2.5 4.5 4.75
+int-fixed-exit 21 10
+float-fixed-exit 20.25 10

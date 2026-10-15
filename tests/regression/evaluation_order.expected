@@ -1,0 +1,28 @@
+inline 12 11
+call 12 50
+assign 12
+compound 12
+float 2 9
+index 7 99
+alias 12 30
+arguments 1031 11
+list [10, 2, 11]
+tuple (10, 2, 11)
+struct 10 2 11
+map 2 11
+field-assignment 12 9
+index-assignment 123 9
+byte-assignment 123 9
+float-assignment 123 2.5
+ref-field field-original replaced
+ref-list list-original replaced
+captured-list 42 99
+short-global false
+short-member false
+function-field 12 9
+function-index 123 9
+function-byte 123 9
+function-float 123 2.5
+function-ref-field field-original replaced
+function-ref-list list-original replaced
+function-captured-list 42 99

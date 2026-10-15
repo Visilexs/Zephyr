@@ -1,0 +1,18 @@
+fib -3 -1 0 1 1 2 5 55
+sum 0 0 1 15 55
+wrap 7 -9223372036854775801 8 -9223372036854775798
+base -5 1 4 7 10 27
+effects 6 321
+global 12
+float 15
+mutual 15 21
+subtract 3
+right-not-self 15
+two-parameters 30
+guard-call 6 3210
+base-call 13 7
+next-call 6 210
+guard-global 6
+base-global 10
+next-global 6
+multiple-branches 12

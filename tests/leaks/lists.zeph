@@ -1,0 +1,21 @@
+// Leak check: growing lists and nested lists (clean).
+// Runs body() N and 2N times; the live-object delta (runtimeLiveObjectCount, a
+// heap census) must not grow. Run by tests/linux/run.sh at baseline and -O2.
+fn body(i: int) {
+    var l: [int] = []
+    for j in 0..i % 40 { l.push(j) }
+    var nested = [l, [i]]
+    nested.push([1, 2])
+    assert(nested.len() == 3)
+}
+fn measure(n: int) -> int {
+    let before = runtimeLiveObjectCount()
+    for i in 0..n { body(i) }
+    return runtimeLiveObjectCount() - before
+}
+let warm = measure(20)
+let once = measure(100)
+let twice = measure(200)
+print("leak-delta", once, twice)
+assert(twice <= once, "live objects grow with iterations")
+print("ok")

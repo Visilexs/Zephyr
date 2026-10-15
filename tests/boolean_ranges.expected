@@ -1,0 +1,61 @@
+-1 false false false
+64 false false false
+65 true true true
+66 true true true
+89 true true true
+90 true true true
+91 false false false
+255 false false false
+false true true false true 4
+-1 false
+0 false
+7 true
+10 true
+letter -1 false false
+letter 65 true true
+letter 90 true true
+letter 95 true true
+letter 97 true true
+letter 122 true true
+letter 123 false false
+interval -1 false false false false false false
+interval 30 false false true false false true
+interval 31 false false true false false true
+interval 32 false false true false false true
+interval 33 false false true false false true
+interval 34 false false false false false false
+interval 62 false false true false false true
+interval 63 false false true false false true
+interval 64 true true true true true true
+interval 65 true true true true true true
+interval 66 true true false true true false
+interval 67 true false false true false false
+interval 68 false false false false false false
+interval 95 false false false false false false
+interval 96 true true false true true false
+interval 98 true true false true true false
+interval 99 true true false true true false
+interval 100 false false false false false false
+distant 1073741823 false false
+distant 1073741824 true true
+distant 1073741827 true true
+distant 1073741828 false false
+distant 1073741856 true true
+distant 1073741859 true true
+distant 1073741860 false false
+extra -65 false false false
+extra -64 false true false
+extra -61 false true false
+extra -60 false false false
+extra -33 false false false
+extra -32 false true false
+extra -29 false true false
+extra -28 false false false
+extra 63 false false false
+extra 64 true false true
+extra 67 true false true
+extra 68 false false false
+extra 95 false false false
+extra 96 true false false
+extra 99 true false false
+extra 100 false false false

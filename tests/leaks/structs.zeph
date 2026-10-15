@@ -1,0 +1,20 @@
+// Leak check: struct values with string fields stored in a list (clean).
+// Runs body() N and 2N times; the live-object delta (runtimeLiveObjectCount, a
+// heap census) must not grow. Run by tests/linux/run.sh at baseline and -O2.
+struct P { x: int, name: str }
+fn body(i: int) {
+    let p = P { x: i, name: "n{i}" }
+    let q = [p, p]
+    assert(q.len() == 2)
+}
+fn measure(n: int) -> int {
+    let before = runtimeLiveObjectCount()
+    for i in 0..n { body(i) }
+    return runtimeLiveObjectCount() - before
+}
+let warm = measure(20)
+let once = measure(100)
+let twice = measure(200)
+print("leak-delta", once, twice)
+assert(twice <= once, "live objects grow with iterations")
+print("ok")

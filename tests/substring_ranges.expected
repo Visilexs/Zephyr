@@ -1,0 +1,4 @@
+ranges 0 abcdef 0 def
+temporary oken
+bounds bcd abcdef changed-end 2
+retained 256 1024 oken oken

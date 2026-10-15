@@ -31,7 +31,37 @@ On Windows, run these after `scripts/selfbuild.ps1`, in this order:
 | `run_parity.ps1` | executables and `zc run` give identical output |
 | `crosscheck-linux.ps1` | Windows and Linux (x86-64 WSL) output are byte-identical |
 | `crosscheck-wasm.ps1` | Windows and WebAssembly (Node.js) output are byte-identical |
+| `linux/run.sh` | on Linux: the full harness, see the Linux section below |
 | `linux_extern.sh` | on Linux: `extern fn` through `dlopen`/`dlsym` (`tests/linux/`), baseline and `-O2`, as an executable and as an `.o` linked with gcc |
+
+
+## Linux
+
+Run `tests/linux/run.sh -j 16` from the repo root (it needs `./zc-linux`, or
+set `ZC=`). It copies zc-linux, `compiler/runtime.zeph` and `lib/` into a temp
+dir, so the checkout stays clean, and takes about 15 s with `-j`.
+
+- Every test in `tests/*.zeph`, `tests/regression/`, `tests/fixtures/basics/`,
+  `tests/fixtures/threads/`, `tests/linux/` and `tests/leaks/` is built at
+  baseline and `-O2` and run with a 60 s timeout and no stdin. Each tier must
+  exit 0 (or the code in `EXPECT_EXIT`) and match `NAME.expected` next to the
+  source when that file exists (stdout only). Both tiers must also print the
+  same thing (`:parity`, skipped for `tests/leaks/`).
+- `tests/leaks/*.zeph` run a body N and 2N times and assert that the
+  live-object delta from `runtimeLiveObjectCount()` does not grow. That
+  function (and `runtimeLiveObjectBytes()`) is a heap census in
+  `compiler/runtime.zeph`. It is only valid single-threaded. Copy an existing
+  leak test to add one.
+- It also runs `include_path.py`, `assert_message_release.py`,
+  `argument_tests.py` and, when gcc is installed, `linux_extern.sh`.
+
+Options: `-k PATTERN` (grep -E on unit names such as `moves:O2`,
+`leaks/replace:base` or `py:argument_tests`), `-j N`, and `-v` to print the logs
+of failing units. Each unit prints PASS, FAIL, XFAIL or XPASS, then a summary
+line. The exit status is nonzero on any FAIL or XPASS. Known failures are
+listed in `KNOWN_FAIL` at the top of the script, each with the audit item it
+maps to (`docs/audit-2026-10-15.txt`). When you fix one, remove its entry, and
+add a `.expected` file if the test prints something.
 
 `regression/tail_recursion.zeph` covers the `-O2` tail-recursion rewrite:
 - swapped parameters

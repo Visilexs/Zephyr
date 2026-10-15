@@ -1,0 +1,18 @@
+770297739
+0 1
+50 51
+100 101
+150 151
+2 -2
+3 0
+4 -8
+5 -16
+6 -24
+8 -40
+500 501
+4
+ordinary 50 60 70 80 30 40
+empty 2 EmptyRecord{}
+variant old1 number12 number34
+variant old1 new1 empty
+emptyVariant number71
