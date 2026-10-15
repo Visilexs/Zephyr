@@ -1,0 +1,7 @@
+fn f(x: int) -> int {
+    let y: str = x
+    return y
+}
+let a = 1
+let b: str = a
+print(c)

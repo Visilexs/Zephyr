@@ -1,0 +1,2 @@
+generic.zeph:2:5: error: initializer: expected str, got int
+  note: while instantiating first[T=int] from generic.zeph:5

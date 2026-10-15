@@ -1,0 +1,8 @@
+fn add(a: int, b: int) -> int { return a + b }
+test "adds" { assert(add(1, 2) == 3) }
+test "broken" { assert(add(1, 2) == 4) }
+test "strings" { assert("a" + "b" == "ab") }
+test "panics" {
+    let xs = [1]
+    print(xs[3])
+}

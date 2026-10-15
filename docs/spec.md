@@ -339,9 +339,14 @@ at the top level, it is called after all top-level statements have run.
 `test "name" { ... }` blocks at the top level of the main file are ignored by
 a normal build. `zc --test file.zeph out.exe` (which implies `--rt`) builds a
 program that runs the top-level statements, then each test in order, printing
-`test name ... ok`, and finally the count; `main()` is not called. A failing
-`assert` or panic ends the run at that test with a non-zero exit code. Test
-blocks in imported files are ignored.
+`test name ... ok`, and finally the count; `main()` is not called. On Linux
+each test runs in a forked child process: a failing `assert`, a panic or a
+crash prints `FAILED` for that test and the rest still run; the run ends with
+`N passed, M failed` and exit code 1 when any test failed (`N tests passed`
+and exit code 0 otherwise). On the other targets a failing test ends the run
+at that test with a non-zero exit code. `--test-filter NAME` keeps only the
+tests whose name contains `NAME` (and implies `--test`). Test blocks in
+imported files are ignored.
 
 ### 3.0.3 Function values
 
@@ -717,7 +722,7 @@ running it.
 | `readFile(p)` | str → str | whole file, read until end of file (so `/proc` files and pipes work); panics if unreadable |
 | `writeFile(p, d)` | str, str → void | create/overwrite; panics on failure |
 | `zeros(n)` | int → [int] | preallocated list of `n` zeros (panics when `n < 0`, "out of memory" when it cannot fit) |
-| `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
+| `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false. When `c` is a comparison (`== != < <= > >=`) of two values of the same scalar type (int, float, bool, str, enum), the message shows both: `assertion failed: left == right` then `left: 3` and `right: 4` lines; each operand is evaluated once |
 | `abs(x)`   | int→int / float→float | absolute value |
 | `min(a, b)` / `max(a, b)` | numbers → number | int or float (widened if mixed) |
 | `pow(b, e)` | int, int → int | fast exponentiation; `e < 0` yields 0 (integer division of 1 by `b^-e`) |
@@ -926,6 +931,25 @@ location: a SIGSEGV handler on an alternate signal stack reports it), and heap e
 large to represent). Printing a panic never allocates, so it works when memory
 is what ran out. Under an address-space limit the runtime reserves less address
 space for its heap rather than failing at startup. Panics are not catchable.
+Messages carry the offending values:
+`index 7 out of bounds for length 3` (lists, packed lists, `s.byte(i)`),
+`map key "b" not found` / `map key 7 not found` (str and int keys), and the
+two sides of a failed comparison `assert` (§3.5).
+
+Compile errors are not panics: the compiler prints
+`<file>:<line>:<col>: error: <message>`, optionally followed by
+`  note: ...` (for an error inside a generic function, the instantiation and
+its call site: `while instantiating first[T=int] from main.zeph:5`) and
+`  hint: ...` (for habits from other languages: `&&`, `||`, `!`, `++`, `--`,
+`;`, `=>`, `null`/`nil`/`None`, `True`/`False`, `len(x)`, `let mut`,
+`string`, ...), and exits with code 2. Syntax errors stop at the first one;
+type errors are collected: after an error the checker skips the rest of that
+statement and resumes at the next one, reporting at most 20 errors.
+`--error-format=json` prints each error as one JSON object per line instead:
+`{"file", "line", "col", "severity": "error", "code", "message", "hint"}`
+(`hint` is `null` when there is none; `code` is `syntax`, `type`, `import`
+or `cli`; an error in a generic function adds `"note"`). Command-line
+problems print `zc: error: <message>` and also exit with code 2.
 
 ## 7. Programs and linkage
 
@@ -967,7 +991,7 @@ zc.exe run [flags] input.zeph [program arguments...]
 | Flag | Effect |
 |------|--------|
 | `--rt` | Link the Zephyr-written runtime (memory management, strings, threads, native interop). Output depends only on the target's kernel interface. Required for anything in §3.5/§3.6/§8. |
-| `--linux` / `--wasm` | Select the target (§7.1); default is Windows. |
+| `--linux` / `--wasm` | Select the target (§7.1); default is Windows. `--linux` implies `--rt`. |
 | `-O2` | Compile each function through the optimizing SSA tier; functions it cannot handle fall back to baseline code. See [optimizer.md](optimizer.md). |
 | `--profile-generate FILE` | Instrument the program with function and branch counters; a normal exit writes them to `FILE`. |
 | `--profile-use FILE` | Read counters from `FILE` to guide block layout, spill costs and inlining trials under `-O2`. A profile from different source is rejected with a warning. |
@@ -976,6 +1000,9 @@ zc.exe run [flags] input.zeph [program arguments...]
 | `--opt-dump` | Print the optimizer's SSA IR for each region it compiles. |
 | `--map` | Write `<output>.map`, one `rva name` line per code symbol, for profilers. |
 | `--test` | Run the main file's `test` blocks instead of `main` (implies `--rt`). |
+| `--test-filter NAME` | Only the tests whose name contains `NAME` (implies `--test`). |
+| `--error-format=json` | Compile errors as JSON lines (§6). `--error-format=text` is the default. |
+| `-h` / `--help` | Print usage to stdout and exit 0. |
 | `-g` / `--debug` | Emit a `.zdbg` debug-info sidecar (native-exe output only). |
 | `--version` | Print the compiler version; compiles nothing if given alone. |
 
@@ -988,6 +1015,13 @@ assembled in process, for linking with C code (`gcc -no-pie prog.o main.c`,
 where `main` calls `zephyrMain`). `--version` lists `features: elf-object` so
 build scripts can probe for it. `run` compiles into memory and runs the program in the
 compiler's process; every argument after the program path goes to the program.
+On a Linux host `run` implies `--linux --rt`: the ELF is linked into an
+anonymous memory file (`memfd_create`) and exec'd in place of the compiler, so
+the program's exit code is `zc run`'s.
+
+An unknown flag, a third positional argument, a missing input file or a
+missing output path is an error (exit code 2). A missing import names the
+directories that were searched.
 
 ## 8. Concurrency
 

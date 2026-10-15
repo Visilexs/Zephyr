@@ -1,0 +1,4 @@
+multi.zeph:2:5: error: initializer: expected str, got int
+multi.zeph:3:5: error: return: expected int, got str
+multi.zeph:6:1: error: initializer: expected str, got int
+multi.zeph:7:7: error: unknown variable 'c'

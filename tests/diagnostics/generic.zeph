@@ -1,0 +1,5 @@
+fn first[T](xs: [T]) -> T {
+    let y: str = xs[0]
+    return xs[0]
+}
+print(first([1, 2]))

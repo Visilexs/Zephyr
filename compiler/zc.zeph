@@ -278,12 +278,13 @@ let declarationFlagReturnType = 2  // nodeDeclaration.op: typed as the enclosing
 
 // ---------------- data structures ----------------
 struct StringPart { isExpression: bool, text: str, line: int }
-struct Token { tokenKind: int, line: int, text: str, integerValue: int, floatValue: float, parts: [StringPart] }
+struct Token { tokenKind: int, line: int, column: int, text: str, integerValue: int, floatValue: float, parts: [StringPart] }
 struct Node {
     nodeKind: int, line: int, operator: int,
     name: str, integerValue: int, floatValue: float,
     children: [Node],
     typeIndex: int, slot: int, auxiliary: int, referenceIndex: int, isMutable: bool,
+    column: int,  // 1-based source column (0: unknown)
     file: str    // source file this node was parsed from (for -g debug info)
 }
 struct VariableInformation { name: str, typeIndex: int, isMutable: bool, kind: int, index: int, isConstant: bool }
@@ -305,7 +306,7 @@ struct FunctionDefinition { name: str, parameterNames: [str], parameterTypes: [i
               typeParameters: [str], node: Node, label: str, hasEnvironment: bool,
               pristine: Node, inlinable: bool, pristineSlotCount: int }
 // one pending monomorphisation: check fi's body with tnames bound to ttypes
-struct Instantiation { functionIndex: int, typeParameterNames: [str], typeArguments: [int] }
+struct Instantiation { functionIndex: int, typeParameterNames: [str], typeArguments: [int], site: str }
 
 // ---------------- compiler state ----------------
 var currentSourceFile = ""
@@ -342,6 +343,24 @@ var generatingUserFunction = false    // generating a main-file function body ri
 // parser
 var parserTokens: [Token] = []
 var parserPosition = 0
+var diagnosticJson = false
+var diagnosticRecover = false        // set while check() runs
+var diagnosticCount = 0
+var diagnosticSuppressed = false     // this statement already reported an error
+var diagnosticCalls = 0
+let diagnosticLimit = 20
+var diagnosticHint = ""              // a hint for the next error, set by the caller
+var diagnosticCode = "syntax"        // "syntax" while lexing/parsing, "type" while checking
+var instantiationNote = ""           // "while instantiating f[T=int] from file:line"
+var diagnosticSources: [str: str] = [:]   // file -> source text, for columns
+var knownErrorLine = 0               // the node or token being worked on: its line and column
+var knownErrorColumn = 0
+var lexerSource = ""
+var lexerTokenStart = 0 - 1          // >= 0 while tokenizing: start of the current token
+var parserActive = false
+var lexerTokenColumn = 0
+var testFilter = ""                  // --test-filter
+var runOnLinux = false               // zc run on a Linux host
 var structLiteralNesting = 0
 var labelNames: [str] = []   // loop labels; a loop's ival is its label's index + 1
 var pendingLabel = 0         // set by `name:` for the loop that follows
@@ -477,16 +496,151 @@ fn emptyStrings() -> [str] {
 }
 
 fn makeToken(tokenKind: int, line: int) -> Token {
-    return Token{tokenKind: tokenKind, line: line, text: "", integerValue: 0, floatValue: 0.0, parts: emptyStringParts()}
+    return Token{tokenKind: tokenKind, line: line, column: lexerTokenColumn, text: "", integerValue: 0, floatValue: 0.0, parts: emptyStringParts()}
+}
+
+// while parsing: the column of the token just consumed (or the next one) on line
+fn parserColumnFor(line: int) -> int {
+    if not parserActive or parserTokens.len() == 0 { return 0 }
+    var position = parserPosition
+    if position >= parserTokens.len() { position = parserTokens.len() - 1 }
+    if position > 0 and parserTokens[position - 1].line == line { return parserTokens[position - 1].column }
+    if parserTokens[position].line == line { return parserTokens[position].column }
+    return 0
 }
 
 fn makeNode(nodeKind: int, line: int) -> Node {
     return Node{nodeKind: nodeKind, line: line, operator: 0, name: "", integerValue: 0, floatValue: 0.0,
-                children: emptyNodes(), typeIndex: 0, slot: 0, auxiliary: 0, referenceIndex: 0, isMutable: false, file: currentSourceFile}
+                children: emptyNodes(), typeIndex: 0, slot: 0, auxiliary: 0, referenceIndex: 0, isMutable: false, column: parserColumnFor(line), file: currentSourceFile}
+}
+
+// ---------------- diagnostics ----------------
+// Compile errors print as `file:line:col: error: message` (plus an optional
+// `  hint: ...` line) and exit with code 2; --error-format=json prints one JSON
+// object per line instead. While the checker runs, an error does not stop the
+// compile: the rest of the statement is suppressed (to avoid cascades) and
+// checking resumes at the next statement, up to diagnosticLimit errors.
+
+fn jsonEscape(text: str) -> str {
+    var output = ""
+    for i in 0..text.len() {
+        let character = text.byte(i)
+        if character == 34 { output += "\\\"" }
+        else if character == 92 { output += "\\\\" }
+        else if character == 10 { output += "\\n" }
+        else if character == 9 { output += "\\t" }
+        else if character < 32 { output += " " }
+        else { output += chr(character) }
+    }
+    return output
+}
+
+// column of position in source (1-based)
+fn columnAt(source: str, position: int) -> int {
+    var start = position
+    while start > 0 and source.byte(start - 1) != 10 { start -= 1 }
+    return position - start + 1
+}
+
+// first non-blank column of a line in a known source file, or 1
+fn firstColumnOfLine(file: str, line: int) -> int {
+    if not diagnosticSources.has(file) { return 1 }
+    let source = diagnosticSources[file]
+    var position = 0
+    var currentLine = 1
+    while currentLine < line and position < source.len() {
+        if source.byte(position) == 10 { currentLine += 1 }
+        position += 1
+    }
+    var column = 1
+    while position < source.len() and (source.byte(position) == 32 or source.byte(position) == 9) {
+        position += 1
+        column += 1
+    }
+    return column
+}
+
+fn errorColumnFor(line: int) -> int {
+    if lexerTokenStart >= 0 { return columnAt(lexerSource, lexerTokenStart) }
+    if parserActive and parserTokens.len() > 0 {
+        var position = parserPosition
+        if position >= parserTokens.len() { position = parserTokens.len() - 1 }
+        if parserTokens[position].line == line and parserTokens[position].column > 0 { return parserTokens[position].column }
+        if position > 0 and parserTokens[position - 1].line == line and parserTokens[position - 1].column > 0 { return parserTokens[position - 1].column }
+    }
+    if knownErrorLine == line and knownErrorColumn > 0 { return knownErrorColumn }
+    return firstColumnOfLine(currentSourceFile, line)
+}
+
+// Targeted hints for habits from other languages, keyed on the message.
+fn habitHint(message: str) -> str {
+    for word in ["null", "nil", "None", "undefined"] {
+        if message == "unknown variable '{word}'" { return "Zephyr has no null; use an optional: `let x: T? = none`, test with `if let v = x \{ ... \}` or `x.or(default)`" }
+    }
+    if message == "unknown variable 'True'" or message == "unknown variable 'TRUE'" { return "booleans are lowercase: true" }
+    if message == "unknown variable 'False'" or message == "unknown variable 'FALSE'" { return "booleans are lowercase: false" }
+    if message == "unknown variable 'self'" { return "self is only defined inside methods (impl blocks)" }
+    if message == "unknown variable 'this'" { return "methods name their receiver self" }
+    for name in ["len", "length", "size", "count"] {
+        if message == "unknown function '{name}'" or message == "unknown method or function '{name}'" { return "length is a method: x.len()" }
+    }
+    if message == "unknown function 'str'" or message == "unknown function 'string'" or message == "unknown function 'toString'" { return "convert with a cast: x as str, or interpolate: \"\{x\}\"" }
+    if message == "unknown function 'int'" or message == "unknown function 'parseInt'" { return "convert with a cast: s as int" }
+    if message == "unknown function 'float'" { return "convert with a cast: x as float" }
+    if message == "unknown function 'println'" or message == "unknown function 'printf'" or message == "unknown function 'puts'" or message == "unknown function 'console'" { return "use print(x); it adds a newline" }
+    if message == "unknown function 'range'" { return "write ranges as a..b (end exclusive): for i in 0..n \{ ... \}" }
+    if message == "unknown function 'append'" { return "lists grow with xs.push(x)" }
+    if message == "unknown type 'string'" or message == "unknown type 'String'" { return "the string type is str" }
+    if message == "unknown type 'i64'" or message == "unknown type 'Int'" or message == "unknown type 'long'" { return "the integer type is int (64-bit)" }
+    if message == "unknown type 'f64'" or message == "unknown type 'double'" or message == "unknown type 'Float'" { return "the float type is float (64-bit)" }
+    if message == "unknown type 'boolean'" or message == "unknown type 'Bool'" { return "the boolean type is bool" }
+    return ""
+}
+
+fn reportDiagnostic(file: str, line: int, column: int, code: str, message: str, hint: str, note: str) {
+    if diagnosticJson {
+        var text = "\{\"file\":\"{jsonEscape(file)}\",\"line\":{line},\"col\":{column},\"severity\":\"error\",\"code\":\"{code}\",\"message\":\"{jsonEscape(message)}\""
+        if hint != "" { text += ",\"hint\":\"{jsonEscape(hint)}\"" } else { text += ",\"hint\":null" }
+        if note != "" { text += ",\"note\":\"{jsonEscape(note)}\"" }
+        runtimeWriteStandardError(text + "\}\n")
+        return
+    }
+    var text = "{file}:{line}:{column}: error: {message}\n"
+    if note != "" { text += "  note: {note}\n" }
+    if hint != "" { text += "  hint: {hint}\n" }
+    runtimeWriteStandardError(text)
+}
+
+// A problem with the command line or the input files (no source location).
+fn failCommandLine(message: str) {
+    if diagnosticJson {
+        runtimeExitWithMessage("\{\"file\":null,\"line\":0,\"col\":0,\"severity\":\"error\",\"code\":\"cli\",\"message\":\"{jsonEscape(message)}\",\"hint\":\"run zc --help for usage\"\}\n", 2)
+    }
+    runtimeExitWithMessage("zc: error: {message}\n  hint: run zc --help for usage\n", 2)
+}
+
+fn finishDiagnostics() {
+    if diagnosticCount == 0 { return }
+    let result = win("ExitProcess", 2)
 }
 
 fn failCompilation(line: int, message: str) {
-    runtimePanicWithString("{currentSourceFile}:{line}: error: {message}")
+    var hint = diagnosticHint
+    diagnosticHint = ""
+    if hint == "" { hint = habitHint(message) }
+    if diagnosticRecover {
+        diagnosticCalls += 1
+        if diagnosticCalls > 100000 { finishDiagnostics() }
+        if diagnosticSuppressed { return }
+    }
+    runtimePanicQuietExitCode = 2          // a later internal crash exits quietly
+    reportDiagnostic(currentSourceFile, line, errorColumnFor(line), diagnosticCode, message, hint, instantiationNote)
+    diagnosticCount += 1
+    if not diagnosticRecover or diagnosticCount >= diagnosticLimit {
+        if diagnosticRecover and not diagnosticJson { runtimeWriteStandardError("stopping after {diagnosticLimit} errors\n") }
+        finishDiagnostics()
+    }
+    diagnosticSuppressed = true
 }
 
 fn isDigit(character: int) -> bool { return character >= 48 and character <= 57 }
@@ -959,6 +1113,38 @@ fn literalFloatBits(text: str) -> int {
     return (biased << 52) | (quotient - 4503599627370496)
 }
 
+// Operators other languages have and Zephyr spells differently: fail with a hint.
+fn habitPunctuation(character: int, next: int, afterNext: int, line: int) {
+    if character == 38 and next == 38 {
+        diagnosticHint = "Zephyr spells logical and as 'and': if a and b \{ ... \}"
+        failCompilation(line, "unexpected '&&'")
+    }
+    if character == 124 and next == 124 {
+        diagnosticHint = "Zephyr spells logical or as 'or': if a or b \{ ... \}"
+        failCompilation(line, "unexpected '||'")
+    }
+    if character == 33 and next != 61 {
+        diagnosticHint = "Zephyr spells logical not as 'not': if not done \{ ... \}"
+        failCompilation(line, "unexpected '!'")
+    }
+    if character == 43 and next == 43 {
+        diagnosticHint = "there is no ++; write x += 1"
+        failCompilation(line, "unexpected '++'")
+    }
+    if character == 45 and next == 45 and not isIdentifierCharacter(afterNext) and afterNext != 40 {
+        diagnosticHint = "there is no --; write x -= 1"
+        failCompilation(line, "unexpected '--'")
+    }
+    if character == 59 {
+        diagnosticHint = "statements end at a newline; remove the ';' (put two statements on two lines)"
+        failCompilation(line, "unexpected ';'")
+    }
+    if character == 61 and next == 62 {
+        diagnosticHint = "match arms are written `pattern \{ ... \}` with no '=>'; closures are fn(x: int) -> int \{ ... \}"
+        failCompilation(line, "unexpected '=>'")
+    }
+}
+
 fn tokenizeSource(source: str, startLine: int) -> [Token] {
     var output: [Token] = []
     var position = 0
@@ -966,9 +1152,21 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
     var depth = 0
     var savedDepths: [int] = []      // paren depth saved at each open brace
     let sourceLength = source.len()
+    let savedLexerSource = lexerSource
+    let savedLexerTokenStart = lexerTokenStart
+    lexerSource = source
+    if startLine == 1 and sourceLength > 0 and not diagnosticSources.has(currentSourceFile) { diagnosticSources[currentSourceFile] = source }
+    var lineStart = 0
+    var lineStartLine = line
     while position < sourceLength {
         let character = source.byte(position)
         let tokenLine = line
+        lexerTokenStart = position
+        if lineStartLine != line {           // a comment or string spanned lines
+            lineStart = position - columnAt(source, position) + 1
+            lineStartLine = line
+        }
+        lexerTokenColumn = position - lineStart + 1
         if character == 10 {
             // A following line that begins with `.` continues this statement, so
             // a method chain can be written one call per line. `..` is the range
@@ -981,6 +1179,8 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
             }
             position += 1
             line += 1
+            lineStart = position
+            lineStartLine = line
             continue
         }
         if character == 32 or character == 9 or character == 13 {
@@ -1150,6 +1350,7 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
             position = tokenEnd
             continue
         }
+        habitPunctuation(character, byteAt(source, position + 1), byteAt(source, position + 2), tokenLine)
         var punctuationKind = -1
         var punctuationLength = 3
         if (character == 60 or character == 62) and byteAt(source, position + 1) == character and byteAt(source, position + 2) == 61 {
@@ -1184,6 +1385,8 @@ fn tokenizeSource(source: str, startLine: int) -> [Token] {
         position += punctuationLength
     }
     output.push(makeToken(tokenEndOfFile, line))
+    lexerSource = savedLexerSource
+    lexerTokenStart = savedLexerTokenStart
     return output
 }
 
@@ -1905,6 +2108,10 @@ fn parseStatement() -> Node {
         var statementNode = makeNode(nodeDeclaration, token.line)
         statementNode.isMutable = token.tokenKind == tokenVariable
         if token.tokenKind == tokenConstant { statementNode.integerValue = declarationFlagConstant }
+        if atTokenKind(tokenIdentifier) and peek().text == "mut" and parserTokens[parserPosition + 1].tokenKind == tokenIdentifier {
+            diagnosticHint = "a mutable variable is declared with var: var x = 1 (let is immutable)"
+            failCompilation(token.line, "unexpected 'mut'")
+        }
         statementNode.name = expect(tokenIdentifier, "variable name").text
         var declaredType = makeNode(nodeNone, token.line)
         if atTokenKind(tokenColon) {
@@ -2429,6 +2636,14 @@ fn parsePrimary() -> Node {
 }
 
 fn parse(tokens: [Token]) -> Node {
+    let wasParserActive = parserActive
+    parserActive = true
+    let program = parseTokens(tokens)
+    parserActive = wasParserActive
+    return program
+}
+
+fn parseTokens(tokens: [Token]) -> Node {
     parserTokens = tokens
     parserPosition = 0
     structLiteralNesting = 0
@@ -3258,7 +3473,13 @@ fn resolveTypeHere(typeExpression: Node) -> int {
     let interfaceIndex = findInterface(typeName)
     if interfaceIndex >= 0 { return interfaceTypeOf(interfaceIndex) }
     let structIndex = findStruct(typeName)
-    if structIndex < 0 { failCompilation(typeExpression.line, "unknown type '{typeName}'") }
+    if structIndex < 0 {
+        if typeExpression.column > 0 {
+            knownErrorLine = typeExpression.line
+            knownErrorColumn = typeExpression.column
+        }
+        failCompilation(typeExpression.line, "unknown type '{typeName}'")
+    }
     let expectedCount = structDefinitions[structIndex].typeParameters.len()
     if typeExpression.children.len() != expectedCount {
         if expectedCount == 0 { failCompilation(typeExpression.line, "'{typeName}' takes no type arguments") }
@@ -3750,7 +3971,9 @@ fn checkMethod(expression: Node) -> int {
     var functionIndex = 0 - 1
     if typeKinds[receiverType] == kindStruct or typeKinds[receiverType] == kindEnum { functionIndex = findFunction(methodScope(receiverType) + "." + callee.name) }
     if functionIndex < 0 { functionIndex = findFunction(callee.name) }
-    if functionIndex < 0 { failCompilation(expression.line, "unknown method or function '{callee.name}'") }
+    if functionIndex < 0 { failCompilation(expression.line, "unknown method or function '{callee.name}'")
+        return typeIdInteger                     // keep checking (see failCompilation)
+    }
     let functionDefinition = functionDefinitions[functionIndex]
     fillDefaults(expression, functionDefinition.node, argumentCount + 1)
     argumentCount = expression.children.len() - 1
@@ -3884,6 +4107,7 @@ fn cloneNode(node: Node) -> Node {
     copy.auxiliary = node.auxiliary
     copy.referenceIndex = node.referenceIndex
     copy.isMutable = node.isMutable
+    copy.column = node.column
     copy.file = node.file    // preserve source origin so -g line info isn't misattributed after inlining/monomorphisation
     for child in node.children { copy.children.push(cloneNode(child)) }
     return copy
@@ -3990,7 +4214,10 @@ fn instantiate(functionIndex: int, names: [str], types: [int], line: int) -> int
     instantiationFunctionIndices.push(instanceIndex)                         // recursive generic terminates
     instantiatedFunctions.push(instanceIndex)
     instantiationDepths[instanceIndex] = currentInstantiationDepth + 1
-    pendingInstantiations.push(Instantiation{functionIndex: instanceIndex, typeParameterNames: names, typeArguments: types})
+    var bindings: [str] = []
+    for i in 0..names.len() { bindings.push("{names[i]}={describeType(types[i])}") }
+    let site = "while instantiating {functionDefinition.name}[{joinNames(bindings)}] from {currentSourceFile}:{knownErrorLine}"
+    pendingInstantiations.push(Instantiation{functionIndex: instanceIndex, typeParameterNames: names, typeArguments: types, site: site})
     return instanceIndex
 }
 
@@ -4166,6 +4393,7 @@ fn checkCall(expression: Node) -> int {
     if callee.name == "assert" {
         if argumentCount != 1 and argumentCount != 2 { failCompilation(expression.line, "assert(cond) or assert(cond, msg)") }
         if typeKinds[checkExpression(expression.children[1])] != kindBoolean { failCompilation(expression.line, "assert condition must be bool") }
+        if argumentCount == 1 and assertShowsOperands(expression.children[1]) { return lowerComparisonAssert(expression) }
         if argumentCount == 2 and typeKinds[checkExpression(expression.children[2])] != kindString { failCompilation(expression.line, "assert message must be str") }
         expression.auxiliary = callKindAssert
         return typeIdVoid
@@ -4345,7 +4573,9 @@ fn checkCall(expression: Node) -> int {
     }
     if environmentFind(callee.name) >= 0 { return checkIndirect(expression, checkExpression(callee)) }   // variable holding a function
     let functionIndex = findFunction(callee.name)
-    if functionIndex < 0 { failCompilation(expression.line, "unknown function '{callee.name}'") }
+    if functionIndex < 0 { failCompilation(expression.line, "unknown function '{callee.name}'")
+        return typeIdInteger                     // keep checking (see failCompilation)
+    }
     let functionDefinition = functionDefinitions[functionIndex]
     fillDefaults(expression, functionDefinition.node, argumentCount)
     let givenArgumentCount = expression.children.len() - 1
@@ -4426,6 +4656,7 @@ fn checkExpressionInner(expression: Node) -> int {
                 failCompilation(expression.line, "'{expression.name}' is a builtin -- call it with (...)")
             }
             failCompilation(expression.line, "unknown variable '{expression.name}'")
+            return typeIdInteger                 // keep checking (see failCompilation)
         }
         let variableInformation = environmentGet(handle)
         let captureIndex = captureOf(expression, handle, variableInformation)
@@ -4558,7 +4789,9 @@ fn checkExpressionInner(expression: Node) -> int {
     if expression.nodeKind == nodeStructLiteral {
         expression.name = qualifyName(expression.name)
         let structIndex = findStruct(expression.name)
-        if structIndex < 0 { failCompilation(expression.line, "unknown struct '{expression.name}'") }
+        if structIndex < 0 { failCompilation(expression.line, "unknown struct '{expression.name}'")
+        return typeIdInteger                     // keep checking (see failCompilation)
+    }
         if not expression.isMutable and (structDefinitions[structIndex].node.isMutable or structDefinitions[structIndex].unionIndex >= 0) {
             failCompilation(expression.line, "'{expression.name}' is an enum; make a value with {expression.name}.Member(...)")
         }
@@ -4731,7 +4964,19 @@ fn checkExpressionInner(expression: Node) -> int {
 fn checkExpression(expression: Node) -> int {
     let savedFile = currentSourceFile                   // names resolve in the file the node came from
     if expression.file != "" { currentSourceFile = expression.file }
+    let savedLine = knownErrorLine
+    let savedColumn = knownErrorColumn
+    if expression.column > 0 {
+        knownErrorLine = expression.line
+        knownErrorColumn = expression.column
+        // a call or a binary operation is reported where it starts
+        if (expression.nodeKind == nodeCall or expression.nodeKind == nodeBinary or expression.nodeKind == nodeMember or expression.nodeKind == nodeIndex) and expression.children.len() > 0 and expression.children[0].line == expression.line and expression.children[0].column > 0 and expression.children[0].column < expression.column {
+            knownErrorColumn = expression.children[0].column
+        }
+    }
     let typeIndex = checkExpressionInner(expression)
+    knownErrorLine = savedLine
+    knownErrorColumn = savedColumn
     currentSourceFile = savedFile
     expression.typeIndex = typeIndex
     return typeIndex
@@ -4797,7 +5042,21 @@ fn checkBlock(block: Node) {
     environmentPop()
 }
 
+// Each statement is where checking resumes after an error (see failCompilation).
 fn checkStatement(statement: Node) {
+    let savedLine = knownErrorLine
+    let savedColumn = knownErrorColumn
+    if statement.column > 0 {
+        knownErrorLine = statement.line
+        knownErrorColumn = statement.column
+    }
+    checkStatementInner(statement)
+    knownErrorLine = savedLine
+    knownErrorColumn = savedColumn
+    diagnosticSuppressed = false
+}
+
+fn checkStatementInner(statement: Node) {
     if statement.nodeKind == nodeMatch {
         lowerMatch(statement, false)
         checkStatement(statement)
@@ -5376,6 +5635,63 @@ fn lowerFor(statement: Node, iterableType: int) {
     nodeBecome(statement, lowered)
 }
 
+// assert(a == b) (any comparison of two scalars, already checked): on failure
+// it reports both values. The operands are evaluated once, into hidden locals:
+//   let l = a; let r = b; assert(l == r, "assertion failed: left == right ...")
+// The message is built only on the failure path.
+fn assertShowsOperands(condition: Node) -> bool {
+    if condition.nodeKind != nodeBinary or condition.children.len() != 2 { return false }
+    let operator = condition.operator
+    if operator != tokenEquals and operator != tokenNotEquals and operator != tokenLessThan and operator != tokenLessOrEqual and operator != tokenGreaterThan and operator != tokenGreaterOrEqual { return false }
+    let leftType = condition.children[0].typeIndex
+    if leftType != condition.children[1].typeIndex { return false }
+    let kind = typeKinds[leftType]
+    return kind == kindInteger or kind == kindFloat or kind == kindBoolean or kind == kindString or kind == kindEnum
+}
+
+fn lowerComparisonAssert(expression: Node) -> int {
+    let condition = expression.children[1]
+    let line = expression.line
+    lowerCount += 1
+    let leftName = "__z{lowerCount}_left"
+    let rightName = "__z{lowerCount}_right"
+    var leftDeclaration = makeNode(nodeDeclaration, line)
+    leftDeclaration.name = leftName
+    leftDeclaration.operator = declarationFlagPrechecked
+    leftDeclaration.children.push(condition.children[0])
+    leftDeclaration.children.push(makeNode(nodeNone, line))
+    var rightDeclaration = makeNode(nodeDeclaration, line)
+    rightDeclaration.name = rightName
+    rightDeclaration.operator = declarationFlagPrechecked
+    rightDeclaration.children.push(condition.children[1])
+    rightDeclaration.children.push(makeNode(nodeNone, line))
+    var message = makeNode(nodeStringLiteral, line)
+    var head = makeNode(nodeStringText, line)
+    head.name = "assertion failed: left {tokenNames[condition.operator]} right\n  left:  "
+    message.children.push(head)
+    var leftPart = makeNode(nodeInterpolation, line)
+    leftPart.children.push(nameNode(leftName, line))
+    message.children.push(leftPart)
+    var middle = makeNode(nodeStringText, line)
+    middle.name = "\n  right: "
+    message.children.push(middle)
+    var rightPart = makeNode(nodeInterpolation, line)
+    rightPart.children.push(nameNode(rightName, line))
+    message.children.push(rightPart)
+    var assertCall = makeNode(nodeCall, line)
+    assertCall.children.push(nameNode("assert", line))
+    assertCall.children.push(binaryNode(condition.operator, nameNode(leftName, line), nameNode(rightName, line), line))
+    assertCall.children.push(message)
+    var inner = makeNode(nodeLetExpression, line)
+    inner.children.push(rightDeclaration)
+    inner.children.push(assertCall)
+    var outer = makeNode(nodeLetExpression, line)
+    outer.children.push(leftDeclaration)
+    outer.children.push(inner)
+    nodeBecome(expression, outer)
+    return checkExpression(expression)
+}
+
 // n as Color: the int, checked to be a member's ordinal
 //   let hidden = n; assert(0 <= hidden and hidden < count, "..."); hidden
 fn lowerEnumFromInteger(expression: Node, enumType: int) {
@@ -5839,6 +6155,14 @@ fn dispatchTableIndex(structIndex: int, interfaceIndex: int) -> int {
 }
 
 fn check(program: Node) {
+    diagnosticCode = "type"
+    diagnosticRecover = true
+    checkProgram(program)
+    diagnosticRecover = false
+    finishDiagnostics()
+}
+
+fn checkProgram(program: Node) {
     // pass 0: enum names + members (int-backed, resolved at compile time)
     for topLevelNode in program.children {
         currentSourceFile = topLevelNode.file
@@ -5994,6 +6318,7 @@ fn check(program: Node) {
             // a generic function is a template: nothing to check until it is
             // instantiated with concrete types
             if functionDefinitions[topLevelNode.referenceIndex].typeParameters.len() == 0 { checkFunctionBody(functionDefinitions[topLevelNode.referenceIndex]) }
+            diagnosticSuppressed = false
             continue
         }
         checkStatement(topLevelNode)
@@ -6044,9 +6369,13 @@ fn drainPending() {
             typeBindingNames.push(instance.typeParameterNames[i])
             typeBindingTypes.push(instance.typeArguments[i])
         }
+        let savedNote = instantiationNote
+        instantiationNote = instance.site
         currentInstantiationDepth = instantiationDepths[instance.functionIndex]
         checkFunctionBody(functionDefinitions[instance.functionIndex])
         currentInstantiationDepth = 0
+        diagnosticSuppressed = false
+        instantiationNote = savedNote
         for i in 0..instance.typeParameterNames.len() {
             let poppedName = typeBindingNames.pop()
             let poppedType = typeBindingTypes.pop()
@@ -8522,6 +8851,21 @@ fn coldPanic(expression: Node, message: str) {
     deferredColdBlocks.push("  call runtimePanicWithString\n")
 }
 
+// A failed bounds check reports the index and the length: the cold block
+// passes both to runtimeFailIndexAt (rcx = site, rdx = index, r8 = length).
+fn coldIndexPanic(expression: Node, indexRegister: str, lengthOperand: str) {
+    var scratch = "r11"
+    if indexRegister == "r11" { scratch = "r10" }
+    deferredColdBlocks.push("  mov {scratch}, {lengthOperand}\n")
+    deferredColdBlocks.push("  mov rdx, {indexRegister}\n")
+    deferredColdBlocks.push("  mov r8, {scratch}\n")
+    deferredColdBlocks.push("  lea rcx, [rip + __s{addDataString(panicSite(expression))}]\n")
+    deferredColdBlocks.push("  mov r12, rsp\n")
+    deferredColdBlocks.push("  and rsp, -16\n")
+    deferredColdBlocks.push("  sub rsp, 32\n")
+    deferredColdBlocks.push("  call runtimeFailIndexAt\n")
+}
+
 fn generateZeroCheck(expression: Node) {
     let nonZeroLabel = allocateLabel()
     emitInstruction("test rcx, rcx")
@@ -8536,7 +8880,7 @@ fn generateBoundsCheck(listRegister: str, indexRegister: str, expression: Node) 
     emitInstruction("cmp {indexRegister}, [{listRegister}]")
     emitInstruction("jae {labelText(failLabel)}")
     deferredColdBlocks.push(".L{failLabel}:\n")
-    coldPanic(expression, "index out of bounds")
+    coldIndexPanic(expression, indexRegister, "[{listRegister}]")
 }
 
 // bounds check against a cached length in a frame slot (hoisted list base)
@@ -8545,7 +8889,7 @@ fn generateBoundsCheckSlot(lengthSlot: str, indexRegister: str, expression: Node
     emitInstruction("cmp {indexRegister}, " + lengthSlot)
     emitInstruction("jae {labelText(failLabel)}")
     deferredColdBlocks.push(".L{failLabel}:\n")
-    coldPanic(expression, "index out of bounds")
+    coldIndexPanic(expression, indexRegister, lengthSlot)
 }
 
 // flush the cold blocks collected while generating one function body
@@ -18734,7 +19078,11 @@ fn textStatement(builtin: str, text: str, line: int) -> Node {
 // ponytail: no isolation; the first failure stops the run. A process per test
 // would let the rest run.
 fn addTestRunner(program: Node, tests: [Node]) {
+    var selected: [int] = []
     for i in 0..tests.len() {
+        if testFilter == "" or tests[i].name.indexOf(testFilter) >= 0 { selected.push(i) }
+    }
+    for i in selected {
         let test = tests[i]
         var body = makeNode(nodeFunction, test.line)
         body.name = "__test{i}"
@@ -18744,14 +19092,27 @@ fn addTestRunner(program: Node, tests: [Node]) {
         body.children.push(makeNode(nodeProgram, test.line))     // not generic
         program.children.push(body)
     }
-    for i in 0..tests.len() {
+    if linuxTargetEnabled {
+        // Each test runs in a forked child, so a failing test (a panic, a failed
+        // assert, a crash) is reported and the rest still run.
+        for statement in parse(tokenizeSource("var __zt_passed = 0\nvar __zt_failed = 0\nlet __zt_status = chr(0).repeat(8)\n", 1)).children { program.children.push(statement) }
+        for i in selected {
+            program.children.push(textStatement("emit", "test {tests[i].name} ... ", tests[i].line))
+            let source = "let __zt_pid{i} = syscall(57)\nif __zt_pid{i} == 0 \{\n__test{i}()\nlet __zt_done{i} = syscall(231, 0)\n\}\nlet __zt_wait{i} = syscall(61, __zt_pid{i}, addr(__zt_status) + 8, 0, 0)\nif load32(addr(__zt_status) + 8) == 0 \{\nprint(\"ok\")\n__zt_passed += 1\n\} else \{\nprint(\"FAILED\")\n__zt_failed += 1\n\}\n"
+            for statement in parse(tokenizeSource(source, tests[i].line)).children { program.children.push(statement) }
+        }
+        let summary = "if __zt_failed == 0 \{\nif __zt_passed == 1 \{ print(\"1 test passed\") \} else \{ print(\"\{__zt_passed\} tests passed\") \}\n\} else \{\nprint(\"\{__zt_passed\} passed, \{__zt_failed\} failed\")\nlet __zt_exit = syscall(231, 1)\n\}\n"
+        for statement in parse(tokenizeSource(summary, 1)).children { program.children.push(statement) }
+        return
+    }
+    for i in selected {
         program.children.push(textStatement("emit", "test {tests[i].name} ... ", tests[i].line))
         program.children.push(callStatement("__test{i}", tests[i].line))
         program.children.push(textStatement("print", "ok", tests[i].line))
     }
     var plural = "s"
-    if tests.len() == 1 { plural = "" }
-    program.children.push(textStatement("print", "{tests.len()} test{plural} passed", 0))
+    if selected.len() == 1 { plural = "" }
+    program.children.push(textStatement("print", "{selected.len()} test{plural} passed", 0))
 }
 
 // splice each `import "path"` in place with that file's declarations.
@@ -18795,6 +19156,22 @@ fn expandImports(program: Node, baseDirectory: str) -> Node {
                     path = "embed:" + embeddedLibraryName(embeddedIndex)
                     display = "lib/" + embeddedLibraryName(embeddedIndex)
                 }
+            }
+            if embeddedIndex < 0 and not pathExists(path) {
+                var searched: [str] = []
+                if isAbsolutePath(topLevelNode.name) { searched.push(topLevelNode.name) }
+                else {
+                    if baseDirectory == "" { searched.push("./") } else { searched.push(baseDirectory) }
+                    for directory in includeDirectories { searched.push(directory) }
+                    if cachedExecutableDirectory != "" {
+                        searched.push(cachedExecutableDirectory)
+                        searched.push(cachedExecutableDirectory + "lib/")
+                    }
+                    searched.push("the library built into zc")
+                }
+                diagnosticCode = "import"
+                diagnosticHint = "std modules are imported as \"std/name.zeph\"; add a directory with -I DIR"
+                failCompilation(topLevelNode.line, "cannot find import '{topLevelNode.name}' (looked in: {joinNames(searched)})")
             }
             var key = path
             if embeddedIndex < 0 { key = canonicalPathKey(path) }
@@ -21623,6 +22000,62 @@ fn assembleAndLink(path: str) {
 
 import "optimizer.zeph"
 
+// ---------------- zc run on Linux ----------------
+// The program is linked into a memfd (an anonymous file), then exec'd from
+// /proc/self/fd/N: nothing is left on disk. Without memfd_create the image
+// goes to a temp file instead. The exec replaces zc, so the program's exit
+// code is zc's.
+fn cStringOf(text: str) -> str { return text + chr(0) }
+
+fn linuxRunImagePath() -> str {
+    let name = cStringOf("zc-run")
+    let fileDescriptor = syscall(319, addr(name) + 8, 0)          // memfd_create
+    if fileDescriptor >= 0 { return "/proc/self/fd/{fileDescriptor}" }
+    return "/tmp/zc-run-{syscall(39)}"                               // getpid
+}
+
+fn linuxReadProcFile(path: str) -> str {
+    let pathText = cStringOf(path)
+    let fileDescriptor = syscall(2, addr(pathText) + 8, 0, 0)
+    if fileDescriptor < 0 { return "" }
+    var output = ""
+    let chunk = chr(0).repeat(65536)
+    var going = true
+    while going {
+        let count = syscall(0, fileDescriptor, addr(chunk) + 8, 65536)
+        if count <= 0 { going = false } else { output += chunk.sub(0, count) }
+    }
+    let closed = syscall(3, fileDescriptor)
+    return output
+}
+
+// a NULL-terminated array of pointers to the strings (each ends in a NUL)
+fn linuxPointerArray(strings: [str]) -> str {
+    let array = chr(0).repeat((strings.len() + 1) * 8)
+    for i in 0..strings.len() { store64(addr(array) + 8 + i * 8, addr(strings[i]) + 8) }
+    return array
+}
+
+fn linuxExecute(imagePath: str, programName: str, programArguments: [str]) {
+    let modeResult = syscall(90, addr(cStringOf(imagePath)) + 8, 493)    // chmod 0755 (a temp file)
+    var argumentStrings: [str] = [cStringOf(programName)]
+    for argument in programArguments { argumentStrings.push(cStringOf(argument)) }
+    var environmentStrings: [str] = []
+    let environment = linuxReadProcFile("/proc/self/environ")
+    var start = 0
+    for i in 0..environment.len() {
+        if environment.byte(i) == 0 {
+            if i > start { environmentStrings.push(cStringOf(environment.sub(start, i))) }
+            start = i + 1
+        }
+    }
+    let argumentArray = linuxPointerArray(argumentStrings)
+    let environmentArray = linuxPointerArray(environmentStrings)
+    let pathText = cStringOf(imagePath)
+    let result = syscall(59, addr(pathText) + 8, addr(argumentArray) + 8, addr(environmentArray) + 8)    // execve
+    failCommandLine("zc run: cannot execute the program (execve returned {result})")
+}
+
 // ---------------- driver ----------------
 let commandLineArguments = args()
 var includeRuntime = false
@@ -21635,6 +22068,31 @@ var argumentIndex = 1
 // everything after the program path belongs to the program
 var runInProcess = false
 var guestCommandLine = ""
+var guestArguments: [str] = []
+var showHelp = false
+let zcUsage = """
+usage: zc [flags] <input.zeph> <output>       compile (output: exe, .s, .o with --linux, .wasm)
+       zc run [flags] <input.zeph> [program args...]   compile and run now
+       zc --test [--test-filter NAME] [flags] <input.zeph> <output>   build a test runner
+
+flags:
+  --linux               target Linux x86-64 (ELF); implies --rt
+  --rt                  link the Zephyr runtime (needed by almost every program)
+  --wasm                target WebAssembly
+  -O2                   optimize (SSA tier)
+  -g, --debug           debug info (.zdbg next to the output)
+  -I DIR                add an import search directory
+  --test                compile the file's test blocks into a runner instead of main
+  --test-filter NAME    only tests whose name contains NAME (implies --test)
+  --error-format=json   print compile errors as JSON, one object per line:
+                        \{file, line, col, severity, code, message, hint\}
+  --map                 write <output>.map (symbol addresses, for profilers)
+  --version             print the version
+  -h, --help            this help
+
+compile errors print as file:line:col: error: message and exit with code 2;
+runtime panics print panic: file:line: message and exit with code 1.
+"""
 if commandLineArguments.len() > 1 and commandLineArguments[1] == "run" {
     runInProcess = true
     includeRuntime = true
@@ -21643,6 +22101,7 @@ if commandLineArguments.len() > 1 and commandLineArguments[1] == "run" {
 while argumentIndex < commandLineArguments.len() {
     let argument = commandLineArguments[argumentIndex]
     if runInProcess and inputPath != "" {
+        guestArguments.push(argument)
         if argument.indexOf(" ") >= 0 { guestCommandLine += " \"" + argument + "\"" }
         else { guestCommandLine += " " + argument }
     }
@@ -21659,7 +22118,7 @@ while argumentIndex < commandLineArguments.len() {
     else if argument == "--callgraph-report" { callGraphReport = true }
     else if argument == "--profile-generate" or argument == "--profile-use" {
         argumentIndex += 1
-        if argumentIndex >= commandLineArguments.len() { panic(argument + " requires a profile file path") }
+        if argumentIndex >= commandLineArguments.len() { failCommandLine(argument + " requires a profile file path") }
         if argument == "--profile-generate" { profileGeneratePath = commandLineArguments[argumentIndex] }
         else { profileUsePath = commandLineArguments[argumentIndex] }
     }
@@ -21668,7 +22127,7 @@ while argumentIndex < commandLineArguments.len() {
         var directory = ""
         if argument == "-I" {
             argumentIndex += 1
-            if argumentIndex >= commandLineArguments.len() { panic("-I requires a directory") }
+            if argumentIndex >= commandLineArguments.len() { failCommandLine("-I requires a directory") }
             directory = commandLineArguments[argumentIndex]
         } else { directory = argument.sub(2, argument.len()) }
         if not directory.endsWith("/") and not directory.endsWith("\\") { directory += "/" }
@@ -21678,10 +22137,27 @@ while argumentIndex < commandLineArguments.len() {
         runTests = true
         includeRuntime = true
     }
+    else if argument == "--test-filter" {
+        argumentIndex += 1
+        if argumentIndex >= commandLineArguments.len() { failCommandLine("--test-filter requires a test name (a substring)") }
+        testFilter = commandLineArguments[argumentIndex]
+        runTests = true
+        includeRuntime = true
+    }
+    else if argument == "--error-format=json" { diagnosticJson = true }
+    else if argument == "--error-format=text" { diagnosticJson = false }
+    else if argument == "--help" or argument == "-h" { showHelp = true }
+    else if argument.len() > 1 and argument.startsWith("-") { failCommandLine("unknown flag '{argument}'") }
     else if inputPath == "" { inputPath = argument }
-    else { outputPath = argument }
+    else if outputPath == "" and not runInProcess { outputPath = argument }
+    else { failCommandLine("unexpected extra argument '{argument}' (zc takes one input file and one output file)") }
     argumentIndex += 1
 }
+if showHelp {
+    print(zcUsage)
+    let helpExit = win("ExitProcess", 0)
+}
+if linuxTargetEnabled { includeRuntime = true }      // a Linux program always needs the runtime
 if showVersion {
     print("zc 0.2 -- the Zephyr compiler, written in Zephyr")
     print("features: elf-object linux-extern")      // --linux out.o writes an ELF relocatable; extern fn loads shared libraries (build scripts probe these)
@@ -21689,13 +22165,20 @@ if showVersion {
 if inputPath == "" and showVersion {
     // --version alone: nothing to compile
 } else {
-    if inputPath == "" or (outputPath == "" and not runInProcess) {
-        panic("usage: zc [--rt] [--test] [--linux | --wasm] [-g] [-I dir] [--version] <input.zeph> <output.exe|output.s|output.wasm>\n       zc run [--test] <input.zeph> [program arguments...]")
+    if inputPath == "" { failCommandLine("no input file") }
+    if outputPath == "" and not runInProcess { failCommandLine("no output file (zc <input.zeph> <output>, or zc run <input.zeph>)") }
+    if not pathExists(inputPath) { failCommandLine("cannot read input '{inputPath}': no such file") }
+    if macosTargetEnabled and (linuxTargetEnabled or wasmTargetEnabled or runInProcess) { failCommandLine("--macos-ir requires scalar assembly output; use scripts/macos.py to build or run native ARM64 programs") }
+    if macosTargetEnabled and not outputPath.endsWith(".s") { failCommandLine("--macos-ir output must end in .s") }
+    if macosTargetEnabled and not includeRuntime { failCommandLine("--macos-ir requires --rt") }
+    if runInProcess and pathExists("/proc/self/exe") {
+        // a Linux host: build an ELF into an anonymous file and exec it
+        runOnLinux = true
+        linuxTargetEnabled = true
+        includeRuntime = true
+        outputPath = linuxRunImagePath()
     }
-    if macosTargetEnabled and (linuxTargetEnabled or wasmTargetEnabled or runInProcess) { panic("--macos-ir requires scalar assembly output; use scripts/macos.py to build or run native ARM64 programs") }
-    if macosTargetEnabled and not outputPath.endsWith(".s") { panic("--macos-ir output must end in .s") }
-    if macosTargetEnabled and not includeRuntime { panic("--macos-ir requires --rt") }
-    if runInProcess and (linuxTargetEnabled or wasmTargetEnabled) { panic("zc run: runs Windows x86-64 code in this process; --linux and --wasm do not apply") }
+    if runInProcess and not runOnLinux and (linuxTargetEnabled or wasmTargetEnabled) { failCommandLine("zc run: runs Windows x86-64 code in this process; --linux and --wasm do not apply") }
     currentSourceFile = baseName(inputPath)
     cachedExecutableDirectory = executableDirectory()
     var program = parse(tokenizeSource(readFile(inputPath), 1))
@@ -21724,7 +22207,7 @@ if inputPath == "" and showVersion {
         } else {
             currentSourceFile = "runtime.zeph (embedded)"
             runtimeSource = embeddedRuntimeSource()
-            if runtimeSource == "" { panic("runtime.zeph not found next to zc.exe or in the current directory, and this build has no embedded runtime") }
+            if runtimeSource == "" { failCommandLine("runtime.zeph not found next to zc.exe or in the current directory, and this build has no embedded runtime") }
         }
         // --linux: the kernel32 entry points the runtime calls are provided as
         // ordinary Zephyr functions over syscalls, so runtime.zeph itself needs
@@ -21751,6 +22234,7 @@ if inputPath == "" and showVersion {
             runtimeSource = runtimeSource.replace("runtimeFail(\"cannot convert to float\")", "runtimeFail(site + \"cannot convert to float\")")
             runtimeSource = runtimeSource.replace("runtimeFail(\"pop from empty list\")", "runtimeFail(site + \"pop from empty list\")")
             runtimeSource = runtimeSource.replace("runtimeFail(\"map key not found\")", "runtimeFail(site + \"map key not found\")")
+            runtimeSource = runtimeSource.replace("runtimeFailMissingKey(mapAddress, key, \"\")", "runtimeFailMissingKey(mapAddress, key, site)")
             runtimeSource = runtimeSource.replace("runtimeFail(\"cannot read file\")", "runtimeFail(site + \"cannot read file\")")
             runtimeSource = runtimeSource.replace("runtimeFail(\"cannot write file\")", "runtimeFail(site + \"cannot write file\")")
             runtimeSource += "\nfn runtimePanicAt(site: str, msg: str) \{ runtimeFail(site + msg) \}\n"
@@ -21797,6 +22281,9 @@ if inputPath == "" and showVersion {
         generateProgram(program)
         if isAssemblyOutput {
             writeFile(outputPath, assemblyLines.join())
+        } else if runOnLinux {
+            assembleAndLink(outputPath)
+            linuxExecute(outputPath, inputPath, guestArguments)
         } else if runInProcess {
             currentAssemblySection = sectionText
             for line in assemblyLines { assembleLine(line) }
