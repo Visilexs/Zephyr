@@ -1,0 +1,16 @@
+true
+got hi oops 3
+false
+0 a b|
+["forty two", "/tmp"]
+ZEPHYR_TEST_VALUE=forty two
+2
+50000
+spawn zephyr-no-such-program: not found on PATH
+spawn /etc/hostname-nope: no such file or directory
+spawn /etc: permission denied
+true true
+ping
+
+true 143
+false

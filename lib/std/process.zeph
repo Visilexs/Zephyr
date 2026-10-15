@@ -1,0 +1,371 @@
+// std/process.zeph -- child processes with piped stdin/stdout/stderr (Linux).
+//
+//     import "std/process.zeph"
+//     match spawn(["sh", "-c", "read x; echo got $x"], SpawnOptions{}) {
+//         Ok(child) {
+//             let sent = child.write("hi\n")
+//             child.closeStdin()
+//             print(child.readAll())           // got hi
+//             print(child.wait())              // 0
+//         }
+//         Err(message) { print(message) }
+//     }
+//     print(runCapture(["ls", "/nope"]).unwrap().code)   // 2
+//
+// argv[0] is looked up on PATH unless it contains a '/'. Spawn failures
+// (missing program, exec error) come back as Err, never a panic. Writing to a
+// child that has exited gives false (SIGPIPE is ignored once spawn runs).
+// Uses raw syscalls: fork, pipe2, dup2, execve, poll, wait4, kill.
+import "std/bytes.zeph"
+import "std/result.zeph"
+
+struct SpawnOptions {
+    environment: [str: str]? // NAME -> value, set on top of the inherited environment
+    clearEnvironment: bool = false   // start from an empty environment instead
+    directory: str = ""              // working directory for the child ("" = ours)
+    mergeStderr: bool = false        // the child's stderr goes to the stdout pipe
+}
+
+struct Process {
+    pid: int
+    stdinFd: int
+    stdoutFd: int
+    stderrFd: int
+    stdoutOpen: bool = true
+    stderrOpen: bool = true
+    exited: bool = false
+    exitCode: int = 0
+    stderrText: str = ""           // stderr collected by readAll/readAvailable
+}
+
+struct ProcessOutput { code: int, stdout: str, stderr: str }
+
+const processCloexec = 524288
+const processNonblock = 2048
+
+private fn processErrnoText(errno: int) -> str {
+    let names = [2: "no such file or directory", 13: "permission denied", 8: "exec format error",
+        20: "not a directory", 7: "argument list too long", 12: "out of memory", 11: "resource temporarily unavailable"]
+    return names.get(errno).or("errno {errno}")
+}
+
+private fn processIgnoreSigpipe() {
+    let action = Bytes.new(32)
+    action.put64(0, 1)                                   // SIG_IGN
+    let ignored = syscall(13, 13, action.addr(), 0, 8, 0, 0)  // rt_sigaction(SIGPIPE)
+}
+
+private fn processPipe() -> (int, int)? {
+    let fds = Bytes.new(8)
+    if syscall(293, fds.addr(), processCloexec, 0, 0, 0, 0) != 0 { return none }
+    return (fds.get32(0), fds.get32(4))
+}
+
+private fn processClose(fd: int) {
+    if fd >= 0 { let closed = syscall(3, fd, 0, 0, 0, 0, 0) }
+}
+
+private fn processIsExecutable(path: str) -> bool {
+    let name = cString(path)
+    return syscall(21, name.addr(), 1, 0, 0, 0, 0) == 0     // access(X_OK)
+}
+
+// The environment as NAME=value strings, from /proc/self/environ.
+fn currentEnvironment() -> [str] {
+    var entries: [str] = []
+    let name = cString("/proc/self/environ")
+    let fd = syscall(2, name.addr(), 0, 0, 0, 0, 0)
+    if fd < 0 { return entries }
+    let text = processReadToEnd(fd)
+    processClose(fd)
+    for entry in text.split(chr(0)) { if entry != "" { entries.push(entry) } }
+    return entries
+}
+
+private fn processReadToEnd(fd: int) -> str {
+    let buffer = Bytes.new(65536)
+    var parts: [str] = []
+    while true {
+        let count = syscall(0, fd, buffer.addr(), 65536, 0, 0, 0)
+        if count == 0 - 4 { continue }
+        if count <= 0 { break }
+        parts.push(buffer.getString(0, count))
+    }
+    return parts.join()
+}
+
+private fn processEnvironment(options: SpawnOptions) -> [str] {
+    var entries: [str] = []
+    if not options.clearEnvironment { entries = currentEnvironment() }
+    if let overrides = options.environment {
+        var kept: [str] = []
+        for entry in entries {
+            let equals = entry.indexOf("=")
+            if equals < 0 or not overrides.has(entry.sub(0, equals)) { kept.push(entry) }
+        }
+        for name in overrides.keys() { kept.push(name + "=" + overrides[name]) }
+        entries = kept
+    }
+    return entries
+}
+
+// argv[0] resolved against PATH (from the given environment), or none.
+private fn processFindProgram(program: str, environment: [str]) -> str? {
+    if program.contains("/") { return program }
+    var searchPath = "/usr/local/bin:/usr/bin:/bin"
+    for entry in environment { if entry.startsWith("PATH=") { searchPath = entry.sub(5, entry.len()) } }
+    for directory in searchPath.split(":") {
+        let base = if directory == "" { "." } else { directory }
+        let candidate = base + "/" + program
+        if processIsExecutable(candidate) { return candidate }
+    }
+    return none
+}
+
+// Runs in the forked child: only raw syscalls on precomputed addresses.
+private fn processChild(stdinRead: int, stdoutWrite: int, stderrWrite: int, directory: int,
+                        path: int, argv: int, envp: int, errorWrite: int, errorBuffer: int) {
+    let a = syscall(33, stdinRead, 0, 0, 0, 0, 0)
+    let b = syscall(33, stdoutWrite, 1, 0, 0, 0, 0)
+    let c = syscall(33, stderrWrite, 2, 0, 0, 0, 0)
+    var failure = 0
+    if a < 0 or b < 0 or c < 0 { failure = 9 }
+    if failure == 0 and directory != 0 {
+        let changed = syscall(80, directory, 0, 0, 0, 0, 0)
+        if changed < 0 { failure = 0 - changed }
+    }
+    if failure == 0 {
+        let executed = syscall(59, path, argv, envp, 0, 0, 0)
+        failure = 0 - executed
+    }
+    store32(errorBuffer, failure)
+    let reported = syscall(1, errorWrite, errorBuffer, 4, 0, 0, 0)
+    let exited = syscall(60, 127, 0, 0, 0, 0, 0)
+}
+
+// Starts argv[0] with argv. Ok(Process) with stdin/stdout/stderr pipes.
+fn spawn(argv: [str], options: SpawnOptions) -> Result[Process, str] {
+    if argv.len() == 0 { return Result.Err("spawn: empty argv") }
+    for argument in argv {
+        for i in 0..argument.len() { if argument.byte(i) == 0 { return Result.Err("spawn: embedded NUL in argv") } }
+    }
+    let environment = processEnvironment(options)
+    let found = processFindProgram(argv[0], environment)
+    if found == none { return Result.Err("spawn {argv[0]}: not found on PATH") }
+    let path = cString(found.get())
+    let argumentArray = cStringArray(argv)
+    let environmentArray = cStringArray(environment)
+    let environmentEmpty = Bytes.new(8)
+    var envp = environmentArray.addr()
+    if envp == 0 { envp = environmentEmpty.addr() }
+    let directory = cString(options.directory)
+    var directoryAddress = 0
+    if options.directory != "" { directoryAddress = directory.addr() }
+    processIgnoreSigpipe()
+    let stdinPipe = processPipe()
+    let stdoutPipe = processPipe()
+    let stderrPipe = processPipe()
+    let errorPipe = processPipe()
+    if stdinPipe == none or stdoutPipe == none or stderrPipe == none or errorPipe == none {
+        for p in [stdinPipe, stdoutPipe, stderrPipe, errorPipe] {
+            if let pair = p {
+                processClose(pair.0)
+                processClose(pair.1)
+            }
+        }
+        return Result.Err("spawn {argv[0]}: pipe2 failed")
+    }
+    let (stdinRead, stdinWrite) = stdinPipe.get()
+    let (stdoutRead, stdoutWrite) = stdoutPipe.get()
+    let (stderrRead, stderrWrite) = stderrPipe.get()
+    let (errorRead, errorWrite) = errorPipe.get()
+    var childStderr = stderrWrite
+    if options.mergeStderr { childStderr = stdoutWrite }
+    let errorBuffer = Bytes.new(8)
+    let pid = syscall(57, 0, 0, 0, 0, 0, 0)               // fork
+    if pid == 0 {
+        processChild(stdinRead, stdoutWrite, childStderr, directoryAddress, path.addr(),
+                     argumentArray.addr(), envp, errorWrite, errorBuffer.addr())
+    }
+    processClose(stdinRead)
+    processClose(stdoutWrite)
+    processClose(stderrWrite)
+    processClose(errorWrite)
+    if pid < 0 {
+        for fd in [stdinWrite, stdoutRead, stderrRead, errorRead] { processClose(fd) }
+        return Result.Err("spawn {argv[0]}: fork failed (" + processErrnoText(0 - pid) + ")")
+    }
+    // the error pipe closes on a successful execve (O_CLOEXEC) with no data
+    var got = syscall(0, errorRead, errorBuffer.addr(), 4, 0, 0, 0)
+    while got == 0 - 4 { got = syscall(0, errorRead, errorBuffer.addr(), 4, 0, 0, 0) }
+    processClose(errorRead)
+    if got == 4 {
+        let errno = errorBuffer.get32(0)
+        let status = Bytes.new(8)
+        let reaped = syscall(61, pid, status.addr(), 0, 0, 0, 0)
+        for fd in [stdinWrite, stdoutRead, stderrRead] { processClose(fd) }
+        return Result.Err("spawn {argv[0]}: " + processErrnoText(errno))
+    }
+    let r1 = syscall(72, stdoutRead, 4, processNonblock, 0, 0, 0)   // fcntl F_SETFL
+    let r2 = syscall(72, stderrRead, 4, processNonblock, 0, 0, 0)
+    return Result.Ok(Process{pid: pid, stdinFd: stdinWrite, stdoutFd: stdoutRead, stderrFd: stderrRead})
+}
+
+// Runs argv to completion with stdin closed: Ok(code, stdout, stderr).
+fn runCapture(argv: [str]) -> Result[ProcessOutput, str] {
+    return runCaptureWith(argv, SpawnOptions{}, "")
+}
+
+// Like runCapture, writing `input` to the child's stdin first.
+fn runCaptureWith(argv: [str], options: SpawnOptions, input: str) -> Result[ProcessOutput, str] {
+    match spawn(argv, options) {
+        Ok(child) {
+            let sent = child.write(input)
+            child.closeStdin()
+            let out = child.readAll()
+            let code = child.wait()
+            return Result.Ok(ProcessOutput{code: code, stdout: out, stderr: child.stderrText})
+        }
+        Err(message) { return Result.Err(message) }
+    }
+}
+
+impl Process {
+    // Writes all of `text` to the child's stdin (blocking). False once the
+    // child has closed its stdin or stdin was closed here.
+    fn write(self, text: str) -> bool {
+        if self.stdinFd < 0 { return false }
+        if text.len() == 0 { return true }
+        let buffer = cString(text)
+        var offset = 0
+        while offset < text.len() {
+            let count = syscall(1, self.stdinFd, buffer.addr() + offset, text.len() - offset, 0, 0, 0)
+            if count == 0 - 4 { continue }
+            if count <= 0 { return false }
+            offset += count
+        }
+        return true
+    }
+
+    // Closes the child's stdin, so it sees EOF.
+    fn closeStdin(self) {
+        processClose(self.stdinFd)
+        self.stdinFd = 0 - 1
+    }
+
+    // Whatever stdout has right now, waiting at most timeoutMilliseconds
+    // (0: don't wait, -1: until data or EOF). "" when nothing arrived; check
+    // stdoutOpen for EOF. Stderr that is ready is moved into stderrText.
+    fn readAvailable(self, timeoutMilliseconds: int = 0) -> str {
+        if not self.stdoutOpen { return "" }
+        let pollSet = Bytes.new(16)
+        pollSet.put32(0, self.stdoutFd)
+        pollSet.put16(4, 1)                                 // POLLIN
+        let ready = syscall(7, pollSet.addr(), 1, timeoutMilliseconds, 0, 0, 0)
+        self.drainStderr()
+        if ready <= 0 { return "" }
+        return self.readStdoutNow()
+    }
+
+    // Reads stdout until EOF (and stderr alongside, into stderrText, so a
+    // chatty stderr cannot deadlock the child).
+    fn readAll(self) -> str {
+        var parts: [str] = []
+        let pollSet = Bytes.new(16)
+        while self.stdoutOpen or self.stderrOpen {
+            pollSet.put32(0, if self.stdoutOpen { self.stdoutFd } else { 0 - 1 })
+            pollSet.put16(4, 1)
+            pollSet.put16(6, 0)
+            pollSet.put32(8, if self.stderrOpen { self.stderrFd } else { 0 - 1 })
+            pollSet.put16(12, 1)
+            pollSet.put16(14, 0)
+            let ready = syscall(7, pollSet.addr(), 2, 0 - 1, 0, 0, 0)
+            if ready == 0 - 4 { continue }
+            if ready < 0 { break }
+            if self.stdoutOpen { parts.push(self.readStdoutNow()) }
+            self.drainStderr()
+        }
+        return parts.join()
+    }
+
+    // Non-blocking read of everything stdout holds now; marks EOF.
+    fn readStdoutNow(self) -> str {
+        let (text, open) = processDrain(self.stdoutFd)
+        if not open {
+            self.stdoutOpen = false
+            processClose(self.stdoutFd)
+            self.stdoutFd = 0 - 1
+        }
+        return text
+    }
+
+    fn drainStderr(self) {
+        if not self.stderrOpen { return }
+        let (text, open) = processDrain(self.stderrFd)
+        if text != "" { self.stderrText = self.stderrText + text }
+        if not open {
+            self.stderrOpen = false
+            processClose(self.stderrFd)
+            self.stderrFd = 0 - 1
+        }
+    }
+
+    // Waits for exit and returns the exit code (128 + N if killed by signal
+    // N). Closes stdin first so a child reading it can finish.
+    fn wait(self) -> int {
+        if self.exited { return self.exitCode }
+        self.closeStdin()
+        let status = Bytes.new(8)
+        var result = syscall(61, self.pid, status.addr(), 0, 0, 0, 0)
+        while result == 0 - 4 { result = syscall(61, self.pid, status.addr(), 0, 0, 0, 0) }
+        self.finish(status.get32(0))
+        return self.exitCode
+    }
+
+    // The exit code if the child has exited, else none (never blocks).
+    fn tryWait(self) -> int? {
+        if self.exited { return self.exitCode }
+        let status = Bytes.new(8)
+        let result = syscall(61, self.pid, status.addr(), 1, 0, 0, 0)   // WNOHANG
+        if result != self.pid { return none }
+        self.finish(status.get32(0))
+        return self.exitCode
+    }
+
+    fn finish(self, status: int) {
+        self.exited = true
+        self.exitCode = if (status & 127) == 0 { (status >> 8) & 255 } else { 128 + (status & 127) }
+        self.closeStdin()
+    }
+
+    // Sends a signal (default SIGTERM). False if the child is already reaped.
+    fn kill(self, signal: int = 15) -> bool {
+        if self.exited { return false }
+        return syscall(62, self.pid, signal, 0, 0, 0, 0) == 0
+    }
+
+    // Closes every pipe still open (wait() does not close stdout/stderr).
+    fn close(self) {
+        self.closeStdin()
+        if self.stdoutFd >= 0 { processClose(self.stdoutFd) }
+        if self.stderrFd >= 0 { processClose(self.stderrFd) }
+        self.stdoutFd = 0 - 1
+        self.stderrFd = 0 - 1
+        self.stdoutOpen = false
+        self.stderrOpen = false
+    }
+}
+
+// (text read without blocking, still open?)
+private fn processDrain(fd: int) -> (str, bool) {
+    let buffer = Bytes.new(65536)
+    var parts: [str] = []
+    while true {
+        let count = syscall(0, fd, buffer.addr(), 65536, 0, 0, 0)
+        if count == 0 - 4 { continue }
+        if count == 0 - 11 { return (parts.join(), true) }   // EAGAIN
+        if count <= 0 { return (parts.join(), false) }
+        parts.push(buffer.getString(0, count))
+    }
+    return (parts.join(), true)
+}
