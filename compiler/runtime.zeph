@@ -1551,6 +1551,39 @@ fn runtimeCopyMemory(destination: int, source: int, byteCount: int) {
     }
 }
 
+// copyMemory(dst, src, n): memmove, so the ranges may overlap
+fn runtimeMoveMemory(destination: int, source: int, byteCount: int) {
+    if byteCount <= 0 or destination == source { return }
+    if destination < source or destination >= source + byteCount {
+        runtimeCopyMemory(destination, source, byteCount)
+        return
+    }
+    var index = byteCount                 // dst overlaps src's tail: copy back to front
+    while index >= 8 {
+        index -= 8
+        store64(destination + index, load64(source + index))
+    }
+    while index > 0 {
+        index -= 1
+        store8(destination + index, load8(source + index))
+    }
+}
+
+// fillMemory(dst, byte, n): memset
+fn runtimeFillMemory(destination: int, value: int, byteCount: int) {
+    if byteCount <= 0 { return }
+    let word = (value & 255) * 72340172838076673         // the byte in all 8 lanes
+    var index = 0
+    while index + 8 <= byteCount {
+        store64(destination + index, word)
+        index += 8
+    }
+    while index < byteCount {
+        store8(destination + index, value)
+        index += 1
+    }
+}
+
 // ---- strings ----  (a str value is a pointer to {i64 len; bytes})
 fn runtimeAllocateString(stringLength: int) -> int {
     let stringAddress = runtimeAllocateObject(8 + stringLength)

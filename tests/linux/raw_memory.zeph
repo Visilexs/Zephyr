@@ -1,0 +1,46 @@
+// raw memory builtins: store16, sign-extending loads, f32/f64, copy, fill, dataAddr
+fn main() {
+    var buffer: [u8] = []
+    for i in 0..64 { buffer.push(0) }
+    let base = dataAddr(buffer)
+
+    store16(base, 0xFFFE)
+    print(load16(base), loadI16(base), load8(base + 2))   // 65534 -2 0
+    store8(base + 4, 200)
+    print(loadI8(base + 4), load8(base + 4))              // -56 200
+    store32(base + 8, 0xFFFFFFFF)
+    print(loadI32(base + 8), load32(base + 8))            // -1 4294967295
+    store16(base + 12, 0x1234)
+    print(loadI16(base + 12), buffer[12], buffer[13])     // 4660 52 18
+
+    storeF64(base + 16, 2.5)
+    print(loadF64(base + 16))                             // 2.5
+    storeF64(base + 16, 3)                                // ints widen
+    print(loadF64(base + 16))
+    storeF32(base + 24, 0.1)
+    print(loadF32(base + 24), load32(base + 24))          // 0.100000001490116 1036831949
+    storeF32(base + 24, 1e300)
+    print(loadF32(base + 24))                             // inf
+
+    fillMemory(base, 7, 10)
+    print(buffer[0], buffer[9], buffer[10])               // 7 7 255 (byte 10 is from the store32 above)
+    for i in 0..10 { store8(base + i, i) }
+    copyMemory(base + 2, base, 8)                         // overlapping, forwards
+    print(buffer[2], buffer[3], buffer[9])                // 0 1 7
+    copyMemory(base, base + 2, 8)                         // overlapping, backwards
+    print(buffer[0], buffer[1], buffer[7])                // 0 1 7
+    copyMemory(base, base + 30, 0)
+    fillMemory(base, 1, -5)
+
+    let text = "hello"
+    print(load8(dataAddr(text)), load8(dataAddr(text) + 4))  // 104 111
+    var floats: [f32] = [1.5, 0.25]
+    print(loadF32(dataAddr(floats) + 4))                  // 0.25
+    let ints = [10, 20, 30]
+    print(load64(dataAddr(ints) + 16))                    // 30
+
+    // a function using the builtins inside a loop, so -O2 lowers them
+    var total = 0
+    for i in 0..10 { total += loadI8(base + i) }
+    print(total)
+}

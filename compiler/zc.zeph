@@ -254,6 +254,9 @@ let callKindRoundToSingle = 42    // toSingle(x): round a double to the nearest 
 let callKindSystemVCall = 43       // Linux: System V AMD64 call through a raw code address (dlsym)
 let callKindSystemVCallFloat = 44  // the same, returning xmm0
 let callKindDynamicImport = 45     // Linux: address of a GOT slot ld.so fills (dlopen, dlsym)
+let callKindStore16 = 46
+let callKindSingleBits = 47        // float -> bits of the nearest IEEE single (storeF32)
+let callKindFloatFromSingleBits = 48   // bits of an IEEE single -> the float, widened exactly (loadF32)
 // cast kinds
 let castKindNoOperation = 0
 let castKindTruncate = 1
@@ -3396,6 +3399,8 @@ fn isBuiltinName(name: str) -> bool {
     if name == "abs" or name == "min" or name == "max" or name == "pow" { return true }
     if name == "load64" or name == "load32" or name == "load16" or name == "load8" or name == "store64" or name == "store32" or name == "store8" { return true }
     if name == "stackPointer" or name == "win" or name == "addr" { return true }
+    if name == "store16" or name == "loadI8" or name == "loadI16" or name == "loadI32" or name == "dataAddr" { return true }
+    if name == "loadF32" or name == "storeF32" or name == "loadF64" or name == "storeF64" or name == "copyMemory" or name == "fillMemory" { return true }
     return false
 }
 
@@ -4284,7 +4289,33 @@ fn checkIndirect(expression: Node, valueType: int) -> int {
 }
 
 var checkCallBuiltinNames: [str: bool] = [:]       // every name checkCall handles itself, ahead of user functions
-for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV", "callSysVFloat", "chr", "dynamicImport", "emit", "floatFromBits", "growMemory", "hostExit", "hostWrite", "load16", "load32", "load64", "load8", "max", "min", "panic", "pow", "print", "readFile", "sqrt", "stackPointer", "store32", "store64", "store8", "syscall", "toSingle", "win", "writeFile", "zeros"] { checkCallBuiltinNames[name] = true }
+for name in ["abs", "addr", "args", "assert", "bits", "callPointer", "callSysV", "callSysVFloat", "chr", "copyMemory", "dataAddr", "dynamicImport", "fillMemory", "loadF32", "loadF64", "loadI16", "loadI32", "loadI8", "store16", "storeF32", "storeF64", "emit", "floatFromBits", "growMemory", "hostExit", "hostWrite", "load16", "load32", "load64", "load8", "max", "min", "panic", "pow", "print", "readFile", "sqrt", "stackPointer", "store32", "store64", "store8", "syscall", "toSingle", "win", "writeFile", "zeros"] { checkCallBuiltinNames[name] = true }
+
+// an already-checked builtin call node, for rewrites in the checker
+fn rawCallNode(line: int, name: str, callKind: int, typeIndex: int, arguments: [Node]) -> Node {
+    var callee = makeNode(nodeIdentifier, line)
+    callee.name = name
+    var call = makeNode(nodeCall, line)
+    call.children.push(callee)
+    for argument in arguments { call.children.push(argument) }
+    call.auxiliary = callKind
+    call.typeIndex = typeIndex
+    return call
+}
+
+// an already-checked `left OP constant` on ints
+fn integerBinaryNode(line: int, operator: int, left: Node, constant: int) -> Node {
+    var right = makeNode(nodeInteger, line)
+    right.integerValue = constant
+    right.typeIndex = typeIdInteger
+    var binary = makeNode(nodeBinary, line)
+    binary.operator = operator
+    binary.children.push(left)
+    binary.children.push(right)
+    binary.auxiliary = binaryCategoryInteger
+    binary.typeIndex = typeIdInteger
+    return binary
+}
 
 fn checkCall(expression: Node) -> int {
     let callee = expression.children[0]
@@ -4456,6 +4487,84 @@ fn checkCall(expression: Node) -> int {
         else if callee.name == "store32" { expression.auxiliary = callKindStore32 }
         else { expression.auxiliary = callKindStore8 }
         return typeIdVoid
+    }
+    if callee.name == "store16" or callee.name == "storeF32" or callee.name == "storeF64" {
+        if argumentCount != 2 { failCompilation(expression.line, "{callee.name}(addr, value) takes two arguments") }
+        if typeKinds[checkExpression(expression.children[1])] != kindInteger { failCompilation(expression.line, "{callee.name} address must be int") }
+        let valueKind = typeKinds[checkExpression(expression.children[2])]
+        if callee.name == "store16" {
+            if valueKind != kindInteger { failCompilation(expression.line, "store16 value must be int") }
+            expression.auxiliary = callKindStore16
+            return typeIdVoid
+        }
+        if valueKind != kindInteger and valueKind != kindFloat { failCompilation(expression.line, "{callee.name} value must be float") }
+        let value = coerce(expression.children[2], typeIdFloat, callee.name)
+        // storeF64(a, v) is store64(a, bits(v)); storeF32 stores the rounded single's bits
+        if callee.name == "storeF64" {
+            expression.children[2] = rawCallNode(expression.line, "bits", callKindBits, typeIdInteger, [value])
+            callee.name = "store64"
+            expression.auxiliary = callKindStore64
+        } else {
+            expression.children[2] = rawCallNode(expression.line, "__singleBits", callKindSingleBits, typeIdInteger, [value])
+            callee.name = "store32"
+            expression.auxiliary = callKindStore32
+        }
+        return typeIdVoid
+    }
+    if callee.name == "loadI8" or callee.name == "loadI16" or callee.name == "loadI32" or callee.name == "loadF32" or callee.name == "loadF64" {
+        if argumentCount != 1 { failCompilation(expression.line, "{callee.name}(addr) takes one int argument") }
+        if typeKinds[checkExpression(expression.children[1])] != kindInteger { failCompilation(expression.line, "{callee.name} argument must be int") }
+        let address = expression.children[1]
+        if callee.name == "loadF64" {             // floatFromBits(load64(a))
+            expression.children[1] = rawCallNode(expression.line, "load64", callKindLoad64, typeIdInteger, [address])
+            callee.name = "floatFromBits"
+            expression.auxiliary = callKindBits
+            return typeIdFloat
+        }
+        if callee.name == "loadF32" {             // the single at a, widened exactly
+            expression.children[1] = rawCallNode(expression.line, "load32", callKindLoad32, typeIdInteger, [address])
+            callee.name = "__floatFromSingleBits"
+            expression.auxiliary = callKindFloatFromSingleBits
+            return typeIdFloat
+        }
+        // sign extension: (loadN(a) << (64 - N)) >> (64 - N), >> being arithmetic
+        var loadName = "load8"
+        var loadKind = callKindLoad8
+        var shift = 56
+        if callee.name == "loadI16" {
+            loadName = "load16"
+            loadKind = callKindLoad16
+            shift = 48
+        } else if callee.name == "loadI32" {
+            loadName = "load32"
+            loadKind = callKindLoad32
+            shift = 32
+        }
+        let loaded = rawCallNode(expression.line, loadName, loadKind, typeIdInteger, [address])
+        let shifted = integerBinaryNode(expression.line, tokenShiftLeft, loaded, shift)
+        nodeBecome(expression, integerBinaryNode(expression.line, tokenShiftRight, shifted, shift))
+        return typeIdInteger
+    }
+    if callee.name == "dataAddr" {
+        // address of element 0: a str's bytes follow its length word; a list
+        // (also [u8] and [f32]) points at a separate element array
+        if argumentCount != 1 { failCompilation(expression.line, "dataAddr(x) takes one argument") }
+        let typeIndex = checkExpression(expression.children[1])
+        if typeKinds[typeIndex] != kindString and typeKinds[typeIndex] != kindList { failCompilation(expression.line, "dataAddr() needs a str or list, got {describeType(typeIndex)}") }
+        let reference = rawCallNode(expression.line, "addr", callKindBits, typeIdInteger, [expression.children[1]])
+        if typeKinds[typeIndex] == kindString {
+            nodeBecome(expression, integerBinaryNode(expression.line, tokenPlus, reference, 8))
+            return typeIdInteger
+        }
+        expression.children[1] = integerBinaryNode(expression.line, tokenPlus, reference, 16)
+        callee.name = "load64"
+        expression.auxiliary = callKindLoad64
+        return typeIdInteger
+    }
+    if callee.name == "copyMemory" or callee.name == "fillMemory" {
+        // plain calls into the runtime (memmove and memset), checked as such below
+        if argumentCount != 3 { failCompilation(expression.line, "{callee.name} takes three int arguments") }
+        if callee.name == "copyMemory" { callee.name = "runtimeMoveMemory" } else { callee.name = "runtimeFillMemory" }
     }
     if callee.name == "stackPointer" {
         if argumentCount != 0 { failCompilation(expression.line, "stackPointer() takes no arguments") }
@@ -8562,6 +8671,7 @@ fn isInlineCallKind(callKind: int) -> bool {
     if callKind == callKindSquareRoot or callKind == callKindRoundToSingle or callKind == callKindLength or callKind == callKindBits { return true }
     if callKind == callKindLoad64 or callKind == callKindLoad32 or callKind == callKindLoad16 or callKind == callKindLoad8 { return true }
     if callKind == callKindStore64 or callKind == callKindStore32 or callKind == callKindStore8 { return true }
+    if callKind == callKindStore16 or callKind == callKindSingleBits or callKind == callKindFloatFromSingleBits { return true }
     if callKind == callKindStackPointer or callKind == callKindAbsolute or callKind == callKindMin or callKind == callKindMax { return true }
     return false
 }
@@ -10558,6 +10668,31 @@ fn generateCallKinds(expression: Node) {
     }
     if callKind == callKindStore8 {
         generateStoreRaw(expression, "al")
+        return
+    }
+    if callKind == callKindStore16 {            // two byte stores: the assembler has no 16-bit registers
+        generateExpression(expression.children[1])
+        emitInstruction("push rax")
+        generateExpression(expression.children[2])
+        emitInstruction("pop rcx")
+        emitInstruction("mov [rcx], al")
+        emitInstruction("shr rax, 8")
+        emitInstruction("mov [rcx + 1], al")
+        return
+    }
+    if callKind == callKindSingleBits {
+        generateExpression(expression.children[1])
+        emitInstruction("movq xmm0, rax")
+        emitInstruction("cvtsd2ss xmm0, xmm0")
+        emitInstruction("movq rax, xmm0")
+        emitInstruction("mov eax, eax")
+        return
+    }
+    if callKind == callKindFloatFromSingleBits {
+        generateExpression(expression.children[1])
+        emitInstruction("movq xmm0, rax")
+        emitInstruction("cvtss2sd xmm0, xmm0")
+        emitInstruction("movq rax, xmm0")
         return
     }
     if callKind == callKindStackPointer {
