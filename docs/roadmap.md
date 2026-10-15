@@ -117,8 +117,8 @@ unnoticed.
   fixed arrays `[T; N]`, `sizeOf[T]()` and `offsetOf[T]("f")`, and
   copy-in/copy-out `loadStruct[T]` / `storeStruct` on raw addresses and Bytes.
   Layouts are checked against gcc (tests/c_layout). Open: `addr(s)` of a @C
-  struct is not C-laid-out; 16-bit fields are stored with two `store8` (TODO:
-  `store16` from 2A); f32 fields convert in software (TODO: `loadF32/storeF32`).
+  struct is not C-laid-out. 16-bit fields use `store16` and f32 fields use
+  `loadF32/storeF32` from 2A.
 - [ ] `ptr[T]` typed pointers and `span[T]` views over off-heap memory, with
   inline bounds checks.
 - [~] extern: f32 args and returns, narrow and unsigned types (done on

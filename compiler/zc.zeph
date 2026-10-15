@@ -4231,8 +4231,8 @@ fn checkCLayoutCall(expression: Node) -> int {
 fn cLoadElementText(elementType: int, address: str, asPackedElement: bool) -> str {
     if typeKinds[elementType] == kindBoolean { return "load8({address}) != 0" }
     if elementType == typeIdF32 {
-        if asPackedElement { return "floatFromBits(runtimeWidenFloat32Bits(load32({address})))" }
-        return "floatFromBits(runtimeWidenFloat32Bits(load32({address}))) as f32"
+        if asPackedElement { return "loadF32({address})" }
+        return "loadF32({address}) as f32"
     }
     if typeKinds[elementType] == kindFloat { return "floatFromBits(load64({address}))" }
     if isCStruct(elementType) { return "loadStruct[{structDefinitions[typeDefinitionIds[elementType]].name}]({address})" }
@@ -4255,12 +4255,10 @@ fn cLoadText(layout: CLayout, fieldIndex: int, fieldType: int, pointer: str) -> 
 // Zephyr statements writing `value` (an element of C type `elementType`) at `address`.
 fn cStoreElementText(elementType: int, address: str, value: str) -> str {
     if typeKinds[elementType] == kindBoolean { return "store8({address}, if {value} \{ 1 \} else \{ 0 \})" }
-    if elementType == typeIdF32 { return "store32({address}, runtimeNarrowFloat32Bits(bits({value} as float)))" }
+    if elementType == typeIdF32 { return "storeF32({address}, {value} as float)" }
     if typeKinds[elementType] == kindFloat { return "store64({address}, bits({value}))" }
     if isCStruct(elementType) { return "storeStruct({address}, {value})" }
     let bitCount = sizedBits(elementType)
-    // TODO(rm-memory): use store16 once the raw builtin set has it
-    if bitCount == 16 { return "store8({address}, ({value} as int) & 255)\nstore8({address} + 1, (({value} as int) >> 8) & 255)" }
     return "store{bitCount}({address}, {value} as int)"
 }
 
