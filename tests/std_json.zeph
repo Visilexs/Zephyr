@@ -1,0 +1,48 @@
+// std/json.zeph: parse, query, stringify, pretty print, partial streaming.
+import "std/json.zeph"
+
+fn show(text: str) {
+    match jsonParse(text) {
+        Ok(value) { print(jsonStringify(value)) }
+        Err(message) { print("error: " + message) }
+    }
+}
+
+show("\{\"a\": 1, \"b\": [true, false, null], \"c\": \{\"d\": \"x\\ny\"\}\}")
+show("  [1, -2, 3.5, -0.25, 1e3, 1.5E-3, 0, -0, 12345678901234567890]  ")
+show("\"\\u00e9\\u4e16\\ud83d\\ude00\\/\\\"\"")
+show("[0.1, 0.2, 0.30000000000000004, 1e21, 1e-7, 5e-324, 1.7976931348623157e308, 123456.789]")
+show("[1e400]")
+for bad in ["", "[1,]", "\{\"a\" 1\}", "[01]", "\"abc", "[1] x", "tru", "\"\\x\"", "[-]", "\{1: 2\}", "\"a" + chr(10) + "\"", "[.5]", "[1.]"] {
+    show(bad)
+}
+// deep nesting is rejected, not a stack overflow
+show("[".repeat(2000) + "]".repeat(2000))
+
+let doc = jsonParse("\{\"choices\": [\{\"delta\": \{\"content\": \"hi\", \"n\": 42, \"ok\": true\}\}], \"x\": 2.5\}").unwrap()
+print(jsonGetStr(doc, "choices[0].delta.content").or("?"), jsonGetInt(doc, "choices[0].delta.n").or(0))
+print(jsonGetBool(doc, "choices[0].delta.ok").or(false), jsonGetFloat(doc, "x").or(0.0))
+print(doc.path("choices[1]").has(), doc.path("nope.deeper").has(), doc.path("x[0]").has(), doc.path("").get().kind())
+print(doc.keys(), doc.get("choices").get().len(), doc.has("x"), doc.has("y"))
+
+let built = jsonObject().set("name", jsonText("zé \"q\" \\ " + chr(1))).set("n", jsonInt(3)).set("tags", jsonTextList(["a", "b"]))
+built.set("n", jsonNumber(4.5))
+built.set("empty", jsonArray()).set("obj", jsonObject())
+built.get("tags").get().add(Json.Null)
+print(jsonStringify(built))
+print(jsonStringifyAscii(jsonText("é世😀" + chr(127))))
+print(jsonPretty(built, 2))
+// round trip
+let again = jsonParse(jsonPretty(built, 4)).unwrap()
+print(again == built, jsonStringify(again) == jsonStringify(built))
+
+// partial (streaming) documents
+for prefix in ["", "\{", "\{\"pa", "\{\"path\"", "\{\"path\": ", "\{\"path\": \"src/ma", "\{\"path\": \"a\\", "\{\"path\": \"a\\u00", "\{\"path\": \"x\", \"n\": 12", "\{\"path\": \"x\", \"n\": 12,", "[1, [2, \{\"k\": tr", "\{\"a\": \"\\ud83d"] {
+    let partial = jsonParsePartial(prefix)
+    if partial.has() { print("partial: " + jsonStringify(partial.get())) } else { print("partial: none") }
+}
+print(jsonParsePartial("[1, x").has())
+for field in jsonPartialFields("\{\"command\": \"ls -la\", \"cwd\": \"/ho") {
+    print(field.key, field.value, field.complete)
+}
+print(jsonPartialString("\{\"command\": \"echo \\\"hi", "command").or("-"), jsonPartialString("\{\"a\": 1", "command").has())

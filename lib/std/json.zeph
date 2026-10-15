@@ -1,0 +1,885 @@
+// std/json.zeph -- JSON values: parse, build, query, stringify, and read
+// JSON that is still streaming in (tool-call arguments from an LLM).
+//
+//     import "std/json.zeph"
+//     match jsonParse("\{\"name\": \"zephyr\", \"tags\": [\"fast\"]\}") {
+//         Ok(value) { print(value.path("tags[0]").or(Json.Null).asStr().or("?")) }
+//         Err(message) { print(message) }
+//     }
+//     let reply = jsonObject().set("ok", Json.Bool(true)).set("n", Json.Number(3.0))
+//     print(jsonStringify(reply))           // {"ok":true,"n":3}
+//
+// Parsing never panics: malformed input (untrusted network data) gives an
+// Err with the byte offset. Objects keep their keys in source order;
+// duplicate keys are kept, and lookups find the first.
+import "std/result.zeph"
+import "std/string.zeph"
+import "std/utf8.zeph"
+
+enum Json {
+    Null
+    Bool(bool)
+    Number(float)
+    Text(str)
+    Array([Json])
+    Object([str], [Json])      // keys and values, in parallel and in order
+}
+
+// ---- building ----
+
+fn jsonObject() -> Json {
+    var keys: [str] = []
+    var values: [Json] = []
+    return Json.Object(keys, values)
+}
+
+fn jsonArray() -> Json {
+    var items: [Json] = []
+    return Json.Array(items)
+}
+
+fn jsonText(text: str) -> Json { return Json.Text(text) }
+fn jsonNumber(value: float) -> Json { return Json.Number(value) }
+fn jsonInt(value: int) -> Json { return Json.Number(value as float) }
+fn jsonBool(value: bool) -> Json { return Json.Bool(value) }
+fn jsonTextList(items: [str]) -> Json {
+    var values: [Json] = []
+    for item in items { values.push(Json.Text(item)) }
+    return Json.Array(values)
+}
+
+impl Json {
+    // Object: set `key` (replacing an existing one) and return self, so
+    // calls chain. Panics when self is not an object.
+    fn set(self, key: str, value: Json) -> Json {
+        match self {
+            Object(keys, values) {
+                for i in 0..keys.len() {
+                    if keys[i] == key {
+                        values[i] = value
+                        return self
+                    }
+                }
+                keys.push(key)
+                values.push(value)
+            }
+            else { panic("Json.set: not an object") }
+        }
+        return self
+    }
+
+    // Array: append and return self. Panics when self is not an array.
+    fn add(self, value: Json) -> Json {
+        match self {
+            Array(items) { items.push(value) }
+            else { panic("Json.add: not an array") }
+        }
+        return self
+    }
+
+    // ---- reading ----
+
+    // Object member, or none (absent, or self is not an object).
+    fn get(self, key: str) -> Json? {
+        match self {
+            Object(keys, values) {
+                for i in 0..keys.len() {
+                    if keys[i] == key { return values[i] }
+                }
+            }
+            else { }
+        }
+        return none
+    }
+
+    // Array element, or none (out of range, or not an array).
+    fn at(self, index: int) -> Json? {
+        match self {
+            Array(items) {
+                if index >= 0 and index < items.len() { return items[index] }
+            }
+            else { }
+        }
+        return none
+    }
+
+    // Whether this is an object with member `key`.
+    fn has(self, key: str) -> bool { return self.get(key).has() }
+
+    // A member reached by a path of keys and indices: "choices[0].delta.content",
+    // "a.b", "[2]", "items[1][0]". Keys containing `.` or `[` cannot be named
+    // this way; use get(). The empty path is self.
+    fn path(self, path: str) -> Json? {
+        var current = self
+        var i = 0
+        let n = path.len()
+        while i < n {
+            let c = path.byte(i)
+            if c == 46 {                       // '.'
+                i += 1
+            } else if c == 91 {                // '[' index ']'
+                var j = i + 1
+                var index = 0
+                var digits = 0
+                while j < n and path.byte(j) >= 48 and path.byte(j) <= 57 {
+                    index = index * 10 + (path.byte(j) - 48)
+                    j += 1
+                    digits += 1
+                }
+                if digits == 0 or j >= n or path.byte(j) != 93 { return none }
+                let next = current.at(index)
+                if not next.has() { return none }
+                current = next.get()
+                i = j + 1
+            } else {
+                var j = i
+                while j < n and path.byte(j) != 46 and path.byte(j) != 91 { j += 1 }
+                let next = current.get(path.sub(i, j))
+                if not next.has() { return none }
+                current = next.get()
+                i = j
+            }
+        }
+        return current
+    }
+
+    fn asStr(self) -> str? {
+        match self {
+            Text(text) { return text }
+            else { }
+        }
+        return none
+    }
+
+    fn asFloat(self) -> float? {
+        match self {
+            Number(value) { return value }
+            else { }
+        }
+        return none
+    }
+
+    // The number truncated toward zero; none for non-numbers and values
+    // outside the int range.
+    fn asInt(self) -> int? {
+        match self {
+            Number(value) {
+                if value == value and value > -9223372036854775808.0 and value < 9223372036854775807.0 { return value as int }
+            }
+            else { }
+        }
+        return none
+    }
+
+    fn asBool(self) -> bool? {
+        match self {
+            Bool(value) { return value }
+            else { }
+        }
+        return none
+    }
+
+    fn isNull(self) -> bool { return self is Null }
+
+    // Array elements; empty for anything else.
+    fn items(self) -> [Json] {
+        match self {
+            Array(items) { return items }
+            else { }
+        }
+        var empty: [Json] = []
+        return empty
+    }
+
+    // Object keys in order; empty for anything else.
+    fn keys(self) -> [str] {
+        match self {
+            Object(keys, values) { return keys }
+            else { }
+        }
+        var empty: [str] = []
+        return empty
+    }
+
+    // Element count of an array or object, byte length of a string, else 0.
+    fn len(self) -> int {
+        match self {
+            Array(items) { return items.len() }
+            Object(keys, values) { return keys.len() }
+            Text(text) { return text.len() }
+            else { }
+        }
+        return 0
+    }
+
+    // The type name: "null", "bool", "number", "string", "array", "object".
+    fn kind(self) -> str {
+        match self {
+            Null { return "null" }
+            Bool(b) { return "bool" }
+            Number(n) { return "number" }
+            Text(t) { return "string" }
+            Array(a) { return "array" }
+            Object(k, v) { return "object" }
+        }
+        return "null"
+    }
+}
+
+// Shorthands for the common "dig out one field" case.
+fn jsonGetStr(value: Json, path: str) -> str? {
+    let found = value.path(path)
+    if not found.has() { return none }
+    return found.get().asStr()
+}
+fn jsonGetFloat(value: Json, path: str) -> float? {
+    let found = value.path(path)
+    if not found.has() { return none }
+    return found.get().asFloat()
+}
+fn jsonGetInt(value: Json, path: str) -> int? {
+    let found = value.path(path)
+    if not found.has() { return none }
+    return found.get().asInt()
+}
+fn jsonGetBool(value: Json, path: str) -> bool? {
+    let found = value.path(path)
+    if not found.has() { return none }
+    return found.get().asBool()
+}
+
+// ---- parsing ----
+
+struct JsonReader {
+    src: str
+    pos: int = 0
+    error: str = ""
+    partial: bool = false       // end of input closes whatever is open
+    cut: bool = false           // partial mode: the last string had no closing quote
+}
+
+const jsonMaxDepth = 512
+
+// Parses one JSON document (RFC 8259; surrounding whitespace allowed).
+fn jsonParse(text: str) -> Result[Json, str] {
+    let reader = JsonReader{src: text}
+    let value = jsonReadValue(reader, 0)
+    if reader.error == "" {
+        jsonSkipSpace(reader)
+        if reader.pos != text.len() { jsonError(reader, "trailing characters") }
+    }
+    if reader.error != "" { return Result.Err(reader.error) }
+    return Result.Ok(value)
+}
+
+// jsonParse without the message: none when the text is not valid JSON.
+fn jsonTryParse(text: str) -> Json? {
+    match jsonParse(text) {
+        Ok(value) { return value }
+        Err(message) { }
+    }
+    return none
+}
+
+// Parses a prefix of a JSON document that is still arriving, closing every
+// open string, array and object at the end of the input: `{"a": [1, 2` gives
+// {"a": [1, 2]} and `{"path": "src/ma` gives {"path": "src/ma"}. A member
+// whose value has not started yet is left out, and so is a number or
+// literal that may still be cut short (`12` could become `123`). none when
+// the prefix can never become valid JSON.
+fn jsonParsePartial(text: str) -> Json? {
+    let reader = JsonReader{src: text, partial: true}
+    jsonSkipSpace(reader)
+    if reader.pos >= text.len() { return none }
+    let value = jsonReadValue(reader, 0)
+    if reader.error != "" { return none }
+    return value
+}
+
+fn jsonError(reader: JsonReader, message: str) -> Json {
+    if reader.error == "" { reader.error = "json: {message} at byte {reader.pos}" }
+    reader.pos = reader.src.len()
+    return Json.Null
+}
+
+// End of input in partial mode: a quiet stop, not an error.
+fn jsonAtEnd(reader: JsonReader) -> bool { return reader.pos >= reader.src.len() }
+
+fn jsonSkipSpace(reader: JsonReader) {
+    let n = reader.src.len()
+    while reader.pos < n {
+        let c = reader.src.byte(reader.pos)
+        if c != 32 and c != 9 and c != 10 and c != 13 { return }
+        reader.pos += 1
+    }
+}
+
+// Marker for "the value never started" in partial mode.
+let jsonMissingMarker = chr(0) + "json-missing"
+
+fn jsonReadValue(reader: JsonReader, depth: int) -> Json {
+    jsonSkipSpace(reader)
+    if jsonAtEnd(reader) {
+        if reader.partial { return Json.Text(jsonMissingMarker) }
+        return jsonError(reader, "unexpected end of input")
+    }
+    if depth > jsonMaxDepth { return jsonError(reader, "nesting too deep") }
+    let c = reader.src.byte(reader.pos)
+    if c == 123 { return jsonReadObject(reader, depth) }
+    if c == 91 { return jsonReadArray(reader, depth) }
+    if c == 34 {
+        let text = jsonReadString(reader)
+        return Json.Text(text)
+    }
+    if c == 116 { return jsonReadLiteral(reader, "true", Json.Bool(true)) }
+    if c == 102 { return jsonReadLiteral(reader, "false", Json.Bool(false)) }
+    if c == 110 { return jsonReadLiteral(reader, "null", Json.Null) }
+    if c == 45 or (c >= 48 and c <= 57) { return jsonReadNumber(reader) }
+    return jsonError(reader, "unexpected character '{chr(c)}'")
+}
+
+fn jsonIsMissing(value: Json) -> bool {
+    match value {
+        Text(text) { return text == jsonMissingMarker }
+        else { }
+    }
+    return false
+}
+
+fn jsonReadObject(reader: JsonReader, depth: int) -> Json {
+    reader.pos += 1
+    var keys: [str] = []
+    var values: [Json] = []
+    let result = Json.Object(keys, values)
+    jsonSkipSpace(reader)
+    if jsonAtEnd(reader) and reader.partial { return result }
+    if reader.pos < reader.src.len() and reader.src.byte(reader.pos) == 125 {
+        reader.pos += 1
+        return result
+    }
+    while reader.error == "" {
+        jsonSkipSpace(reader)
+        if jsonAtEnd(reader) {
+            if reader.partial { return result }
+            return jsonError(reader, "unexpected end of input in object")
+        }
+        if reader.src.byte(reader.pos) != 34 { return jsonError(reader, "expected a string key") }
+        let key = jsonReadString(reader)
+        if reader.error != "" { return Json.Null }
+        if jsonAtEnd(reader) and reader.partial { return result }   // the key itself may be cut
+        jsonSkipSpace(reader)
+        if jsonAtEnd(reader) {
+            if reader.partial { return result }
+            return jsonError(reader, "unexpected end of input in object")
+        }
+        if reader.src.byte(reader.pos) != 58 { return jsonError(reader, "expected ':'") }
+        reader.pos += 1
+        let value = jsonReadValue(reader, depth + 1)
+        if reader.error != "" { return Json.Null }
+        if jsonIsMissing(value) { return result }
+        keys.push(key)
+        values.push(value)
+        jsonSkipSpace(reader)
+        if jsonAtEnd(reader) {
+            if reader.partial { return result }
+            return jsonError(reader, "unexpected end of input in object")
+        }
+        let d = reader.src.byte(reader.pos)
+        reader.pos += 1
+        if d == 125 { return result }
+        if d != 44 {
+            reader.pos -= 1
+            return jsonError(reader, "expected ',' or '}'")
+        }
+    }
+    return Json.Null
+}
+
+fn jsonReadArray(reader: JsonReader, depth: int) -> Json {
+    reader.pos += 1
+    var items: [Json] = []
+    let result = Json.Array(items)
+    jsonSkipSpace(reader)
+    if jsonAtEnd(reader) and reader.partial { return result }
+    if reader.pos < reader.src.len() and reader.src.byte(reader.pos) == 93 {
+        reader.pos += 1
+        return result
+    }
+    while reader.error == "" {
+        let value = jsonReadValue(reader, depth + 1)
+        if reader.error != "" { return Json.Null }
+        if jsonIsMissing(value) { return result }
+        items.push(value)
+        jsonSkipSpace(reader)
+        if jsonAtEnd(reader) {
+            if reader.partial { return result }
+            return jsonError(reader, "unexpected end of input in array")
+        }
+        let d = reader.src.byte(reader.pos)
+        reader.pos += 1
+        if d == 93 { return result }
+        if d != 44 {
+            reader.pos -= 1
+            return jsonError(reader, "expected ',' or ']'")
+        }
+    }
+    return Json.Null
+}
+
+fn jsonReadLiteral(reader: JsonReader, word: str, value: Json) -> Json {
+    let n = reader.src.len()
+    let available = min(word.len(), n - reader.pos)
+    if reader.src.sub(reader.pos, reader.pos + available) != word.sub(0, available) {
+        return jsonError(reader, "invalid literal")
+    }
+    if available < word.len() {
+        if reader.partial {
+            reader.pos = n
+            return Json.Text(jsonMissingMarker)
+        }
+        return jsonError(reader, "unexpected end of input")
+    }
+    reader.pos += word.len()
+    return value
+}
+
+fn jsonIsDigit(c: int) -> bool { return c >= 48 and c <= 57 }
+
+fn jsonReadNumber(reader: JsonReader) -> Json {
+    let src = reader.src
+    let n = src.len()
+    let start = reader.pos
+    var i = start
+    if i < n and src.byte(i) == 45 { i += 1 }
+    if i >= n { return jsonNumberCut(reader) }
+    if src.byte(i) == 48 {
+        i += 1
+    } else if jsonIsDigit(src.byte(i)) {
+        while i < n and jsonIsDigit(src.byte(i)) { i += 1 }
+    } else {
+        reader.pos = i
+        return jsonError(reader, "invalid number")
+    }
+    var integral = true
+    if i < n and src.byte(i) == 46 {
+        integral = false
+        i += 1
+        let fractionStart = i
+        while i < n and jsonIsDigit(src.byte(i)) { i += 1 }
+        if i == fractionStart {
+            if i >= n { return jsonNumberCut(reader) }
+            reader.pos = i
+            return jsonError(reader, "invalid number")
+        }
+    }
+    if i < n and (src.byte(i) == 101 or src.byte(i) == 69) {
+        integral = false
+        i += 1
+        if i < n and (src.byte(i) == 43 or src.byte(i) == 45) { i += 1 }
+        let exponentStart = i
+        while i < n and jsonIsDigit(src.byte(i)) { i += 1 }
+        if i == exponentStart {
+            if i >= n { return jsonNumberCut(reader) }
+            reader.pos = i
+            return jsonError(reader, "invalid number")
+        }
+    }
+    if i >= n and reader.partial { return jsonNumberCut(reader) }   // more digits may follow
+    reader.pos = i
+    let digitCount = i - start
+    // Fast path: short integers are exact in a double.
+    if integral and digitCount <= 15 {
+        var value = 0
+        var k = start
+        var negative = false
+        if src.byte(k) == 45 {
+            negative = true
+            k += 1
+        }
+        while k < i {
+            value = value * 10 + (src.byte(k) - 48)
+            k += 1
+        }
+        if negative {
+            if value == 0 { return Json.Number(0.0 - 0.0) }
+            return Json.Number((0 - value) as float)
+        }
+        return Json.Number(value as float)
+    }
+    let parsed = parseFloat(src.sub(start, i))
+    if not parsed.has() { return jsonError(reader, "number out of range") }
+    return Json.Number(parsed.get())
+}
+
+fn jsonNumberCut(reader: JsonReader) -> Json {
+    if reader.partial {
+        reader.pos = reader.src.len()
+        return Json.Text(jsonMissingMarker)
+    }
+    return jsonError(reader, "unexpected end of input in number")
+}
+
+fn jsonHexDigit(c: int) -> int {
+    if c >= 48 and c <= 57 { return c - 48 }
+    if c >= 97 and c <= 102 { return c - 87 }
+    if c >= 65 and c <= 70 { return c - 55 }
+    return -1
+}
+
+// Four hex digits at reader.pos; -1 when invalid, -2 when cut short.
+fn jsonReadHex4(reader: JsonReader) -> int {
+    var value = 0
+    for k in 0..4 {
+        if reader.pos + k >= reader.src.len() { return -2 }
+        let d = jsonHexDigit(reader.src.byte(reader.pos + k))
+        if d < 0 { return -1 }
+        value = value * 16 + d
+    }
+    reader.pos += 4
+    return value
+}
+
+// Reads a string starting at the opening quote. In partial mode an
+// unterminated string returns what has arrived (without a half escape).
+fn jsonReadString(reader: JsonReader) -> str {
+    reader.pos += 1
+    var parts: [str] = []
+    var runStart = reader.pos
+    let src = reader.src
+    let n = src.len()
+    while reader.pos < n {
+        let c = src.byte(reader.pos)
+        if c == 34 {
+            let last = src.sub(runStart, reader.pos)
+            reader.pos += 1
+            if parts.len() == 0 { return last }
+            parts.push(last)
+            return parts.join()
+        }
+        if c < 32 {
+            jsonError(reader, "control character in string")
+            return ""
+        }
+        if c == 92 {
+            parts.push(src.sub(runStart, reader.pos))
+            if reader.pos + 1 >= n {
+                    runStart = n
+                    break
+                }
+            let e = src.byte(reader.pos + 1)
+            reader.pos += 2
+            if e == 34 { parts.push("\"") }
+            else if e == 92 { parts.push("\\") }
+            else if e == 47 { parts.push("/") }
+            else if e == 110 { parts.push("\n") }
+            else if e == 116 { parts.push("\t") }
+            else if e == 114 { parts.push("\r") }
+            else if e == 98 { parts.push(chr(8)) }
+            else if e == 102 { parts.push(chr(12)) }
+            else if e == 117 {
+                var cp = jsonReadHex4(reader)
+                if cp == -2 {
+                    runStart = n
+                    break
+                }
+                if cp == -1 {
+                    jsonError(reader, "invalid \\u escape")
+                    return ""
+                }
+                if cp >= 55296 and cp < 56320 {
+                    // a high surrogate: a low one must follow to make one codepoint
+                    if reader.pos + 1 < n and src.byte(reader.pos) == 92 and src.byte(reader.pos + 1) == 117 {
+                        let save = reader.pos
+                        reader.pos += 2
+                        let low = jsonReadHex4(reader)
+                        if low == -2 {
+                    runStart = n
+                    break
+                }
+                        if low >= 56320 and low < 57344 {
+                            cp = 65536 + ((cp - 55296) << 10) + (low - 56320)
+                        } else {
+                            cp = 65533
+                            reader.pos = save
+                        }
+                    } else if reader.pos + 1 >= n and reader.partial {
+                        runStart = n
+                        break
+                    } else {
+                        cp = 65533
+                    }
+                } else if cp >= 56320 and cp < 57344 {
+                    cp = 65533
+                }
+                parts.push(utf8Encode(cp))
+            } else {
+                reader.pos -= 1
+                jsonError(reader, "invalid escape")
+                return ""
+            }
+            runStart = reader.pos
+        } else {
+            reader.pos += 1
+        }
+    }
+    // unterminated
+    if not reader.partial {
+        jsonError(reader, "unterminated string")
+        return ""
+    }
+    if runStart < n { parts.push(src.sub(runStart, n)) }
+    reader.pos = n
+    reader.cut = true
+    return parts.join()
+}
+
+// ---- streaming partial fields ----
+
+// One string member of JSON that is still arriving: `complete` is false for
+// the last one while its closing quote has not come yet.
+struct JsonPartialField { key: str, value: str, complete: bool }
+
+// The string-valued members of a JSON prefix, in order, at any depth, with
+// the last value possibly cut short -- tool-call arguments as a model
+// writes them, e.g. to show a file path or a command while it streams.
+// Never fails; non-string values are skipped.
+fn jsonPartialFields(src: str) -> [JsonPartialField] {
+    var out: [JsonPartialField] = []
+    let reader = JsonReader{src: src, partial: true}
+    var key = ""
+    var expectValue = false
+    let n = src.len()
+    while reader.pos < n {
+        let c = src.byte(reader.pos)
+        if c == 34 {
+            let text = jsonReadString(reader)
+            if reader.error != "" { return out }
+            let done = not reader.cut
+            if expectValue {
+                out.push(JsonPartialField{key: key, value: text, complete: done})
+                expectValue = false
+            } else if done {
+                jsonSkipSpace(reader)
+                if reader.pos < n and src.byte(reader.pos) == 58 {
+                    key = text
+                    expectValue = true
+                    reader.pos += 1
+                }
+            }
+            if not done { return out }
+        } else {
+            if c != 32 and c != 9 and c != 10 and c != 13 { expectValue = false }
+            reader.pos += 1
+        }
+    }
+    return out
+}
+
+// The (possibly partial) value of the first string member named `key`, or
+// none while it has not started.
+fn jsonPartialString(src: str, key: str) -> str? {
+    for field in jsonPartialFields(src) {
+        if field.key == key { return field.value }
+    }
+    return none
+}
+
+// ---- stringify ----
+
+// A JSON string literal: quotes, backslashes and control characters are
+// escaped; other bytes (UTF-8 included) pass through.
+fn jsonQuote(text: str) -> str { return jsonQuoteWith(text, false) }
+
+// Like jsonQuote, but every non-ASCII codepoint becomes \uXXXX (a surrogate
+// pair above U+FFFF), so the output is pure ASCII. Invalid UTF-8 bytes
+// become �.
+fn jsonQuoteAscii(text: str) -> str { return jsonQuoteWith(text, true) }
+
+fn jsonHex4(value: int) -> str {
+    let hex = "0123456789abcdef"
+    return "\\u" + chr(hex.byte((value >> 12) & 15)) + chr(hex.byte((value >> 8) & 15)) + chr(hex.byte((value >> 4) & 15)) + chr(hex.byte(value & 15))
+}
+
+fn jsonQuoteWith(text: str, ascii: bool) -> str {
+    var parts: [str] = ["\""]
+    var runStart = 0
+    var i = 0
+    let n = text.len()
+    while i < n {
+        let c = text.byte(i)
+        if c == 34 or c == 92 or c < 32 or c == 127 or (ascii and c >= 128) {
+            parts.push(text.sub(runStart, i))
+            if c == 34 { parts.push("\\\"") }
+            else if c == 92 { parts.push("\\\\") }
+            else if c == 10 { parts.push("\\n") }
+            else if c == 13 { parts.push("\\r") }
+            else if c == 9 { parts.push("\\t") }
+            else if c == 8 { parts.push("\\b") }
+            else if c == 12 { parts.push("\\f") }
+            else if c < 128 { parts.push(jsonHex4(c)) }
+            else {
+                let (cp, size) = utf8DecodeAt(text, i)
+                if cp >= 65536 {
+                    let v = cp - 65536
+                    parts.push(jsonHex4(55296 + (v >> 10)))
+                    parts.push(jsonHex4(56320 + (v & 1023)))
+                } else {
+                    parts.push(jsonHex4(cp))
+                }
+                i += size
+                runStart = i
+                continue
+            }
+            runStart = i + 1
+        }
+        i += 1
+    }
+    parts.push(text.sub(runStart, n))
+    parts.push("\"")
+    return parts.join()
+}
+
+// The shortest decimal that reads back as exactly `value`; NaN and the
+// infinities (which JSON cannot spell) become null.
+fn jsonFormatNumber(value: float) -> str {
+    if value != value { return "null" }
+    let magnitude = abs(value)
+    if magnitude > 1.7976931348623157e308 { return "null" }
+    if value == 0.0 { return "0" }
+    if magnitude < 1e15 and ((magnitude as int) as float) == magnitude {
+        return "{value as int}"
+    }
+    var sign = ""
+    if value < 0.0 { sign = "-" }
+    // the exact decimal expansion, then the fewest digits that round-trip
+    let exponentBits = (bits(magnitude) >> 52) & 2047
+    var decimals = 1075 - exponentBits
+    if exponentBits == 0 { decimals = 1074 }
+    if decimals < 0 { decimals = 0 }
+    let exact = formatFixed(magnitude, decimals)
+    var digits: [int] = []
+    var pointAt = exact.len()
+    for i in 0..exact.len() {
+        let c = exact.byte(i)
+        if c == 46 { pointAt = digits.len() } else { digits.push(c - 48) }
+    }
+    if pointAt == exact.len() { pointAt = digits.len() }
+    var first = 0
+    while first < digits.len() and digits[first] == 0 { first += 1 }
+    // value = 0.d[first]d[first+1]... * 10^(pointAt - first)
+    let exponent10 = pointAt - first
+    for precision in 1..18 {
+        var kept: [int] = []
+        for k in 0..precision {
+            if first + k < digits.len() { kept.push(digits[first + k]) } else { kept.push(0) }
+        }
+        var exponent = exponent10
+        if first + precision < digits.len() and digits[first + precision] >= 5 {
+            var k = precision - 1
+            var carry = true
+            while carry and k >= 0 {
+                kept[k] += 1
+                if kept[k] == 10 {
+                    kept[k] = 0
+                    k -= 1
+                } else {
+                    carry = false
+                }
+            }
+            if carry {
+                kept[0] = 1             // 99..9 rounded up to 100..0
+                exponent += 1
+            }
+        }
+        while kept.len() > 1 and kept[kept.len() - 1] == 0 { kept.pop() }
+        let candidate = jsonLayoutDigits(kept, exponent)
+        let back = parseFloat(candidate)
+        if back.has() and back.get() == magnitude { return sign + candidate }
+    }
+    return sign + formatFixed(magnitude, 17)
+}
+
+// digits d1 d2 ... dn meaning 0.d1d2...dn * 10^exponent, laid out the way
+// JavaScript does: plain notation for 1e-6 <= x < 1e21, else d.ddde+X.
+fn jsonLayoutDigits(kept: [int], exponent: int) -> str {
+    var text: [str] = []
+    for d in kept { text.push(chr(48 + d)) }
+    let digits = text.join()
+    let n = digits.len()
+    if exponent > 21 or exponent < -5 {
+        var mantissa = digits.sub(0, 1)
+        if n > 1 { mantissa = mantissa + "." + digits.sub(1, n) }
+        let e = exponent - 1
+        if e >= 0 { return mantissa + "e+{e}" }
+        return mantissa + "e{e}"
+    }
+    if exponent <= 0 { return "0." + "0".repeat(0 - exponent) + digits }
+    if exponent >= n { return digits + "0".repeat(exponent - n) }
+    return digits.sub(0, exponent) + "." + digits.sub(exponent, n)
+}
+
+// Compact JSON text (no whitespace).
+fn jsonStringify(value: Json) -> str {
+    var parts: [str] = []
+    jsonWrite(value, parts, false, "", "", 0)
+    return parts.join()
+}
+
+// Like jsonStringify, but with every non-ASCII codepoint escaped.
+fn jsonStringifyAscii(value: Json) -> str {
+    var parts: [str] = []
+    jsonWrite(value, parts, true, "", "", 0)
+    return parts.join()
+}
+
+// Indented JSON text, one member per line, `indent` spaces per level.
+fn jsonPretty(value: Json, indent: int) -> str {
+    var parts: [str] = []
+    jsonWrite(value, parts, false, " ".repeat(max(indent, 0)), "\n", 0)
+    return parts.join()
+}
+
+fn jsonWrite(value: Json, parts: [str], ascii: bool, indent: str, newline: str, depth: int) {
+    match value {
+        Null { parts.push("null") }
+        Bool(flag) {
+            if flag { parts.push("true") } else { parts.push("false") }
+        }
+        Number(number) { parts.push(jsonFormatNumber(number)) }
+        Text(text) { parts.push(jsonQuoteWith(text, ascii)) }
+        Array(items) {
+            if items.len() == 0 {
+                parts.push("[]")
+                return
+            }
+            parts.push("[")
+            for i in 0..items.len() {
+                if i > 0 { parts.push(",") }
+                parts.push(newline)
+                parts.push(indent.repeat(depth + 1))
+                jsonWrite(items[i], parts, ascii, indent, newline, depth + 1)
+            }
+            parts.push(newline)
+            parts.push(indent.repeat(depth))
+            parts.push("]")
+        }
+        Object(keys, values) {
+            if keys.len() == 0 {
+                parts.push("\{\}")
+                return
+            }
+            parts.push("\{")
+            for i in 0..keys.len() {
+                if i > 0 { parts.push(",") }
+                parts.push(newline)
+                parts.push(indent.repeat(depth + 1))
+                parts.push(jsonQuoteWith(keys[i], ascii))
+                if newline == "" { parts.push(":") } else { parts.push(": ") }
+                jsonWrite(values[i], parts, ascii, indent, newline, depth + 1)
+            }
+            parts.push(newline)
+            parts.push(indent.repeat(depth))
+            parts.push("\}")
+        }
+    }
+}
