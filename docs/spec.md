@@ -426,7 +426,9 @@ Generics are monomorphised: each distinct set of type arguments compiles to its
 own copy of the body, type-checked with `T` bound. That checking is the whole
 contract — `contains` compiles `v == x` for the concrete `T`, so it works for
 `int`, `str` and enums, and is rejected for element types with no `==`. There is
-no trait system.
+no trait system. Because every instantiation is a separate copy, polymorphic
+recursion (a generic calling itself with a growing type such as `Box[T]`) is a
+compile error: instantiations may nest at most 64 deep.
 
 A generic function has no single type, so it cannot be used as a function value.
 

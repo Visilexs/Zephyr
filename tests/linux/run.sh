@@ -5,7 +5,8 @@
 # with a timeout, and checks the exit code, the .expected file next to the
 # source (when one exists), the lines of a .stderr file (each must appear in
 # stderr) and that both tiers print the same thing. Also runs
-# the leak checks (tests/leaks), the python checks that work on Linux and
+# the compile-error checks (tests/compile_fail/*.zeph with a .error file), the
+# leak checks (tests/leaks), the python checks that work on Linux and
 # tests/linux_extern.sh (when gcc is available).
 #
 # The compiler, runtime and lib/ are copied into a temp dir first, so the
@@ -128,6 +129,22 @@ run_test() {
     } >"$work/res/$id"
 }
 
+# run_compile_fail NAME: tests/compile_fail/NAME.zeph must be rejected (within
+# 60 s, at baseline and -O2) with every line of NAME.error in the message.
+run_compile_fail() {
+    local name="$1" id="cf__$1" reason=ok flag line log
+    for flag in "" -O2; do
+        log="$work/out/$id$flag.log"
+        if timeout 60 "$work/zc-linux" --linux --rt $flag "$root/tests/compile_fail/$name.zeph" "$work/out/$id.exe" >"$log" 2>&1; then
+            reason="compiled (want an error)"; break
+        fi
+        while IFS= read -r line; do
+            grep -qF -- "$line" "$log" || { reason="message lacks: $line"; break 2; }
+        done <"$root/tests/compile_fail/$name.error"
+    done
+    verdict "compile_fail/$name" "$reason" >"$work/res/$id"
+}
+
 run_python() {
     local check="$1" id="py__$1" result reason=ok
     shift
@@ -146,7 +163,7 @@ run_extern() {
     verdict "sh:linux_extern" "$reason" >"$work/res/sh__linux_extern"
 }
 
-export -f run_tier verdict run_test run_python run_extern no_parity
+export -f run_tier verdict run_test run_compile_fail run_python run_extern no_parity
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -154,6 +171,11 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
 
 {
     for name in "${tests[@]}"; do matches "$name" && echo "run_test $name"; done
+    for source in "$root"/tests/compile_fail/*.zeph; do
+        [ -f "$source" ] || continue
+        name="$(basename "$source" .zeph)"
+        matches "compile_fail/$name" && echo "run_compile_fail $name"
+    done
     matches "py:include_path" && echo "run_python include_path"
     matches "py:assert_message_release" && echo "run_python assert_message_release"
     matches "py:argument_tests" && echo "run_python argument_tests --compiler $work/zc-linux"

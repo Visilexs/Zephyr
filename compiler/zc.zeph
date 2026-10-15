@@ -369,6 +369,12 @@ var dispatchInterfaceIndices: [int] = []
 var instantiationKeys: [str] = []
 var instantiationFunctionIndices: [int] = []
 var pendingInstantiations: [Instantiation] = []
+// polymorphic-recursion guard: how deep each instance sits in the chain of
+// instantiations that created it (an instance queued while checking another
+// is one deeper), and the depth of the body being checked right now
+var instantiationDepths: [int: int] = [:]
+var currentInstantiationDepth = 0
+let maximumInstantiationDepth = 64
 var instantiatedFunctions: [int] = []          // functionDefinitions indices to code-generate after program.children
 var typeBindingNames: [str] = []
 var typeBindingTypes: [int] = []
@@ -3900,7 +3906,7 @@ fn unifyTypeParameters(typeExpression: Node, actualType: int, typeParameters: [s
 // Get (or create) the monomorphisation of generic fi for these bindings.
 // Every value is 64 bits, so an instantiation is just the body re-checked with
 // T bound -- which also gives each one the right ==, <, and print for its T.
-fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
+fn instantiate(functionIndex: int, names: [str], types: [int], line: int) -> int {
     let functionDefinition = functionDefinitions[functionIndex]
     var keyParts: [str] = []
     keyParts.push(functionDefinition.name)
@@ -3911,6 +3917,9 @@ fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
     let instantiationKey = keyParts.join()
     for i in 0..instantiationKeys.len() {
         if instantiationKeys[i] == instantiationKey { return instantiationFunctionIndices[i] }
+    }
+    if currentInstantiationDepth >= maximumInstantiationDepth {
+        failCompilation(line, "polymorphic recursion: instantiating '{functionDefinition.name}' exceeds the generic instantiation depth limit of {maximumInstantiationDepth} (a generic function calls itself with an ever-growing type)")
     }
     for i in 0..names.len() {                    // bind, resolve the signature
         typeBindingNames.push(names[i])
@@ -3939,6 +3948,7 @@ fn instantiate(functionIndex: int, names: [str], types: [int]) -> int {
     instantiationKeys.push(instantiationKey)                        // cache before checking, so a
     instantiationFunctionIndices.push(instanceIndex)                         // recursive generic terminates
     instantiatedFunctions.push(instanceIndex)
+    instantiationDepths[instanceIndex] = currentInstantiationDepth + 1
     pendingInstantiations.push(Instantiation{functionIndex: instanceIndex, typeParameterNames: names, typeArguments: types})
     return instanceIndex
 }
@@ -3975,7 +3985,7 @@ fn checkGenericCall(expression: Node, functionIndex: int, receiver: Node) -> int
             if names[j] == typeParameter { orderedTypes.push(types[j]) }
         }
     }
-    let instanceIndex = instantiate(functionIndex, functionDefinition.typeParameters, orderedTypes)
+    let instanceIndex = instantiate(functionIndex, functionDefinition.typeParameters, orderedTypes, expression.line)
     let instantiatedFunction = functionDefinitions[instanceIndex]
     if receiver.nodeKind != nodeNone {
         expression.children[0].children[0] = coerce(receiver, instantiatedFunction.parameterTypes[0], "argument 1")
@@ -5993,7 +6003,9 @@ fn drainPending() {
             typeBindingNames.push(instance.typeParameterNames[i])
             typeBindingTypes.push(instance.typeArguments[i])
         }
+        currentInstantiationDepth = instantiationDepths[instance.functionIndex]
         checkFunctionBody(functionDefinitions[instance.functionIndex])
+        currentInstantiationDepth = 0
         for i in 0..instance.typeParameterNames.len() {
             let poppedName = typeBindingNames.pop()
             let poppedType = typeBindingTypes.pop()
