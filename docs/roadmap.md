@@ -148,14 +148,21 @@ merged and every 2A item is still open.
 
 ## Phase 4: LLM apps in Zephyr (std)
 - [x] `std/utf8.zeph`: codepoints, runeCount, validate, encode, safe
-  truncate and pad. (tests/std_utf8.zeph; docs/std.md section still to write)
+  truncate and pad. (tests/std_utf8.zeph; documented in docs/std.md)
 - [x] `std/json.zeph`: parse, stringify and streaming partial fields
-  (promoted from zui). (tests/std_json.zeph; docs/std.md section still to write)
-- [ ] `std/process.zeph`: spawn with pipes and wait (promoted from zui
-  proc.zeph). Linux `run()` and `environmentVariable()`.
-- [ ] `tryReadFile`/`tryWriteFile` returning `Result`.
-- [ ] `std/http.zeph`: HTTP/1.1 client with SSE streaming. Plain TCP via
-  syscalls; HTTPS via `extern` libcurl or libssl.
+  (promoted from zui). (tests/std_json.zeph; documented in docs/std.md)
+- [x] `std/process.zeph`: spawn with pipes (fork + execve, no libc),
+  readAvailable/readAll, wait/tryWait/kill, environment override, working
+  directory. Linux `run()` (`/bin/sh -c`) and `environmentVariable()`
+  (`/proc/self/environ`) shims. (tests/linux/std_process, io_process)
+- [x] `tryReadFile`/`tryWriteFile` returning `Result` with errno text.
+- [x] `std/net.zeph`: TCP connect (IPv4/IPv6), send/recv with timeouts,
+  /etc/hosts + UDP DNS A queries. Not done: AAAA queries, listening sockets.
+- [x] `std/http.zeph`: HTTP/1.1 client (Content-Length, chunked,
+  close-delimited), streaming callback, SSE events. HTTPS via dlopen'd
+  libcurl (multi interface writing into memfds, since native callbacks do
+  not exist yet). Tested against local python servers (tests/linux/net.sh).
+  Not done: redirects, keep-alive, a pure-Zephyr TLS.
 - [ ] A postfix `?` operator for Result and optionals.
 
 ## Phase 5: language-level memory model (larger, later)

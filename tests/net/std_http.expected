@@ -1,0 +1,23 @@
+https ::1 8443 /v1/chat?x=1
+/ bad url ftp://x: unsupported scheme ftp true
+200 OK hello world zephyr-test true
+200 POST /echo|yes|payload 1
+PUT /echo|-|
+first,second,third chunked
+300000 0123456789
+until the end
+404 false no such thing
+200 true
+200 18
+text/event-stream
+start|1|{"n": 1}
+message|1|line one
+line two
+message|1|no space
+delta|1|{"text": "Hello"}
+message|1|[DONE]
+true
+true
+true
+message  a\nb
+e 7 x

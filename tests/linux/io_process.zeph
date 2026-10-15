@@ -1,0 +1,34 @@
+// std/io on Linux: run (fork + /bin/sh -c + wait4), environmentVariable
+// (/proc/self/environ), tryReadFile/tryWriteFile with errno text.
+import "std/io.zeph"
+
+print(run("exit 0"), run("exit 7"), run("true"), run("kill -9 $$"))
+print(run("echo from-child >/dev/null"))
+print(environmentVariable("ZEPHYR_SURELY_UNSET_VARIABLE") == none)
+print(environmentVariable("PATH").or("").len() > 0, environmentVariable("HOME") == none)
+print(run("test -n \"$PATH\""))
+
+let path = "/tmp/zephyr_io_process_{syscall(39, 0, 0, 0, 0, 0, 0)}.txt"
+match tryWriteFile(path, "hello\nworld\n") {
+    Ok(n) { print("wrote", n) }
+    Err(e) { print("write error", e) }
+}
+match tryReadFile(path) {
+    Ok(text) { print(text.len(), text.split("\n")[1]) }
+    Err(e) { print("read error", e) }
+}
+print(run("test -s {path}"))
+let removed = deleteFile(path)
+match tryReadFile(path) {
+    Ok(text) { print("unexpected", text) }
+    Err(e) { print(e == "open {path}: no such file or directory") }
+}
+match tryReadFile("/") {
+    Ok(text) { print("unexpected dir read") }
+    Err(e) { print(e) }
+}
+match tryWriteFile("/proc/zephyr/nope", "x") {
+    Ok(n) { print("unexpected", n) }
+    Err(e) { print(e) }
+}
+print(tryReadFile("/proc/self/status").unwrapOr("").contains("Name:"))

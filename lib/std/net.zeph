@@ -1,0 +1,452 @@
+// std/net.zeph -- TCP client sockets and host name resolution (Linux).
+//
+//     import "std/net.zeph"
+//     match tcpConnect("example.com", 80, 5000) {
+//         Ok(conn) {
+//             let sent = conn.send("HEAD / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+//             print(conn.recv(4096).unwrapOr(""))
+//             conn.close()
+//         }
+//         Err(message) { print(message) }      // "connect example.com:80: connection refused"
+//     }
+//
+// Every operation returns a Result or optional and never panics on network
+// errors. Sockets are non-blocking underneath; each send/recv waits at most
+// conn.timeoutMilliseconds (poll), then gives Err("... timed out").
+// Resolution: IP literals, then /etc/hosts, then a UDP DNS A-record query to
+// the first IPv4 nameserver in /etc/resolv.conf. IPv6 works for literals
+// ("::1", "[::1]") and /etc/hosts entries; DNS asks only for A records.
+import "std/bytes.zeph"
+import "std/result.zeph"
+
+struct TcpConnection {
+    fd: int
+    timeoutMilliseconds: int = 30000
+    open: bool = true
+    peer: str = ""                // "host:port" as given to tcpConnect
+}
+
+// An address: family 4 or 6, and its bytes (4 or 16 of them).
+struct IpAddress { family: int, bytes: [int] }
+
+impl IpAddress {
+    fn text(self) -> str {
+        if self.family == 4 {
+            return "{self.bytes[0]}.{self.bytes[1]}.{self.bytes[2]}.{self.bytes[3]}"
+        }
+        var groups: [str] = []
+        for i in 0..8 { groups.push(netHex(self.bytes[2 * i] * 256 + self.bytes[2 * i + 1])) }
+        return groups.join(":")
+    }
+}
+
+private fn netHex(value: int) -> str {
+    let digits = "0123456789abcdef"
+    if value == 0 { return "0" }
+    var text = ""
+    var rest = value
+    while rest > 0 {
+        text = digits.sub(rest % 16, rest % 16 + 1) + text
+        rest = rest / 16
+    }
+    return text
+}
+
+fn netErrnoText(errno: int) -> str {
+    let names = [111: "connection refused", 110: "timed out", 101: "network unreachable",
+        113: "no route to host", 104: "connection reset by peer", 32: "broken pipe",
+        99: "cannot assign requested address", 97: "address family not supported",
+        24: "too many open files", 103: "connection aborted", 107: "not connected"]
+    return names.get(errno).or("errno {errno}")
+}
+
+// ---- address parsing ----
+
+// "1.2.3.4" -> IpAddress, else none.
+fn parseIpv4(text: str) -> IpAddress? {
+    let parts = text.split(".")
+    if parts.len() != 4 { return none }
+    var bytes: [int] = []
+    for part in parts {
+        if part.len() == 0 or part.len() > 3 { return none }
+        var value = 0
+        for i in 0..part.len() {
+            let c = part.byte(i)
+            if c < 48 or c > 57 { return none }
+            value = value * 10 + c - 48
+        }
+        if value > 255 { return none }
+        bytes.push(value)
+    }
+    return IpAddress{family: 4, bytes: bytes}
+}
+
+private fn netHexValue(c: int) -> int {
+    if c >= 48 and c <= 57 { return c - 48 }
+    if c >= 97 and c <= 102 { return c - 87 }
+    if c >= 65 and c <= 70 { return c - 55 }
+    return 0 - 1
+}
+
+private fn netParseGroups(text: str) -> [int]? {
+    var groups: [int] = []
+    if text == "" { return groups }
+    for part in text.split(":") {
+        if part.len() == 0 or part.len() > 4 { return none }
+        var value = 0
+        for i in 0..part.len() {
+            let digit = netHexValue(part.byte(i))
+            if digit < 0 { return none }
+            value = value * 16 + digit
+        }
+        groups.push(value)
+    }
+    return groups
+}
+
+// "::1", "fe80::1", "[::1]" -> IpAddress, else none. (No embedded IPv4 form.)
+fn parseIpv6(input: str) -> IpAddress? {
+    var text = input
+    if text.startsWith("[") and text.endsWith("]") { text = text.sub(1, text.len() - 1) }
+    let percent = text.indexOf("%")
+    if percent >= 0 { text = text.sub(0, percent) }
+    if not text.contains(":") { return none }
+    var groups: [int] = []
+    let gap = text.indexOf("::")
+    if gap >= 0 {
+        let head = netParseGroups(text.sub(0, gap))
+        let tail = netParseGroups(text.sub(gap + 2, text.len()))
+        if head == none or tail == none { return none }
+        let missing = 8 - head.get().len() - tail.get().len()
+        if missing < 1 { return none }
+        for g in head.get() { groups.push(g) }
+        for i in 0..missing { groups.push(0) }
+        for g in tail.get() { groups.push(g) }
+    } else {
+        let all = netParseGroups(text)
+        if all == none { return none }
+        groups = all.get()
+    }
+    if groups.len() != 8 { return none }
+    var bytes: [int] = []
+    for g in groups {
+        bytes.push(g / 256)
+        bytes.push(g % 256)
+    }
+    return IpAddress{family: 6, bytes: bytes}
+}
+
+fn parseIp(text: str) -> IpAddress? {
+    if let v4 = parseIpv4(text) { return v4 }
+    return parseIpv6(text)
+}
+
+// ---- resolution ----
+
+private fn netReadFile(path: str) -> str {
+    let name = cString(path)
+    let fd = syscall(2, name.addr(), 524288, 0, 0, 0, 0)
+    if fd < 0 { return "" }
+    let buffer = Bytes.new(16384)
+    var parts: [str] = []
+    while true {
+        let count = syscall(0, fd, buffer.addr(), 16384, 0, 0, 0)
+        if count <= 0 { break }
+        parts.push(buffer.getString(0, count))
+    }
+    let closed = syscall(3, fd, 0, 0, 0, 0, 0)
+    return parts.join()
+}
+
+// Splits a config line on spaces and tabs, dropping a # comment.
+private fn netFields(line: str) -> [str] {
+    var text = line
+    let hash = text.indexOf("#")
+    if hash >= 0 { text = text.sub(0, hash) }
+    var fields: [str] = []
+    for piece in text.replace("\t", " ").split(" ") { if piece != "" { fields.push(piece) } }
+    return fields
+}
+
+// Addresses /etc/hosts lists for `host` (case-insensitive), IPv4 first.
+fn hostsLookup(host: str) -> [IpAddress] {
+    var v4: [IpAddress] = []
+    var v6: [IpAddress] = []
+    let wanted = host.lower()
+    for line in netReadFile("/etc/hosts").split("\n") {
+        let fields = netFields(line)
+        if fields.len() < 2 { continue }
+        var listed = false
+        for i in 1..fields.len() { if fields[i].lower() == wanted { listed = true } }
+        if not listed { continue }
+        if let address = parseIp(fields[0]) {
+            if address.family == 4 { v4.push(address) } else { v6.push(address) }
+        }
+    }
+    for a in v6 { v4.push(a) }
+    return v4
+}
+
+// The first IPv4 nameserver in /etc/resolv.conf, else none.
+fn systemNameserver() -> IpAddress? {
+    for line in netReadFile("/etc/resolv.conf").split("\n") {
+        let fields = netFields(line)
+        if fields.len() >= 2 and fields[0] == "nameserver" {
+            if let address = parseIpv4(fields[1]) { return address }
+        }
+    }
+    return none
+}
+
+private fn netSockaddr(address: IpAddress, port: int) -> Bytes {
+    let sockaddr = Bytes.new(28)
+    if address.family == 4 {
+        sockaddr.put16(0, 2)                       // AF_INET
+        sockaddr.put8(2, (port >> 8) & 255)
+        sockaddr.put8(3, port & 255)
+        for i in 0..4 { sockaddr.put8(4 + i, address.bytes[i]) }
+    } else {
+        sockaddr.put16(0, 10)                      // AF_INET6
+        sockaddr.put8(2, (port >> 8) & 255)
+        sockaddr.put8(3, port & 255)
+        for i in 0..16 { sockaddr.put8(8 + i, address.bytes[i]) }
+    }
+    return sockaddr
+}
+
+private fn netSockaddrLength(address: IpAddress) -> int {
+    return if address.family == 4 { 16 } else { 28 }
+}
+
+// Waits for `events` (1 = POLLIN, 4 = POLLOUT) on fd: true if ready.
+private fn netPoll(fd: int, events: int, timeoutMilliseconds: int) -> bool {
+    let pollSet = Bytes.new(8)
+    pollSet.put32(0, fd)
+    pollSet.put16(4, events)
+    var ready = syscall(7, pollSet.addr(), 1, timeoutMilliseconds, 0, 0, 0)
+    while ready == 0 - 4 { ready = syscall(7, pollSet.addr(), 1, timeoutMilliseconds, 0, 0, 0) }
+    return ready > 0
+}
+
+private fn netPutName(packet: [int], host: str) -> bool {
+    for label in host.split(".") {
+        if label.len() == 0 or label.len() > 63 { return false }
+        packet.push(label.len())
+        for i in 0..label.len() { packet.push(label.byte(i)) }
+    }
+    packet.push(0)
+    return true
+}
+
+// Offset just past a (possibly compressed) DNS name at `offset`, or -1.
+private fn netSkipName(reply: str, offset: int) -> int {
+    var at = offset
+    while at < reply.len() {
+        let length = reply.byte(at)
+        if length == 0 { return at + 1 }
+        if (length & 192) == 192 { return at + 2 }
+        at += length + 1
+    }
+    return 0 - 1
+}
+
+// One DNS A-record query for `host` to server:port over UDP. Ok(addresses)
+// (possibly empty: no A records), or Err on timeout / server error.
+fn dnsQueryA(host: str, server: IpAddress, port: int, timeoutMilliseconds: int) -> Result[[IpAddress], str] {
+    let trimmed = if host.endsWith(".") { host.sub(0, host.len() - 1) } else { host }
+    let id = (syscall(39, 0, 0, 0, 0, 0, 0) * 7919 + trimmed.len()) & 65535
+    var packet = [id >> 8, id & 255, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]   // RD, one question
+    if not netPutName(packet, trimmed) { return Result.Err("resolve {host}: invalid name") }
+    for b in [0, 1, 0, 1] { packet.push(b) }                          // QTYPE A, QCLASS IN
+    let family = if server.family == 4 { 2 } else { 10 }
+    let fd = syscall(41, family, 2 | 524288, 0, 0, 0, 0)            // SOCK_DGRAM | CLOEXEC
+    if fd < 0 { return Result.Err("resolve {host}: socket: " + netErrnoText(0 - fd)) }
+    let sockaddr = netSockaddr(server, port)
+    let connected = syscall(42, fd, sockaddr.addr(), netSockaddrLength(server), 0, 0, 0)
+    let query = Bytes.new(packet.len())
+    for i, b in packet { query.put8(i, b) }
+    let reply = Bytes.new(4096)
+    var answer = ""
+    var attempt = 0
+    while attempt < 2 and answer == "" and connected == 0 {
+        let sent = syscall(44, fd, query.addr(), packet.len(), 0, 0, 0)
+        if sent == packet.len() and netPoll(fd, 1, timeoutMilliseconds / 2 + 1) {
+            let got = syscall(45, fd, reply.addr(), 4096, 64, 0, 0)     // MSG_DONTWAIT
+            if got >= 12 and reply.get8(0) == (id >> 8) and reply.get8(1) == (id & 255) {
+                answer = reply.getString(0, got)
+            }
+        }
+        attempt += 1
+    }
+    let closed = syscall(3, fd, 0, 0, 0, 0, 0)
+    if connected != 0 { return Result.Err("resolve {host}: " + netErrnoText(0 - connected)) }
+    if answer == "" { return Result.Err("resolve {host}: DNS query timed out") }
+    let rcode = answer.byte(3) & 15
+    var addresses: [IpAddress] = []
+    if rcode == 3 { return Result.Ok(addresses) }                   // NXDOMAIN
+    if rcode != 0 { return Result.Err("resolve {host}: DNS server error {rcode}") }
+    let questions = answer.byte(4) * 256 + answer.byte(5)
+    let answers = answer.byte(6) * 256 + answer.byte(7)
+    var at = 12
+    for q in 0..questions {
+        at = netSkipName(answer, at)
+        if at < 0 { return Result.Err("resolve {host}: malformed DNS reply") }
+        at += 4
+    }
+    for a in 0..answers {
+        at = netSkipName(answer, at)
+        if at < 0 or at + 10 > answer.len() { return Result.Err("resolve {host}: malformed DNS reply") }
+        let recordType = answer.byte(at) * 256 + answer.byte(at + 1)
+        let length = answer.byte(at + 8) * 256 + answer.byte(at + 9)
+        at += 10
+        if at + length > answer.len() { return Result.Err("resolve {host}: malformed DNS reply") }
+        if recordType == 1 and length == 4 {
+            addresses.push(IpAddress{family: 4, bytes: [answer.byte(at), answer.byte(at + 1), answer.byte(at + 2), answer.byte(at + 3)]})
+        }
+        at += length
+    }
+    return Result.Ok(addresses)
+}
+
+// IP literal, /etc/hosts, then DNS (A records). Err when nothing is found.
+fn resolveHost(host: str, timeoutMilliseconds: int = 5000) -> Result[[IpAddress], str] {
+    var found: [IpAddress] = []
+    if let literal = parseIp(host) {
+        found.push(literal)
+        return Result.Ok(found)
+    }
+    found = hostsLookup(host)
+    if found.len() > 0 { return Result.Ok(found) }
+    if host.lower() == "localhost" {
+        found.push(IpAddress{family: 4, bytes: [127, 0, 0, 1]})
+        return Result.Ok(found)
+    }
+    let server = systemNameserver()
+    if server == none { return Result.Err("resolve {host}: no nameserver in /etc/resolv.conf") }
+    match dnsQueryA(host, server.get(), 53, timeoutMilliseconds) {
+        Ok(addresses) {
+            if addresses.len() == 0 { return Result.Err("resolve {host}: no such host") }
+            return Result.Ok(addresses)
+        }
+        Err(message) { return Result.Err(message) }
+    }
+}
+
+// ---- TCP ----
+
+// Connects to one address. Ok(fd) or Err(errno text).
+private fn netConnectAddress(address: IpAddress, port: int, timeoutMilliseconds: int) -> Result[int, str] {
+    let family = if address.family == 4 { 2 } else { 10 }
+    let fd = syscall(41, family, 1 | 2048 | 524288, 0, 0, 0, 0)     // SOCK_STREAM | NONBLOCK | CLOEXEC
+    if fd < 0 { return Result.Err(netErrnoText(0 - fd)) }
+    let sockaddr = netSockaddr(address, port)
+    var result = syscall(42, fd, sockaddr.addr(), netSockaddrLength(address), 0, 0, 0)
+    if result == 0 - 115 {                                           // EINPROGRESS
+        if not netPoll(fd, 4, timeoutMilliseconds) {
+            let closed = syscall(3, fd, 0, 0, 0, 0, 0)
+            return Result.Err("timed out")
+        }
+        let value = Bytes.new(8)
+        let valueLength = Bytes.new(8)
+        valueLength.put32(0, 4)
+        let got = syscall(55, fd, 1, 4, value.addr(), valueLength.addr(), 0)   // SO_ERROR
+        result = 0 - value.get32(0)
+        if got < 0 { result = got }
+    }
+    if result != 0 {
+        let closed = syscall(3, fd, 0, 0, 0, 0, 0)
+        return Result.Err(netErrnoText(0 - result))
+    }
+    let one = Bytes.new(8)
+    one.put32(0, 1)
+    let nodelay = syscall(54, fd, 6, 1, one.addr(), 4, 0)          // TCP_NODELAY
+    return Result.Ok(fd)
+}
+
+// Resolves `host` and connects to its first reachable address. The timeout
+// covers each connect attempt and becomes the connection's I/O timeout.
+fn tcpConnect(host: str, port: int, timeoutMilliseconds: int = 30000) -> Result[TcpConnection, str] {
+    let peer = "{host}:{port}"
+    if port <= 0 or port > 65535 { return Result.Err("connect {peer}: invalid port") }
+    var addresses: [IpAddress] = []
+    match resolveHost(host, timeoutMilliseconds) {
+        Ok(found) { addresses = found }
+        Err(message) { return Result.Err(message) }
+    }
+    var lastError = "no address"
+    for address in addresses {
+        match netConnectAddress(address, port, timeoutMilliseconds) {
+            Ok(fd) { return Result.Ok(TcpConnection{fd: fd, timeoutMilliseconds: timeoutMilliseconds, peer: peer}) }
+            Err(message) { lastError = message }
+        }
+    }
+    return Result.Err("connect {peer}: {lastError}")
+}
+
+impl TcpConnection {
+    // Sends all of `data`. Ok(byte count), or Err on timeout or a peer reset.
+    fn send(self, data: str) -> Result[int, str] {
+        if not self.open { return Result.Err("send {self.peer}: connection closed") }
+        let buffer = cString(data)
+        var offset = 0
+        while offset < data.len() {
+            let count = syscall(44, self.fd, buffer.addr() + offset, data.len() - offset, 16384, 0, 0)  // MSG_NOSIGNAL
+            if count == 0 - 11 or count == 0 - 4 {
+                if count == 0 - 11 and not netPoll(self.fd, 4, self.timeoutMilliseconds) {
+                    return Result.Err("send {self.peer}: timed out")
+                }
+                continue
+            }
+            if count < 0 { return Result.Err("send {self.peer}: " + netErrnoText(0 - count)) }
+            offset += count
+        }
+        return Result.Ok(offset)
+    }
+
+    // Up to maxBytes of whatever arrives first. Ok("") means the peer closed
+    // the connection; Err on timeout or error.
+    fn recv(self, maxBytes: int = 65536) -> Result[str, str] {
+        if not self.open { return Result.Err("recv {self.peer}: connection closed") }
+        let size = max(1, maxBytes)
+        let buffer = Bytes.new(size)
+        while true {
+            let count = syscall(45, self.fd, buffer.addr(), size, 0, 0, 0)
+            if count >= 0 { return Result.Ok(buffer.getString(0, count)) }
+            if count == 0 - 11 {
+                if not netPoll(self.fd, 1, self.timeoutMilliseconds) {
+                    return Result.Err("recv {self.peer}: timed out")
+                }
+            } else if count != 0 - 4 {
+                return Result.Err("recv {self.peer}: " + netErrnoText(0 - count))
+            }
+        }
+        return Result.Err("recv {self.peer}: unreachable")
+    }
+
+    // Reads until the peer closes the connection.
+    fn recvAll(self) -> Result[str, str] {
+        var parts: [str] = []
+        while true {
+            match self.recv(65536) {
+                Ok(chunk) {
+                    if chunk == "" { return Result.Ok(parts.join()) }
+                    parts.push(chunk)
+                }
+                Err(message) { return Result.Err(message) }
+            }
+        }
+        return Result.Ok(parts.join())
+    }
+
+    // Half-close: tells the peer we are done sending.
+    fn shutdownWrite(self) {
+        if self.open { let done = syscall(48, self.fd, 1, 0, 0, 0, 0) }
+    }
+
+    fn close(self) {
+        if self.open {
+            let closed = syscall(3, self.fd, 0, 0, 0, 0, 0)
+            self.open = false
+        }
+    }
+}

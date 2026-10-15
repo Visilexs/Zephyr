@@ -358,6 +358,35 @@ structs by pointer into `Bytes` memory. `load64/store64/load8/store8`,
   `newWaitGroup()` (`add`, `done`, `wait`).
 - `linux`: `openPath`, `readAll(fd)`, `closeFd`, `memOpen(pid)`, `memRead`,
   `memWrite`, `vmRead`, `vmWrite`, `monotonicNanoseconds()`.
+- `io` also: `tryReadFile(path) -> Result[str, str]`,
+  `tryWriteFile(path, s) -> Result[int, str]` (errors like
+  `"open x: no such file or directory"`), `environmentVariable(name) -> str?`,
+  `run(command) -> int` (Linux: `/bin/sh -c`, exit code).
+- `utf8`: `utf8RuneCount`, `utf8Codepoints`, `utf8Encode`, `utf8IsValid`,
+  `utf8Sub(s, start, end)`, `utf8Truncate(s, n)`, `utf8TruncateBytes`,
+  `utf8DisplayWidth`, `utf8Fit(s, columns)`, `utf8PadLeft/Right`.
+- `json`: `jsonParse(s) -> Result[Json, str]`, `jsonTryParse(s) -> Json?`,
+  `j.path("choices[0].delta.content")`, `jsonGetStr(j, path) -> str?`
+  (also Int/Float/Bool), `j.get/at/asStr/asInt/items/keys`,
+  `jsonObject().set(k, v)`, `jsonArray().add(v)`, `jsonText/jsonInt/jsonBool`,
+  `jsonStringify(j)`, `jsonPretty(j, 2)`, `jsonParsePartial(prefix)`,
+  `jsonPartialString(prefix, key)` for streamed tool-call arguments.
+- `process` (Linux): `spawn(argv, SpawnOptions{}) -> Result[Process, str]`,
+  `p.write(s) -> bool`, `p.closeStdin()`, `p.readAvailable(timeoutMs) -> str`,
+  `p.readAll() -> str` (stderr lands in `p.stderrText`), `p.wait() -> int`,
+  `p.tryWait() -> int?`, `p.kill()`, `runCapture(argv)` ->
+  `ProcessOutput{code, stdout, stderr}`. Options: `environment: [str: str]`,
+  `clearEnvironment`, `directory`, `mergeStderr`.
+- `net` (Linux): `tcpConnect(host, port, timeoutMs) -> Result[TcpConnection, str]`,
+  `conn.send(s) -> Result[int, str]`, `conn.recv(max) -> Result[str, str]`
+  (`Ok("")` = closed), `conn.recvAll()`, `conn.close()`, `resolveHost(host)`.
+- `http` (Linux): `request(method, url, headers, body) -> Result[Response, str]`
+  (`r.status`, `r.body`, `r.header(name)`), `requestWith(..., HttpOptions{})`,
+  `requestStream(..., options, fn(chunk: str) -> bool)`,
+  `requestEvents(..., options, fn(event: SseEvent) -> bool)` for SSE
+  (`event.event`, `event.data`, `event.id`; return false to stop). https://
+  needs libcurl.so.4 at run time. An HTTP error status is still `Ok`.
+  Write `{` in string literals as `\{` (JSON bodies): `"\{\"a\": 1}"`.
 
 ## Common mistakes and the correct form
 

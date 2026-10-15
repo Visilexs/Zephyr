@@ -1,0 +1,45 @@
+// std/process: spawn with pipes, write/closeStdin, readAvailable, readAll,
+// wait, tryWait, kill, environment override, directory, spawn errors.
+import "std/process.zeph"
+
+match spawn(["sh", "-c", "read x; echo got $x; echo oops >&2; exit 3"], SpawnOptions{}) {
+    Ok(child) {
+        print(child.write("hi\n"))
+        child.closeStdin()
+        print(child.readAll().trim(), child.stderrText.trim(), child.wait())
+        print(child.write("late"))
+        child.close()
+    }
+    Err(message) { print(message) }
+}
+
+let captured = runCapture(["printf", "%s|%s", "a b", ""]).unwrap()
+print(captured.code, captured.stdout)
+
+var environment: [str: str] = [:]
+environment["ZEPHYR_TEST_VALUE"] = "forty two"
+let env = runCaptureWith(["sh", "-c", "echo $ZEPHYR_TEST_VALUE; pwd"], SpawnOptions{environment: environment, directory: "/tmp"}, "")
+print(env.unwrap().stdout.trim().split("\n"))
+let cleared = runCaptureWith(["/usr/bin/env"], SpawnOptions{clearEnvironment: true, environment: environment}, "")
+print(cleared.unwrap().stdout.trim())
+let merged = runCaptureWith(["sh", "-c", "echo out; echo err >&2"], SpawnOptions{mergeStderr: true}, "")
+print(merged.unwrap().stdout.trim().split("\n").len())
+let catted = runCaptureWith(["cat"], SpawnOptions{}, "x".repeat(50000))
+print(catted.unwrap().stdout.len())
+
+print(spawn(["zephyr-no-such-program"], SpawnOptions{}).error().or("ok"))
+print(spawn(["/etc/hostname-nope"], SpawnOptions{}).error().or("ok"))
+print(spawn(["/etc"], SpawnOptions{}).error().or("ok"))
+
+// interactive: line in, line out
+match spawn(["cat"], SpawnOptions{}) {
+    Ok(child) {
+        print(child.readAvailable(0) == "", child.tryWait() == none)
+        let sent = child.write("ping\n")
+        print(child.readAvailable(5000))
+        print(child.kill(), child.wait())
+        print(child.kill())
+        child.close()
+    }
+    Err(message) { print(message) }
+}

@@ -1,0 +1,43 @@
+// std/net against tests/net/server.py: args are the echo, DNS and HTTP ports.
+import "std/net.zeph"
+
+let echoPort = args()[1] as int
+let dnsPort = args()[2] as int
+
+print(parseIpv4("10.0.0.255").get().text(), parseIpv4("256.1.1.1") == none, parseIpv4("1.2.3") == none)
+print(parseIpv6("::1").get().text(), parseIpv6("[fe80::a:b]").get().text(), parseIpv6("1::2::3") == none)
+print(resolveHost("127.0.0.1").unwrap()[0].text(), resolveHost("localhost").unwrap()[0].family)
+
+let server = parseIpv4("127.0.0.1").get()
+let found = dnsQueryA("api.zephyr.test", server, dnsPort, 2000).unwrap()
+print(found.len(), found[0].text(), found[1].text())
+print(dnsQueryA("nothing.invalid", server, dnsPort, 2000).unwrap().len())
+print(dnsQueryA("silent.test", server, dnsPort, 400).error().or("ok"))
+
+match tcpConnect("127.0.0.1", echoPort, 5000) {
+    Ok(conn) {
+        print(conn.send("ping").unwrap())
+        print(conn.recv(100).unwrap())
+        let big = "z".repeat(300000)
+        let sent = conn.send(big)
+        var got = 0
+        while got < big.len() { got += conn.recv(65536).unwrap().len() }
+        print(sent.unwrap(), got)
+        conn.timeoutMilliseconds = 200
+        print(conn.recv(10).error().or("data?").replace("{echoPort}", "PORT"))
+        conn.shutdownWrite()
+        print(conn.recv(10).unwrap() == "")
+        conn.close()
+        print(conn.send("x").error().or("sent?").replace("{echoPort}", "PORT"))
+    }
+    Err(message) { print(message) }
+}
+match tcpConnect("localhost", echoPort, 5000) {
+    Ok(conn) {
+        print(conn.send("via localhost").isOk(), conn.recv(100).unwrap())
+        conn.close()
+    }
+    Err(message) { print(message) }
+}
+print(tcpConnect("127.0.0.1", 1, 2000).error().or("connected?"))
+print(tcpConnect("127.0.0.1", 70000).error().or("connected?"))

@@ -8,7 +8,9 @@
 # the compile-error checks (tests/compile_fail/*.zeph with a .error file), the
 # leak checks (tests/leaks), the python checks that work on Linux,
 # tests/linux_extern.sh (when gcc is available) and tests/linux/diagnostics.sh
-# (compile errors, CLI, zc run, the --test runner, runtime panic messages).
+# (compile errors, CLI, zc run, the --test runner, runtime panic messages)
+# and tests/linux/net.sh (std/net, std/http, https via libcurl, against local
+# python servers).
 #
 # The compiler, runtime and lib/ are copied into a temp dir first, so the
 # repository stays clean.
@@ -177,7 +179,14 @@ run_diagnostics() {
     verdict "sh:diagnostics" "$reason" >"$work/res/sh__diagnostics"
 }
 
-export -f run_tier verdict run_test run_compile_fail run_python run_extern run_diagnostics no_parity run_mode
+# std/net and std/http against local python servers (tests/linux/net.sh)
+run_net() {
+    local reason=ok
+    (cd "$root" && timeout 900 bash tests/linux/net.sh "$work") >"$work/out/sh__net.log" 2>&1 || reason="$(grep -m1 '^FAIL' "$work/out/sh__net.log" || tail -1 "$work/out/sh__net.log")"
+    verdict "sh:net" "$reason" >"$work/res/sh__net"
+}
+
+export -f run_tier verdict run_test run_compile_fail run_python run_extern run_diagnostics no_parity run_mode run_net
 export root work
 export KNOWN_FAIL_DUMP="$(declare -p KNOWN_FAIL EXPECT_EXIT)"
 
@@ -197,6 +206,7 @@ matches() { [ -z "$pattern" ] || echo "$1" | grep -Eq -- "$pattern"; }
     if command -v gcc >/dev/null && matches "sh:linux_extern"; then echo "run_extern"; fi
     matches "sh:elf_mode" && echo "run_mode"
     matches "sh:diagnostics" && echo "run_diagnostics"
+    matches "sh:net" && echo "run_net"
 } | xargs -P "$jobs" -I{} bash -c 'eval "$KNOWN_FAIL_DUMP"; {}'
 
 pass=0 fail=0 xfail=0 xpass=0
