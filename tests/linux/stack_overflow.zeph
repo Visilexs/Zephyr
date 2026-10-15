@@ -1,0 +1,9 @@
+// Unbounded recursion used to die with a silent SIGSEGV (exit 139). A SIGSEGV
+// handler on an alternate signal stack prints "panic: stack overflow" and
+// exits 1 (tests/linux/run.sh EXPECT_EXIT).
+fn depth(n: int) -> int {
+    if n < 0 { return 0 }
+    return depth(n + 1) + 1
+}
+print("start")
+print(depth(0))

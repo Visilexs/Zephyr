@@ -48,6 +48,8 @@ declare -A EXPECT_EXIT=(
     [fill_loops]=1
     [negative_zeros]=1
     [huge_repeat]=1
+    [stack_overflow]=1
+    [thread_stack_overflow]=1
 )
 # Tests whose two tiers may legitimately print different things.
 no_parity() { case "$1" in leaks/*) return 0 ;; esac; return 1; }

@@ -1,0 +1,10 @@
+// Stack overflow on a worker thread: its guard page faults, and the handler
+// (on the worker's own alternate signal stack) panics with exit 1.
+import "std/thread.zeph"
+fn depth(n: int) -> int {
+    if n < 0 { return 0 }
+    return depth(n + 1) + 1
+}
+print("start")
+let worker = spawnThread(fn(unused: int) { print(depth(0)) }, 0)
+worker.join()

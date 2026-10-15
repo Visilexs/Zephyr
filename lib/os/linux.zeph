@@ -454,6 +454,11 @@ fn linuxFindStack() {
 fn kernel32GetCurrentThreadStackLimits(lowLimitAddress: int, highLimitAddress: int) -> int {
     let threadRecord = linuxCurrentThread()
     if threadRecord != 0 {
+        // a worker's first call (runtimeMarkThreadReady): its alternate signal
+        // stack, which linuxCloseThread unmaps (record + 4168)
+        if load64(threadRecord + 4168) == 0 {
+            store64(threadRecord + 4168, linuxAlternateSignalStack())
+        }
         store64(lowLimitAddress, load64(threadRecord + 8) + 8192)
         store64(highLimitAddress, load64(threadRecord + 40))
         return 0
@@ -655,8 +660,171 @@ fn linuxNativeInitialize() {
     store8(codeAddress + 189, 0)
     store8(codeAddress + 190, 0)
     store8(codeAddress + 191, 195)
+    // SIGSEGV handler (at +256, SysV: rdi signal, rsi siginfo, rdx ucontext).
+    // A fault within 1 MiB of the faulting RSP is a stack overflow: write
+    // "panic: stack overflow" and exit 1. Anything else puts the default
+    // action back (the zeroed sigaction at +640) and returns through the
+    // rt_sigreturn restorer (+400), so the fault repeats and dumps core as before.
+    store8(codeAddress + 256, 72)
+    store8(codeAddress + 257, 139)
+    store8(codeAddress + 258, 70)
+    store8(codeAddress + 259, 16)
+    store8(codeAddress + 260, 72)
+    store8(codeAddress + 261, 139)
+    store8(codeAddress + 262, 138)
+    store8(codeAddress + 263, 160)
+    store8(codeAddress + 264, 0)
+    store8(codeAddress + 265, 0)
+    store8(codeAddress + 266, 0)
+    store8(codeAddress + 267, 72)
+    store8(codeAddress + 268, 41)
+    store8(codeAddress + 269, 200)
+    store8(codeAddress + 270, 72)
+    store8(codeAddress + 271, 5)
+    store8(codeAddress + 272, 0)
+    store8(codeAddress + 273, 0)
+    store8(codeAddress + 274, 16)
+    store8(codeAddress + 275, 0)
+    store8(codeAddress + 276, 72)
+    store8(codeAddress + 277, 61)
+    store8(codeAddress + 278, 0)
+    store8(codeAddress + 279, 0)
+    store8(codeAddress + 280, 32)
+    store8(codeAddress + 281, 0)
+    store8(codeAddress + 282, 115)
+    store8(codeAddress + 283, 36)
+    store8(codeAddress + 284, 184)
+    store8(codeAddress + 285, 1)
+    store8(codeAddress + 286, 0)
+    store8(codeAddress + 287, 0)
+    store8(codeAddress + 288, 0)
+    store8(codeAddress + 289, 191)
+    store8(codeAddress + 290, 2)
+    store8(codeAddress + 291, 0)
+    store8(codeAddress + 292, 0)
+    store8(codeAddress + 293, 0)
+    store8(codeAddress + 294, 72)
+    store8(codeAddress + 295, 141)
+    store8(codeAddress + 296, 53)
+    store8(codeAddress + 297, 211)
+    store8(codeAddress + 298, 0)
+    store8(codeAddress + 299, 0)
+    store8(codeAddress + 300, 0)
+    store8(codeAddress + 301, 186)
+    store8(codeAddress + 302, 22)
+    store8(codeAddress + 303, 0)
+    store8(codeAddress + 304, 0)
+    store8(codeAddress + 305, 0)
+    store8(codeAddress + 306, 15)
+    store8(codeAddress + 307, 5)
+    store8(codeAddress + 308, 184)
+    store8(codeAddress + 309, 231)
+    store8(codeAddress + 310, 0)
+    store8(codeAddress + 311, 0)
+    store8(codeAddress + 312, 0)
+    store8(codeAddress + 313, 191)
+    store8(codeAddress + 314, 1)
+    store8(codeAddress + 315, 0)
+    store8(codeAddress + 316, 0)
+    store8(codeAddress + 317, 0)
+    store8(codeAddress + 318, 15)
+    store8(codeAddress + 319, 5)
+    store8(codeAddress + 320, 184)
+    store8(codeAddress + 321, 13)
+    store8(codeAddress + 322, 0)
+    store8(codeAddress + 323, 0)
+    store8(codeAddress + 324, 0)
+    store8(codeAddress + 325, 191)
+    store8(codeAddress + 326, 11)
+    store8(codeAddress + 327, 0)
+    store8(codeAddress + 328, 0)
+    store8(codeAddress + 329, 0)
+    store8(codeAddress + 330, 72)
+    store8(codeAddress + 331, 141)
+    store8(codeAddress + 332, 53)
+    store8(codeAddress + 333, 47)
+    store8(codeAddress + 334, 1)
+    store8(codeAddress + 335, 0)
+    store8(codeAddress + 336, 0)
+    store8(codeAddress + 337, 49)
+    store8(codeAddress + 338, 210)
+    store8(codeAddress + 339, 65)
+    store8(codeAddress + 340, 186)
+    store8(codeAddress + 341, 8)
+    store8(codeAddress + 342, 0)
+    store8(codeAddress + 343, 0)
+    store8(codeAddress + 344, 0)
+    store8(codeAddress + 345, 15)
+    store8(codeAddress + 346, 5)
+    store8(codeAddress + 347, 195)
+    store8(codeAddress + 400, 184)
+    store8(codeAddress + 401, 15)
+    store8(codeAddress + 402, 0)
+    store8(codeAddress + 403, 0)
+    store8(codeAddress + 404, 0)
+    store8(codeAddress + 405, 15)
+    store8(codeAddress + 406, 5)
+    store8(codeAddress + 512, 112)
+    store8(codeAddress + 513, 97)
+    store8(codeAddress + 514, 110)
+    store8(codeAddress + 515, 105)
+    store8(codeAddress + 516, 99)
+    store8(codeAddress + 517, 58)
+    store8(codeAddress + 518, 32)
+    store8(codeAddress + 519, 115)
+    store8(codeAddress + 520, 116)
+    store8(codeAddress + 521, 97)
+    store8(codeAddress + 522, 99)
+    store8(codeAddress + 523, 107)
+    store8(codeAddress + 524, 32)
+    store8(codeAddress + 525, 111)
+    store8(codeAddress + 526, 118)
+    store8(codeAddress + 527, 101)
+    store8(codeAddress + 528, 114)
+    store8(codeAddress + 529, 102)
+    store8(codeAddress + 530, 108)
+    store8(codeAddress + 531, 111)
+    store8(codeAddress + 532, 119)
+    store8(codeAddress + 533, 10)
     linuxNative = codeAddress
 }
+
+// Give the calling thread an alternate signal stack, so the SIGSEGV handler
+// still has a stack to run on when the thread's own is exhausted. Returns the
+// mapping (64 KiB) or 0.
+fn linuxAlternateSignalStack() -> int {
+    let stackBytes = 65536
+    let mapping = linuxMapMemory(0, stackBytes + 4096, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if mapping == 0 { return 0 }
+    // stack_t { ss_sp, ss_flags, ss_size } in the mapping's first page
+    store64(mapping, mapping + 4096)
+    store64(mapping + 8, 0)
+    store64(mapping + 16, stackBytes)
+    if syscall(131, mapping, 0) != 0 {
+        let released = syscall(11, mapping, stackBytes + 4096)
+        return 0
+    }
+    return mapping
+}
+
+// Runs once at startup (a top-level initializer, below): the main thread's
+// alternate stack and the process-wide SIGSEGV handler. Workers get their
+// alternate stack in kernel32GetCurrentThreadStackLimits, their first act.
+fn linuxInstallStackOverflowHandler() -> int {
+    linuxNativeInitialize()
+    if linuxAlternateSignalStack() == 0 { return 0 }
+    // struct sigaction { handler, flags, restorer, mask }:
+    // SA_SIGINFO | SA_ONSTACK | SA_RESTORER | SA_NODEFER
+    let action = linuxNative + 704
+    store64(action, linuxNative + 256)
+    store64(action + 8, 4 + 134217728 + 67108864 + 1073741824)
+    store64(action + 16, linuxNative + 400)
+    store64(action + 24, 0)
+    store64(linuxNative + 648, 67108864)               // the default action keeps a restorer too
+    store64(linuxNative + 656, linuxNative + 400)
+    return syscall(13, 11, action, 0, 8)
+}
+let linuxStackOverflowHandlerStatus = linuxInstallStackOverflowHandler()
 
 // Return the current worker's native record, or zero for the main thread.
 // ponytail: linear range lookup; index ranges if many live records make TLS hot.
@@ -879,6 +1047,10 @@ fn linuxCloseThread(threadHandle: int) -> bool {
                 store64(threadRecord + 56, load64(threadRecord + 56) + 1)
                 let stackMapping = load64(threadRecord + 8)
                 let freed = syscall(11, stackMapping, load64(threadRecord + 40) - stackMapping)
+                if load64(threadRecord + 4168) != 0 {
+                    let alternateFreed = syscall(11, load64(threadRecord + 4168), 69632)
+                    store64(threadRecord + 4168, 0)
+                }
                 store64(threadRecord + 8, 0)
                 store64(threadRecord + 40, 0)
                 store64(threadRecord + 48, 0)
