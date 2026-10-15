@@ -304,24 +304,88 @@ fn linuxReadWholeFile(path: int, buffer: int, capacity: int) -> int {
 
 // ---- command line ----
 
-// /proc/self/cmdline is argv joined by NULs; runtimeArguments wants the Windows
-// GetCommandLineA shape, so the NULs become spaces.
-// ponytail: no quoting, so an argument containing a space splits in two.
-// Capture argv at _start if that ever matters.
+// /proc/self/cmdline is argv exactly, joined by NULs and read to EOF (no size
+// limit). runtimeArguments wants the Windows GetCommandLineA shape, so each
+// argument is written back quoted by the Windows rules it parses
+// (CommandLineToArgv): wrapped in quotes, with a quote or a run of backslashes
+// before one escaped. Empty arguments, spaces, tabs and quotes all survive.
 var linuxCommandLine = 0
 
 fn kernel32GetCommandLineA() -> int {
     if linuxCommandLine != 0 { return linuxCommandLine }
-    let page = linuxMapMemory(0, 8192, memoryProtectionReadWrite, mapAnonymousPrivate)
-    if page == 0 { return 0 }
-    let path = linuxProcCommandLinePath(page + 4096)
-    let byteCount = linuxReadWholeFile(path, page, 4096)
-    for i in 0..byteCount {
-        if load8(page + i) == 0 { store8(page + i, 32) }
+    let pathPage = linuxMapMemory(0, 4096, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if pathPage == 0 { return 0 }
+    let path = linuxProcCommandLinePath(pathPage)
+    let fileDescriptor = syscall(systemCallOpen, path, 0, 0)
+    let pathReleased = syscall(11, pathPage, 4096)
+    if fileDescriptor < 0 { return 0 }
+    var capacity = 65536
+    var raw = linuxMapMemory(0, capacity, memoryProtectionReadWrite, mapAnonymousPrivate)
+    var byteCount = 0
+    var going = raw != 0
+    while going {
+        if byteCount == capacity {
+            let grown = linuxMapMemory(0, capacity * 2, memoryProtectionReadWrite, mapAnonymousPrivate)
+            if grown == 0 { going = false } else {
+                for i in 0..byteCount { store8(grown + i, load8(raw + i)) }
+                let oldReleased = syscall(11, raw, capacity)
+                raw = grown
+                capacity = capacity * 2
+            }
+        }
+        if going {
+            let result = syscall(systemCallRead, fileDescriptor, raw + byteCount, capacity - byteCount)
+            if result <= 0 { going = false } else { byteCount += result }
+        }
     }
-    store8(page + byteCount, 0)
-    linuxCommandLine = page
-    return page
+    let closed = syscall(systemCallClose, fileDescriptor)
+    if raw == 0 { return 0 }
+    // worst case: every byte a backslash before a quote (2x), plus quotes and a space per argument
+    let encodedCapacity = byteCount * 4 + 16
+    let encoded = linuxMapMemory(0, encodedCapacity, memoryProtectionReadWrite, mapAnonymousPrivate)
+    if encoded == 0 { return 0 }
+    var out = 0
+    var start = 0
+    while start < byteCount {
+        var end = start
+        while end < byteCount and load8(raw + end) != 0 { end += 1 }
+        if start > 0 {
+            store8(encoded + out, 32)
+            out += 1
+        }
+        store8(encoded + out, 34)
+        out += 1
+        var index = start
+        while index <= end {
+            var backslashes = 0
+            while index < end and load8(raw + index) == 92 {
+                backslashes += 1
+                index += 1
+            }
+            // backslashes double before a quote or the closing quote
+            if index == end or load8(raw + index) == 34 { backslashes = backslashes * 2 }
+            for b in 0..backslashes {
+                store8(encoded + out, 92)
+                out += 1
+            }
+            if index < end {
+                if load8(raw + index) == 34 {
+                    store8(encoded + out, 92)
+                    out += 1
+                }
+                store8(encoded + out, load8(raw + index))
+                out += 1
+            }
+            index += 1
+        }
+        store8(encoded + out, 34)
+        out += 1
+        start = end + 1
+    }
+    store8(encoded + out, 0)
+    let rawReleased = syscall(11, raw, capacity)
+    linuxCommandLine = encoded
+    return encoded
 }
 
 // ---- stack bounds (GC root scanning) ----

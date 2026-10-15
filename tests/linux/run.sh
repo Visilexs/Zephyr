@@ -42,11 +42,6 @@ declare -A KNOWN_FAIL=(
     [macos_loops:base]="codegen: tryReduce weighted-reduction fast path runs on maps"
     [macos_loops:O2]="codegen: tryReduce weighted-reduction fast path runs on maps"
     [leaks/padleft:O2]="rc: -O2 inliner takeOwnership leaks owned temporary argument"
-    [leaks/readfile:base]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/readfile:O2]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/args:base]="runtime: readFile/writeFile/args leak temporaries"
-    [leaks/args:O2]="runtime: readFile/writeFile/args leak temporaries"
-    [py:argument_tests]="frontend: Linux args() splits on spaces, drops empty args, truncates at 4 KB"
 )
 # Tests that are expected to exit nonzero (an intentional panic).
 declare -A EXPECT_EXIT=(

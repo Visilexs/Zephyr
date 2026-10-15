@@ -702,8 +702,8 @@ running it.
 | `s.sub(lo, hi)` | str, int, int → str | half-open byte range; panics if invalid |
 | `l.join()` | [str] → str | single-pass concatenation |
 | `l.join(sep)` | [str], str → str | concatenation with `sep` between elements |
-| `args()`   | → [str] | process arguments, `args()[0]` is the program |
-| `readFile(p)` | str → str | whole file; panics if unreadable |
+| `args()`   | → [str] | process arguments, `args()[0]` is the program; each argument exactly as passed (on Linux, argv: empty arguments, spaces and quotes survive) |
+| `readFile(p)` | str → str | whole file, read until end of file (so `/proc` files and pipes work); panics if unreadable |
 | `writeFile(p, d)` | str, str → void | create/overwrite; panics on failure |
 | `zeros(n)` | int → [int] | preallocated list of `n` zeros (panics when `n < 0`, "out of memory" when it cannot fit) |
 | `assert(c)` / `assert(c, m)` | bool, str? → void | panics with `m` (or "assertion failed") if `c` is false |
@@ -908,8 +908,11 @@ or struct); lists as `[e1, e2]`; structs as `Name{field: value, ...}`.
 A panic prints `panic: <file>:<line>: <message>` to stderr (the source
 location of the panicking operation) and terminates the process with exit
 code 1. Sources: `panic(msg)`, index out of bounds, `/` or `%` by zero
-(int), `.pop()` on an empty list, failed `as int`/`as float` parse, and heap
-exhaustion. Panics are not catchable.
+(int), `.pop()` on an empty list, failed `as int`/`as float` parse, a negative
+length (`zeros(n)`), and heap exhaustion (`out of memory`, also for a size too
+large to represent). Printing a panic never allocates, so it works when memory
+is what ran out. Under an address-space limit the runtime reserves less address
+space for its heap rather than failing at startup. Panics are not catchable.
 
 ## 7. Programs and linkage
 
